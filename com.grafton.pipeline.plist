@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd plist — auto-starts Pipeline Dashboard on Mac Mini login.
+
+  INSTALL:
+    cp com.grafton.pipeline.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.grafton.pipeline.plist
+
+  START NOW:
+    launchctl start com.grafton.pipeline
+
+  STOP:
+    launchctl stop com.grafton.pipeline
+
+  UNINSTALL:
+    launchctl unload ~/Library/LaunchAgents/com.grafton.pipeline.plist
+
+  LOGS:
+    tail -f /usr/local/var/log/grafton-pipeline.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.grafton.pipeline</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/anurag/Documents/Projects/Applications/lead-lifecycle/backend/venv/bin/python3</string>
+    <string>/Users/anurag/Documents/Projects/Applications/lead-lifecycle/backend/main.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/anurag/Documents/Projects/Applications/lead-lifecycle/backend</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/grafton-pipeline.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/grafton-pipeline.log</string>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>

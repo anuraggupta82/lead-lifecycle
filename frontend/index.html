@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pipeline Dashboard — Grafton Dental Care</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --teal: #0d7a7f; --teal-dark: #0a5f63; --teal-light: #e8f4f4;
+      --green: #22c55e; --yellow: #f59e0b; --red: #ef4444; --purple: #8b5cf6;
+      --gray: #6b7280; --gray-light: #f3f4f6; --border: #e5e7eb;
+      --text: #111827; --text-muted: #6b7280;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #f0f4f8; color: var(--text); min-height: 100vh; }
+    #root { display: flex; flex-direction: column; min-height: 100vh; }
+
+    /* Header */
+    .header { background: var(--teal-dark); color: #fff; padding: 0 24px;
+               display: flex; align-items: center; gap: 16px; height: 56px; }
+    .header-logo { font-size: 18px; font-weight: 700; }
+    .header-logo span { color: #5eead4; }
+    .header-sub { font-size: 13px; opacity: .7; }
+    .header-right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+    .btn { padding: 7px 14px; border-radius: 6px; border: none; cursor: pointer;
+            font-size: 13px; font-weight: 500; transition: opacity .15s; }
+    .btn:hover { opacity: .85; }
+    .btn-teal { background: var(--teal); color: #fff; }
+    .btn-white { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.3); }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+    .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text-muted); }
+
+    /* Layout */
+    .main { flex: 1; padding: 20px 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
+    .section-title { font-size: 15px; font-weight: 600; color: var(--text-muted);
+                      text-transform: uppercase; letter-spacing: .5px; margin-bottom: 12px; }
+
+    /* KPI cards */
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                 gap: 14px; margin-bottom: 24px; }
+    .kpi-card { background: #fff; border-radius: 10px; padding: 16px 18px;
+                 border: 1px solid var(--border); }
+    .kpi-label { font-size: 12px; color: var(--text-muted); font-weight: 500;
+                  text-transform: uppercase; letter-spacing: .4px; }
+    .kpi-value { font-size: 28px; font-weight: 700; margin: 4px 0 2px; }
+    .kpi-sub { font-size: 12px; color: var(--text-muted); }
+    .kpi-teal { color: var(--teal); }
+    .kpi-green { color: var(--green); }
+    .kpi-yellow { color: var(--yellow); }
+    .kpi-purple { color: var(--purple); }
+
+    /* Funnel */
+    .funnel-row { display: flex; gap: 8px; margin-bottom: 24px; overflow-x: auto; padding-bottom: 4px; }
+    .funnel-stage { flex: 1; min-width: 100px; background: #fff; border-radius: 8px;
+                     border: 1px solid var(--border); padding: 12px 10px; text-align: center;
+                     cursor: pointer; transition: all .15s; position: relative; }
+    .funnel-stage:hover { border-color: var(--teal); box-shadow: 0 2px 8px rgba(13,122,127,.1); }
+    .funnel-stage.active { border-color: var(--teal); background: var(--teal-light); }
+    .funnel-stage-name { font-size: 11px; color: var(--text-muted); font-weight: 500;
+                          text-transform: uppercase; letter-spacing: .3px; margin-bottom: 6px; }
+    .funnel-stage-count { font-size: 26px; font-weight: 700; color: var(--teal); }
+    .funnel-arrow { display: flex; align-items: center; padding-top: 30px;
+                     color: var(--border); font-size: 18px; }
+
+    /* Two-column layout */
+    .two-col { display: grid; grid-template-columns: 1fr 340px; gap: 20px; }
+    @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+
+    /* Lead table */
+    .card { background: #fff; border-radius: 10px; border: 1px solid var(--border);
+             overflow: hidden; }
+    .card-header { padding: 14px 18px; border-bottom: 1px solid var(--border);
+                    display: flex; align-items: center; gap: 10px; }
+    .card-header h3 { font-size: 15px; font-weight: 600; flex: 1; }
+    .filters { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 18px;
+                border-bottom: 1px solid var(--border); background: var(--gray-light); }
+    .filter-btn { padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 500;
+                   border: 1px solid var(--border); background: #fff; cursor: pointer;
+                   color: var(--text-muted); transition: all .15s; }
+    .filter-btn.active { background: var(--teal); color: #fff; border-color: var(--teal); }
+    .search-box { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border);
+                   font-size: 13px; flex: 1; min-width: 180px; outline: none; }
+    .search-box:focus { border-color: var(--teal); }
+
+    /* Lead list */
+    .lead-list { overflow-y: auto; max-height: 520px; }
+    .lead-item { padding: 14px 18px; border-bottom: 1px solid var(--border); cursor: pointer;
+                  display: flex; align-items: flex-start; gap: 12px; transition: background .1s; }
+    .lead-item:hover { background: var(--gray-light); }
+    .lead-item.selected { background: var(--teal-light); border-left: 3px solid var(--teal); }
+    .lead-avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--teal-light);
+                    color: var(--teal); display: flex; align-items: center; justify-content: center;
+                    font-weight: 700; font-size: 14px; flex-shrink: 0; }
+    .lead-main { flex: 1; min-width: 0; }
+    .lead-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden;
+                  text-overflow: ellipsis; }
+    .lead-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+    .lead-right { text-align: right; flex-shrink: 0; }
+    .stage-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
+                    font-size: 11px; font-weight: 500; }
+    .days-badge { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+    /* Stage colors */
+    .stage-new { background: #dbeafe; color: #1d4ed8; }
+    .stage-engaged { background: #fef9c3; color: #854d0e; }
+    .stage-smile_completed { background: #f3e8ff; color: #7c3aed; }
+    .stage-nurturing { background: #fed7aa; color: #c2410c; }
+    .stage-scheduled { background: #d1fae5; color: #065f46; }
+    .stage-confirmed { background: #a7f3d0; color: #064e3b; }
+    .stage-showed { background: #bbf7d0; color: #15803d; }
+    .stage-treatment_presented { background: #cffafe; color: #0e7490; }
+    .stage-treatment_accepted { background: #99f6e4; color: #0f766e; }
+    .stage-treatment_completed { background: #d1fae5; color: #065f46; }
+    .stage-cold { background: #f3f4f6; color: #6b7280; }
+
+    /* Source icons */
+    .source-badge { font-size: 11px; display: inline-flex; align-items: center; gap: 3px;
+                     padding: 1px 6px; border-radius: 4px; background: var(--gray-light);
+                     color: var(--text-muted); }
+
+    /* Lead detail panel */
+    .detail-panel { background: #fff; border-radius: 10px; border: 1px solid var(--border);
+                     overflow: hidden; }
+    .detail-header { padding: 16px 18px; border-bottom: 1px solid var(--border);
+                      background: var(--teal-light); }
+    .detail-name { font-size: 18px; font-weight: 700; }
+    .detail-contact { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+    .detail-body { padding: 16px 18px; overflow-y: auto; max-height: 560px; }
+    .detail-section { margin-bottom: 20px; }
+    .detail-section h4 { font-size: 12px; font-weight: 600; color: var(--text-muted);
+                           text-transform: uppercase; letter-spacing: .4px; margin-bottom: 10px; }
+    .detail-row { display: flex; justify-content: space-between; font-size: 13px;
+                   padding: 4px 0; }
+    .detail-label { color: var(--text-muted); }
+    .detail-value { font-weight: 500; text-align: right; max-width: 60%; word-break: break-word; }
+
+    /* Timeline */
+    .timeline { position: relative; padding-left: 20px; }
+    .timeline::before { content: ''; position: absolute; left: 7px; top: 0; bottom: 0;
+                          width: 1px; background: var(--border); }
+    .timeline-item { position: relative; padding: 0 0 14px 16px; }
+    .timeline-item::before { content: ''; position: absolute; left: -13px; top: 5px;
+                               width: 8px; height: 8px; border-radius: 50%;
+                               background: var(--teal); border: 2px solid #fff;
+                               box-shadow: 0 0 0 1px var(--teal); }
+    .timeline-type { font-size: 12px; font-weight: 600; color: var(--teal); }
+    .timeline-time { font-size: 11px; color: var(--text-muted); }
+    .timeline-detail { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+    /* Follow-up queue panel */
+    .queue-item { padding: 12px 14px; border-bottom: 1px solid var(--border);
+                   display: flex; gap: 10px; align-items: flex-start; }
+    .queue-channel { width: 32px; height: 32px; border-radius: 6px; display: flex;
+                      align-items: center; justify-content: center; font-size: 14px;
+                      flex-shrink: 0; }
+    .queue-email { background: #dbeafe; }
+    .queue-sms { background: #d1fae5; }
+    .queue-info { flex: 1; }
+    .queue-template { font-size: 13px; font-weight: 500; }
+    .queue-meta { font-size: 11px; color: var(--text-muted); }
+
+    /* Revenue bar */
+    .revenue-bar { background: var(--teal-light); border-radius: 8px; padding: 14px 16px;
+                    border: 1px solid rgba(13,122,127,.15); margin-bottom: 16px; }
+    .revenue-row { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
+    .revenue-label { color: var(--text-muted); }
+    .revenue-value { font-weight: 700; color: var(--teal); }
+
+    /* Empty state */
+    .empty { text-align: center; padding: 40px; color: var(--text-muted); }
+    .empty-icon { font-size: 32px; margin-bottom: 8px; }
+    .empty-text { font-size: 14px; }
+
+    /* Status dot */
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot-green { background: var(--green); }
+    .dot-red { background: var(--red); }
+    .dot-yellow { background: var(--yellow); }
+
+    /* Toast */
+    .toast { position: fixed; bottom: 24px; right: 24px; background: #111; color: #fff;
+              padding: 10px 18px; border-radius: 8px; font-size: 13px;
+              animation: fadeup .3s ease; z-index: 9999; }
+    @keyframes fadeup { from { opacity:0; transform:translateY(10px); }
+                         to { opacity:1; transform:translateY(0); } }
+
+    /* Spinner */
+    .spin { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border);
+             border-top-color: var(--teal); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 11px;
+            font-weight: 500; background: var(--gray-light); color: var(--gray); margin: 2px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+const API = window.location.origin;
+const ADMIN_PW = 'GDC-pipeline-2026!'; // override in Settings if changed
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function api(path, opts = {}) {
+  return fetch(`${API}${path}`, {
+    headers: { 'X-Admin-Password': ADMIN_PW, 'Content-Type': 'application/json', ...(opts.headers||{}) },
+    ...opts,
+  }).then(r => r.json());
+}
+
+function timeAgo(iso) {
+  if (!iso) return '';
+  const diff = (Date.now() - new Date(iso)) / 1000;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+  return `${Math.floor(diff/86400)}d ago`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
+}
+
+function initials(first, last) {
+  return ((first||'')[0] || '') + ((last||'')[0] || '') || '?';
+}
+
+function stageName(s) {
+  return (s||'').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function sourceIcon(src) {
+  if (!src) return '🌐';
+  if (src.includes('smile')) return '✨';
+  if (src.includes('pearly') || src.includes('chat')) return '💬';
+  if (src.includes('contact') || src.includes('form')) return '📋';
+  if (src.includes('waitlist')) return '📅';
+  if (src.includes('scheduler')) return '📆';
+  return '🌐';
+}
+
+const STAGES = ['new','engaged','smile_completed','nurturing','scheduled',
+                 'confirmed','showed','treatment_presented','treatment_accepted',
+                 'treatment_completed'];
+
+// ─── Stage Badge ──────────────────────────────────────────────────────────────
+
+function StageBadge({ stage }) {
+  return <span className={`stage-badge stage-${stage}`}>{stageName(stage)}</span>;
+}
+
+// ─── KPI Card ─────────────────────────────────────────────────────────────────
+
+function KpiCard({ label, value, sub, colorClass }) {
+  return (
+    <div className="kpi-card">
+      <div className="kpi-label">{label}</div>
+      <div className={`kpi-value ${colorClass||''}`}>{value}</div>
+      {sub && <div className="kpi-sub">{sub}</div>}
+    </div>
+  );
+}
+
+// ─── Funnel ───────────────────────────────────────────────────────────────────
+
+function Funnel({ stats, activeStage, onSelect }) {
+  const by = stats?.by_stage || {};
+  const shown = ['new','engaged','smile_completed','nurturing','scheduled','showed','treatment_accepted','treatment_completed'];
+  return (
+    <div className="funnel-row">
+      {shown.map((s, i) => (
+        <React.Fragment key={s}>
+          <div
+            className={`funnel-stage ${activeStage === s ? 'active' : ''}`}
+            onClick={() => onSelect(activeStage === s ? null : s)}
+          >
+            <div className="funnel-stage-name">{stageName(s)}</div>
+            <div className="funnel-stage-count">{by[s] || 0}</div>
+          </div>
+          {i < shown.length - 1 && <div className="funnel-arrow">›</div>}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+// ─── Lead Item ────────────────────────────────────────────────────────────────
+
+function LeadItem({ lead, selected, onClick }) {
+  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ') || lead.email || 'Unknown';
+  const lastAct = lead.last_event?.created_at;
+  return (
+    <div className={`lead-item ${selected ? 'selected' : ''}`} onClick={onClick}>
+      <div className="lead-avatar">{initials(lead.first_name, lead.last_name)}</div>
+      <div className="lead-main">
+        <div className="lead-name">{name}</div>
+        <div className="lead-meta">
+          <span className="source-badge">{sourceIcon(lead.source)} {lead.source}</span>
+          {lead.utm_campaign && <span className="tag">{lead.utm_campaign}</span>}
+        </div>
+        {lead.attributed_production > 0 && (
+          <div className="lead-meta" style={{color:'var(--green)',fontWeight:600}}>
+            ${lead.attributed_production.toFixed(0)} attributed
+          </div>
+        )}
+      </div>
+      <div className="lead-right">
+        <StageBadge stage={lead.stage} />
+        <div className="days-badge">{timeAgo(lastAct || lead.updated_at)}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Lead Detail ──────────────────────────────────────────────────────────────
+
+function LeadDetail({ leadId, onClose }) {
+  const [data, setData] = useState(null);
+  const [advancing, setAdvancing] = useState(false);
+
+  useEffect(() => {
+    if (!leadId) return;
+    api(`/api/lead/${leadId}`).then(setData);
+  }, [leadId]);
+
+  if (!leadId) return (
+    <div className="detail-panel">
+      <div className="empty" style={{paddingTop:80}}>
+        <div className="empty-icon">👆</div>
+        <div className="empty-text">Select a lead to see details</div>
+      </div>
+    </div>
+  );
+
+  if (!data) return <div className="detail-panel"><div className="empty"><div className="spin"/></div></div>;
+
+  const { lead, events, follow_up_queue } = data;
+  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ') || 'Unknown';
+  const nextStageIdx = STAGES.indexOf(lead.stage) + 1;
+  const nextStage = STAGES[nextStageIdx];
+
+  async function advanceStage() {
+    if (!nextStage) return;
+    setAdvancing(true);
+    await api(`/api/admin/lead/${leadId}/stage`, {
+      method: 'PUT',
+      body: JSON.stringify({ stage: nextStage }),
+    });
+    const updated = await api(`/api/lead/${leadId}`);
+    setData(updated);
+    setAdvancing(false);
+  }
+
+  return (
+    <div className="detail-panel">
+      <div className="detail-header">
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+          <div>
+            <div className="detail-name">{name}</div>
+            <div className="detail-contact">
+              {lead.email && <span>📧 {lead.email}</span>}
+              {lead.phone && <span style={{marginLeft:8}}>📞 {lead.phone}</span>}
+            </div>
+          </div>
+          <StageBadge stage={lead.stage} />
+        </div>
+        {nextStage && (
+          <button className="btn btn-teal btn-sm" style={{marginTop:10}} onClick={advanceStage} disabled={advancing}>
+            {advancing ? <span className="spin"/> : `→ Mark as ${stageName(nextStage)}`}
+          </button>
+        )}
+      </div>
+      <div className="detail-body">
+        {lead.attributed_production > 0 && (
+          <div className="revenue-bar">
+            <div className="revenue-row">
+              <span className="revenue-label">Attributed Production</span>
+              <span className="revenue-value">${lead.attributed_production.toFixed(2)}</span>
+            </div>
+            {lead.od_patient_num && (
+              <div className="revenue-row">
+                <span className="revenue-label">OD Patient #</span>
+                <span className="revenue-value">{lead.od_patient_num}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="detail-section">
+          <h4>Lead Info</h4>
+          {[
+            ['Source', lead.source],
+            ['Created', fmtDate(lead.created_at)],
+            ['Campaign', lead.utm_campaign || lead.gclid ? (lead.utm_campaign || 'Google Ads') : '—'],
+            ['Keyword', lead.utm_term || '—'],
+            ['Goals', (() => { try { const g = JSON.parse(lead.goals||'[]'); return g.join(', ') || '—'; } catch { return lead.goals || '—'; } })()],
+          ].map(([k, v]) => (
+            <div key={k} className="detail-row">
+              <span className="detail-label">{k}</span>
+              <span className="detail-value">{v||'—'}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="detail-section">
+          <h4>Follow-up Queue</h4>
+          {follow_up_queue.length === 0 ? <div className="empty-text">No follow-ups queued</div> : (
+            follow_up_queue.map(q => (
+              <div key={q.id} style={{display:'flex',gap:8,padding:'4px 0',fontSize:13}}>
+                <span>{q.channel === 'email' ? '📧' : '💬'}</span>
+                <span style={{flex:1}}>{q.template.replace(/_/g,' ')}</span>
+                <span style={{fontSize:11,color:
+                  q.status==='sent' ? 'var(--green)' :
+                  q.status==='skipped' ? 'var(--gray)' :
+                  q.status==='failed' ? 'var(--red)' : 'var(--yellow)'
+                }}>
+                  {q.status === 'sent' ? `✓ ${fmtDate(q.sent_at)}` :
+                   q.status === 'skipped' ? '— skipped' :
+                   q.status === 'failed' ? '✗ failed' :
+                   fmtDate(q.scheduled_at)}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="detail-section">
+          <h4>Timeline ({events.length} events)</h4>
+          <div className="timeline">
+            {[...events].reverse().slice(0, 20).map(e => (
+              <div key={e.id} className="timeline-item">
+                <div className="timeline-type">{e.event_type.replace(/_/g,' ')}</div>
+                <div className="timeline-time">{fmtDate(e.created_at)} · {e.source}</div>
+                {e.detail && e.detail !== '{}' && (
+                  <div className="timeline-detail">
+                    {(() => { try { const d = JSON.parse(e.detail); return Object.entries(d).map(([k,v])=>`${k}: ${v}`).join(' · '); } catch { return e.detail; } })()}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin Sidebar ────────────────────────────────────────────────────────────
+
+function AdminSidebar({ stats, onRefresh }) {
+  const [syncing, setSyncing] = useState(false);
+  const [matching, setMatching] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [lastSync, setLastSync] = useState(null);
+  const [toast, setToast] = useState('');
+
+  function showToast(msg) {
+    setToast(msg);
+    setTimeout(() => setToast(''), 3000);
+  }
+
+  async function doSync() {
+    setSyncing(true);
+    const r = await api('/api/admin/sync', { method: 'POST' });
+    setSyncing(false);
+    setLastSync(r.result);
+    showToast(`Synced ${r.result?.synced || 0} new leads from Firestore`);
+    onRefresh();
+  }
+
+  async function doMatch() {
+    setMatching(true);
+    const r = await api('/api/admin/match', { method: 'POST' });
+    setMatching(false);
+    showToast(`Matched ${r.result?.matched || 0} leads to OpenDental`);
+    onRefresh();
+  }
+
+  async function doRunQueue() {
+    setRunning(true);
+    await api('/api/admin/run-queue', { method: 'POST' });
+    setRunning(false);
+    showToast('Follow-up queue processed');
+    onRefresh();
+  }
+
+  const by = stats?.by_stage || {};
+  const stagesWithLeads = STAGES.filter(s => (by[s] || 0) > 0);
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      {/* Revenue summary */}
+      <div className="card">
+        <div className="card-header"><h3>💰 Revenue Attribution</h3></div>
+        <div style={{padding:'14px 16px'}}>
+          <div className="revenue-bar" style={{margin:0}}>
+            <div className="revenue-row">
+              <span className="revenue-label">Total Attributed</span>
+              <span className="revenue-value">${(stats?.attributed_revenue||0).toFixed(2)}</span>
+            </div>
+            <div className="revenue-row">
+              <span className="revenue-label">Completed Treatments</span>
+              <span className="revenue-value">{by.treatment_completed||0}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Actions */}
+      <div className="card">
+        <div className="card-header"><h3>⚡ Actions</h3></div>
+        <div style={{padding:'14px 16px',display:'flex',flexDirection:'column',gap:10}}>
+          <button className="btn btn-teal" onClick={doSync} disabled={syncing} style={{width:'100%',justifyContent:'center'}}>
+            {syncing ? <><span className="spin"/> Syncing...</> : '🔄 Sync from Firestore'}
+          </button>
+          {lastSync && <div style={{fontSize:12,color:'var(--text-muted)'}}>Last sync: +{lastSync.synced} new, {lastSync.skipped} existing</div>}
+          <button className="btn btn-ghost" onClick={doMatch} disabled={matching} style={{width:'100%'}}>
+            {matching ? <><span className="spin"/> Matching...</> : '🏥 Match OpenDental Patients'}
+          </button>
+          <button className="btn btn-ghost" onClick={doRunQueue} disabled={running} style={{width:'100%'}}>
+            {running ? <><span className="spin"/> Running...</> : '📤 Run Follow-up Queue Now'}
+          </button>
+          <div style={{fontSize:12,color:'var(--text-muted)'}}>
+            📬 {stats?.pending_follow_ups||0} pending · ✓ {stats?.sent_today||0} sent today
+          </div>
+        </div>
+      </div>
+
+      {/* Stage breakdown */}
+      <div className="card">
+        <div className="card-header"><h3>📊 All Stages</h3></div>
+        <div style={{padding:'8px 0'}}>
+          {[...STAGES, 'cold'].map(s => (
+            <div key={s} style={{display:'flex',justifyContent:'space-between',
+                                  padding:'6px 16px',fontSize:13,
+                                  background: (by[s]||0) > 0 ? 'transparent' : 'transparent',
+                                  opacity: (by[s]||0) > 0 ? 1 : .45}}>
+              <span style={{color:'var(--text-muted)'}}>{stageName(s)}</span>
+              <span style={{fontWeight:600,color:(by[s]||0)>0?'var(--teal)':'var(--text-muted)'}}>{by[s]||0}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {toast && <div className="toast">{toast}</div>}
+    </div>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+
+function App() {
+  const [leads, setLeads] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [selectedId, setSelectedId] = useState(null);
+  const [activeStage, setActiveStage] = useState(null);
+  const [search, setSearch] = useState('');
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const timerRef = useRef(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [pipe, st] = await Promise.all([
+        api('/api/pipeline?limit=500'),
+        api('/api/admin/stats'),
+      ]);
+      setLeads(pipe.leads || []);
+      setStats(st);
+      setLastRefresh(new Date());
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    timerRef.current = setInterval(load, 60000); // auto-refresh every 60s
+    return () => clearInterval(timerRef.current);
+  }, [load]);
+
+  // Filter leads
+  const filtered = leads.filter(l => {
+    if (activeStage && l.stage !== activeStage) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      const name = `${l.first_name} ${l.last_name}`.toLowerCase();
+      if (!name.includes(q) && !l.email?.toLowerCase().includes(q) &&
+          !l.phone?.includes(q) && !l.utm_campaign?.toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
+  return (
+    <div id="root">
+      {/* Header */}
+      <div className="header">
+        <div>
+          <div className="header-logo">✨ nXt<span>smile</span> Pipeline</div>
+          <div className="header-sub">Grafton Dental Care — Lead to Income Dashboard</div>
+        </div>
+        <div className="header-right">
+          <span style={{fontSize:12,opacity:.6}}>
+            <span className={`dot dot-${loading?'yellow':'green'}`}/>&nbsp;
+            {lastRefresh ? `Updated ${timeAgo(lastRefresh.toISOString())}` : 'Loading...'}
+          </span>
+          <button className="btn btn-white btn-sm" onClick={load}>↻ Refresh</button>
+        </div>
+      </div>
+
+      <div className="main">
+        {/* KPIs */}
+        <div className="section-title">Overview</div>
+        <div className="kpi-grid">
+          <KpiCard label="Total Leads" value={stats?.total_leads||0} colorClass="kpi-teal"
+                   sub="all time" />
+          <KpiCard label="In Nurture" value={(stats?.by_stage||{}).nurturing||0} colorClass="kpi-yellow"
+                   sub="active sequences" />
+          <KpiCard label="Scheduled" value={((stats?.by_stage||{}).scheduled||0)+((stats?.by_stage||{}).confirmed||0)}
+                   colorClass="kpi-green" sub="booked appointments" />
+          <KpiCard label="Treated" value={((stats?.by_stage||{}).treatment_accepted||0)+((stats?.by_stage||{}).treatment_completed||0)}
+                   colorClass="kpi-purple" sub="accepted treatment" />
+          <KpiCard label="Attributed $" value={`$${((stats?.attributed_revenue)||0).toFixed(0)}`}
+                   colorClass="kpi-green" sub="from OD production" />
+          <KpiCard label="Follow-ups" value={stats?.pending_follow_ups||0} colorClass="kpi-yellow"
+                   sub={`${stats?.sent_today||0} sent today`} />
+        </div>
+
+        {/* Funnel */}
+        <div className="section-title">Pipeline Funnel</div>
+        <Funnel stats={stats} activeStage={activeStage} onSelect={setActiveStage} />
+
+        {/* Main content */}
+        <div className="two-col">
+          {/* Lead list */}
+          <div>
+            <div className="card">
+              <div className="card-header">
+                <h3>
+                  {activeStage ? `${stageName(activeStage)} — ` : 'All Leads — '}
+                  <span style={{color:'var(--teal)'}}>{filtered.length}</span>
+                </h3>
+                {activeStage && (
+                  <button className="btn btn-ghost btn-sm" onClick={() => setActiveStage(null)}>
+                    × Clear filter
+                  </button>
+                )}
+              </div>
+              <div className="filters">
+                <input
+                  className="search-box"
+                  placeholder="Search name, email, phone, campaign..."
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                />
+              </div>
+              <div className="lead-list">
+                {loading && <div className="empty"><div className="spin"/></div>}
+                {!loading && filtered.length === 0 && (
+                  <div className="empty">
+                    <div className="empty-icon">🔍</div>
+                    <div className="empty-text">No leads{activeStage ? ` in "${stageName(activeStage)}"` : ''}</div>
+                  </div>
+                )}
+                {filtered.map(lead => (
+                  <LeadItem
+                    key={lead.id}
+                    lead={lead}
+                    selected={selectedId === lead.id}
+                    onClick={() => setSelectedId(lead.id === selectedId ? null : lead.id)}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Right column: detail + admin */}
+          <div style={{display:'flex',flexDirection:'column',gap:16}}>
+            <LeadDetail leadId={selectedId} onClose={() => setSelectedId(null)} />
+            <AdminSidebar stats={stats} onRefresh={load} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
