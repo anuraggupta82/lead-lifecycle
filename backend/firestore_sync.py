@@ -2,6 +2,7 @@
 Firestore sync — pulls existing nxtsmile leads from Firestore into SQLite on startup.
 Also callable via admin API to re-sync at any time.
 """
+import hashlib
 import logging
 import urllib.request
 import json
@@ -23,8 +24,14 @@ def _normalize_firestore_lead(doc: dict) -> dict:
         doc.get("firestore_id") or
         None
     )
+
+    # Firestore leads often lack an ID field — generate one from email
     if not lead_id:
-        return None
+        email = raw.get("email", "").strip().lower()
+        if email:
+            lead_id = "fs_" + hashlib.sha256(email.encode()).hexdigest()[:12]
+        else:
+            return None
 
     # Parse name — may be combined "full_name" or split
     first = raw.get("first_name") or raw.get("firstName") or ""
