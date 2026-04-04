@@ -615,6 +615,7 @@ function App() {
             {lastRefresh ? `Updated ${timeAgo(lastRefresh.toISOString())}` : 'Loading...'}
           </span>
           <button className="btn btn-white btn-sm" onClick={load}>↻ Refresh</button>
+          <button className="btn btn-white btn-sm" onClick={() => { document.querySelector('.admin-section')?.scrollIntoView({behavior: 'smooth', block: 'start'}); }}>⚙️ Admin</button>
         </div>
       </div>
 
@@ -646,7 +647,7 @@ function App() {
           <div>
             <div className="card">
               <div className="card-header">
-                <h3>
+                <h3 className="admin-section">
                   {activeStage ? `${stageName(activeStage)} — ` : 'All Leads — '}
                   <span style={{color:'var(--teal)'}}>{filtered.length}</span>
                 </h3>
@@ -687,7 +688,9 @@ function App() {
           {/* Right column: detail + admin */}
           <div style={{display:'flex',flexDirection:'column',gap:16}}>
             <LeadDetail leadId={selectedId} onClose={() => setSelectedId(null)} />
-            <AdminSidebar stats={stats} onRefresh={load} />
+            <div className="admin-section">
+              <AdminSidebar stats={stats} onRefresh={load} />
+            </div>
           </div>
         </div>
       </div>
