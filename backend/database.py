@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS leads (
     attributed_production REAL DEFAULT 0.0,
     booking_id  TEXT DEFAULT '',           -- scheduler booking ID when booked
     notes       TEXT DEFAULT '',
+    -- Google Ads resolved fields (populated by google_ads_sync.py)
+    keyword_text    TEXT DEFAULT '',       -- matched keyword from Google Ads
+    search_term     TEXT DEFAULT '',       -- actual search query the user typed
+    ad_group_name   TEXT DEFAULT '',       -- ad group name
+    ad_id           TEXT DEFAULT '',       -- ad creative ID
+    click_cost      REAL DEFAULT 0.0,     -- cost per click in dollars
+    gads_synced_at  TEXT DEFAULT '',       -- when gclid was last resolved
     updated_at  TEXT NOT NULL
 );
 
@@ -45,6 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
 CREATE INDEX IF NOT EXISTS idx_leads_phone_hash ON leads(phone_hash);
 CREATE INDEX IF NOT EXISTS idx_leads_stage ON leads(stage);
 CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at);
+CREATE INDEX IF NOT EXISTS idx_leads_gclid ON leads(gclid);
 
 CREATE TABLE IF NOT EXISTS lifecycle_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +108,23 @@ CREATE TABLE IF NOT EXISTS od_matches (
     FOREIGN KEY (lead_id) REFERENCES leads(id)
 );
 
+CREATE TABLE IF NOT EXISTS conversion_uploads (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id           TEXT NOT NULL,
+    conversion_action TEXT NOT NULL,     -- 'Qualified Lead','Appointment Booked','Treatment Accepted','Treatment Completed'
+    gclid             TEXT NOT NULL,
+    conversion_time   TEXT NOT NULL,     -- when the conversion happened (ISO timestamp)
+    conversion_value  REAL DEFAULT 0.0,  -- dollar value uploaded
+    uploaded_at       TEXT DEFAULT '',   -- when we sent it to Google
+    status            TEXT DEFAULT 'pending',  -- 'pending','uploaded','failed'
+    google_response   TEXT DEFAULT '',   -- response from Google Ads API
+    FOREIGN KEY (lead_id) REFERENCES leads(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversions_lead ON conversion_uploads(lead_id);
+CREATE INDEX IF NOT EXISTS idx_conversions_status ON conversion_uploads(status);
+CREATE INDEX IF NOT EXISTS idx_conversions_action ON conversion_uploads(conversion_action);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -136,6 +161,49 @@ def _conn() -> sqlite3.Connection:
 def init_db():
     with _conn() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn):
+    """Add columns that may not exist in older databases."""
+    # Get existing columns on leads table
+    cursor = conn.execute("PRAGMA table_info(leads)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+
+    new_columns = [
+        ("keyword_text",   "TEXT DEFAULT ''"),
+        ("search_term",    "TEXT DEFAULT ''"),
+        ("ad_group_name",  "TEXT DEFAULT ''"),
+        ("ad_id",          "TEXT DEFAULT ''"),
+        ("click_cost",     "REAL DEFAULT 0.0"),
+        ("gads_synced_at", "TEXT DEFAULT ''"),
+    ]
+
+    for col_name, col_type in new_columns:
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE leads ADD COLUMN {col_name} {col_type}")
+
+    # Create conversion_uploads table if not exists (already in _SCHEMA but safe to re-check)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversion_uploads (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id           TEXT NOT NULL,
+            conversion_action TEXT NOT NULL,
+            gclid             TEXT NOT NULL,
+            conversion_time   TEXT NOT NULL,
+            conversion_value  REAL DEFAULT 0.0,
+            uploaded_at       TEXT DEFAULT '',
+            status            TEXT DEFAULT 'pending',
+            google_response   TEXT DEFAULT '',
+            FOREIGN KEY (lead_id) REFERENCES leads(id)
+        )
+    """)
+
+    # Create indexes if missing
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_gclid ON leads(gclid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversions_lead ON conversion_uploads(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversions_status ON conversion_uploads(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversions_action ON conversion_uploads(conversion_action)")
 
 
 def _now() -> str:
@@ -168,7 +236,9 @@ def upsert_lead(data: dict) -> dict:
             for col in ["first_name","last_name","email","phone","goals","gclid",
                         "fbclid","msclkid","utm_source","utm_medium","utm_campaign",
                         "utm_term","smile_image_url","smile_generated_at","source","notes",
-                        "booking_id","od_patient_num","attributed_production"]:
+                        "booking_id","od_patient_num","attributed_production",
+                        "keyword_text","search_term","ad_group_name","ad_id",
+                        "click_cost","gads_synced_at"]:
                 if data.get(col) not in (None, ""):
                     fields.append(f"{col}=?")
                     values.append(data[col])

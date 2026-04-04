@@ -59,6 +59,19 @@ class Settings(BaseSettings):
     practice_name: str = "Grafton Dental Care"
     practice_url: str = "https://nxtsmile.com"
 
+    # GA4 Measurement Protocol
+    ga4_measurement_id: str = "G-B3G7NKS06D"
+    ga4_api_secret: str = ""  # Create in GA4 Admin → Data Streams → Measurement Protocol API Secrets
+
+    # Google Ads API
+    google_ads_client_id: str = ""
+    google_ads_client_secret: str = ""
+    google_ads_refresh_token: str = ""
+    google_ads_developer_token: str = ""
+    google_ads_customer_id: str = "2498049505"
+    google_ads_login_customer_id: str = "2498049505"
+    google_ads_manager_id: str = "4814239317"
+
     class Config:
         env_file = ".env"
         case_sensitive = False

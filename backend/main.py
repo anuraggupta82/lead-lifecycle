@@ -39,6 +39,8 @@ from database import (
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
 from firestore_sync import sync_from_firestore
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,13 +62,65 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Startup Firestore sync failed (non-fatal): {e}")
 
-    # Start follow-up scheduler
+    # Start follow-up scheduler (every 15 min)
     start_scheduler()
+
+    # Start Google Ads scheduled jobs
+    ads_scheduler = BackgroundScheduler(timezone="America/New_York")
+
+    # 6 AM — Resolve gclids to keywords
+    def _gads_sync_job():
+        try:
+            from google_ads_sync import sync_gclids_to_keywords
+            result = sync_gclids_to_keywords(days_back=7)
+            logger.info(f"Scheduled Google Ads sync: {result}")
+        except Exception as e:
+            logger.error(f"Scheduled Google Ads sync failed: {e}")
+
+    # 7 AM — AI optimizer (after fresh data)
+    def _optimizer_job():
+        try:
+            from ai_optimizer import optimize_campaign
+            result = optimize_campaign(dry_run=True)  # Start in dry-run mode
+            logger.info(f"Scheduled optimizer: {result.get('summary', {})}")
+        except Exception as e:
+            logger.error(f"Scheduled optimizer failed: {e}")
+
+    # 10 PM — OpenDental matcher + treatment stages
+    def _od_sync_job():
+        try:
+            from od_matcher import run_full_od_sync
+            result = run_full_od_sync()
+            logger.info(f"Scheduled OD sync: {result}")
+        except Exception as e:
+            logger.error(f"Scheduled OD sync failed: {e}")
+
+    # 11 PM — Upload offline conversions
+    def _conversion_upload_job():
+        try:
+            from google_ads_conversions import upload_offline_conversions
+            result = upload_offline_conversions()
+            logger.info(f"Scheduled conversion upload: {result}")
+        except Exception as e:
+            logger.error(f"Scheduled conversion upload failed: {e}")
+
+    ads_scheduler.add_job(_gads_sync_job, CronTrigger(hour=6, minute=0),
+                          id="gads_sync", name="Google Ads GCLID Sync", replace_existing=True)
+    ads_scheduler.add_job(_optimizer_job, CronTrigger(hour=7, minute=0),
+                          id="ai_optimizer", name="AI Campaign Optimizer", replace_existing=True)
+    ads_scheduler.add_job(_od_sync_job, CronTrigger(hour=22, minute=0),
+                          id="od_sync", name="OpenDental Patient Match + Treatment Stages", replace_existing=True)
+    ads_scheduler.add_job(_conversion_upload_job, CronTrigger(hour=23, minute=0),
+                          id="conversion_upload", name="Google Ads Conversion Upload", replace_existing=True)
+
+    ads_scheduler.start()
+    logger.info("Google Ads scheduled jobs started (6AM sync, 7AM optimizer, 10PM OD, 11PM conversions)")
 
     yield
 
     # Shutdown
     stop_scheduler()
+    ads_scheduler.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -328,8 +382,29 @@ def admin_sync():
 
 @app.post("/api/admin/match", dependencies=[Depends(_require_admin)])
 async def admin_od_match():
-    from od_matcher import match_leads_to_od
-    result = match_leads_to_od()
+    from od_matcher import run_full_od_sync
+    result = run_full_od_sync()
+    return {"status": "ok", "result": result}
+
+
+@app.post("/api/admin/gads-sync", dependencies=[Depends(_require_admin)])
+def admin_gads_sync():
+    from google_ads_sync import sync_gclids_to_keywords
+    result = sync_gclids_to_keywords()
+    return {"status": "ok", "result": result}
+
+
+@app.post("/api/admin/upload-conversions", dependencies=[Depends(_require_admin)])
+def admin_upload_conversions():
+    from google_ads_conversions import upload_offline_conversions
+    result = upload_offline_conversions()
+    return {"status": "ok", "result": result}
+
+
+@app.post("/api/admin/optimize", dependencies=[Depends(_require_admin)])
+def admin_optimize(dry_run: bool = True):
+    from ai_optimizer import optimize_campaign
+    result = optimize_campaign(dry_run=dry_run)
     return {"status": "ok", "result": result}
 
 

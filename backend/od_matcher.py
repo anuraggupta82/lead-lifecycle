@@ -1,13 +1,20 @@
 """
 OpenDental patient matcher — matches leads to OD patients by phone/email hash.
+Also syncs treatment plan stages for matched patients.
+
 Runs as a nightly job. Never stores raw PHI — uses SHA-256 hashes for comparison.
 Only accessible on the office LAN (GraftonServer).
+
+Three functions:
+  1. match_leads_to_od()         — match unmatched leads to OD patients
+  2. sync_treatment_stages()     — update stages for already-matched leads
+  3. run_full_od_sync()          — runs both (called by scheduler)
 """
 import hashlib
 import logging
 import json
 from datetime import datetime, timezone
-from database import get_all_leads, get_lead, add_event
+from database import get_all_leads, get_lead, add_event, update_stage
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -47,6 +54,19 @@ def _get_db():
         return None
 
 
+def _get_sqlite():
+    """Direct SQLite connection for batch updates."""
+    import sqlite3
+    import os
+    settings = get_settings()
+    os.makedirs(os.path.dirname(settings.db_path), exist_ok=True)
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ── Part 1: Match unmatched leads to OD patients ────────────────────────────
+
 def match_leads_to_od() -> dict:
     """
     Match unmatched leads to OpenDental patients using phone/email hashes.
@@ -56,7 +76,6 @@ def match_leads_to_od() -> dict:
     if not conn:
         return {"matched": 0, "errors": 1, "error": "OpenDental MySQL unavailable (office network required)"}
 
-    # Get leads that don't yet have an OD match and have contact info
     unmatched = [
         l for l in get_all_leads()
         if not l.get("od_patient_num") and (l.get("phone_hash") or l.get("email_hash"))
@@ -67,7 +86,6 @@ def match_leads_to_od() -> dict:
 
     try:
         with conn.cursor() as cur:
-            # Pull all patients with phone + email hashes (SELECT only — read-only access)
             cur.execute("""
                 SELECT PatNum,
                        LOWER(HmPhone)       AS home_phone,
@@ -111,14 +129,8 @@ def match_leads_to_od() -> dict:
                 # Get production for this patient (implant codes only)
                 production = _get_patient_production(conn, pat_num)
 
-                # Update lead
-                import sqlite3 as _sqlite
-                from config import get_settings as _gs
-                import os as _os
-                settings = _gs()
-                _os.makedirs(_os.path.dirname(settings.db_path), exist_ok=True)
-                lconn = _sqlite.connect(settings.db_path)
-                lconn.row_factory = _sqlite.Row
+                # Update lead in SQLite
+                lconn = _get_sqlite()
                 now = datetime.now(timezone.utc).isoformat()
                 lconn.execute("""
                     UPDATE leads SET od_patient_num=?, od_matched_at=?, attributed_production=?, updated_at=?
@@ -148,19 +160,163 @@ def match_leads_to_od() -> dict:
     return {"matched": matched, "unmatched": len(unmatched) - matched, "errors": errors}
 
 
-def _get_patient_production(conn, pat_num: str) -> dict:
-    """Get total implant production for a patient."""
+# ── Part 2: Sync treatment stages for already-matched leads ─────────────────
+
+def sync_treatment_stages() -> dict:
+    """
+    For leads already matched to OD patients, check their treatment status:
+      - Has a treatment plan with implant codes → "treatment_presented"
+      - Has scheduled procedures (ProcStatus=1 with future AptNum) → "treatment_accepted"
+      - Has completed procedures (ProcStatus=2) → "treatment_completed"
+    Also refreshes attributed_production for all matched leads.
+    """
+    conn = _get_db()
+    if not conn:
+        return {"updated": 0, "errors": 1, "error": "OpenDental MySQL unavailable (office network required)"}
+
+    # Get all leads that have an OD match
+    matched_leads = [
+        l for l in get_all_leads()
+        if l.get("od_patient_num")
+    ]
+    logger.info(f"Treatment stage sync: checking {len(matched_leads)} matched leads")
+
+    updated = 0
+    errors = 0
+
     try:
+        for lead in matched_leads:
+            try:
+                pat_num = lead["od_patient_num"]
+                current_stage = lead["stage"]
+
+                # Check treatment plan status
+                tp_status = _get_treatment_plan_status(conn, pat_num)
+                production = _get_patient_production(conn, pat_num)
+
+                # Determine what stage the lead should be in based on OD data
+                new_stage = None
+
+                if production["total"] > 0:
+                    # Completed procedures exist
+                    new_stage = "treatment_completed"
+                elif tp_status["has_scheduled_procedures"]:
+                    # Procedures are scheduled (accepted and on the books)
+                    new_stage = "treatment_accepted"
+                elif tp_status["has_treatment_plan"]:
+                    # Treatment plan exists but nothing scheduled yet
+                    new_stage = "treatment_presented"
+
+                # Update production amount (always refresh)
+                if production["total"] != lead.get("attributed_production", 0):
+                    lconn = _get_sqlite()
+                    now = datetime.now(timezone.utc).isoformat()
+                    lconn.execute("""
+                        UPDATE leads SET attributed_production=?, updated_at=? WHERE id=?
+                    """, (production["total"], now, lead["id"]))
+                    lconn.commit()
+                    lconn.close()
+
+                # Advance stage if appropriate
+                if new_stage and new_stage != current_stage:
+                    update_stage(lead["id"], new_stage, source="od_matcher",
+                                 detail=json.dumps({
+                                     "production": production["total"],
+                                     "tp_value": tp_status["plan_value"],
+                                     "codes": production["codes"],
+                                 }))
+                    add_event(lead["id"], f"od_stage_{new_stage}", source="od_matcher",
+                              detail=json.dumps({
+                                  "from_stage": current_stage,
+                                  "to_stage": new_stage,
+                                  "production": production["total"],
+                                  "tp_value": tp_status["plan_value"],
+                              }))
+                    updated += 1
+                    logger.info(
+                        f"Lead {lead['id']} (PatNum {pat_num}): "
+                        f"{current_stage} → {new_stage}, "
+                        f"production=${production['total']:.2f}, "
+                        f"TP value=${tp_status['plan_value']:.2f}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error syncing treatment stage for lead {lead['id']}: {e}")
+                errors += 1
+
+    finally:
+        conn.close()
+
+    return {"updated": updated, "checked": len(matched_leads), "errors": errors}
+
+
+def _get_treatment_plan_status(conn, pat_num: str) -> dict:
+    """
+    Check if patient has treatment plans with implant codes.
+    Returns: {has_treatment_plan, has_scheduled_procedures, plan_value}
+    """
+    result = {
+        "has_treatment_plan": False,
+        "has_scheduled_procedures": False,
+        "plan_value": 0.0,
+    }
+
+    try:
+        placeholders = ",".join(["%s"] * len(CDT_IMPLANT_CODES))
+
         with conn.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(CDT_IMPLANT_CODES))
+            # Check for treatment plan entries with implant codes
+            # proctp = treatment plan procedures
             cur.execute(f"""
-                SELECT pl.ProcCode, SUM(pl.ProcFee) as total
+                SELECT SUM(pt.FeeAmt) as plan_total, COUNT(*) as plan_count
+                FROM proctp pt
+                JOIN treatplan tp ON pt.TreatPlanNum = tp.TreatPlanNum
+                JOIN procedurecode pc ON pt.CodeNum = pc.CodeNum
+                WHERE tp.PatNum = %s
+                  AND tp.TPStatus IN (0, 1)
+                  AND pc.ProcCode IN ({placeholders})
+            """, [int(pat_num)] + list(CDT_IMPLANT_CODES))
+            row = cur.fetchone()
+
+            if row and row[1] and int(row[1]) > 0:
+                result["has_treatment_plan"] = True
+                result["plan_value"] = float(row[0] or 0)
+
+            # Check for scheduled procedures (ProcStatus=1 = treatment planned,
+            # with a future appointment)
+            cur.execute(f"""
+                SELECT COUNT(*) as scheduled_count
+                FROM procedurelog pl
+                JOIN procedurecode pc ON pl.CodeNum = pc.CodeNum
+                WHERE pl.PatNum = %s
+                  AND pl.ProcStatus = 1
+                  AND pl.AptNum > 0
+                  AND pc.ProcCode IN ({placeholders})
+            """, [int(pat_num)] + list(CDT_IMPLANT_CODES))
+            sched_row = cur.fetchone()
+
+            if sched_row and int(sched_row[0]) > 0:
+                result["has_scheduled_procedures"] = True
+
+    except Exception as e:
+        logger.warning(f"Error checking treatment plan for PatNum {pat_num}: {e}")
+
+    return result
+
+
+def _get_patient_production(conn, pat_num: str) -> dict:
+    """Get total completed implant production for a patient."""
+    try:
+        placeholders = ",".join(["%s"] * len(CDT_IMPLANT_CODES))
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT pc.ProcCode, SUM(pl.ProcFee) as total
                 FROM procedurelog pl
                 JOIN procedurecode pc ON pl.CodeNum = pc.CodeNum
                 WHERE pl.PatNum = %s
                   AND pl.ProcStatus = 2
                   AND pc.ProcCode IN ({placeholders})
-                GROUP BY pl.ProcCode
+                GROUP BY pc.ProcCode
             """, [int(pat_num)] + list(CDT_IMPLANT_CODES))
             rows = cur.fetchall()
             total = sum(float(r[1]) for r in rows)
@@ -168,3 +324,21 @@ def _get_patient_production(conn, pat_num: str) -> dict:
             return {"total": total, "codes": codes}
     except Exception:
         return {"total": 0.0, "codes": []}
+
+
+# ── Combined runner ──────────────────────────────────────────────────────────
+
+def run_full_od_sync() -> dict:
+    """Run both matching and treatment stage sync. Called by nightly scheduler."""
+    match_result = match_leads_to_od()
+    stage_result = sync_treatment_stages()
+    return {
+        "match": match_result,
+        "treatment_stages": stage_result,
+    }
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    result = run_full_od_sync()
+    print(json.dumps(result, indent=2))
