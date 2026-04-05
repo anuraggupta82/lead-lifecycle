@@ -102,8 +102,24 @@ def sync_from_firestore() -> dict:
         return {"synced": 0, "skipped": 0, "errors": 1, "error": str(e)}
 
     # Payload may be a list or {"leads": [...], "source": "firestore"}
-    docs = payload if isinstance(payload, list) else payload.get("leads", [])
-    logger.info(f"Firestore returned {len(docs)} leads")
+    all_docs = payload if isinstance(payload, list) else payload.get("leads", [])
+    logger.info(f"Firestore returned {len(all_docs)} leads")
+
+    # Deduplicate by email — keep only the newest doc per email address.
+    # Old test submissions create many legacy docs with auto-generated IDs;
+    # we only want one record per person in the local DB.
+    seen_emails: dict = {}
+    no_email_docs = []
+    for doc in all_docs:
+        email = (doc.get("email") or "").strip().lower()
+        ts = doc.get("timestamp") or ""
+        if not email:
+            no_email_docs.append(doc)
+            continue
+        if email not in seen_emails or ts > seen_emails[email].get("timestamp", ""):
+            seen_emails[email] = doc
+    docs = list(seen_emails.values()) + no_email_docs
+    logger.info(f"After dedup by email: {len(docs)} unique leads (skipped {len(all_docs) - len(docs)} duplicates)")
 
     synced = skipped = errors = 0
 

@@ -870,42 +870,74 @@ def force_stage(lead_id: str, new_stage: str, source: str = "admin", detail: str
 # ─── Campaign stats ─────────────────────────────────────────────────────────
 
 def get_campaign_stats() -> list:
-    """Return lead counts and revenue grouped by Google Ads campaign (only leads with campaign data)."""
+    """Return lead counts and revenue grouped by Google Ads campaign.
+    Total cost comes from the gads_keywords_cache (real Google Ads spend),
+    falling back to SUM(click_cost) on leads if no cache data exists yet.
+    CPL = real total campaign cost / number of leads.
+    """
     with _conn() as conn:
         rows = conn.execute("""
+            WITH campaign_leads AS (
+                SELECT
+                    COALESCE(NULLIF(campaign_name, ''), utm_campaign) as campaign,
+                    COUNT(*) as lead_count,
+                    SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
+                        'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as scheduled_count,
+                    SUM(CASE WHEN stage = 'no_show' THEN 1 ELSE 0 END) as no_show_count,
+                    SUM(CASE WHEN stage IN ('showed',
+                        'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as showed_count,
+                    SUM(CASE WHEN stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treated_count,
+                    SUM(CASE WHEN stage = 'treatment_completed' THEN 1 ELSE 0 END) as completed_count,
+                    SUM(CASE WHEN stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treatment_presented_count,
+                    SUM(CASE WHEN stage IN ('treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treatment_accepted_count,
+                    SUM(attributed_production) as revenue,
+                    SUM(attributed_income) as attributed_income,
+                    SUM(click_cost) as leads_click_cost_sum,
+                    AVG(NULLIF(click_cost, 0)) as avg_cpc
+                FROM leads
+                WHERE campaign_name != '' OR utm_campaign != ''
+                GROUP BY COALESCE(NULLIF(campaign_name, ''), utm_campaign)
+            ),
+            campaign_gads_cost AS (
+                -- Sum real Google Ads spend from keywords cache, grouped by campaign
+                SELECT campaign_name, SUM(cost) as total_gads_cost
+                FROM gads_keywords_cache
+                WHERE days = 30 AND campaign_name != ''
+                GROUP BY campaign_name
+            )
             SELECT
-                COALESCE(NULLIF(campaign_name, ''), utm_campaign) as campaign,
-                COUNT(*) as lead_count,
-                SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
-                    'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as scheduled_count,
-                SUM(CASE WHEN stage = 'no_show' THEN 1 ELSE 0 END) as no_show_count,
-                SUM(CASE WHEN stage IN ('showed',
-                    'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as showed_count,
-                SUM(CASE WHEN stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treated_count,
-                SUM(CASE WHEN stage = 'treatment_completed' THEN 1 ELSE 0 END) as completed_count,
-                SUM(CASE WHEN stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treatment_presented_count,
-                SUM(CASE WHEN stage IN ('treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treatment_accepted_count,
-                SUM(attributed_production) as revenue,
-                SUM(attributed_income) as attributed_income,
-                SUM(click_cost) as total_ad_spend,
-                AVG(NULLIF(click_cost, 0)) as avg_cpc,
-                -- Calculated metrics
-                CASE WHEN COUNT(*) > 0 THEN ROUND(SUM(click_cost) / COUNT(*), 2) ELSE 0 END as cpl,
-                CASE WHEN SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
-                    'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) > 0
-                    THEN ROUND(SUM(click_cost) / SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
-                    'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END), 2)
+                cl.campaign,
+                cl.lead_count,
+                cl.scheduled_count,
+                cl.no_show_count,
+                cl.showed_count,
+                cl.treated_count,
+                cl.completed_count,
+                cl.treatment_presented_count,
+                cl.treatment_accepted_count,
+                cl.revenue,
+                cl.attributed_income,
+                cl.avg_cpc,
+                -- Use real Google Ads cost when available, fall back to leads sum
+                COALESCE(gc.total_gads_cost, cl.leads_click_cost_sum, 0) as total_ad_spend,
+                -- CPL = real total cost / leads
+                CASE WHEN cl.lead_count > 0
+                    THEN ROUND(COALESCE(gc.total_gads_cost, cl.leads_click_cost_sum, 0) / cl.lead_count, 2)
+                    ELSE 0 END as cpl,
+                -- CPA = real total cost / scheduled leads
+                CASE WHEN cl.scheduled_count > 0
+                    THEN ROUND(COALESCE(gc.total_gads_cost, cl.leads_click_cost_sum, 0) / cl.scheduled_count, 2)
                     ELSE 0 END as cpa,
-                CASE WHEN SUM(click_cost) > 0
-                    THEN ROUND(SUM(attributed_production) / SUM(click_cost), 2)
+                -- ROAS = revenue / real total cost
+                CASE WHEN COALESCE(gc.total_gads_cost, cl.leads_click_cost_sum, 0) > 0
+                    THEN ROUND(cl.revenue / COALESCE(gc.total_gads_cost, cl.leads_click_cost_sum, 0), 2)
                     ELSE 0 END as roas,
-                CASE WHEN COUNT(*) > 0
-                    THEN ROUND(CAST(SUM(CASE WHEN stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS REAL) / COUNT(*) * 100, 1)
+                CASE WHEN cl.lead_count > 0
+                    THEN ROUND(CAST(cl.treated_count AS REAL) / cl.lead_count * 100, 1)
                     ELSE 0 END as conversion_rate
-            FROM leads
-            WHERE campaign_name != '' OR utm_campaign != ''
-            GROUP BY COALESCE(NULLIF(campaign_name, ''), utm_campaign)
-            ORDER BY lead_count DESC
+            FROM campaign_leads cl
+            LEFT JOIN campaign_gads_cost gc ON LOWER(cl.campaign) = LOWER(gc.campaign_name)
+            ORDER BY cl.lead_count DESC
         """).fetchall()
         return [dict(r) for r in rows]
 
