@@ -146,5 +146,30 @@ def sync_from_firestore() -> dict:
             logger.error(f"Error syncing lead {doc}: {e}")
             errors += 1
 
-    logger.info(f"Firestore sync complete: synced={synced} skipped={skipped} errors={errors}")
-    return {"synced": synced, "skipped": skipped, "errors": errors}
+    # Purge local Firestore-sourced leads (id starts with "fs_") that no longer
+    # exist in Firestore. This handles the case where a lead is deleted from
+    # Firestore (via admin delete) but the stale record remains in SQLite.
+    purged = 0
+    firestore_emails = {(d.get("email") or "").strip().lower() for d in docs if d.get("email")}
+    try:
+        from database import get_all_leads, _conn
+        local_leads = get_all_leads(limit=5000)
+        for lead in local_leads:
+            lid = lead.get("id", "")
+            if not lid.startswith("fs_"):
+                continue  # not a Firestore-sourced lead
+            local_email = (lead.get("email") or "").strip().lower()
+            if local_email and local_email not in firestore_emails:
+                # This lead was from Firestore but its email is no longer there — purge
+                with _conn() as conn:
+                    conn.execute("DELETE FROM lifecycle_events WHERE lead_id = ?", (lid,))
+                    conn.execute("DELETE FROM follow_up_queue WHERE lead_id = ?", (lid,))
+                    conn.execute("DELETE FROM lead_notes WHERE lead_id = ?", (lid,))
+                    conn.execute("DELETE FROM leads WHERE id = ?", (lid,))
+                purged += 1
+                logger.info(f"Purged stale local lead {lid} ({local_email}) — no longer in Firestore")
+    except Exception as e:
+        logger.warning(f"Purge step failed (non-fatal): {e}")
+
+    logger.info(f"Firestore sync complete: synced={synced} skipped={skipped} errors={errors} purged={purged}")
+    return {"synced": synced, "skipped": skipped, "errors": errors, "purged": purged}

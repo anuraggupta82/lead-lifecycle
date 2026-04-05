@@ -740,13 +740,37 @@ def admin_test_email(body: TestEmailRequest):
             "template": template,
             "to": test_lead["email"],
             "lead_id": body.lead_id,
-            "has_smile_image": bool(lead.get("smile_image_url")),
+            "has_smile_image": bool(lead.get("smile_blob_name") or lead.get("smile_image_url")),
         }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Test email failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/debug-smile/{lead_id}", dependencies=[Depends(_require_admin)])
+def debug_smile_resign(lead_id: str):
+    """Debug endpoint: test GCS re-sign for a lead's smile blob."""
+    from database import get_lead
+    from email_service import _resign_smile_url, _fetch_smile_image
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    blob_name = lead.get("smile_blob_name", "")
+    result = {"lead_id": lead_id, "blob_name": blob_name, "smile_image_url": lead.get("smile_image_url", "")}
+    if blob_name:
+        try:
+            url = _resign_smile_url(blob_name)
+            result["signed_url"] = url[:80] if url else ""
+            result["resign_ok"] = bool(url)
+            if url:
+                img_bytes = _fetch_smile_image(url)
+                result["image_bytes"] = len(img_bytes)
+                result["image_ok"] = len(img_bytes) > 1000
+        except Exception as e:
+            result["resign_error"] = str(e)
+    return result
 
 
 # ─── GA4 Analytics ───────────────────────────────────────────────────────────
