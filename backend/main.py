@@ -447,30 +447,35 @@ def delete_smile_image(lead_id: str):
         </div></body></html>
         """)
 
+    blob_name = lead.get("smile_blob_name", "")
     image_url = lead.get("smile_image_url", "")
     deleted_from_gcs = False
 
-    # Delete from GCS if URL exists
-    if image_url and "storage.googleapis.com" in image_url:
+    # Delete from GCS using blob name (preferred) or parse from URL (legacy)
+    gcs_blob_name = blob_name
+    if not gcs_blob_name and image_url and "storage.googleapis.com" in image_url:
+        try:
+            path = image_url.split("storage.googleapis.com/")[1].split("?")[0]
+            _, gcs_blob_name = path.split("/", 1)
+        except Exception:
+            pass
+
+    if gcs_blob_name:
         try:
             from google.cloud import storage as gcs_storage
-            path = image_url.split("storage.googleapis.com/")[1].split("?")[0]
-            bucket_name, blob_name = path.split("/", 1)
+            from config import get_settings as _gs
             client = gcs_storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_name)
-            blob.delete()
+            client.bucket(_gs().gcs_bucket).blob(gcs_blob_name).delete()
             deleted_from_gcs = True
-            logger.info(f"Deleted GCS smile image for lead {lead_id}")
+            logger.info(f"Deleted GCS smile image for lead {lead_id}: {gcs_blob_name}")
         except Exception as e:
             logger.warning(f"Could not delete GCS image for lead {lead_id}: {e}")
-            # Still clear the URL even if GCS delete fails
 
-    # Clear the URL from the database
+    # Clear both URL and blob name from the database
     from database import _conn
     with _conn() as conn:
         conn.execute(
-            "UPDATE leads SET smile_image_url = '', updated_at = ? WHERE id = ?",
+            "UPDATE leads SET smile_image_url = '', smile_blob_name = '', updated_at = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), lead_id)
         )
 
@@ -630,20 +635,40 @@ def admin_delete_lead(lead_id: str):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    # Delete smile image from GCS first if present
+    # Delete smile image from GCS using blob name (preferred) or parse from URL (legacy)
+    gcs_blob_name = lead.get("smile_blob_name", "")
     image_url = lead.get("smile_image_url", "")
-    if image_url and "storage.googleapis.com" in image_url:
+    if not gcs_blob_name and image_url and "storage.googleapis.com" in image_url:
+        try:
+            path = image_url.split("storage.googleapis.com/")[1].split("?")[0]
+            _, gcs_blob_name = path.split("/", 1)
+        except Exception:
+            pass
+    if gcs_blob_name:
         try:
             from google.cloud import storage as gcs_storage
-            path = image_url.split("storage.googleapis.com/")[1].split("?")[0]
-            bucket_name, blob_name = path.split("/", 1)
             client = gcs_storage.Client()
-            client.bucket(bucket_name).blob(blob_name).delete()
-            logger.info(f"Deleted GCS smile image for deleted lead {lead_id}")
+            client.bucket(settings.gcs_bucket).blob(gcs_blob_name).delete()
+            logger.info(f"Deleted GCS smile image for lead {lead_id}: {gcs_blob_name}")
         except Exception as e:
             logger.warning(f"Could not delete GCS image for lead {lead_id}: {e}")
 
-    # Delete all associated records then the lead itself
+    # Delete from Firestore via nxtsmile API
+    try:
+        import requests as _req
+        resp = _req.delete(
+            f"{settings.nxtsmile_api}/api/leads/{lead_id}",
+            headers={"X-Secret": settings.firestore_secret},
+            timeout=10,
+        )
+        if resp.status_code in (200, 204, 404):
+            logger.info(f"Deleted lead {lead_id} from Firestore (status {resp.status_code})")
+        else:
+            logger.warning(f"Firestore delete returned {resp.status_code} for lead {lead_id}")
+    except Exception as e:
+        logger.warning(f"Could not delete lead {lead_id} from Firestore: {e}")
+
+    # Delete all associated local records then the lead itself
     from database import _conn
     with _conn() as conn:
         conn.execute("DELETE FROM lifecycle_events WHERE lead_id = ?", (lead_id,))

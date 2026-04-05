@@ -53,6 +53,7 @@ class Settings(BaseSettings):
 
     # GCS (smile image storage)
     gcs_bucket: str = "nxtsmile-smile-images"
+    gcs_sa_email: str = "1096868046685-compute@developer.gserviceaccount.com"
 
     # Practice
     office_phone: str = "508-318-4477"

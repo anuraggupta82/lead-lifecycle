@@ -139,7 +139,7 @@ def _get_case_photo(goals: str) -> bytes:
 
 
 def _fetch_smile_image(url: str) -> bytes:
-    """Download smile preview image from GCS signed URL."""
+    """Download smile preview image from a GCS signed URL."""
     if not url:
         return b""
     try:
@@ -152,14 +152,69 @@ def _fetch_smile_image(url: str) -> bytes:
     return b""
 
 
+def _resign_smile_url(blob_name: str) -> str:
+    """
+    Generate a fresh 7-day signed URL from a GCS blob name.
+    Called at email-send time so Day 14 / Day 30 emails always get a valid URL
+    even though GCS V4 signed URLs cap at 7 days.
+    Returns '' on failure (email falls back to text link).
+    """
+    if not blob_name:
+        return ""
+    try:
+        from datetime import timedelta
+        from google.cloud import storage as gcs_storage
+        import google.auth
+        from google.auth.transport import requests as g_requests
+
+        settings = get_settings()
+        credentials, _ = google.auth.default()
+        credentials.refresh(g_requests.Request())
+
+        # Use the known compute SA email (set in config or env)
+        sa_email = getattr(settings, "gcs_sa_email",
+                           "1096868046685-compute@developer.gserviceaccount.com")
+
+        client = gcs_storage.Client()
+        blob = client.bucket(settings.gcs_bucket).blob(blob_name)
+        signed_url = blob.generate_signed_url(
+            expiration=timedelta(days=7),
+            method="GET",
+            version="v4",
+            service_account_email=sa_email,
+            access_token=credentials.token,
+        )
+        return signed_url
+    except Exception as e:
+        logger.warning(f"GCS re-sign failed for {blob_name}: {e}")
+        return ""
+
+
+def _get_smile_bytes(lead: dict) -> bytes:
+    """
+    Get smile image bytes for a lead.
+    Prefers re-signing from blob name (works for 30-day nurture sequence).
+    Falls back to fetching from stored signed URL if blob name not present.
+    """
+    blob_name = lead.get("smile_blob_name", "")
+    if blob_name:
+        fresh_url = _resign_smile_url(blob_name)
+        if fresh_url:
+            return _fetch_smile_image(fresh_url)
+    # Fallback: try stored signed URL (may be expired for Day 14/30)
+    stored_url = lead.get("smile_image_url", "")
+    if stored_url:
+        return _fetch_smile_image(stored_url)
+    return b""
+
+
 def send_day1_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
     name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
-    smile_url = lead.get("smile_image_url", "")
 
-    # Download the after image from GCS
-    smile_bytes = _fetch_smile_image(smile_url)
+    # Fetch smile image — re-signs fresh URL from blob name so it never expires
+    smile_bytes = _get_smile_bytes(lead)
 
     # Build image block — embedded cid if we have the image, fallback text if not
     if smile_bytes:
@@ -249,7 +304,7 @@ def send_day1_email(lead: dict, unsubscribe_url: str) -> bool:
         <div style="background:#f8fafa;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
           <p style="color:#666;font-size:12px;line-height:1.5;margin:0;">
             🔒 Your photo is securely stored and will be automatically deleted after 30 days.
-            If you'd like it removed now, <a href="http://localhost:{settings.port}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
+            If you'd like it removed now, <a href="{settings.nxtsmile_api}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
           </p>
         </div>
 
@@ -382,7 +437,7 @@ def send_day7_email(lead: dict, unsubscribe_url: str) -> bool:
         <div style="background:#f8fafa;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
           <p style="color:#666;font-size:12px;line-height:1.5;margin:0;">
             🔒 Your photo is securely stored and will be automatically deleted after 30 days.
-            If you'd like it removed now, <a href="http://localhost:{settings.port}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
+            If you'd like it removed now, <a href="{settings.nxtsmile_api}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
           </p>
         </div>
 
@@ -414,10 +469,9 @@ def send_day14_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
     name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
-    smile_url = lead.get("smile_image_url", "")
 
-    # Download the after image from GCS
-    smile_bytes = _fetch_smile_image(smile_url)
+    # Fetch smile image — re-signs fresh URL from blob name so it never expires
+    smile_bytes = _get_smile_bytes(lead)
 
     if smile_bytes:
         image_block = """
@@ -504,7 +558,7 @@ def send_day14_email(lead: dict, unsubscribe_url: str) -> bool:
         <div style="background:#f8fafa;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
           <p style="color:#666;font-size:12px;line-height:1.5;margin:0;">
             🔒 Your photo is securely stored and will be automatically deleted after 30 days.
-            If you'd like it removed now, <a href="http://localhost:{settings.port}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
+            If you'd like it removed now, <a href="{settings.nxtsmile_api}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
           </p>
         </div>
 
@@ -537,10 +591,8 @@ def send_day30_cold_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
     name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
-    smile_url = lead.get("smile_image_url", "")
-
-    # Download the after image from GCS (last chance before deletion)
-    smile_bytes = _fetch_smile_image(smile_url)
+    # Fetch smile image — re-signs fresh URL from blob name so it never expires
+    smile_bytes = _get_smile_bytes(lead)
 
     if smile_bytes:
         image_block = """
@@ -652,7 +704,7 @@ def send_no_show_email(lead: dict, unsub_url: str) -> bool:
     settings = get_settings()
     name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
-    delete_url = f"http://localhost:{settings.port}/delete-image/{lead_id}"
+    delete_url = f"{settings.nxtsmile_api}/delete-image/{lead_id}"
     booking_link = settings.booking_url
 
     html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0 auto">

@@ -78,6 +78,7 @@ def _normalize_firestore_lead(doc: dict) -> dict:
         "utm_content": tracking.get("utm_content") or raw.get("utm_content") or "",
         "landing_url": tracking.get("landing_url") or raw.get("landing_url") or "",
         "smile_image_url": raw.get("smile_url") or raw.get("smile_image_url") or "",
+        "smile_blob_name": raw.get("smile_blob_name") or "",
         "notes": raw.get("message") or raw.get("notes") or "",
     }
 

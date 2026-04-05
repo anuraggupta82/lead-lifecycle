@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS leads (
     utm_term    TEXT DEFAULT '',
     utm_content TEXT DEFAULT '',
     landing_url TEXT DEFAULT '',
-    smile_image_url TEXT DEFAULT '',       -- GCS signed URL to smile image
+    smile_image_url TEXT DEFAULT '',       -- GCS signed URL (legacy, may be expired)
+    smile_blob_name TEXT DEFAULT '',       -- GCS blob name for fresh re-signing
     smile_generated_at TEXT DEFAULT '',
     unsubscribed_email INTEGER DEFAULT 0,
     unsubscribed_sms   INTEGER DEFAULT 0,
@@ -338,6 +339,8 @@ def _migrate(conn):
         ("tx_accepted_at",      "TEXT DEFAULT ''"),
         ("tx_completed_at",     "TEXT DEFAULT ''"),
         ("cold_at",             "TEXT DEFAULT ''"),
+        # GCS blob name for re-signing fresh signed URLs at email-send time
+        ("smile_blob_name",     "TEXT DEFAULT ''"),
     ]
 
     for col_name, col_type in new_columns:
@@ -572,7 +575,7 @@ def upsert_lead(data: dict) -> dict:
             for col in ["first_name","last_name","email","phone","goals","gclid",
                         "fbclid","msclkid","utm_source","utm_medium","utm_campaign",
                         "utm_term","utm_content","landing_url",
-                        "smile_image_url","smile_generated_at","source","notes",
+                        "smile_image_url","smile_blob_name","smile_generated_at","source","notes",
                         "booking_id","od_patient_num","attributed_production",
                         "treatment_plan_value","attributed_income",
                         "appointment_date","appointment_status","no_show_count",
@@ -598,8 +601,8 @@ def upsert_lead(data: dict) -> dict:
                     first_name, last_name, email, phone, phone_hash, email_hash,
                     goals, gclid, fbclid, msclkid, utm_source, utm_medium,
                     utm_campaign, utm_term, utm_content, landing_url,
-                    smile_image_url, notes)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    smile_image_url, smile_blob_name, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
                 data.get("source", "unknown"), data.get("stage", "new"),
@@ -612,7 +615,8 @@ def upsert_lead(data: dict) -> dict:
                 data.get("utm_source", ""), data.get("utm_medium", ""),
                 data.get("utm_campaign", ""), data.get("utm_term", ""),
                 data.get("utm_content", ""), data.get("landing_url", ""),
-                data.get("smile_image_url", ""), data.get("notes", ""),
+                data.get("smile_image_url", ""), data.get("smile_blob_name", ""),
+                data.get("notes", ""),
             ))
         return dict(conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
 
@@ -737,7 +741,7 @@ def get_due_follow_ups() -> list:
     with _conn() as conn:
         rows = conn.execute("""
             SELECT fq.*, l.email, l.phone, l.first_name, l.last_name,
-                   l.goals, l.smile_image_url, l.stage, l.unsubscribed_email, l.unsubscribed_sms,
+                   l.goals, l.smile_image_url, l.smile_blob_name, l.stage, l.unsubscribed_email, l.unsubscribed_sms,
                    l.source, l.gclid, l.utm_campaign
             FROM follow_up_queue fq
             JOIN leads l ON fq.lead_id = l.id
