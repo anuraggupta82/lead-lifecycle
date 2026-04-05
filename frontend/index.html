@@ -247,12 +247,18 @@ function timeAgo(iso) {
   if (!iso) return '';
   const d = Date.now() - new Date(iso).getTime();
   const m = Math.floor(d/60000);
-  if (m < 1) return 'now'; if (m < 60) return m+'m';
+  if (m < 1) return '1m'; if (m < 60) return m+'m';
   const h = Math.floor(m/60);
   if (h < 24) return h+'h'; const dy = Math.floor(h/24);
   if (dy < 30) return dy+'d'; return Math.floor(dy/30)+'mo';
 }
 function fmtDate(iso) { if (!iso) return ''; return new Date(iso).toLocaleDateString('en-US',{month:'short',day:'numeric'}); }
+function fmtDateTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US',{month:'short',day:'numeric'}) + ' ' +
+         d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});
+}
 function fmtMoney(v) { if (!v) return '$0'; return '$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}); }
 function pct(a,b) { if (!b) return '0%'; return Math.round(a/b*100)+'%'; }
 
@@ -297,7 +303,7 @@ function LeadChip({ lead, isSelected, onClick, onDragStart }) {
       {shortCamp && <span className="chip-campaign" title={camp}>{shortCamp}</span>}
       {(lead.notes_count||0)>0 && <span className="chip-notes">{lead.notes_count}</span>}
       {lead.attributed_production>0 && <span className="chip-revenue">{fmtMoney(lead.attributed_production)}</span>}
-      <span className="chip-time">{timeAgo(lead.updated_at)}</span>
+      <span className="chip-time">{fmtDateTime(lead.created_at)}</span>
     </span>
   );
 }
@@ -429,7 +435,7 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
               <div className="detail-section">
                 <div className="detail-section-title">Lead Info</div>
                 {lead.source&&<div className="detail-row"><div className="detail-row-label">Source</div><div className="detail-row-value">{lead.source}</div></div>}
-                <div className="detail-row"><div className="detail-row-label">Created</div><div className="detail-row-value">{fmtDate(lead.created_at)}</div></div>
+                <div className="detail-row"><div className="detail-row-label">Created</div><div className="detail-row-value">{fmtDateTime(lead.created_at)}</div></div>
                 {lead.goals&&<div className="detail-row"><div className="detail-row-label">Goals</div><div className="detail-row-value">{lead.goals}</div></div>}
               </div>
               {(lead.campaign_name||lead.keyword_text||lead.gclid||lead.utm_source) && (

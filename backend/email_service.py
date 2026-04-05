@@ -193,15 +193,52 @@ def _resign_smile_url(blob_name: str) -> str:
 def _get_smile_bytes(lead: dict) -> bytes:
     """
     Get smile image bytes for a lead.
-    Prefers re-signing from blob name (works for 30-day nurture sequence).
-    Falls back to fetching from stored signed URL if blob name not present.
+    Strategy (in order):
+      1. Direct GCS blob download (works with any valid GCS credentials — no signBlob needed)
+      2. Re-sign a fresh signed URL from blob name (needs signBlob IAM permission)
+      3. Fetch from stored signed URL (may be expired for Day 14/30)
     """
     blob_name = lead.get("smile_blob_name", "")
+
+    # Strategy 1: Direct download from GCS — fastest, most reliable
+    if blob_name:
+        try:
+            from google.cloud import storage as gcs_storage
+            settings = get_settings()
+            client = gcs_storage.Client()
+            blob = client.bucket(settings.gcs_bucket).blob(blob_name)
+            data = blob.download_as_bytes()
+            if len(data) > 1000:
+                logger.info(f"Smile image downloaded directly from GCS: {blob_name} ({len(data)} bytes)")
+                return data
+            logger.warning(f"GCS blob too small ({len(data)} bytes): {blob_name}")
+        except Exception as e:
+            # If blob is gone (404), clear it from the local DB so we don't keep trying
+            if "404" in str(e) or "No such object" in str(e):
+                logger.info(f"GCS blob deleted remotely, clearing smile_blob_name for lead: {blob_name}")
+                try:
+                    from database import _conn
+                    lead_id = lead.get("lead_id") or lead.get("id", "")
+                    if lead_id:
+                        with _conn() as conn:
+                            conn.execute(
+                                "UPDATE leads SET smile_blob_name='', smile_image_url='' WHERE id=?",
+                                (lead_id,)
+                            )
+                except Exception as db_err:
+                    logger.warning(f"Could not clear smile_blob_name: {db_err}")
+                return b""
+            logger.warning(f"GCS direct download failed for {blob_name}: {e}")
+
+    # Strategy 2: Re-sign and fetch via HTTP (needs signBlob permission)
     if blob_name:
         fresh_url = _resign_smile_url(blob_name)
         if fresh_url:
-            return _fetch_smile_image(fresh_url)
-    # Fallback: try stored signed URL (may be expired for Day 14/30)
+            data = _fetch_smile_image(fresh_url)
+            if data:
+                return data
+
+    # Strategy 3: Stored signed URL (may be expired for Day 14/30)
     stored_url = lead.get("smile_image_url", "")
     if stored_url:
         return _fetch_smile_image(stored_url)

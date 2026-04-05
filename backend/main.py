@@ -753,23 +753,63 @@ def admin_test_email(body: TestEmailRequest):
 def debug_smile_resign(lead_id: str):
     """Debug endpoint: test GCS re-sign for a lead's smile blob."""
     from database import get_lead
-    from email_service import _resign_smile_url, _fetch_smile_image
+    from email_service import _fetch_smile_image
+    from datetime import timedelta
     lead = get_lead(lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     blob_name = lead.get("smile_blob_name", "")
     result = {"lead_id": lead_id, "blob_name": blob_name, "smile_image_url": lead.get("smile_image_url", "")}
     if blob_name:
+        # Test re-sign step by step, capturing exact errors
         try:
-            url = _resign_smile_url(blob_name)
-            result["signed_url"] = url[:80] if url else ""
-            result["resign_ok"] = bool(url)
-            if url:
-                img_bytes = _fetch_smile_image(url)
-                result["image_bytes"] = len(img_bytes)
-                result["image_ok"] = len(img_bytes) > 1000
+            from google.cloud import storage as gcs_storage
+            result["gcs_import"] = "ok"
         except Exception as e:
-            result["resign_error"] = str(e)
+            result["gcs_import_error"] = str(e)
+            return result
+        try:
+            import google.auth
+            from google.auth.transport import requests as g_requests
+            credentials, project = google.auth.default()
+            result["auth_project"] = project
+            result["credentials_type"] = type(credentials).__name__
+        except Exception as e:
+            result["auth_error"] = str(e)
+            return result
+        try:
+            credentials.refresh(g_requests.Request())
+            result["token_ok"] = bool(credentials.token)
+            result["token_prefix"] = credentials.token[:20] if credentials.token else ""
+        except Exception as e:
+            result["refresh_error"] = str(e)
+            return result
+        # Test direct blob download (Strategy 1 — no signBlob needed)
+        try:
+            from config import get_settings
+            settings = get_settings()
+            result["gcs_bucket"] = settings.gcs_bucket
+            client = gcs_storage.Client()
+            blob = client.bucket(settings.gcs_bucket).blob(blob_name)
+            data = blob.download_as_bytes()
+            result["direct_download_bytes"] = len(data)
+            result["direct_download_ok"] = len(data) > 1000
+        except Exception as e:
+            result["direct_download_error"] = str(e)
+
+        # Test signed URL (Strategy 2 — needs signBlob permission)
+        try:
+            sa_email = getattr(settings, "gcs_sa_email", "1096868046685-compute@developer.gserviceaccount.com")
+            result["sa_email"] = sa_email
+            blob2 = client.bucket(settings.gcs_bucket).blob(blob_name)
+            signed_url = blob2.generate_signed_url(
+                expiration=timedelta(days=7), method="GET", version="v4",
+                service_account_email=sa_email, access_token=credentials.token,
+            )
+            result["signed_url"] = signed_url[:80] if signed_url else ""
+            result["resign_ok"] = bool(signed_url)
+        except Exception as e:
+            result["sign_error"] = str(e)
     return result
 
 

@@ -718,7 +718,7 @@ def enqueue_follow_ups(lead_id: str, created_at: str):
         (7,  "email", "day7_email"),
         (14, "email", "day14_email"),
         (21, "sms",   "day21_sms"),
-        (30, "email", "day30_cold"),   # marks cold + deletes image
+        (30, "email", "day30_cold"),   # marks cold; GCS lifecycle is 31 days so blob still exists
     ]
 
     with _conn() as conn:
