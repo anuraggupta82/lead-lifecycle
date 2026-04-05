@@ -1,11 +1,13 @@
 """
-Email service — sends follow-up emails via Gmail SMTP.
+Email service — sends follow-up emails via Zoho SMTP (info@nxtsmile.com).
 All templates are HTML with plain-text fallback.
 """
 import smtplib
 import logging
+import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,27 @@ def _send(to_email: str, subject: str, html: str, plain: str = "") -> bool:
         return False
 
 
+def _send_msg(msg: MIMEMultipart) -> bool:
+    """Send a pre-built MIME message via Zoho SMTP."""
+    settings = get_settings()
+    if not settings.smtp_password:
+        logger.warning("SMTP password not set — email not sent")
+        return False
+    to_addr = msg.get("To", "?")
+    subject = msg.get("Subject", "?")
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(settings.smtp_user, settings.smtp_password)
+            server.send_message(msg)
+        logger.info(f"Email sent to {to_addr}: {subject}")
+        return True
+    except Exception as e:
+        logger.error(f"Email failed to {to_addr}: {e}")
+        return False
+
+
 def _base_html(content: str, unsubscribe_url: str, settings) -> str:
     return f"""<!DOCTYPE html>
 <html>
@@ -61,7 +84,7 @@ def _base_html(content: str, unsubscribe_url: str, settings) -> str:
 </head>
 <body>
   <div class="card">
-    <div class="logo">✨ {settings.practice_name}</div>
+    <div class="logo">✨ nXtsmile @ {settings.practice_name}</div>
     {content}
     <div class="footer">
       You received this because you expressed interest in dental implants at {settings.practice_name}.
@@ -73,100 +96,555 @@ def _base_html(content: str, unsubscribe_url: str, settings) -> str:
 </html>"""
 
 
+def _get_goal_case_description(goals: str) -> str:
+    """Map patient goals to a case description for the email."""
+    if not goals:
+        return "transformed smiles and restored confidence"
+    goals_lower = goals.lower()
+    if "missing" in goals_lower:
+        return "replaced missing teeth and restored confidence"
+    elif "denture" in goals_lower:
+        return "replaced uncomfortable dentures with permanent teeth and restored confidence"
+    elif "cosmetic" in goals_lower or "makeover" in goals_lower:
+        return "created a beautiful cosmetic transformation and restored confidence"
+    elif "full mouth" in goals_lower or "full arch" in goals_lower:
+        return "performed a complete full mouth restoration and restored confidence"
+    else:
+        return "transformed smiles and restored confidence"
+
+
+def _get_case_photo(goals: str) -> bytes:
+    """Load the appropriate before/after case photo based on patient goals.
+    Falls back to default.jpg if no tag-specific image exists."""
+    from pathlib import Path
+    case_dir = Path(__file__).parent / "case_photos"
+    goals_lower = (goals or "").lower()
+    tag_map = {
+        "missing": "missing_teeth.jpg",
+        "denture": "denture.jpg",
+        "cosmetic": "cosmetic.jpg",
+        "makeover": "cosmetic.jpg",
+        "full mouth": "full_mouth.jpg",
+        "full arch": "full_mouth.jpg",
+    }
+    for keyword, filename in tag_map.items():
+        if keyword in goals_lower:
+            tagged_path = case_dir / filename
+            if tagged_path.exists():
+                return tagged_path.read_bytes()
+    default_path = case_dir / "default.jpg"
+    if default_path.exists():
+        return default_path.read_bytes()
+    return b""
+
+
+def _fetch_smile_image(url: str) -> bytes:
+    """Download smile preview image from GCS signed URL."""
+    if not url:
+        return b""
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            return resp.content
+        logger.warning(f"Smile image fetch failed: status={resp.status_code} size={len(resp.content)}")
+    except Exception as e:
+        logger.warning(f"Smile image fetch error: {e}")
+    return b""
+
+
 def send_day1_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
     name = lead.get("first_name") or "there"
-    html_content = f"""
-    <h2>How did your smile preview look, {name}?</h2>
-    <p>We saw you took a look at what your new smile could look like — we hope it was exciting!</p>
-    <p>A lot of our patients say that the moment they saw their preview, everything clicked. If yours had that effect, we'd love to meet you.</p>
-    <p>Your <strong>free consultation</strong> with Dr. Gupta is still available — no pressure, no obligation. Just a chance to see if nXtsmile is right for you.</p>
-    <a href="{settings.practice_url}#consult" class="btn">Book My Free Consultation →</a>
-    <p>Or call us directly at <span class="phone">{settings.office_phone}</span></p>
-    <p>— The nXtsmile Team at {settings.practice_name}</p>
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+    smile_url = lead.get("smile_image_url", "")
+
+    # Download the after image from GCS
+    smile_bytes = _fetch_smile_image(smile_url)
+
+    # Build image block — embedded cid if we have the image, fallback text if not
+    if smile_bytes:
+        image_block = """
+        <img src="cid:smile_preview"
+             style="width:100%;max-height:420px;object-fit:contain;border-radius:12px;border:1px solid #e5e7eb;display:block;margin:0 auto 24px;"
+             alt="Your smile preview" />
+        """
+    else:
+        image_block = """
+        <p style="background:#e8f5f5;border-radius:12px;padding:40px;text-align:center;color:#0d7a7f;
+                  font-size:16px;font-weight:600;margin:0 0 24px;">
+          Your smile preview is waiting at<br/>
+          <a href="{url}" style="color:#0d7a7f;">nxtsmile.com</a>
+        </p>
+        """.format(url=settings.practice_url)
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = f"Your new smile is closer than you think, {name} :)"
+    msg["From"] = settings.email_from
+    msg["To"] = lead["email"]
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;color:#333;max-width:560px;margin:0 auto;padding:0;">
+      <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0;">
+        <h2 style="color:#fff;margin:0;font-size:24px;">Your new smile is closer than you think, {name} :)</h2>
+      </div>
+      <div style="padding:28px 32px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px;">
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          Hi {name},
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          We hope you loved your smile preview! Take another look — this could be you.
+        </p>
+
+        {image_block}
+
+        <p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">
+          *AI generated image. Actual results will vary.
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 12px;">
+          Every smile transformation starts with a single step. Hundreds of patients walked into
+          Grafton Dental Care feeling unsure — and walked out with a smile they couldn't stop showing off.
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 12px;">
+          You deserve to eat the foods you love, laugh without thinking twice, and feel proud every
+          time you look in the mirror. Dr. Gupta and the nXtsmile team are here to make that happen.
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 24px;">
+          Your free consultation is waiting — no pressure, no obligation. Just a conversation
+          about what's possible.
+        </p>
+
+        <p style="text-align:center;margin:0 0 12px;">
+          <a href="{settings.practice_url}#consult"
+             style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:16px;">
+            Book My Free Consultation
+          </a>
+        </p>
+
+        <p style="text-align:center;margin:0 0 28px;">
+          <a href="{settings.practice_url}#callback"
+             style="display:inline-block;background:#fff;color:#0d7a7f;padding:12px 28px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:15px;border:2px solid #0d7a7f;">
+            Request a Callback
+          </a>
+        </p>
+
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:0 0 20px;"/>
+
+        <p style="text-align:center;color:#333;font-size:14px;font-weight:700;margin:0 0 4px;">
+          nXtsmile @ {settings.practice_name}
+        </p>
+        <p style="text-align:center;color:#0d7a7f;font-size:14px;margin:0 0 4px;">
+          <a href="https://www.nxtsmile.com" style="color:#0d7a7f;text-decoration:none;">www.nxtsmile.com</a>
+        </p>
+        <p style="text-align:center;color:#333;font-size:14px;margin:0 0 16px;">
+          {settings.office_phone}
+        </p>
+
+        <div style="background:#f8fafa;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
+          <p style="color:#666;font-size:12px;line-height:1.5;margin:0;">
+            🔒 Your photo is securely stored and will be automatically deleted after 30 days.
+            If you'd like it removed now, <a href="http://localhost:{settings.port}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
+          </p>
+        </div>
+
+        <div style="font-size:12px;color:#999;border-top:1px solid #eee;padding-top:16px;">
+          You received this because you expressed interest in dental implants at {settings.practice_name}.
+          &nbsp;|&nbsp; <a href="{unsubscribe_url}" style="color:#0d7a7f;">Unsubscribe</a>
+          &nbsp;|&nbsp; {settings.practice_name}, Grafton, MA
+        </div>
+      </div>
+    </body></html>
     """
-    return _send(
-        lead["email"],
-        f"How did your smile preview look, {name}?",
-        _base_html(html_content, unsubscribe_url, settings),
-        f"Hi {name}, how did your smile preview look? Book your free consult at {settings.practice_url} or call {settings.office_phone}"
-    )
+
+    msg.attach(MIMEText(html, "html"))
+
+    # Embed smile preview image
+    if smile_bytes:
+        try:
+            img_mime = MIMEImage(smile_bytes, _subtype="png")
+            img_mime.add_header("Content-ID", "<smile_preview>")
+            img_mime.add_header("Content-Disposition", "inline", filename="smile-preview.png")
+            msg.attach(img_mime)
+        except Exception as e:
+            logger.warning(f"Could not attach smile image: {e}")
+
+    return _send_msg(msg)
 
 
 def send_day7_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
     name = lead.get("first_name") or "there"
-    html_content = f"""
-    <h2>What's holding you back, {name}?</h2>
-    <p>We've had a lot of people tell us the same things before they finally came in:</p>
-    <p>
-      <strong>"I'm worried about the cost."</strong><br>
-      We work with CareCredit, Cherry, and in-house financing — many patients pay less than $100/month.
-    </p>
-    <p>
-      <strong>"I'm not sure I'm a candidate."</strong><br>
-      That's exactly what the free consultation is for. There's no commitment — just answers.
-    </p>
-    <p>
-      <strong>"I'm nervous."</strong><br>
-      Dr. Gupta has helped hundreds of patients just like you. The consultation is relaxed and pressure-free.
-    </p>
-    <a href="{settings.practice_url}#consult" class="btn">Get My Questions Answered →</a>
-    <p>Or call us at <span class="phone">{settings.office_phone}</span> — we're happy to talk before you book.</p>
-    <p>— Dr. Gupta & the nXtsmile Team</p>
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+    goals = lead.get("goals", "")
+    # Parse goals if stored as JSON string
+    if goals and goals.startswith("["):
+        import json
+        try:
+            goals = ", ".join(json.loads(goals))
+        except Exception:
+            pass
+
+    case_description = _get_goal_case_description(goals)
+    case_photo_bytes = _get_case_photo(goals)
+
+    # Case photo block
+    if case_photo_bytes:
+        case_photo_block = """
+        <img src="cid:case_photo"
+             style="width:100%;border-radius:12px;border:1px solid #e5e7eb;display:block;margin:0 auto 8px;"
+             alt="Before and after dental implant case by Dr. Gupta" />
+        <p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">
+          *Actual patient results. Individual results may vary.
+        </p>
+        """
+    else:
+        case_photo_block = ""
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = f"What's holding you back, {name}?"
+    msg["From"] = settings.email_from
+    msg["To"] = lead["email"]
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;color:#333;max-width:560px;margin:0 auto;padding:0;">
+      <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0;">
+        <h2 style="color:#fff;margin:0;font-size:24px;">What's holding you back, {name}?</h2>
+      </div>
+      <div style="padding:28px 32px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px;">
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          Hi {name},
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          We've had a lot of people tell us the same things before they finally came in:
+        </p>
+
+        <div style="background:#f8fafa;border-radius:10px;padding:20px 24px;margin:0 0 24px;">
+          <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 16px;">
+            <strong>"I'm worried about the cost."</strong><br/>
+            We work with CareCredit, Cherry, and in-house financing — many patients pay as little as $300 a month.
+          </p>
+          <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 16px;">
+            <strong>"I'm not sure I'm a candidate."</strong><br/>
+            That's exactly what the free consultation is for. There's no commitment — just answers.
+          </p>
+          <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 16px;">
+            <strong>"I'm nervous."</strong><br/>
+            Dr. Gupta has helped hundreds of patients just like you. The consultation is relaxed and pressure-free.
+          </p>
+          <p style="color:#333;font-size:15px;line-height:1.6;margin:0;">
+            <strong>"Would it hurt?"</strong><br/>
+            Dr. Gupta is an expert in painless dentistry. You will be provided comfortable sedation to make the procedure as painless as possible.
+          </p>
+        </div>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 8px;">
+          Here's a patient where Dr. Gupta {case_description}. This could be you.
+        </p>
+
+        {case_photo_block}
+
+        <p style="text-align:center;margin:0 0 12px;">
+          <a href="{settings.practice_url}#consult"
+             style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:16px;">
+            Book My Free Consultation
+          </a>
+        </p>
+
+        <p style="text-align:center;margin:0 0 28px;">
+          <a href="{settings.practice_url}#callback"
+             style="display:inline-block;background:#fff;color:#0d7a7f;padding:12px 28px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:15px;border:2px solid #0d7a7f;">
+            Request a Callback
+          </a>
+        </p>
+
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:0 0 20px;"/>
+
+        <p style="text-align:center;color:#333;font-size:14px;font-weight:700;margin:0 0 4px;">
+          nXtsmile @ {settings.practice_name}
+        </p>
+        <p style="text-align:center;color:#0d7a7f;font-size:14px;margin:0 0 4px;">
+          <a href="https://www.nxtsmile.com" style="color:#0d7a7f;text-decoration:none;">www.nxtsmile.com</a>
+        </p>
+        <p style="text-align:center;color:#333;font-size:14px;margin:0 0 20px;">
+          {settings.office_phone}
+        </p>
+
+        <div style="background:#f8fafa;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
+          <p style="color:#666;font-size:12px;line-height:1.5;margin:0;">
+            🔒 Your photo is securely stored and will be automatically deleted after 30 days.
+            If you'd like it removed now, <a href="http://localhost:{settings.port}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
+          </p>
+        </div>
+
+        <div style="font-size:12px;color:#999;border-top:1px solid #eee;padding-top:16px;">
+          You received this because you expressed interest in dental implants at {settings.practice_name}.
+          &nbsp;|&nbsp; <a href="{unsubscribe_url}" style="color:#0d7a7f;">Unsubscribe</a>
+          &nbsp;|&nbsp; {settings.practice_name}, Grafton, MA
+        </div>
+      </div>
+    </body></html>
     """
-    return _send(
-        lead["email"],
-        "A few things we hear a lot...",
-        _base_html(html_content, unsubscribe_url, settings),
-        f"Hi {name}, wondering what's holding you back. Call us at {settings.office_phone} or visit {settings.practice_url}"
-    )
+
+    msg.attach(MIMEText(html, "html"))
+
+    # Embed case photo
+    if case_photo_bytes:
+        try:
+            case_img = MIMEImage(case_photo_bytes, _subtype="jpeg")
+            case_img.add_header("Content-ID", "<case_photo>")
+            case_img.add_header("Content-Disposition", "inline", filename="case-photo.jpg")
+            msg.attach(case_img)
+        except Exception as e:
+            logger.warning(f"Could not attach case photo: {e}")
+
+    return _send_msg(msg)
 
 
 def send_day14_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
     name = lead.get("first_name") or "there"
-    html_content = f"""
-    <h2>Did you know nXtsmile can be $0 down?</h2>
-    <p>Hi {name} — we wanted to share something that surprises most people.</p>
-    <p>All-on-X dental implants don't have to be a huge upfront expense. With our financing options, most patients pay <strong>less per month than a car payment</strong> — and they eat what they want, smile with confidence, and never worry about dentures slipping again.</p>
-    <p><strong>Your options:</strong></p>
-    <p>
-      🏦 <strong>CareCredit</strong> — 0% interest for 12–18 months<br>
-      🍒 <strong>Cherry</strong> — instant approval, flexible monthly plans<br>
-      🏥 <strong>In-house financing</strong> — we'll work with your situation
-    </p>
-    <p>Your free consultation includes a full treatment plan with financing options personalized to your budget. No surprises.</p>
-    <a href="{settings.practice_url}#consult" class="btn">See My Financing Options →</a>
-    <p>Or call <span class="phone">{settings.office_phone}</span> to talk finances before your visit.</p>
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+    smile_url = lead.get("smile_image_url", "")
+
+    # Download the after image from GCS
+    smile_bytes = _fetch_smile_image(smile_url)
+
+    if smile_bytes:
+        image_block = """
+        <img src="cid:smile_preview"
+             style="width:100%;max-height:420px;object-fit:contain;border-radius:12px;border:1px solid #e5e7eb;display:block;margin:0 auto 24px;"
+             alt="Your smile preview" />
+        <p style="color:#999;font-size:11px;margin:-16px 0 20px;text-align:center;">
+          *AI generated image. Actual results will vary.
+        </p>
+        """
+    else:
+        image_block = ""
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = f"Your new smile might cost less than you think, {name}"
+    msg["From"] = settings.email_from
+    msg["To"] = lead["email"]
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;color:#333;max-width:560px;margin:0 auto;padding:0;">
+      <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0;">
+        <h2 style="color:#fff;margin:0;font-size:24px;">Did you know nXtsmile can be $0 down?</h2>
+      </div>
+      <div style="padding:28px 32px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px;">
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          Hi {name},
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          We wanted to share something that surprises most people — All-on-X dental implants don't have to
+          be a huge upfront expense. With our financing options, many patients pay as little as $300 a month
+          — and they eat what they want, smile with confidence, and never worry about dentures slipping again.
+        </p>
+
+        {image_block}
+
+        <div style="background:#f8fafa;border-radius:10px;padding:20px 24px;margin:0 0 24px;">
+          <p style="color:#333;font-size:15px;font-weight:700;margin:0 0 12px;">Your financing options:</p>
+          <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 10px;">
+            🏦 <strong>CareCredit</strong> — 0% interest available
+          </p>
+          <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 10px;">
+            🍒 <strong>Cherry</strong> — instant approval, flexible monthly plans
+          </p>
+          <p style="color:#333;font-size:15px;line-height:1.6;margin:0;">
+            🏥 <strong>In-house financing</strong> — we'll work with your situation
+          </p>
+        </div>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 24px;">
+          We'll discuss your financing options at your free consultation — a full treatment plan
+          personalized to your budget. No surprises.
+        </p>
+
+        <p style="text-align:center;margin:0 0 12px;">
+          <a href="{settings.practice_url}#consult"
+             style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:16px;">
+            Book My Free Consultation
+          </a>
+        </p>
+
+        <p style="text-align:center;margin:0 0 28px;">
+          <a href="{settings.practice_url}#callback"
+             style="display:inline-block;background:#fff;color:#0d7a7f;padding:12px 28px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:15px;border:2px solid #0d7a7f;">
+            Request a Callback
+          </a>
+        </p>
+
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:0 0 20px;"/>
+
+        <p style="text-align:center;color:#333;font-size:14px;font-weight:700;margin:0 0 4px;">
+          nXtsmile @ {settings.practice_name}
+        </p>
+        <p style="text-align:center;color:#0d7a7f;font-size:14px;margin:0 0 4px;">
+          <a href="https://www.nxtsmile.com" style="color:#0d7a7f;text-decoration:none;">www.nxtsmile.com</a>
+        </p>
+        <p style="text-align:center;color:#333;font-size:14px;margin:0 0 20px;">
+          {settings.office_phone}
+        </p>
+
+        <div style="background:#f8fafa;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
+          <p style="color:#666;font-size:12px;line-height:1.5;margin:0;">
+            🔒 Your photo is securely stored and will be automatically deleted after 30 days.
+            If you'd like it removed now, <a href="http://localhost:{settings.port}/delete-image/{lead_id}" style="color:#0d7a7f;">click here to delete immediately</a>.
+          </p>
+        </div>
+
+        <div style="font-size:12px;color:#999;border-top:1px solid #eee;padding-top:16px;">
+          You received this because you expressed interest in dental implants at {settings.practice_name}.
+          &nbsp;|&nbsp; <a href="{unsubscribe_url}" style="color:#0d7a7f;">Unsubscribe</a>
+          &nbsp;|&nbsp; {settings.practice_name}, Grafton, MA
+        </div>
+      </div>
+    </body></html>
     """
-    return _send(
-        lead["email"],
-        "Your new smile might cost less than you think",
-        _base_html(html_content, unsubscribe_url, settings),
-        f"Hi {name}, nXtsmile financing starts at $0 down. Call {settings.office_phone} or visit {settings.practice_url}"
-    )
+
+    msg.attach(MIMEText(html, "html"))
+
+    # Embed smile preview image
+    if smile_bytes:
+        try:
+            img_mime = MIMEImage(smile_bytes, _subtype="png")
+            img_mime.add_header("Content-ID", "<smile_preview>")
+            img_mime.add_header("Content-Disposition", "inline", filename="smile-preview.png")
+            msg.attach(img_mime)
+        except Exception as e:
+            logger.warning(f"Could not attach smile image: {e}")
+
+    return _send_msg(msg)
 
 
 def send_day30_cold_email(lead: dict, unsubscribe_url: str) -> bool:
-    """Final email — marks cold, leaves door open."""
+    """Final email — marks cold, leaves door open, deletes smile image."""
     settings = get_settings()
     name = lead.get("first_name") or "there"
-    html_content = f"""
-    <h2>Still here if you need us, {name}</h2>
-    <p>We won't keep reaching out — but we wanted you to know the door is always open.</p>
-    <p>Whenever you're ready to explore your options, Dr. Gupta would love to meet you. The consultation is always free, always no-pressure.</p>
-    <a href="{settings.practice_url}" class="btn">Visit nXtsmile.com →</a>
-    <p>Or call us at <span class="phone">{settings.office_phone}</span></p>
-    <p>Wishing you a healthy, confident smile — whenever the time is right.</p>
-    <p>— Dr. Gupta & the team at {settings.practice_name}</p>
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+    smile_url = lead.get("smile_image_url", "")
+
+    # Download the after image from GCS (last chance before deletion)
+    smile_bytes = _fetch_smile_image(smile_url)
+
+    if smile_bytes:
+        image_block = """
+        <img src="cid:smile_preview"
+             style="width:100%;max-height:420px;object-fit:contain;border-radius:12px;border:1px solid #e5e7eb;display:block;margin:0 auto 8px;"
+             alt="Your smile preview" />
+        <p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">
+          *AI generated image. Actual results will vary.
+        </p>
+        """
+    else:
+        image_block = ""
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = f"Still here whenever you're ready, {name}"
+    msg["From"] = settings.email_from
+    msg["To"] = lead["email"]
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;color:#333;max-width:560px;margin:0 auto;padding:0;">
+      <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0;">
+        <h2 style="color:#fff;margin:0;font-size:24px;">Still here whenever you're ready, {name}</h2>
+      </div>
+      <div style="padding:28px 32px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px;">
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          Hi {name},
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 16px;">
+          We know life gets busy and sometimes the timing just isn't right. That's completely okay.
+        </p>
+
+        <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 16px;">
+          Whether it's next week, next month, or next year — you deserve a smile you're proud of,
+          and we'd love to help make that happen. Whenever you're ready, reach out to us.
+        </p>
+
+        {image_block}
+
+        <div style="background:#f8fafa;border-radius:10px;padding:16px 20px;margin:0 0 24px;">
+          <p style="color:#555;font-size:14px;line-height:1.5;margin:0;">
+            🔒 Your smile preview will be deleted today as part of our privacy policy.
+            If you'd like to start fresh in the future, we can always create a new one for you.
+          </p>
+        </div>
+
+        <p style="text-align:center;margin:0 0 4px;">
+          <a href="{settings.practice_url}#consult"
+             style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:16px;">
+            I'm Ready!
+          </a>
+        </p>
+        <p style="text-align:center;color:#999;font-size:12px;margin:0 0 16px;">
+          Will take you to schedule your free consultation
+        </p>
+
+        <p style="text-align:center;margin:0 0 28px;">
+          <a href="{settings.practice_url}#callback"
+             style="display:inline-block;background:#fff;color:#0d7a7f;padding:12px 28px;border-radius:10px;
+                    font-weight:700;text-decoration:none;font-size:15px;border:2px solid #0d7a7f;">
+            Request a Callback
+          </a>
+        </p>
+
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:0 0 20px;"/>
+
+        <p style="text-align:center;color:#333;font-size:15px;line-height:1.6;margin:0 0 20px;">
+          Wishing you a healthy, confident smile — whenever the time is right.
+        </p>
+
+        <p style="text-align:center;color:#333;font-size:14px;font-weight:700;margin:0 0 4px;">
+          nXtsmile @ {settings.practice_name}
+        </p>
+        <p style="text-align:center;color:#0d7a7f;font-size:14px;margin:0 0 4px;">
+          <a href="https://www.nxtsmile.com" style="color:#0d7a7f;text-decoration:none;">www.nxtsmile.com</a>
+        </p>
+        <p style="text-align:center;color:#333;font-size:14px;margin:0 0 16px;">
+          {settings.office_phone}
+        </p>
+
+        <div style="font-size:12px;color:#999;border-top:1px solid #eee;padding-top:16px;">
+          You received this because you expressed interest in dental implants at {settings.practice_name}.
+          &nbsp;|&nbsp; <a href="{unsubscribe_url}" style="color:#0d7a7f;">Unsubscribe</a>
+          &nbsp;|&nbsp; {settings.practice_name}, Grafton, MA
+        </div>
+      </div>
+    </body></html>
     """
-    return _send(
-        lead["email"],
-        "Still here if you need us",
-        _base_html(html_content, unsubscribe_url, settings),
-        f"Hi {name}, still here if you need us. {settings.practice_url} or {settings.office_phone}"
-    )
+
+    msg.attach(MIMEText(html, "html"))
+
+    # Embed smile preview image
+    if smile_bytes:
+        try:
+            img_mime = MIMEImage(smile_bytes, _subtype="png")
+            img_mime.add_header("Content-ID", "<smile_preview>")
+            img_mime.add_header("Content-Disposition", "inline", filename="smile-preview.png")
+            msg.attach(img_mime)
+        except Exception as e:
+            logger.warning(f"Could not attach smile image: {e}")
+
+    return _send_msg(msg)
 
 
 def send_office_new_lead(lead: dict) -> bool:

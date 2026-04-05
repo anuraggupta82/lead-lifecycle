@@ -19,682 +19,862 @@
            background: #f0f4f8; color: var(--text); min-height: 100vh; }
     #root { display: flex; flex-direction: column; min-height: 100vh; }
 
-    /* Header */
-    .header { background: var(--teal-dark); color: #fff; padding: 0 24px;
-               display: flex; align-items: center; gap: 16px; height: 56px; }
-    .header-logo { font-size: 18px; font-weight: 700; }
+    .header { background: var(--teal-dark); color: #fff; padding: 0 20px;
+               display: flex; align-items: center; gap: 12px; height: 44px; flex-shrink: 0; }
+    .header-logo { font-size: 15px; font-weight: 700; white-space: nowrap; }
     .header-logo span { color: #5eead4; }
-    .header-sub { font-size: 13px; opacity: .7; }
-    .header-right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
-    .btn { padding: 7px 14px; border-radius: 6px; border: none; cursor: pointer;
-            font-size: 13px; font-weight: 500; transition: opacity .15s; }
+    .header-right { margin-left: auto; display: flex; gap: 8px; align-items: center; font-size: 11px; }
+    .header-dot { width: 6px; height: 6px; border-radius: 50%; background: #5eead4; }
+
+    .btn { padding: 5px 10px; border-radius: 5px; border: none; cursor: pointer;
+            font-size: 11px; font-weight: 500; transition: all .15s; }
     .btn:hover { opacity: .85; }
     .btn-teal { background: var(--teal); color: #fff; }
     .btn-white { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.3); }
-    .btn-sm { padding: 4px 10px; font-size: 12px; }
+    .btn-sm { padding: 3px 8px; font-size: 10px; }
     .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text-muted); }
 
-    /* Layout */
-    .main { flex: 1; padding: 20px 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
-    .section-title { font-size: 15px; font-weight: 600; color: var(--text-muted);
-                      text-transform: uppercase; letter-spacing: .5px; margin-bottom: 12px; }
+    /* Tabs */
+    .tab-bar { background: #fff; border-bottom: 1px solid var(--border); display: flex; gap: 0; flex-shrink: 0; }
+    .tab { padding: 8px 20px; font-size: 12px; font-weight: 500; cursor: pointer; border-bottom: 2px solid transparent;
+           color: var(--text-muted); background: none; border-top: none; border-left: none; border-right: none; }
+    .tab:hover { color: var(--text); background: var(--gray-light); }
+    .tab.active { color: var(--teal); border-bottom-color: var(--teal); font-weight: 600; }
 
-    /* KPI cards */
-    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-                 gap: 14px; margin-bottom: 24px; }
-    .kpi-card { background: #fff; border-radius: 10px; padding: 16px 18px;
-                 border: 1px solid var(--border); }
-    .kpi-label { font-size: 12px; color: var(--text-muted); font-weight: 500;
-                  text-transform: uppercase; letter-spacing: .4px; }
-    .kpi-value { font-size: 28px; font-weight: 700; margin: 4px 0 2px; }
-    .kpi-sub { font-size: 12px; color: var(--text-muted); }
-    .kpi-teal { color: var(--teal); }
-    .kpi-green { color: var(--green); }
-    .kpi-yellow { color: var(--yellow); }
-    .kpi-purple { color: var(--purple); }
+    /* Main content */
+    .main { flex: 1; overflow-y: auto; padding: 12px 16px; }
 
-    /* Funnel */
-    .funnel-row { display: flex; gap: 8px; margin-bottom: 24px; overflow-x: auto; padding-bottom: 4px; }
-    .funnel-stage { flex: 1; min-width: 100px; background: #fff; border-radius: 8px;
-                     border: 1px solid var(--border); padding: 12px 10px; text-align: center;
-                     cursor: pointer; transition: all .15s; position: relative; }
-    .funnel-stage:hover { border-color: var(--teal); box-shadow: 0 2px 8px rgba(13,122,127,.1); }
-    .funnel-stage.active { border-color: var(--teal); background: var(--teal-light); }
-    .funnel-stage-name { font-size: 11px; color: var(--text-muted); font-weight: 500;
-                          text-transform: uppercase; letter-spacing: .3px; margin-bottom: 6px; }
-    .funnel-stage-count { font-size: 26px; font-weight: 700; color: var(--teal); }
-    .funnel-arrow { display: flex; align-items: center; padding-top: 30px;
-                     color: var(--border); font-size: 18px; }
+    /* KPI strip */
+    .kpi-strip { display: flex; gap: 0; background: #fff; border: 1px solid var(--border);
+                 border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
+    .kpi { flex: 1; padding: 10px 12px; text-align: center; border-right: 1px solid var(--border); }
+    .kpi:last-child { border-right: none; }
+    .kpi-val { font-size: 20px; font-weight: 700; color: var(--teal); line-height: 1.1; }
+    .kpi-label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .3px; margin-top: 2px; }
 
-    /* Two-column layout */
-    .two-col { display: grid; grid-template-columns: 1fr 340px; gap: 20px; }
-    @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+    /* Filter bar */
+    .filter-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .filter-select { padding: 5px 10px; border: 1px solid var(--border); border-radius: 5px;
+                     font-size: 11px; background: #fff; color: var(--text); }
+    .search-box { padding: 5px 10px; border: 1px solid var(--border); border-radius: 5px;
+                  font-size: 11px; width: 200px; }
+    .search-box:focus, .filter-select:focus { outline: none; border-color: var(--teal); }
 
-    /* Lead table */
-    .card { background: #fff; border-radius: 10px; border: 1px solid var(--border);
-             overflow: hidden; }
-    .card-header { padding: 14px 18px; border-bottom: 1px solid var(--border);
-                    display: flex; align-items: center; gap: 10px; }
-    .card-header h3 { font-size: 15px; font-weight: 600; flex: 1; }
-    .filters { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 18px;
-                border-bottom: 1px solid var(--border); background: var(--gray-light); }
-    .filter-btn { padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 500;
-                   border: 1px solid var(--border); background: #fff; cursor: pointer;
-                   color: var(--text-muted); transition: all .15s; }
-    .filter-btn.active { background: var(--teal); color: #fff; border-color: var(--teal); }
-    .search-box { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border);
-                   font-size: 13px; flex: 1; min-width: 180px; outline: none; }
-    .search-box:focus { border-color: var(--teal); }
+    /* Stage rows — lab case manager style (always open, no chevrons) */
+    .stage-row { background: #fff; border: 1px solid var(--border); border-radius: 8px;
+                 margin-bottom: 4px; display: flex; align-items: center; flex-wrap: wrap;
+                 padding: 6px 12px; gap: 6px; min-height: 40px; }
+    .stage-row.drag-over { background: rgba(13,122,127,.04); border-color: var(--teal); }
+    .stage-row.special { border-left: 3px solid; }
+    .stage-row.followup-row { border-left-color: #f59e0b; background: #fffbeb; }
+    .stage-row.nurture-row { border-left-color: #8b5cf6; background: #faf5ff; }
+    .stage-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .stage-label { font-size: 11px; font-weight: 600; color: var(--text); white-space: nowrap; }
+    .stage-count { font-size: 10px; font-weight: 600; background: var(--gray-light); padding: 0 6px;
+                   border-radius: 8px; color: var(--text-muted); }
+    .stage-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
 
-    /* Lead list */
-    .lead-list { overflow-y: auto; max-height: 520px; }
-    .lead-item { padding: 14px 18px; border-bottom: 1px solid var(--border); cursor: pointer;
-                  display: flex; align-items: flex-start; gap: 12px; transition: background .1s; }
-    .lead-item:hover { background: var(--gray-light); }
-    .lead-item.selected { background: var(--teal-light); border-left: 3px solid var(--teal); }
-    .lead-avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--teal-light);
-                    color: var(--teal); display: flex; align-items: center; justify-content: center;
-                    font-weight: 700; font-size: 14px; flex-shrink: 0; }
-    .lead-main { flex: 1; min-width: 0; }
-    .lead-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden;
-                  text-overflow: ellipsis; }
-    .lead-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-    .lead-right { text-align: right; flex-shrink: 0; }
-    .stage-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
-                    font-size: 11px; font-weight: 500; }
-    .days-badge { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+    /* Lead chips — compact inline badges like lab case manager */
+    .lead-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px;
+                 border: 1px solid var(--border); border-radius: 6px; background: #fff;
+                 cursor: pointer; font-size: 11px; transition: all .12s; white-space: nowrap;
+                 max-width: 280px; }
+    .lead-chip:hover { border-color: var(--teal); background: var(--teal-light); }
+    .lead-chip.selected { border-color: var(--teal); box-shadow: 0 0 0 2px rgba(13,122,127,.15); }
+    .lead-chip.has-priority { border-left: 3px solid var(--yellow); }
+    .chip-name { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+    .chip-source { font-size: 8px; padding: 0 4px; border-radius: 3px; font-weight: 600; line-height: 14px; }
+    .src-google { background: #dbeafe; color: #1d4ed8; }
+    .src-fb { background: #ede9fe; color: #7c3aed; }
+    .src-smile { background: #f3e8ff; color: #9333ea; }
+    .src-phone { background: #fef9c3; color: #854d0e; }
+    .src-form { background: #d1fae5; color: #065f46; }
+    .src-chat { background: #fce7f3; color: #be185d; }
+    .src-default { background: var(--gray-light); color: var(--gray); }
+    .chip-phone { font-size: 10px; color: var(--text-muted); }
+    .chip-time { font-size: 9px; color: var(--text-muted); }
+    .chip-revenue { font-size: 9px; color: #059669; font-weight: 700; }
+    .chip-notes { font-size: 8px; background: #fef3c7; color: #92400e; padding: 0 3px;
+                  border-radius: 3px; font-weight: 700; }
+    .chip-campaign { font-size: 8px; color: var(--purple); font-weight: 500; max-width: 80px;
+                     overflow: hidden; text-overflow: ellipsis; }
+    .chip-fu { font-size: 8px; background: #fef3c7; color: #92400e; padding: 0 4px;
+               border-radius: 3px; font-weight: 600; }
 
-    /* Stage colors */
-    .stage-new { background: #dbeafe; color: #1d4ed8; }
-    .stage-engaged { background: #fef9c3; color: #854d0e; }
-    .stage-smile_completed { background: #f3e8ff; color: #7c3aed; }
-    .stage-nurturing { background: #fed7aa; color: #c2410c; }
-    .stage-scheduled { background: #d1fae5; color: #065f46; }
-    .stage-confirmed { background: #a7f3d0; color: #064e3b; }
-    .stage-showed { background: #bbf7d0; color: #15803d; }
-    .stage-treatment_presented { background: #cffafe; color: #0e7490; }
-    .stage-treatment_accepted { background: #99f6e4; color: #0f766e; }
-    .stage-treatment_completed { background: #d1fae5; color: #065f46; }
-    .stage-cold { background: #f3f4f6; color: #6b7280; }
+    /* Detail panel */
+    .detail-overlay { position: fixed; top: 0; right: 0; bottom: 0; width: 400px;
+                      background: #fff; border-left: 1px solid var(--border);
+                      box-shadow: -4px 0 20px rgba(0,0,0,.08); z-index: 100;
+                      display: flex; flex-direction: column;
+                      transform: translateX(100%); transition: transform .2s ease; }
+    .detail-overlay.open { transform: translateX(0); }
+    .detail-backdrop { position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                       background: rgba(0,0,0,.1); z-index: 99; }
+    .detail-header { padding: 12px 14px; border-bottom: 1px solid var(--border);
+                     display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .detail-close { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-muted); }
+    .detail-body { flex: 1; overflow-y: auto; padding: 12px 14px; }
+    .detail-section { margin-bottom: 14px; }
+    .detail-section-title { font-size: 10px; font-weight: 600; text-transform: uppercase;
+                            color: var(--text-muted); letter-spacing: .4px; margin-bottom: 6px; }
+    .detail-row { display: flex; justify-content: space-between; padding: 3px 0;
+                  font-size: 11px; border-bottom: 1px solid #f5f5f5; }
+    .detail-row-label { color: var(--text-muted); }
+    .detail-row-value { font-weight: 500; text-align: right; max-width: 200px; word-break: break-all; }
 
-    /* Source icons */
-    .source-badge { font-size: 11px; display: inline-flex; align-items: center; gap: 3px;
-                     padding: 1px 6px; border-radius: 4px; background: var(--gray-light);
-                     color: var(--text-muted); }
+    /* Stage move */
+    .stage-move-menu { position: absolute; top: 100%; left: 0; background: #fff; border: 1px solid var(--border);
+                       border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,.1); z-index: 10;
+                       min-width: 180px; max-height: 280px; overflow-y: auto; }
+    .stage-move-item { padding: 6px 10px; font-size: 11px; cursor: pointer; display: flex;
+                       align-items: center; gap: 6px; }
+    .stage-move-item:hover { background: var(--teal-light); }
+    .stage-move-item.current { background: #f0fdf4; font-weight: 600; }
 
-    /* Lead detail panel */
-    .detail-panel { background: #fff; border-radius: 10px; border: 1px solid var(--border);
-                     overflow: hidden; }
-    .detail-header { padding: 16px 18px; border-bottom: 1px solid var(--border);
-                      background: var(--teal-light); }
-    .detail-name { font-size: 18px; font-weight: 700; }
-    .detail-contact { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
-    .detail-body { padding: 16px 18px; overflow-y: auto; max-height: 560px; }
-    .detail-section { margin-bottom: 20px; }
-    .detail-section h4 { font-size: 12px; font-weight: 600; color: var(--text-muted);
-                           text-transform: uppercase; letter-spacing: .4px; margin-bottom: 10px; }
-    .detail-row { display: flex; justify-content: space-between; font-size: 13px;
-                   padding: 4px 0; }
-    .detail-label { color: var(--text-muted); }
-    .detail-value { font-weight: 500; text-align: right; max-width: 60%; word-break: break-word; }
+    /* Notes */
+    .note-item { background: #fffbeb; border: 1px solid #fef3c7; border-radius: 5px;
+                 padding: 6px 8px; margin-bottom: 4px; font-size: 11px; }
+    .note-header { display: flex; justify-content: space-between; margin-bottom: 2px; }
+    .note-author { font-weight: 600; color: #92400e; font-size: 10px; }
+    .note-time { color: var(--text-muted); font-size: 9px; }
+    .note-input { width: 100%; border: 1px solid var(--border); border-radius: 5px;
+                  padding: 6px 8px; font-size: 11px; resize: vertical; min-height: 50px; font-family: inherit; }
+    .note-input:focus { outline: none; border-color: var(--teal); }
 
     /* Timeline */
-    .timeline { position: relative; padding-left: 20px; }
-    .timeline::before { content: ''; position: absolute; left: 7px; top: 0; bottom: 0;
-                          width: 1px; background: var(--border); }
-    .timeline-item { position: relative; padding: 0 0 14px 16px; }
-    .timeline-item::before { content: ''; position: absolute; left: -13px; top: 5px;
-                               width: 8px; height: 8px; border-radius: 50%;
-                               background: var(--teal); border: 2px solid #fff;
-                               box-shadow: 0 0 0 1px var(--teal); }
-    .timeline-type { font-size: 12px; font-weight: 600; color: var(--teal); }
-    .timeline-time { font-size: 11px; color: var(--text-muted); }
-    .timeline-detail { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+    .timeline-item { display: flex; gap: 6px; padding: 4px 0; border-bottom: 1px solid #f5f5f5; font-size: 10px; }
+    .timeline-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--teal); margin-top: 4px; flex-shrink: 0; }
+    .timeline-type { font-weight: 600; color: var(--teal); }
+    .timeline-time { color: var(--text-muted); font-size: 9px; white-space: nowrap; margin-left: auto; }
 
-    /* Follow-up queue panel */
-    .queue-item { padding: 12px 14px; border-bottom: 1px solid var(--border);
-                   display: flex; gap: 10px; align-items: flex-start; }
-    .queue-channel { width: 32px; height: 32px; border-radius: 6px; display: flex;
-                      align-items: center; justify-content: center; font-size: 14px;
-                      flex-shrink: 0; }
-    .queue-email { background: #dbeafe; }
-    .queue-sms { background: #d1fae5; }
-    .queue-info { flex: 1; }
-    .queue-template { font-size: 13px; font-weight: 500; }
-    .queue-meta { font-size: 11px; color: var(--text-muted); }
+    /* Follow-up queue */
+    .fq-item { display: flex; gap: 4px; align-items: center; padding: 3px 0; font-size: 10px; border-bottom: 1px solid #f5f5f5; }
+    .fq-status { padding: 1px 4px; border-radius: 3px; font-size: 9px; font-weight: 500; }
+    .fq-pending { background: #fef9c3; color: #854d0e; }
+    .fq-sent { background: #d1fae5; color: #065f46; }
+    .fq-skipped { background: #e5e7eb; color: #6b7280; }
+    .fq-failed { background: #fef2f2; color: #dc2626; }
 
-    /* Revenue bar */
-    .revenue-bar { background: var(--teal-light); border-radius: 8px; padding: 14px 16px;
-                    border: 1px solid rgba(13,122,127,.15); margin-bottom: 16px; }
-    .revenue-row { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
-    .revenue-label { color: var(--text-muted); }
-    .revenue-value { font-weight: 700; color: var(--teal); }
+    /* Admin / Reports tab */
+    .report-section { background: #fff; border: 1px solid var(--border); border-radius: 8px;
+                      padding: 14px; margin-bottom: 12px; }
+    .report-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: flex;
+                    align-items: center; gap: 6px; }
+    .report-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .report-table th { text-align: left; padding: 6px 8px; background: var(--gray-light);
+                       font-weight: 600; font-size: 10px; text-transform: uppercase;
+                       letter-spacing: .3px; color: var(--text-muted); border-bottom: 1px solid var(--border); }
+    .report-table td { padding: 6px 8px; border-bottom: 1px solid #f5f5f5; }
+    .report-table tr:hover td { background: #fafafa; }
+    .report-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .report-table .money { color: #059669; font-weight: 600; }
+    .report-table .highlight { background: #f0fdf4; }
 
-    /* Empty state */
-    .empty { text-align: center; padding: 40px; color: var(--text-muted); }
-    .empty-icon { font-size: 32px; margin-bottom: 8px; }
-    .empty-text { font-size: 14px; }
+    /* Funnel bar */
+    .funnel-bar { display: flex; align-items: flex-end; gap: 2px; height: 60px; margin-bottom: 10px; }
+    .funnel-bar-item { flex: 1; background: var(--teal); border-radius: 3px 3px 0 0; min-width: 20px;
+                       position: relative; transition: all .15s; cursor: pointer; }
+    .funnel-bar-item:hover { opacity: .8; }
+    .funnel-bar-label { position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%);
+                        font-size: 8px; color: var(--text-muted); white-space: nowrap; }
+    .funnel-bar-val { position: absolute; top: -14px; left: 50%; transform: translateX(-50%);
+                      font-size: 9px; font-weight: 700; color: var(--text); }
 
-    /* Status dot */
-    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-    .dot-green { background: var(--green); }
-    .dot-red { background: var(--red); }
-    .dot-yellow { background: var(--yellow); }
+    /* Admin actions */
+    .admin-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
 
-    /* Toast */
-    .toast { position: fixed; bottom: 24px; right: 24px; background: #111; color: #fff;
-              padding: 10px 18px; border-radius: 8px; font-size: 13px;
-              animation: fadeup .3s ease; z-index: 9999; }
-    @keyframes fadeup { from { opacity:0; transform:translateY(10px); }
-                         to { opacity:1; transform:translateY(0); } }
-
-    /* Spinner */
-    .spin { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border);
-             border-top-color: var(--teal); border-radius: 50%; animation: spin .7s linear infinite; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    .tag { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 11px;
-            font-weight: 500; background: var(--gray-light); color: var(--gray); margin: 2px; }
+    /* Empty row message */
+    .empty-row { font-size: 10px; color: var(--text-muted); font-style: italic; }
   </style>
 </head>
 <body>
 <div id="root"></div>
-
 <script type="text/babel">
-const { useState, useEffect, useCallback, useRef } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
+const ADMIN_PW = 'GDC-pipeline-2026!';
 const API = window.location.origin;
-const ADMIN_PW = 'GDC-pipeline-2026!'; // override in Settings if changed
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+const STAGES = [
+  'new','engaged','smile_completed','nurturing','scheduled',
+  'confirmed','showed','treatment_presented','treatment_accepted','treatment_completed','cold'
+];
+const STAGE_LABELS = {
+  new:'New Lead', engaged:'Engaged', smile_completed:'Smile Done',
+  nurturing:'Nurturing', scheduled:'Scheduled', confirmed:'Confirmed',
+  showed:'Showed', treatment_presented:'Tx Presented',
+  treatment_accepted:'Tx Accepted', treatment_completed:'Tx Completed', cold:'Cold',
+};
+const STAGE_COLORS = {
+  new:'#3b82f6', engaged:'#f59e0b', smile_completed:'#8b5cf6',
+  nurturing:'#ea580c', scheduled:'#059669', confirmed:'#047857',
+  showed:'#16a34a', treatment_presented:'#0891b2', treatment_accepted:'#0d9488',
+  treatment_completed:'#059669', cold:'#9ca3af',
+};
 
-function api(path, opts = {}) {
-  return fetch(`${API}${path}`, {
-    headers: { 'X-Admin-Password': ADMIN_PW, 'Content-Type': 'application/json', ...(opts.headers||{}) },
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
     ...opts,
-  }).then(r => r.json());
+    headers: { 'Content-Type':'application/json', 'X-Admin-Password':ADMIN_PW, ...(opts.headers||{}) },
+  });
+  if (!res.ok) throw new Error('API ' + res.status);
+  return res.json();
 }
 
 function timeAgo(iso) {
   if (!iso) return '';
-  const diff = (Date.now() - new Date(iso)) / 1000;
-  if (diff < 60) return 'just now';
-  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
-  return `${Math.floor(diff/86400)}d ago`;
+  const d = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(d/60000);
+  if (m < 1) return 'just now'; if (m < 60) return m+'m';
+  const h = Math.floor(m/60);
+  if (h < 24) return h+'h'; const dy = Math.floor(h/24);
+  if (dy < 30) return dy+'d'; return Math.floor(dy/30)+'mo';
+}
+function fmtDate(iso) { if (!iso) return ''; return new Date(iso).toLocaleDateString('en-US',{month:'short',day:'numeric'}); }
+function fmtMoney(v) { if (!v) return '$0'; return '$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}); }
+function pct(a,b) { if (!b) return '0%'; return Math.round(a/b*100)+'%'; }
+
+function srcClass(s) {
+  if (!s) return 'src-default';
+  const l = s.toLowerCase();
+  if (l.includes('google')) return 'src-google';
+  if (l.includes('fb')||l.includes('facebook')) return 'src-fb';
+  if (l.includes('smile')) return 'src-smile';
+  if (l.includes('phone')||l.includes('call')) return 'src-phone';
+  if (l.includes('contact')||l.includes('form')) return 'src-form';
+  if (l.includes('pearly')||l.includes('chat')) return 'src-chat';
+  return 'src-default';
 }
 
-function fmtDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
+// Is a lead needing staff follow-up?
+// Logic: lead is in early stages (new/engaged/smile_completed/nurturing) AND has been
+// around for > 1 day but hasn't advanced to scheduled+
+function isStaffFollowUp(lead) {
+  const earlyStages = ['new','engaged','smile_completed','nurturing'];
+  if (!earlyStages.includes(lead.stage)) return false;
+  const created = new Date(lead.created_at);
+  const daysSince = (Date.now() - created.getTime()) / (1000*60*60*24);
+  return daysSince >= 1;
 }
 
-function initials(first, last) {
-  return ((first||'')[0] || '') + ((last||'')[0] || '') || '?';
+// Is a lead in long-term nurture?
+// Logic: lead is nurturing and has been around for > 21 days (past most automated follow-ups)
+function isLongTermNurture(lead) {
+  if (lead.stage !== 'nurturing') return false;
+  const created = new Date(lead.created_at);
+  const daysSince = (Date.now() - created.getTime()) / (1000*60*60*24);
+  return daysSince >= 21;
 }
 
-function stageName(s) {
-  return (s||'').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-}
+// ─── Lead Chip (compact inline badge like lab case manager) ────────────────
 
-function sourceIcon(src) {
-  if (!src) return '🌐';
-  if (src.includes('smile')) return '✨';
-  if (src.includes('pearly') || src.includes('chat')) return '💬';
-  if (src.includes('contact') || src.includes('form')) return '📋';
-  if (src.includes('waitlist')) return '📅';
-  if (src.includes('scheduler')) return '📆';
-  return '🌐';
-}
-
-const STAGES = ['new','engaged','smile_completed','nurturing','scheduled',
-                 'confirmed','showed','treatment_presented','treatment_accepted',
-                 'treatment_completed'];
-
-// ─── Stage Badge ──────────────────────────────────────────────────────────────
-
-function StageBadge({ stage }) {
-  return <span className={`stage-badge stage-${stage}`}>{stageName(stage)}</span>;
-}
-
-// ─── KPI Card ─────────────────────────────────────────────────────────────────
-
-function KpiCard({ label, value, sub, colorClass }) {
+function LeadChip({ lead, isSelected, onClick, onDragStart }) {
+  const name = [lead.first_name,lead.last_name].filter(Boolean).join(' ') || lead.email || 'Unknown';
+  const camp = lead.campaign_name || '';
+  const shortCamp = camp.replace(/^grafton_nxtsmile_/,'');
   return (
-    <div className="kpi-card">
-      <div className="kpi-label">{label}</div>
-      <div className={`kpi-value ${colorClass||''}`}>{value}</div>
-      {sub && <div className="kpi-sub">{sub}</div>}
-    </div>
+    <span className={'lead-chip' + (isSelected?' selected':'') + (lead.next_follow_up?' has-priority':'')}
+      onClick={()=>onClick(lead.id)}
+      draggable onDragStart={e=>{e.dataTransfer.setData('text/plain',lead.id); e.dataTransfer.effectAllowed='move'; onDragStart&&onDragStart(lead.id);}}>
+      <span className="chip-name">{name}</span>
+      <span className={'chip-source '+srcClass(lead.source)}>{lead.source||'?'}</span>
+      {lead.phone && <span className="chip-phone">{lead.phone}</span>}
+      {shortCamp && <span className="chip-campaign" title={camp}>{shortCamp}</span>}
+      {(lead.notes_count||0)>0 && <span className="chip-notes">{lead.notes_count}</span>}
+      {lead.attributed_production>0 && <span className="chip-revenue">{fmtMoney(lead.attributed_production)}</span>}
+      <span className="chip-time">{timeAgo(lead.updated_at)}</span>
+    </span>
   );
 }
 
-// ─── Funnel ───────────────────────────────────────────────────────────────────
+// ─── Stage Row (flat, always open, no chevrons — like lab case manager) ─────
 
-function Funnel({ stats, activeStage, onSelect }) {
-  const by = stats?.by_stage || {};
-  const shown = ['new','engaged','smile_completed','nurturing','scheduled','showed','treatment_accepted','treatment_completed'];
+function StageRow({ stage, label, leads, selectedId, onCardClick, onDrop, onDragStart, color, className }) {
+  const [dragOver, setDragOver] = useState(false);
+
   return (
-    <div className="funnel-row">
-      {shown.map((s, i) => (
-        <React.Fragment key={s}>
-          <div
-            className={`funnel-stage ${activeStage === s ? 'active' : ''}`}
-            onClick={() => onSelect(activeStage === s ? null : s)}
-          >
-            <div className="funnel-stage-name">{stageName(s)}</div>
-            <div className="funnel-stage-count">{by[s] || 0}</div>
-          </div>
-          {i < shown.length - 1 && <div className="funnel-arrow">›</div>}
-        </React.Fragment>
+    <div className={'stage-row' + (dragOver?' drag-over':'') + (className?' '+className:'')}
+      onDragOver={e=>{e.preventDefault();e.dataTransfer.dropEffect='move';setDragOver(true);}}
+      onDragLeave={()=>setDragOver(false)}
+      onDrop={e=>{e.preventDefault();setDragOver(false);const id=e.dataTransfer.getData('text/plain');onDrop(id,stage);}}>
+      <span className="stage-dot" style={{background:color}} />
+      <span className="stage-label">{label}</span>
+      <span className="stage-count">{leads.length}</span>
+      {leads.length > 0 && <span className="stage-sep" />}
+      {leads.map(l=>(
+        <LeadChip key={l.id} lead={l} isSelected={selectedId===l.id}
+          onClick={onCardClick} onDragStart={onDragStart} />
       ))}
+      {leads.length === 0 && <span className="empty-row">No leads</span>}
     </div>
   );
 }
 
-// ─── Lead Item ────────────────────────────────────────────────────────────────
+// ─── Detail Panel ───────────────────────────────────────────────────────────
 
-function LeadItem({ lead, selected, onClick }) {
-  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ') || lead.email || 'Unknown';
-  const lastAct = lead.last_event?.created_at;
-  return (
-    <div className={`lead-item ${selected ? 'selected' : ''}`} onClick={onClick}>
-      <div className="lead-avatar">{initials(lead.first_name, lead.last_name)}</div>
-      <div className="lead-main">
-        <div className="lead-name">{name}</div>
-        <div className="lead-meta">
-          <span className="source-badge">{sourceIcon(lead.source)} {lead.source}</span>
-          {lead.utm_campaign && <span className="tag">{lead.utm_campaign}</span>}
-        </div>
-        {lead.attributed_production > 0 && (
-          <div className="lead-meta" style={{color:'var(--green)',fontWeight:600}}>
-            ${lead.attributed_production.toFixed(0)} attributed
-          </div>
-        )}
-      </div>
-      <div className="lead-right">
-        <StageBadge stage={lead.stage} />
-        <div className="days-badge">{timeAgo(lastAct || lead.updated_at)}</div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Lead Detail ──────────────────────────────────────────────────────────────
-
-function LeadDetail({ leadId, onClose }) {
-  const [data, setData] = useState(null);
-  const [advancing, setAdvancing] = useState(false);
+function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
+  const [detail, setDetail] = useState(null);
+  const [notes, setNotes] = useState([]);
+  const [newNote, setNewNote] = useState('');
+  const [showMove, setShowMove] = useState(false);
+  const [tab, setTab] = useState('info');
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (!leadId) return;
-    api(`/api/lead/${leadId}`).then(setData);
-  }, [leadId]);
+    if (!lead) return;
+    api('/api/lead/' + lead.id).then(setDetail);
+    api('/api/admin/lead/' + lead.id + '/notes').then(d=>setNotes(d.notes||[]));
+  }, [lead?.id, lead?.stage]);
 
-  if (!leadId) return (
-    <div className="detail-panel">
-      <div className="empty" style={{paddingTop:80}}>
-        <div className="empty-icon">👆</div>
-        <div className="empty-text">Select a lead to see details</div>
-      </div>
-    </div>
-  );
+  if (!lead) return null;
+  const name = [lead.first_name,lead.last_name].filter(Boolean).join(' ')||lead.email||'Unknown';
 
-  if (!data) return <div className="detail-panel"><div className="empty"><div className="spin"/></div></div>;
-
-  const { lead, events, follow_up_queue } = data;
-  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ') || 'Unknown';
-  const nextStageIdx = STAGES.indexOf(lead.stage) + 1;
-  const nextStage = STAGES[nextStageIdx];
-
-  async function advanceStage() {
-    if (!nextStage) return;
-    setAdvancing(true);
-    await api(`/api/admin/lead/${leadId}/stage`, {
-      method: 'PUT',
-      body: JSON.stringify({ stage: nextStage }),
-    });
-    const updated = await api(`/api/lead/${leadId}`);
-    setData(updated);
-    setAdvancing(false);
+  async function addNote() {
+    if (!newNote.trim()) return;
+    setSaving(true);
+    await api('/api/admin/lead/' + lead.id + '/notes',{method:'POST',body:JSON.stringify({note_text:newNote.trim()})});
+    setNewNote('');
+    const d = await api('/api/admin/lead/' + lead.id + '/notes');
+    setNotes(d.notes||[]); setSaving(false); onRefresh();
+  }
+  async function delNote(id) {
+    await api('/api/admin/note/' + id,{method:'DELETE'});
+    setNotes(notes.filter(n=>n.id!==id)); onRefresh();
+  }
+  async function moveStage(s) {
+    setShowMove(false);
+    await api('/api/admin/lead/' + lead.id + '/force-stage',{method:'PUT',body:JSON.stringify({stage:s,reason:'manual move'})});
+    onStageChange(lead.id,s);
   }
 
+  const events = detail?.events||[];
+  const queue = detail?.follow_up_queue||[];
+
   return (
-    <div className="detail-panel">
-      <div className="detail-header">
-        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
-          <div>
-            <div className="detail-name">{name}</div>
-            <div className="detail-contact">
-              {lead.email && <span>📧 {lead.email}</span>}
-              {lead.phone && <span style={{marginLeft:8}}>📞 {lead.phone}</span>}
+    <React.Fragment>
+      <div className="detail-backdrop" onClick={onClose} />
+      <div className="detail-overlay open">
+        <div className="detail-header">
+          <button className="detail-close" onClick={onClose}>✕</button>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:600,fontSize:13}}>{name}</div>
+            <div style={{fontSize:10,color:'var(--text-muted)'}}>
+              {lead.email}{lead.phone&&(' · '+lead.phone)}
             </div>
           </div>
-          <StageBadge stage={lead.stage} />
-        </div>
-        {nextStage && (
-          <button className="btn btn-teal btn-sm" style={{marginTop:10}} onClick={advanceStage} disabled={advancing}>
-            {advancing ? <span className="spin"/> : `→ Mark as ${stageName(nextStage)}`}
-          </button>
-        )}
-      </div>
-      <div className="detail-body">
-        {lead.attributed_production > 0 && (
-          <div className="revenue-bar">
-            <div className="revenue-row">
-              <span className="revenue-label">Attributed Production</span>
-              <span className="revenue-value">${lead.attributed_production.toFixed(2)}</span>
-            </div>
-            {lead.od_patient_num && (
-              <div className="revenue-row">
-                <span className="revenue-label">OD Patient #</span>
-                <span className="revenue-value">{lead.od_patient_num}</span>
+          <div style={{position:'relative'}}>
+            <button className="btn btn-teal btn-sm" onClick={()=>setShowMove(!showMove)}>
+              {STAGE_LABELS[lead.stage]} ▾
+            </button>
+            {showMove && (
+              <div className="stage-move-menu">
+                {STAGES.map(s=>(
+                  <div key={s} className={'stage-move-item'+(s===lead.stage?' current':'')}
+                    onClick={()=>s!==lead.stage&&moveStage(s)}>
+                    <span className="stage-dot" style={{background:STAGE_COLORS[s],width:7,height:7}} />
+                    {STAGE_LABELS[s]}{s===lead.stage&&' ✓'}
+                  </div>
+                ))}
               </div>
             )}
           </div>
-        )}
-
-        <div className="detail-section">
-          <h4>Lead Info</h4>
-          {[
-            ['Source', lead.source],
-            ['Created', fmtDate(lead.created_at)],
-            ['Campaign', lead.utm_campaign || lead.gclid ? (lead.utm_campaign || 'Google Ads') : '—'],
-            ['Keyword', lead.utm_term || '—'],
-            ['Goals', (() => { try { const g = JSON.parse(lead.goals||'[]'); return g.join(', ') || '—'; } catch { return lead.goals || '—'; } })()],
-          ].map(([k, v]) => (
-            <div key={k} className="detail-row">
-              <span className="detail-label">{k}</span>
-              <span className="detail-value">{v||'—'}</span>
-            </div>
+        </div>
+        <div style={{display:'flex',borderBottom:'1px solid var(--border)',flexShrink:0}}>
+          {[['info','Info'],['notes','Notes'],['timeline','Timeline'],['followups','Follow-ups']].map(([k,lbl])=>(
+            <button key={k} onClick={()=>setTab(k)}
+              style={{flex:1,padding:'6px',fontSize:10,fontWeight:tab===k?600:400,
+                border:'none',background:tab===k?'var(--teal-light)':'#fff',
+                borderBottom:tab===k?'2px solid var(--teal)':'2px solid transparent',
+                cursor:'pointer',color:tab===k?'var(--teal)':'var(--text-muted)'}}>
+              {lbl}{k==='notes'&&notes.length>0?(' ('+notes.length+')'):''}
+            </button>
           ))}
         </div>
-
-        <div className="detail-section">
-          <h4>Follow-up Queue</h4>
-          {follow_up_queue.length === 0 ? <div className="empty-text">No follow-ups queued</div> : (
-            follow_up_queue.map(q => (
-              <div key={q.id} style={{display:'flex',gap:8,padding:'4px 0',fontSize:13}}>
-                <span>{q.channel === 'email' ? '📧' : '💬'}</span>
-                <span style={{flex:1}}>{q.template.replace(/_/g,' ')}</span>
-                <span style={{fontSize:11,color:
-                  q.status==='sent' ? 'var(--green)' :
-                  q.status==='skipped' ? 'var(--gray)' :
-                  q.status==='failed' ? 'var(--red)' : 'var(--yellow)'
-                }}>
-                  {q.status === 'sent' ? `✓ ${fmtDate(q.sent_at)}` :
-                   q.status === 'skipped' ? '— skipped' :
-                   q.status === 'failed' ? '✗ failed' :
-                   fmtDate(q.scheduled_at)}
-                </span>
+        <div className="detail-body">
+          {tab==='info'&&(
+            <React.Fragment>
+              {lead.attributed_production>0&&(
+                <div style={{background:'#f0fdf4',padding:8,borderRadius:6,marginBottom:10}}>
+                  <div style={{fontSize:10,color:'#16a34a',fontWeight:600}}>REVENUE</div>
+                  <div style={{fontSize:20,fontWeight:700,color:'#059669'}}>{fmtMoney(lead.attributed_production)}</div>
+                  {lead.od_patient_num&&<div style={{fontSize:10,color:'var(--text-muted)'}}>OD #{lead.od_patient_num}</div>}
+                </div>
+              )}
+              <div className="detail-section">
+                <div className="detail-section-title">Lead Info</div>
+                {[['Source',lead.source],['Created',fmtDate(lead.created_at)],['Updated',timeAgo(lead.updated_at)],
+                  ['Campaign',lead.campaign_name||lead.utm_campaign],['Ad Group',lead.ad_group_name],
+                  ['Keyword',lead.keyword_text],['Search Term',lead.search_term],
+                  ['Click Cost',lead.click_cost>0?'$'+Number(lead.click_cost).toFixed(2):''],
+                  ['UTM Source',lead.utm_source],['UTM Campaign',lead.utm_campaign],
+                  ['GCLID',lead.gclid],['Booking ID',lead.booking_id],
+                  ['Goals',(()=>{try{const g=JSON.parse(lead.goals);return Array.isArray(g)?g.join(', '):lead.goals}catch(e){return lead.goals}})()],
+                ].filter(([,v])=>v).map(([k,v])=>(
+                  <div className="detail-row" key={k}><span className="detail-row-label">{k}</span><span className="detail-row-value">{v}</span></div>
+                ))}
               </div>
-            ))
+            </React.Fragment>
+          )}
+          {tab==='notes'&&(
+            <div className="detail-section">
+              <div style={{marginBottom:8}}>
+                <textarea className="note-input" placeholder="Add a note..." value={newNote}
+                  onChange={e=>setNewNote(e.target.value)}
+                  onKeyDown={e=>{if(e.key==='Enter'&&e.metaKey)addNote();}} />
+                <button className="btn btn-teal btn-sm" style={{marginTop:4}} onClick={addNote}
+                  disabled={saving||!newNote.trim()}>{saving?'...':'Add Note'}</button>
+              </div>
+              {notes.length===0&&<div style={{color:'var(--text-muted)',fontSize:11}}>No notes yet</div>}
+              {notes.map(n=>(
+                <div className="note-item" key={n.id}>
+                  <div className="note-header"><span className="note-author">{n.author}</span><span className="note-time">{timeAgo(n.created_at)}</span></div>
+                  <div style={{fontSize:11}}>{n.note_text}</div>
+                  <button style={{fontSize:9,color:'#dc2626',background:'none',border:'none',cursor:'pointer',marginTop:2}}
+                    onClick={()=>delNote(n.id)}>Delete</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {tab==='timeline'&&(
+            <div className="detail-section">
+              {events.slice().reverse().slice(0,30).map((ev,i)=>(
+                <div className="timeline-item" key={i}>
+                  <span className="timeline-dot"/>
+                  <div style={{flex:1}}>
+                    <span className="timeline-type">{ev.event_type}</span>
+                    {ev.stage_from&&ev.stage_to&&<span style={{color:'var(--text-muted)'}}> {ev.stage_from}→{ev.stage_to}</span>}
+                  </div>
+                  <span className="timeline-time">{timeAgo(ev.created_at)}</span>
+                </div>
+              ))}
+              {events.length===0&&<div style={{color:'var(--text-muted)',fontSize:11}}>No events</div>}
+            </div>
+          )}
+          {tab==='followups'&&(
+            <div className="detail-section">
+              {queue.map((fq,i)=>(
+                <div className="fq-item" key={i}>
+                  <span>{fq.channel==='email'?'📧':'💬'}</span>
+                  <span style={{flex:1,fontWeight:500}}>{fq.template}</span>
+                  <span className={'fq-status fq-'+fq.status}>{fq.status}</span>
+                  <span style={{fontSize:9,color:'var(--text-muted)'}}>{fmtDate(fq.scheduled_at)}</span>
+                </div>
+              ))}
+              {queue.length===0&&<div style={{color:'var(--text-muted)',fontSize:11}}>No follow-ups</div>}
+            </div>
           )}
         </div>
-
-        <div className="detail-section">
-          <h4>Timeline ({events.length} events)</h4>
-          <div className="timeline">
-            {[...events].reverse().slice(0, 20).map(e => (
-              <div key={e.id} className="timeline-item">
-                <div className="timeline-type">{e.event_type.replace(/_/g,' ')}</div>
-                <div className="timeline-time">{fmtDate(e.created_at)} · {e.source}</div>
-                {e.detail && e.detail !== '{}' && (
-                  <div className="timeline-detail">
-                    {(() => { try { const d = JSON.parse(e.detail); return Object.entries(d).map(([k,v])=>`${k}: ${v}`).join(' · '); } catch { return e.detail; } })()}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
       </div>
-    </div>
+    </React.Fragment>
   );
 }
 
-// ─── Admin Sidebar ────────────────────────────────────────────────────────────
+// ─── Reports Tab ────────────────────────────────────────────────────────────
 
-function AdminSidebar({ stats, onRefresh }) {
-  const [syncing, setSyncing] = useState(false);
-  const [matching, setMatching] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [lastSync, setLastSync] = useState(null);
-  const [toast, setToast] = useState('');
+function ReportsTab({ stats, campaignData }) {
+  const campaigns = campaignData?.campaigns || [];
+  const keywords = campaignData?.keywords || [];
+  const byStage = stats?.by_stage || {};
 
-  function showToast(msg) {
-    setToast(msg);
-    setTimeout(() => setToast(''), 3000);
-  }
+  // Split campaigns: Google Ads vs other sources
+  const adsCampaigns = campaigns.filter(c => {
+    const name = (c.campaign || '').toLowerCase();
+    return name.includes('grafton_nxtsmile') || name.includes('google') || (c.total_ad_spend > 0);
+  });
+  const otherSources = campaigns.filter(c => {
+    const name = (c.campaign || '').toLowerCase();
+    return !name.includes('grafton_nxtsmile') && !name.includes('google') && !(c.total_ad_spend > 0);
+  });
 
-  async function doSync() {
-    setSyncing(true);
-    const r = await api('/api/admin/sync', { method: 'POST' });
-    setSyncing(false);
-    setLastSync(r.result);
-    showToast(`Synced ${r.result?.synced || 0} new leads from Firestore`);
-    onRefresh();
-  }
-
-  async function doMatch() {
-    setMatching(true);
-    const r = await api('/api/admin/match', { method: 'POST' });
-    setMatching(false);
-    showToast(`Matched ${r.result?.matched || 0} leads to OpenDental`);
-    onRefresh();
-  }
-
-  async function doRunQueue() {
-    setRunning(true);
-    await api('/api/admin/run-queue', { method: 'POST' });
-    setRunning(false);
-    showToast('Follow-up queue processed');
-    onRefresh();
-  }
-
-  const by = stats?.by_stage || {};
-  const stagesWithLeads = STAGES.filter(s => (by[s] || 0) > 0);
+  // Funnel data
+  const funnelStages = ['new','engaged','smile_completed','nurturing','scheduled','showed',
+                        'treatment_presented','treatment_accepted','treatment_completed'];
+  const maxCount = Math.max(...funnelStages.map(s=>byStage[s]||0), 1);
 
   return (
-    <div style={{display:'flex',flexDirection:'column',gap:16}}>
-      {/* Revenue summary */}
-      <div className="card">
-        <div className="card-header"><h3>💰 Revenue Attribution</h3></div>
-        <div style={{padding:'14px 16px'}}>
-          <div className="revenue-bar" style={{margin:0}}>
-            <div className="revenue-row">
-              <span className="revenue-label">Total Attributed</span>
-              <span className="revenue-value">${(stats?.attributed_revenue||0).toFixed(2)}</span>
-            </div>
-            <div className="revenue-row">
-              <span className="revenue-label">Completed Treatments</span>
-              <span className="revenue-value">{by.treatment_completed||0}</span>
-            </div>
-          </div>
+    <div>
+      {/* Funnel visualization */}
+      <div className="report-section">
+        <div className="report-title">Lead Funnel</div>
+        <div className="funnel-bar">
+          {funnelStages.map(s=>{
+            const c = byStage[s]||0;
+            const h = Math.max(c/maxCount*100, 4);
+            return (
+              <div key={s} className="funnel-bar-item"
+                style={{height:h+'%',background:STAGE_COLORS[s]}}>
+                <span className="funnel-bar-val">{c}</span>
+                <span className="funnel-bar-label">{STAGE_LABELS[s]}</span>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{display:'flex',gap:16,marginTop:20,fontSize:11}}>
+          <div><strong>Lead→Scheduled:</strong> {pct((byStage.scheduled||0)+(byStage.confirmed||0)+(byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0), stats?.total_leads)}</div>
+          <div><strong>Scheduled→Showed:</strong> {pct((byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0), (byStage.scheduled||0)+(byStage.confirmed||0)+(byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0))}</div>
+          <div><strong>Showed→Treated:</strong> {pct((byStage.treatment_accepted||0)+(byStage.treatment_completed||0), (byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0))}</div>
         </div>
       </div>
 
-      {/* Actions */}
-      <div className="card">
-        <div className="card-header"><h3>⚡ Actions</h3></div>
-        <div style={{padding:'14px 16px',display:'flex',flexDirection:'column',gap:10}}>
-          <button className="btn btn-teal" onClick={doSync} disabled={syncing} style={{width:'100%',justifyContent:'center'}}>
-            {syncing ? <><span className="spin"/> Syncing...</> : '🔄 Sync from Firestore'}
-          </button>
-          {lastSync && <div style={{fontSize:12,color:'var(--text-muted)'}}>Last sync: +{lastSync.synced} new, {lastSync.skipped} existing</div>}
-          <button className="btn btn-ghost" onClick={doMatch} disabled={matching} style={{width:'100%'}}>
-            {matching ? <><span className="spin"/> Matching...</> : '🏥 Match OpenDental Patients'}
-          </button>
-          <button className="btn btn-ghost" onClick={doRunQueue} disabled={running} style={{width:'100%'}}>
-            {running ? <><span className="spin"/> Running...</> : '📤 Run Follow-up Queue Now'}
-          </button>
-          <div style={{fontSize:12,color:'var(--text-muted)'}}>
-            📬 {stats?.pending_follow_ups||0} pending · ✓ {stats?.sent_today||0} sent today
-          </div>
-        </div>
+      {/* Google Ads Campaign performance */}
+      <div className="report-section">
+        <div className="report-title">Google Ads Campaign Performance</div>
+        <table className="report-table">
+          <thead>
+            <tr>
+              <th>Campaign</th>
+              <th className="num">Leads</th>
+              <th className="num">Scheduled</th>
+              <th className="num">Showed</th>
+              <th className="num">Treated</th>
+              <th className="num">Conv %</th>
+              <th className="num">Revenue</th>
+              <th className="num">Ad Spend</th>
+              <th className="num">ROAS</th>
+            </tr>
+          </thead>
+          <tbody>
+            {adsCampaigns.map((c,i)=>{
+              const roas = c.total_ad_spend>0 ? (c.revenue/c.total_ad_spend).toFixed(1)+'x' : '—';
+              const conv = c.lead_count>0 ? Math.round(c.scheduled_count/c.lead_count*100)+'%' : '0%';
+              const displayName = (c.campaign||'').replace(/^grafton_nxtsmile_/,'');
+              return (
+                <tr key={i} className={c.revenue>0?'highlight':''}>
+                  <td><strong>{displayName || c.campaign}</strong></td>
+                  <td className="num">{c.lead_count}</td>
+                  <td className="num">{c.scheduled_count}</td>
+                  <td className="num">{c.showed_count||0}</td>
+                  <td className="num">{c.treated_count}</td>
+                  <td className="num">{conv}</td>
+                  <td className="num money">{fmtMoney(c.revenue)}</td>
+                  <td className="num">{c.total_ad_spend>0?fmtMoney(c.total_ad_spend):'—'}</td>
+                  <td className="num" style={{fontWeight:600}}>{roas}</td>
+                </tr>
+              );
+            })}
+            {adsCampaigns.length===0&&<tr><td colSpan={9} style={{textAlign:'center',color:'var(--text-muted)',padding:20}}>No Google Ads campaign data yet. Run Google Ads Sync.</td></tr>}
+          </tbody>
+        </table>
       </div>
+
+      {/* Keyword performance */}
+      <div className="report-section">
+        <div className="report-title">Keyword Performance</div>
+        <table className="report-table">
+          <thead>
+            <tr>
+              <th>Keyword</th>
+              <th>Ad Group</th>
+              <th className="num">Leads</th>
+              <th className="num">Scheduled</th>
+              <th className="num">Treated</th>
+              <th className="num">Revenue</th>
+              <th className="num">Avg CPC</th>
+              <th className="num">Cost</th>
+              <th className="num">ROAS</th>
+            </tr>
+          </thead>
+          <tbody>
+            {keywords.map((k,i)=>{
+              const roas = k.total_cost>0 ? (k.revenue/k.total_cost).toFixed(1)+'x' : '—';
+              return (
+                <tr key={i} className={k.revenue>0?'highlight':''}>
+                  <td style={{fontStyle:'italic'}}>{k.keyword}</td>
+                  <td style={{fontSize:10,color:'var(--text-muted)'}}>{k.ad_group_name}</td>
+                  <td className="num">{k.lead_count}</td>
+                  <td className="num">{k.scheduled_count}</td>
+                  <td className="num">{k.treated_count}</td>
+                  <td className="num money">{fmtMoney(k.revenue)}</td>
+                  <td className="num">{k.avg_cpc>0?'$'+Number(k.avg_cpc).toFixed(2):'—'}</td>
+                  <td className="num">{k.total_cost>0?fmtMoney(k.total_cost):'—'}</td>
+                  <td className="num" style={{fontWeight:600}}>{roas}</td>
+                </tr>
+              );
+            })}
+            {keywords.length===0&&<tr><td colSpan={9} style={{textAlign:'center',color:'var(--text-muted)',padding:20}}>No keyword data yet. Run Google Ads Sync.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Lead Sources (non-ads) */}
+      {otherSources.length>0 && (
+        <div className="report-section">
+          <div className="report-title">Lead Sources (Non-Ads)</div>
+          <table className="report-table">
+            <thead><tr><th>Source</th><th className="num">Leads</th><th className="num">Scheduled</th><th className="num">Treated</th><th className="num">Revenue</th></tr></thead>
+            <tbody>
+              {otherSources.map((c,i)=>(
+                <tr key={i}>
+                  <td>{c.campaign}</td>
+                  <td className="num">{c.lead_count}</td>
+                  <td className="num">{c.scheduled_count}</td>
+                  <td className="num">{c.treated_count}</td>
+                  <td className="num money">{fmtMoney(c.revenue)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {/* Stage breakdown */}
-      <div className="card">
-        <div className="card-header"><h3>📊 All Stages</h3></div>
-        <div style={{padding:'8px 0'}}>
-          {[...STAGES, 'cold'].map(s => (
-            <div key={s} style={{display:'flex',justifyContent:'space-between',
-                                  padding:'6px 16px',fontSize:13,
-                                  background: (by[s]||0) > 0 ? 'transparent' : 'transparent',
-                                  opacity: (by[s]||0) > 0 ? 1 : .45}}>
-              <span style={{color:'var(--text-muted)'}}>{stageName(s)}</span>
-              <span style={{fontWeight:600,color:(by[s]||0)>0?'var(--teal)':'var(--text-muted)'}}>{by[s]||0}</span>
-            </div>
-          ))}
-        </div>
+      <div className="report-section">
+        <div className="report-title">Stage Breakdown</div>
+        <table className="report-table">
+          <thead><tr><th>Stage</th><th className="num">Count</th><th className="num">% of Total</th></tr></thead>
+          <tbody>
+            {STAGES.map(s=>(
+              <tr key={s}>
+                <td><span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:STAGE_COLORS[s],marginRight:6}} />{STAGE_LABELS[s]}</td>
+                <td className="num">{byStage[s]||0}</td>
+                <td className="num">{pct(byStage[s]||0,stats?.total_leads)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
-
-      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
+// ─── Admin Tab ──────────────────────────────────────────────────────────────
+
+function AdminTab({ onAction, adminMsg }) {
+  return (
+    <div>
+      <div className="report-section">
+        <div className="report-title">Admin Actions</div>
+        <div className="admin-actions">
+          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/sync','POST')}>Sync Firestore</button>
+          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/match','POST')}>Match OpenDental</button>
+          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/run-queue','POST')}>Run Follow-ups</button>
+          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/gads-sync','POST')}>Google Ads Sync</button>
+          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/upload-conversions','POST')}>Upload Conversions</button>
+          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/optimize?dry_run=true','POST')}>AI Optimizer (dry)</button>
+        </div>
+        {adminMsg && <div style={{fontSize:11,color:adminMsg.startsWith('Error')?'var(--red)':'var(--teal)',padding:8,background:adminMsg.startsWith('Error')?'#fef2f2':'var(--teal-light)',borderRadius:6,marginTop:8,whiteSpace:'pre-wrap',maxHeight:200,overflow:'auto'}}>{adminMsg}</div>}
+      </div>
+
+      <div className="report-section">
+        <div className="report-title">Scheduled Jobs</div>
+        <table className="report-table">
+          <thead><tr><th>Job</th><th>Schedule</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td>Firestore Sync</td><td>Every 15 min</td><td>Pull new leads from nxtsmile.com</td></tr>
+            <tr><td>Follow-up Engine</td><td>Every 15 min</td><td>Send due emails/SMS</td></tr>
+            <tr><td>Google Ads Sync</td><td>6:00 AM</td><td>Resolve gclid → keyword, campaign, CPC</td></tr>
+            <tr><td>AI Optimizer</td><td>7:00 AM</td><td>Analyze keywords, pause losers, boost winners</td></tr>
+            <tr><td>OD Matcher</td><td>10:00 PM</td><td>Match leads to OD patients, sync treatment stages</td></tr>
+            <tr><td>Conversion Upload</td><td>11:00 PM</td><td>Upload offline conversions to Google Ads</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main App ───────────────────────────────────────────────────────────────
 
 function App() {
   const [leads, setLeads] = useState([]);
-  const [stats, setStats] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [stats, setStats] = useState({});
+  const [campaignData, setCampaignData] = useState({});
   const [selectedId, setSelectedId] = useState(null);
-  const [activeStage, setActiveStage] = useState(null);
   const [search, setSearch] = useState('');
+  const [campaignFilter, setCampaignFilter] = useState('');
+  const [sourceFilter, setSourceFilter] = useState('');
+  const [activeTab, setActiveTab] = useState('pipeline');
   const [lastRefresh, setLastRefresh] = useState(null);
-  const timerRef = useRef(null);
+  const [adminMsg, setAdminMsg] = useState('');
+  const [showCold, setShowCold] = useState(false);
+  const [draggingId, setDraggingId] = useState(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async()=>{
     try {
-      const [pipe, st] = await Promise.all([
-        api('/api/pipeline?limit=500'),
+      const params = new URLSearchParams({limit:'500'});
+      if (campaignFilter) params.set('campaign',campaignFilter);
+      const [pipe, st, camp] = await Promise.all([
+        api('/api/pipeline/enriched?'+params),
         api('/api/admin/stats'),
+        api('/api/admin/campaigns'),
       ]);
-      setLeads(pipe.leads || []);
+      setLeads(pipe.leads||[]);
       setStats(st);
+      setCampaignData(camp);
       setLastRefresh(new Date());
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+    } catch(e) { console.error('Load failed:',e); }
+  },[campaignFilter]);
 
-  useEffect(() => {
-    load();
-    timerRef.current = setInterval(load, 60000); // auto-refresh every 60s
-    return () => clearInterval(timerRef.current);
-  }, [load]);
+  useEffect(()=>{load();const t=setInterval(load,60000);return()=>clearInterval(t);},[load]);
 
-  // Filter leads
-  const filtered = leads.filter(l => {
-    if (activeStage && l.stage !== activeStage) return false;
+  const filtered = useMemo(()=>{
+    let out = leads;
     if (search) {
       const q = search.toLowerCase();
-      const name = `${l.first_name} ${l.last_name}`.toLowerCase();
-      if (!name.includes(q) && !l.email?.toLowerCase().includes(q) &&
-          !l.phone?.includes(q) && !l.utm_campaign?.toLowerCase().includes(q)) return false;
+      out = out.filter(l=>
+        (l.first_name||'').toLowerCase().includes(q)||
+        (l.last_name||'').toLowerCase().includes(q)||
+        (l.email||'').toLowerCase().includes(q)||
+        (l.phone||'').includes(q)||
+        (l.keyword_text||'').toLowerCase().includes(q)
+      );
     }
-    return true;
-  });
+    if (sourceFilter) out = out.filter(l=>l.source===sourceFilter);
+    return out;
+  },[leads,search,sourceFilter]);
+
+  // Compute special rows
+  const staffFollowUp = useMemo(()=>filtered.filter(isStaffFollowUp),[filtered]);
+  const longTermNurture = useMemo(()=>filtered.filter(isLongTermNurture),[filtered]);
+
+  // Leads that appear in the special rows should NOT also appear in their normal stage row
+  const staffFUIds = useMemo(()=>new Set(staffFollowUp.map(l=>l.id)),[staffFollowUp]);
+  const ltnIds = useMemo(()=>new Set(longTermNurture.map(l=>l.id)),[longTermNurture]);
+
+  const byStage = useMemo(()=>{
+    const m={}; STAGES.forEach(s=>m[s]=[]);
+    filtered.forEach(l=>{
+      // Skip leads in special rows
+      if (staffFUIds.has(l.id) || ltnIds.has(l.id)) return;
+      const s=l.stage||'new';
+      if(m[s])m[s].push(l); else m['new'].push(l);
+    });
+    return m;
+  },[filtered, staffFUIds, ltnIds]);
+
+  // Pipeline stages to show (without cold unless toggled)
+  const pipelineStages = showCold ? STAGES : STAGES.filter(s=>s!=='cold');
+  const selectedLead = leads.find(l=>l.id===selectedId);
+
+  async function handleDrop(leadId,newStage) {
+    const lead = leads.find(l=>l.id===leadId);
+    if (!lead||lead.stage===newStage) return;
+    setLeads(prev=>prev.map(l=>l.id===leadId?{...l,stage:newStage}:l));
+    try {
+      await api('/api/admin/lead/'+leadId+'/force-stage',{method:'PUT',body:JSON.stringify({stage:newStage,reason:'drag-and-drop'})});
+    } catch(e) {
+      setLeads(prev=>prev.map(l=>l.id===leadId?{...l,stage:lead.stage}:l));
+    }
+  }
+
+  function handleStageChange(id,s) {
+    setLeads(prev=>prev.map(l=>l.id===id?{...l,stage:s}:l)); load();
+  }
+
+  async function adminAction(endpoint, method) {
+    setAdminMsg('Running...');
+    try {
+      const res = await fetch(API + endpoint, {
+        method: method||'POST',
+        headers: { 'Content-Type':'application/json', 'X-Admin-Password':ADMIN_PW },
+      });
+      const body = await res.json().catch(()=>({detail: res.statusText}));
+      if (!res.ok) {
+        setAdminMsg('Error ' + res.status + ': ' + (body.detail || JSON.stringify(body)));
+        setTimeout(()=>setAdminMsg(''),8000);
+        return;
+      }
+      setAdminMsg(JSON.stringify(body.result||body,null,2).slice(0,500));
+      setTimeout(()=>{setAdminMsg('');load();},4000);
+    } catch(e) { setAdminMsg('Error: '+e.message); setTimeout(()=>setAdminMsg(''),5000); }
+  }
+
+  const byStageStats = stats.by_stage||{};
+  const totalActive = Object.entries(byStageStats).filter(([s])=>s!=='cold').reduce((s,[,c])=>s+c,0);
+  const gAdsCampaigns = campaignData?.google_ads_campaigns||[];
+  const sources = campaignData?.sources||[];
 
   return (
-    <div id="root">
-      {/* Header */}
+    <React.Fragment>
       <div className="header">
-        <div>
-          <div className="header-logo">✨ nXt<span>smile</span> Pipeline</div>
-          <div className="header-sub">Grafton Dental Care — Lead to Income Dashboard</div>
-        </div>
+        <div className="header-logo">✨ <span>nXtsmile</span> Pipeline</div>
         <div className="header-right">
-          <span style={{fontSize:12,opacity:.6}}>
-            <span className={`dot dot-${loading?'yellow':'green'}`}/>&nbsp;
-            {lastRefresh ? `Updated ${timeAgo(lastRefresh.toISOString())}` : 'Loading...'}
-          </span>
-          <button className="btn btn-white btn-sm" onClick={load}>↻ Refresh</button>
-          <button className="btn btn-white btn-sm" onClick={() => { document.querySelector('.admin-section')?.scrollIntoView({behavior: 'smooth', block: 'start'}); }}>⚙️ Admin</button>
+          <span className="header-dot"/>
+          <span>{lastRefresh?timeAgo(lastRefresh.toISOString()):''}</span>
+          <button className="btn btn-white btn-sm" onClick={load}>↻</button>
+        </div>
+      </div>
+
+      <div className="tab-bar">
+        <button className={'tab'+(activeTab==='pipeline'?' active':'')} onClick={()=>setActiveTab('pipeline')}>Pipeline</button>
+        <button className={'tab'+(activeTab==='reports'?' active':'')} onClick={()=>setActiveTab('reports')}>Reports & Campaigns</button>
+        <button className={'tab'+(activeTab==='admin'?' active':'')} onClick={()=>setActiveTab('admin')}>Admin</button>
+      </div>
+
+      {/* KPI strip — always visible */}
+      <div style={{padding:'10px 16px 0'}}>
+        <div className="kpi-strip">
+          <div className="kpi"><div className="kpi-val">{stats.total_leads||0}</div><div className="kpi-label">Total Leads</div></div>
+          <div className="kpi"><div className="kpi-val">{totalActive}</div><div className="kpi-label">Active</div></div>
+          <div className="kpi"><div className="kpi-val">{(byStageStats.scheduled||0)+(byStageStats.confirmed||0)}</div><div className="kpi-label">Scheduled</div></div>
+          <div className="kpi"><div className="kpi-val">{(byStageStats.showed||0)}</div><div className="kpi-label">Showed</div></div>
+          <div className="kpi"><div className="kpi-val">{(byStageStats.treatment_accepted||0)+(byStageStats.treatment_completed||0)}</div><div className="kpi-label">Treated</div></div>
+          <div className="kpi"><div className="kpi-val" style={{color:'#059669'}}>{fmtMoney(stats.attributed_revenue)}</div><div className="kpi-label">Revenue</div></div>
+          <div className="kpi"><div className="kpi-val" style={{color:byStageStats.cold>0?'var(--red)':'var(--text-muted)'}}>{byStageStats.cold||0}</div><div className="kpi-label">Cold</div></div>
         </div>
       </div>
 
       <div className="main">
-        {/* KPIs */}
-        <div className="section-title">Overview</div>
-        <div className="kpi-grid">
-          <KpiCard label="Total Leads" value={stats?.total_leads||0} colorClass="kpi-teal"
-                   sub="all time" />
-          <KpiCard label="In Nurture" value={(stats?.by_stage||{}).nurturing||0} colorClass="kpi-yellow"
-                   sub="active sequences" />
-          <KpiCard label="Scheduled" value={((stats?.by_stage||{}).scheduled||0)+((stats?.by_stage||{}).confirmed||0)}
-                   colorClass="kpi-green" sub="booked appointments" />
-          <KpiCard label="Treated" value={((stats?.by_stage||{}).treatment_accepted||0)+((stats?.by_stage||{}).treatment_completed||0)}
-                   colorClass="kpi-purple" sub="accepted treatment" />
-          <KpiCard label="Attributed $" value={`$${((stats?.attributed_revenue)||0).toFixed(0)}`}
-                   colorClass="kpi-green" sub="from OD production" />
-          <KpiCard label="Follow-ups" value={stats?.pending_follow_ups||0} colorClass="kpi-yellow"
-                   sub={`${stats?.sent_today||0} sent today`} />
-        </div>
-
-        {/* Funnel */}
-        <div className="section-title">Pipeline Funnel</div>
-        <Funnel stats={stats} activeStage={activeStage} onSelect={setActiveStage} />
-
-        {/* Main content */}
-        <div className="two-col">
-          {/* Lead list */}
-          <div>
-            <div className="card">
-              <div className="card-header">
-                <h3 className="admin-section">
-                  {activeStage ? `${stageName(activeStage)} — ` : 'All Leads — '}
-                  <span style={{color:'var(--teal)'}}>{filtered.length}</span>
-                </h3>
-                {activeStage && (
-                  <button className="btn btn-ghost btn-sm" onClick={() => setActiveStage(null)}>
-                    × Clear filter
-                  </button>
-                )}
-              </div>
-              <div className="filters">
-                <input
-                  className="search-box"
-                  placeholder="Search name, email, phone, campaign..."
-                  value={search}
-                  onChange={e => setSearch(e.target.value)}
-                />
-              </div>
-              <div className="lead-list">
-                {loading && <div className="empty"><div className="spin"/></div>}
-                {!loading && filtered.length === 0 && (
-                  <div className="empty">
-                    <div className="empty-icon">🔍</div>
-                    <div className="empty-text">No leads{activeStage ? ` in "${stageName(activeStage)}"` : ''}</div>
-                  </div>
-                )}
-                {filtered.map(lead => (
-                  <LeadItem
-                    key={lead.id}
-                    lead={lead}
-                    selected={selectedId === lead.id}
-                    onClick={() => setSelectedId(lead.id === selectedId ? null : lead.id)}
-                  />
-                ))}
-              </div>
+        {/* ─── Pipeline Tab ─── */}
+        {activeTab==='pipeline'&&(
+          <React.Fragment>
+            <div className="filter-bar">
+              {gAdsCampaigns.length>0&&(
+                <select className="filter-select" value={campaignFilter} onChange={e=>setCampaignFilter(e.target.value)}>
+                  <option value="">All Google Ads Campaigns</option>
+                  {gAdsCampaigns.map(c=><option key={c} value={c}>{c.replace(/^grafton_nxtsmile_/,'')}</option>)}
+                </select>
+              )}
+              <select className="filter-select" value={sourceFilter} onChange={e=>setSourceFilter(e.target.value)}>
+                <option value="">All Sources</option>
+                {sources.map(s=><option key={s} value={s}>{s}</option>)}
+              </select>
+              <input className="search-box" placeholder="Search name, phone, keyword..." value={search} onChange={e=>setSearch(e.target.value)} />
+              <label style={{fontSize:10,display:'flex',alignItems:'center',gap:3,cursor:'pointer',color:'var(--text-muted)'}}>
+                <input type="checkbox" checked={showCold} onChange={e=>setShowCold(e.target.checked)} /> Show Cold
+              </label>
+              <span style={{marginLeft:'auto',fontSize:10,color:'var(--text-muted)'}}>{filtered.length} leads</span>
             </div>
-          </div>
 
-          {/* Right column: detail + admin */}
-          <div style={{display:'flex',flexDirection:'column',gap:16}}>
-            <LeadDetail leadId={selectedId} onClose={() => setSelectedId(null)} />
-            <div className="admin-section">
-              <AdminSidebar stats={stats} onRefresh={load} />
-            </div>
-          </div>
-        </div>
+            {/* Staff Follow-Up row (top) */}
+            <StageRow stage="nurturing" label="Staff Follow-Up" leads={staffFollowUp}
+              selectedId={selectedId} onCardClick={id=>setSelectedId(id===selectedId?null:id)}
+              onDrop={handleDrop} onDragStart={id=>setDraggingId(id)}
+              color="#f59e0b" className="special followup-row" />
+
+            {/* Normal stage rows */}
+            {pipelineStages.map(stage=>(
+              <StageRow key={stage} stage={stage} label={STAGE_LABELS[stage]}
+                leads={byStage[stage]||[]} selectedId={selectedId}
+                onCardClick={id=>setSelectedId(id===selectedId?null:id)}
+                onDrop={handleDrop} onDragStart={id=>setDraggingId(id)}
+                color={STAGE_COLORS[stage]} />
+            ))}
+
+            {/* Long-Term Nurture row (bottom) */}
+            <StageRow stage="nurturing" label="Long-Term Nurture" leads={longTermNurture}
+              selectedId={selectedId} onCardClick={id=>setSelectedId(id===selectedId?null:id)}
+              onDrop={handleDrop} onDragStart={id=>setDraggingId(id)}
+              color="#8b5cf6" className="special nurture-row" />
+          </React.Fragment>
+        )}
+
+        {/* ─── Reports Tab ─── */}
+        {activeTab==='reports'&&(
+          <ReportsTab stats={stats} campaignData={campaignData} />
+        )}
+
+        {/* ─── Admin Tab ─── */}
+        {activeTab==='admin'&&(
+          <AdminTab onAction={adminAction} adminMsg={adminMsg} />
+        )}
       </div>
-    </div>
+
+      {selectedLead&&(
+        <DetailPanel lead={selectedLead} onClose={()=>setSelectedId(null)}
+          onStageChange={handleStageChange} onRefresh={load} />
+      )}
+    </React.Fragment>
   );
 }
 

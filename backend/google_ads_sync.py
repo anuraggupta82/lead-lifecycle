@@ -214,7 +214,9 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
                 "keyword_text": keyword,
                 "search_term": keyword,  # click_view doesn't have search_term; keyword is closest
                 "ad_group_name": click_data["ad_group_name"],
-                "ad_id": click_data.get("campaign_name", ""),  # store campaign name in ad_id for now
+                "ad_id": click_data.get("ad_group_id", ""),
+                "campaign_name": click_data.get("campaign_name", ""),
+                "campaign_id": click_data.get("campaign_id", ""),
                 "click_cost": click_cost,
                 "gads_synced_at": now,
             }

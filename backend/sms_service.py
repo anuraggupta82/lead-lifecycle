@@ -39,22 +39,35 @@ def _send_sms(to_number: str, body: str) -> bool:
 
 
 def send_day3_sms(lead: dict) -> bool:
+    """Day 3 — friendly nudge referencing smile preview."""
     settings = get_settings()
     name = lead.get("first_name") or "there"
+    # TODO: Update booking link once short URL / SMS tracking link is set up
+    booking_link = settings.practice_url + "/#consult"
     body = (
-        f"Hi {name}! Your free All-on-X consultation at {settings.practice_name} is still available. "
-        f"Book now: {settings.practice_url} or call {settings.office_phone}. "
+        f"Hi {name}, it's nXtsmile at Grafton Dental Care \U0001f60a "
+        f"Did you get a chance to look at your smile preview? "
+        f"We'd love to help make it a reality. "
+        f"Book your free consultation: {booking_link} "
+        f"or call us at {settings.office_phone}. "
+        f"- Dr. Gupta's Team\n"
         f"Reply STOP to opt out."
     )
     return _send_sms(lead.get("phone", ""), body)
 
 
 def send_day21_sms(lead: dict) -> bool:
+    """Day 21 — warm re-engagement, pressure-free."""
     settings = get_settings()
     name = lead.get("first_name") or "there"
+    # TODO: Update booking link once short URL / SMS tracking link is set up
+    booking_link = settings.practice_url + "/#consult"
     body = (
-        f"Hi {name}, Dr. Gupta still has openings for free implant consultations this month. "
-        f"Call {settings.office_phone} or visit {settings.practice_url}. "
+        f"Hi {name}, just checking in from nXtsmile \U0001f60a "
+        f"Life gets busy, but your dream smile is still waiting. "
+        f"Your free consultation with Dr. Gupta is just a call away — "
+        f"{settings.office_phone} or book online: {booking_link}. "
+        f"We're here whenever you're ready!\n"
         f"Reply STOP to opt out."
     )
     return _send_sms(lead.get("phone", ""), body)

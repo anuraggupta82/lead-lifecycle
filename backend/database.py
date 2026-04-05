@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS leads (
     search_term     TEXT DEFAULT '',       -- actual search query the user typed
     ad_group_name   TEXT DEFAULT '',       -- ad group name
     ad_id           TEXT DEFAULT '',       -- ad creative ID
+    campaign_name   TEXT DEFAULT '',       -- Google Ads campaign name
+    campaign_id     TEXT DEFAULT '',       -- Google Ads campaign ID
     click_cost      REAL DEFAULT 0.0,     -- cost per click in dollars
     gads_synced_at  TEXT DEFAULT '',       -- when gclid was last resolved
     updated_at  TEXT NOT NULL
@@ -129,6 +131,18 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS lead_notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id     TEXT NOT NULL,
+    note_text   TEXT NOT NULL,
+    author      TEXT DEFAULT 'admin',
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (lead_id) REFERENCES leads(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_lead ON lead_notes(lead_id);
+CREATE INDEX IF NOT EXISTS idx_notes_created ON lead_notes(created_at);
 """
 
 LIFECYCLE_STAGES = [
@@ -175,6 +189,8 @@ def _migrate(conn):
         ("search_term",    "TEXT DEFAULT ''"),
         ("ad_group_name",  "TEXT DEFAULT ''"),
         ("ad_id",          "TEXT DEFAULT ''"),
+        ("campaign_name",  "TEXT DEFAULT ''"),
+        ("campaign_id",    "TEXT DEFAULT ''"),
         ("click_cost",     "REAL DEFAULT 0.0"),
         ("gads_synced_at", "TEXT DEFAULT ''"),
     ]
@@ -204,6 +220,20 @@ def _migrate(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_conversions_lead ON conversion_uploads(lead_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_conversions_status ON conversion_uploads(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_conversions_action ON conversion_uploads(conversion_action)")
+
+    # Create lead_notes table if not exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lead_notes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id     TEXT NOT NULL,
+            note_text   TEXT NOT NULL,
+            author      TEXT DEFAULT 'admin',
+            created_at  TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_lead ON lead_notes(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_created ON lead_notes(created_at)")
 
 
 def _now() -> str:
@@ -238,6 +268,7 @@ def upsert_lead(data: dict) -> dict:
                         "utm_term","smile_image_url","smile_generated_at","source","notes",
                         "booking_id","od_patient_num","attributed_production",
                         "keyword_text","search_term","ad_group_name","ad_id",
+                        "campaign_name","campaign_id",
                         "click_cost","gads_synced_at"]:
                 if data.get(col) not in (None, ""):
                     fields.append(f"{col}=?")
@@ -373,7 +404,7 @@ def get_due_follow_ups() -> list:
     with _conn() as conn:
         rows = conn.execute("""
             SELECT fq.*, l.email, l.phone, l.first_name, l.last_name,
-                   l.smile_image_url, l.stage, l.unsubscribed_email, l.unsubscribed_sms,
+                   l.goals, l.smile_image_url, l.stage, l.unsubscribed_email, l.unsubscribed_sms,
                    l.source, l.gclid, l.utm_campaign
             FROM follow_up_queue fq
             JOIN leads l ON fq.lead_id = l.id
@@ -432,3 +463,122 @@ def get_pipeline_stats() -> dict:
             "pending_follow_ups": pending_followups,
             "sent_today": sent_today,
         }
+
+
+# ─── Lead Notes ─────────────────────────────────────────────────────────────
+
+def add_note(lead_id: str, note_text: str, author: str = "admin") -> dict:
+    now = _now()
+    with _conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO lead_notes (lead_id, note_text, author, created_at) VALUES (?,?,?,?)",
+            (lead_id, note_text, author, now),
+        )
+        return {
+            "id": cursor.lastrowid,
+            "lead_id": lead_id,
+            "note_text": note_text,
+            "author": author,
+            "created_at": now,
+        }
+
+
+def get_notes(lead_id: str) -> list:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM lead_notes WHERE lead_id=? ORDER BY created_at DESC", (lead_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_note(note_id: int) -> bool:
+    with _conn() as conn:
+        conn.execute("DELETE FROM lead_notes WHERE id=?", (note_id,))
+        return True
+
+
+# ─── Force stage (admin override — allows backward movement) ───────────────
+
+def force_stage(lead_id: str, new_stage: str, source: str = "admin", detail: str = "") -> dict:
+    """Set a lead's stage to any value — allows backward movement for admin corrections."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise ValueError(f"Lead {lead_id} not found")
+    old_stage = lead["stage"]
+    if old_stage == new_stage:
+        return lead
+    now = _now()
+    with _conn() as conn:
+        conn.execute("UPDATE leads SET stage=?, updated_at=? WHERE id=?", (new_stage, now, lead_id))
+    add_event(lead_id, "stage_changed", stage_from=old_stage, stage_to=new_stage,
+              source=source, detail=detail)
+    return get_lead(lead_id)
+
+
+# ─── Campaign stats ─────────────────────────────────────────────────────────
+
+def get_campaign_stats() -> list:
+    """Return lead counts and revenue grouped by Google Ads campaign or source."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                COALESCE(NULLIF(campaign_name, ''), COALESCE(NULLIF(utm_campaign, ''), COALESCE(NULLIF(source, ''), 'unknown'))) as campaign,
+                source,
+                COUNT(*) as lead_count,
+                SUM(CASE WHEN stage IN ('scheduled','confirmed','showed',
+                    'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as scheduled_count,
+                SUM(CASE WHEN stage IN ('showed','treatment_presented',
+                    'treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as showed_count,
+                SUM(CASE WHEN stage IN ('treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treated_count,
+                SUM(CASE WHEN stage = 'treatment_completed' THEN 1 ELSE 0 END) as completed_count,
+                SUM(attributed_production) as revenue,
+                SUM(click_cost) as total_ad_spend,
+                AVG(click_cost) as avg_cpc
+            FROM leads
+            GROUP BY COALESCE(NULLIF(campaign_name, ''), COALESCE(NULLIF(utm_campaign, ''), COALESCE(NULLIF(source, ''), 'unknown')))
+            ORDER BY lead_count DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_google_ads_campaigns() -> list:
+    """Return list of distinct Google Ads campaign names for filter dropdown."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT campaign_name
+            FROM leads
+            WHERE campaign_name != ''
+            ORDER BY campaign_name
+        """).fetchall()
+        return [r["campaign_name"] for r in rows]
+
+
+def get_distinct_sources() -> list:
+    """Return list of distinct lead sources."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT source FROM leads WHERE source != '' ORDER BY source
+        """).fetchall()
+        return [r["source"] for r in rows]
+
+
+def get_keyword_stats() -> list:
+    """Return lead counts and revenue grouped by keyword."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                keyword_text as keyword,
+                ad_group_name,
+                COUNT(*) as lead_count,
+                SUM(CASE WHEN stage IN ('scheduled','confirmed','showed',
+                    'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as scheduled_count,
+                SUM(CASE WHEN stage IN ('treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) as treated_count,
+                SUM(attributed_production) as revenue,
+                SUM(click_cost) as total_cost,
+                AVG(click_cost) as avg_cpc
+            FROM leads
+            WHERE keyword_text != ''
+            GROUP BY keyword_text
+            ORDER BY lead_count DESC
+        """).fetchall()
+        return [dict(r) for r in rows]

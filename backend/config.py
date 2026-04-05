@@ -16,12 +16,12 @@ class Settings(BaseSettings):
     # Database
     db_path: str = os.path.expanduser("~/grafton_pipeline/pipeline.db")
 
-    # Email (Gmail SMTP — same App Password used across all services)
-    smtp_host: str = "smtp.gmail.com"
+    # Email (Zoho SMTP — marketing emails from nXtsmile)
+    smtp_host: str = "smtp.zoho.com"
     smtp_port: int = 587
-    smtp_user: str = "info@graftondentalcare.com"
+    smtp_user: str = "info@nxtsmile.com"
     smtp_password: str = ""
-    email_from: str = "Grafton Dental Care <info@graftondentalcare.com>"
+    email_from: str = "nXtsmile <info@nxtsmile.com>"
     notify_email: str = "info@graftondentalcare.com"
 
     # Twilio SMS
