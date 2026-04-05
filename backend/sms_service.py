@@ -56,6 +56,21 @@ def send_day3_sms(lead: dict) -> bool:
     return _send_sms(lead.get("phone", ""), body)
 
 
+def send_no_show_sms(lead: dict) -> bool:
+    """No-show follow-up — encourage rebooking after missed appointment."""
+    settings = get_settings()
+    name = lead.get("first_name") or "there"
+    booking_link = settings.practice_url + "/#consult"
+    body = (
+        f"Hi {name}, we missed you at your appointment at Grafton Dental Care. "
+        f"We know things come up! We'd love to get you rescheduled. "
+        f"A small deposit holds your spot and shows you're committed to your new smile. "
+        f"Book again: {booking_link} or call {settings.office_phone}. "
+        f"- Dr. Gupta's Team\n"
+        f"Reply STOP to opt out."
+    )
+    return _send_sms(lead.get("phone", ""), body)
+
 def send_day21_sms(lead: dict) -> bool:
     """Day 21 — warm re-engagement, pressure-free."""
     settings = get_settings()

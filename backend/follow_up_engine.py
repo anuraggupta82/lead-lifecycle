@@ -51,7 +51,7 @@ def _process_queue():
 
         # Skip if lead already booked or beyond nurturing
         stage = item.get("stage", "new")
-        if stage in ("scheduled", "confirmed", "showed", "treatment_presented",
+        if stage in ("scheduled", "no_show", "showed", "treatment_presented",
                      "treatment_accepted", "treatment_completed", "cold"):
             mark_follow_up_sent(queue_id, "skipped", f"stage={stage}")
             continue
@@ -71,7 +71,7 @@ def _process_queue():
             if template == "day1_email":
                 success = send_day1_email(item, unsub_url)
                 if success:
-                    update_stage(lead_id, "nurturing", source="follow_up_engine")
+                    update_stage(lead_id, "auto_nurture", source="follow_up_engine")
 
             elif template == "day3_sms":
                 success = send_day3_sms(item)

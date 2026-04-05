@@ -158,7 +158,7 @@ def _get_keyword_attribution() -> dict:
         attribution[keyword]["leads"] += 1
 
         stage = lead.get("stage", "")
-        if stage in ("scheduled", "confirmed", "showed", "treatment_presented",
+        if stage in ("scheduled", "no_show", "showed", "treatment_presented",
                       "treatment_accepted", "treatment_completed"):
             attribution[keyword]["booked"] += 1
 
@@ -176,6 +176,25 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list)
     """
     Apply optimization rules. Returns recommended actions.
     """
+    # Load persistent memory — what the optimizer has been taught
+    try:
+        from database import get_optimizer_memory_dict
+        mem = get_optimizer_memory_dict()
+    except Exception as e:
+        logger.warning(f"Could not load optimizer memory: {e}")
+        mem = {'term_classifications': {}, 'keyword_overrides': {}, 'campaign_rules': {}, 'general': {}}
+
+    term_classifications = mem.get('term_classifications', {})   # search term → 'negative'/'good_keyword'/'irrelevant'
+    keyword_overrides = mem.get('keyword_overrides', {})         # keyword → 'never_pause'/'always_bid_up' etc.
+    campaign_rules = mem.get('campaign_rules', {})               # 'min_spend_before_pause' → value
+
+    # Pull configurable thresholds from memory (with sensible defaults)
+    min_spend_before_pause = float(campaign_rules.get('min_spend_before_pause', 20))
+    min_clicks_before_pause = int(campaign_rules.get('min_clicks_before_pause', 10))
+
+    logger.info(f"Optimizer memory loaded: {len(term_classifications)} term classifications, "
+                f"{len(keyword_overrides)} keyword overrides, {len(campaign_rules)} campaign rules")
+
     actions = {
         "pause": [],           # Keywords to pause (high spend, no results)
         "increase_bid": [],    # Keywords to bid up (proven production)
@@ -183,6 +202,7 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list)
         "new_exact": [],       # Search terms to add as exact match keywords
         "new_negatives": [],   # Search terms to add as negatives
         "summary": {},
+        "memory_applied": [],  # Log of memory overrides that changed the outcome
     }
 
     total_spend = sum(k["cost"] for k in keyword_perf)
@@ -190,12 +210,19 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list)
     total_leads = sum(a["leads"] for a in attribution.values())
     total_production = sum(a["production"] for a in attribution.values())
 
-    # Rule 1: Pause keywords with spend > $20 and zero leads
+    # Rule 1: Pause keywords with spend > threshold and zero leads
     for kw in keyword_perf:
         keyword = kw["keyword"]
+        keyword_lower = keyword.lower()
         attr = attribution.get(keyword, {"leads": 0, "booked": 0, "production": 0})
 
-        if kw["cost"] > 20 and attr["leads"] == 0 and kw["clicks"] > 10:
+        # Check memory override first
+        override = keyword_overrides.get(keyword_lower)
+        if override == 'never_pause':
+            actions["memory_applied"].append(f"SKIP PAUSE '{keyword}': memory says '{override}'")
+            continue
+
+        if kw["cost"] > min_spend_before_pause and attr["leads"] == 0 and kw["clicks"] > min_clicks_before_pause:
             actions["pause"].append({
                 "keyword": keyword,
                 "match_type": kw["match_type"],
@@ -242,29 +269,119 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list)
                 "reason": f"{attr['leads']} leads but 0 bookings from ${kw['cost']:.2f} spend",
             })
 
-    # Rule 4: Harvest search terms that converted but aren't exact match keywords
+    # ── Negative keyword signals ──────────────────────────────────────
+    # Search terms that indicate the person can't/won't pay for treatment.
+    # These waste ad budget because they'll never convert to a $15k+ case.
+    # Hard negatives — genuinely not a dental patient searching for treatment
+    _HARD_NEGATIVES = [
+        "dental school", "dental schools",        # looking for student-rate work
+        "diy", "home remed",                      # not seeking professional care
+        "complaint", "lawsuit", "malpractice",    # legal research
+        "salary", "job", "career", "how to become",  # career searches
+    ]
+    # Soft negatives — empty for now, let the pipeline data decide
+    _SOFT_NEGATIVES = []
+    # EVERYTHING ELSE gets tracked and judged by real pipeline data:
+    # cheap, low cost, affordable, discount, free — price-sensitive buyers
+    # cost, price, how much, payment plan, financing — research/buying intent
+    # review — evaluating the practice
+    # clinical trial, medicaid, medicare — let data prove they don't convert
+    # can't afford — might convert with financing options
+
+    def _is_negative_intent(term: str) -> str:
+        """Check if a search term has negative intent. Returns reason or empty string."""
+        t = term.lower()
+        for signal in _HARD_NEGATIVES:
+            if signal in t:
+                return f"Negative intent: '{signal}'"
+        for signal in _SOFT_NEGATIVES:
+            if signal in t:
+                # Make sure it's not a clinical term (e.g. "free gingival graft")
+                if "free gingival" in t or "free connective" in t:
+                    return ""
+                return f"Likely negative: '{signal}'"
+        return ""
+
+    # Rule 4: Harvest search terms that converted AND have buying intent
     existing_keywords = {kw["keyword"].lower() for kw in keyword_perf}
     for st in search_terms:
         term = st["search_term"].lower()
-        if st["conversions"] > 0 and term not in existing_keywords:
-            actions["new_exact"].append({
-                "search_term": st["search_term"],
-                "clicks": st["clicks"],
-                "conversions": st["conversions"],
-                "cost": st["cost"],
-            })
 
-    # Rule 5: Negative keywords — search terms with spend but no clicks or irrelevant
+        # Check memory classification first — overrides all heuristics
+        mem_classification = None
+        for mem_term, mem_val in term_classifications.items():
+            if mem_term in term or term in mem_term:
+                mem_classification = mem_val
+                break
+
+        if mem_classification == 'negative':
+            actions["new_negatives"].append({
+                "search_term": st["search_term"],
+                "clicks": st.get("clicks", 0),
+                "impressions": st.get("impressions", 0),
+                "cost": st["cost"],
+                "reason": f"Memory: classified as negative",
+            })
+            actions["memory_applied"].append(f"NEGATIVE '{st['search_term']}': memory classification")
+            continue
+        elif mem_classification in ('good_keyword', 'irrelevant'):
+            # Skip — don't add as negative, don't add as exact match candidate
+            actions["memory_applied"].append(f"SKIP '{st['search_term']}': memory says '{mem_classification}'")
+            continue
+
+        neg_reason = _is_negative_intent(term)
+
+        if neg_reason:
+            # Even if Google says it "converted", the intent is wrong — add as negative
+            actions["new_negatives"].append({
+                "search_term": st["search_term"],
+                "clicks": st.get("clicks", 0),
+                "impressions": st.get("impressions", 0),
+                "cost": st["cost"],
+                "reason": neg_reason,
+            })
+        elif st["conversions"] > 0 and term not in existing_keywords:
+            # Only add as exact match if it has real lead attribution
+            # (not just a Google Ads "conversion" which could be just a form view)
+            term_has_real_leads = any(
+                term in a_kw.lower() or a_kw.lower() in term
+                for a_kw in attribution.keys()
+            ) if attribution else False
+
+            if term_has_real_leads:
+                actions["new_exact"].append({
+                    "search_term": st["search_term"],
+                    "clicks": st["clicks"],
+                    "conversions": st["conversions"],
+                    "cost": st["cost"],
+                    "reason": "Has real lead attribution + Google conversion",
+                })
+            else:
+                # Conversion in Google but no lead in our system — flag for review
+                actions["new_exact"].append({
+                    "search_term": st["search_term"],
+                    "clicks": st["clicks"],
+                    "conversions": st["conversions"],
+                    "cost": st["cost"],
+                    "reason": "Google conversion but NO lead in pipeline — verify before adding",
+                })
+
+    # Rule 5: Negative keywords — high spend with no results
     for st in search_terms:
-        if st["cost"] > 5 and st["clicks"] == 0 and st["impressions"] > 20:
+        term = st["search_term"].lower()
+        # Skip if already added as negative in Rule 4
+        already_negative = any(n["search_term"].lower() == term for n in actions["new_negatives"])
+        if already_negative:
+            continue
+
+        if st["cost"] > 5 and st.get("clicks", 0) == 0 and st.get("impressions", 0) > 20:
             actions["new_negatives"].append({
                 "search_term": st["search_term"],
                 "impressions": st["impressions"],
                 "cost": st["cost"],
                 "reason": "High impressions, zero clicks — likely irrelevant",
             })
-        elif st["clicks"] > 5 and st["cost"] > 15 and st["conversions"] == 0:
-            # Check if this search term generated any leads
+        elif st.get("clicks", 0) > 5 and st["cost"] > 15 and st["conversions"] == 0:
             term_lower = st["search_term"].lower()
             has_leads = any(
                 term_lower in (a_kw.lower())
@@ -273,9 +390,9 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list)
             if not has_leads:
                 actions["new_negatives"].append({
                     "search_term": st["search_term"],
-                    "clicks": st["clicks"],
+                    "clicks": st.get("clicks", 0),
                     "cost": st["cost"],
-                    "reason": f"${st['cost']:.2f} spent, {st['clicks']} clicks, 0 conversions/leads",
+                    "reason": f"${st['cost']:.2f} spent, {st.get('clicks',0)} clicks, 0 conversions/leads",
                 })
 
     # Summary
@@ -291,7 +408,13 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list)
         "keywords_to_bid_down": len(actions["decrease_bid"]),
         "new_exact_match": len(actions["new_exact"]),
         "new_negatives": len(actions["new_negatives"]),
+        "memory_overrides_applied": len(actions["memory_applied"]),
     }
+
+    if actions["memory_applied"]:
+        logger.info(f"  Memory overrides applied ({len(actions['memory_applied'])}):")
+        for m in actions["memory_applied"]:
+            logger.info(f"    {m}")
 
     return actions
 
@@ -377,6 +500,7 @@ def optimize_campaign(dry_run: bool = True) -> dict:
             "new_exact": actions["new_exact"],
             "new_negatives": actions["new_negatives"],
         },
+        "memory_applied": actions.get("memory_applied", []),
         "executed": {},
     }
 

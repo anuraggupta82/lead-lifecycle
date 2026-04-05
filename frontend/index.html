@@ -60,25 +60,24 @@
                   font-size: 11px; width: 200px; }
     .search-box:focus, .filter-select:focus { outline: none; border-color: var(--teal); }
 
-    /* Stage rows — lab case manager style (always open, no chevrons) */
+    /* Stage rows */
     .stage-row { background: #fff; border: 1px solid var(--border); border-radius: 8px;
                  margin-bottom: 4px; display: flex; align-items: center; flex-wrap: wrap;
                  padding: 6px 12px; gap: 6px; min-height: 40px; }
     .stage-row.drag-over { background: rgba(13,122,127,.04); border-color: var(--teal); }
     .stage-row.special { border-left: 3px solid; }
     .stage-row.followup-row { border-left-color: #f59e0b; background: #fffbeb; }
-    .stage-row.nurture-row { border-left-color: #8b5cf6; background: #faf5ff; }
     .stage-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
     .stage-label { font-size: 11px; font-weight: 600; color: var(--text); white-space: nowrap; }
     .stage-count { font-size: 10px; font-weight: 600; background: var(--gray-light); padding: 0 6px;
                    border-radius: 8px; color: var(--text-muted); }
     .stage-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
 
-    /* Lead chips — compact inline badges like lab case manager */
+    /* Lead chips */
     .lead-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px;
                  border: 1px solid var(--border); border-radius: 6px; background: #fff;
                  cursor: pointer; font-size: 11px; transition: all .12s; white-space: nowrap;
-                 max-width: 280px; }
+                 max-width: 300px; }
     .lead-chip:hover { border-color: var(--teal); background: var(--teal-light); }
     .lead-chip.selected { border-color: var(--teal); box-shadow: 0 0 0 2px rgba(13,122,127,.15); }
     .lead-chip.has-priority { border-left: 3px solid var(--yellow); }
@@ -98,8 +97,7 @@
                   border-radius: 3px; font-weight: 700; }
     .chip-campaign { font-size: 8px; color: var(--purple); font-weight: 500; max-width: 80px;
                      overflow: hidden; text-overflow: ellipsis; }
-    .chip-fu { font-size: 8px; background: #fef3c7; color: #92400e; padding: 0 4px;
-               border-radius: 3px; font-weight: 600; }
+    .chip-appt { font-size: 8px; color: #059669; font-weight: 600; }
 
     /* Detail panel */
     .detail-overlay { position: fixed; top: 0; right: 0; bottom: 0; width: 400px;
@@ -122,7 +120,7 @@
     .detail-row-label { color: var(--text-muted); }
     .detail-row-value { font-weight: 500; text-align: right; max-width: 200px; word-break: break-all; }
 
-    /* Stage move */
+    /* Stage move menu */
     .stage-move-menu { position: absolute; top: 100%; left: 0; background: #fff; border: 1px solid var(--border);
                        border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,.1); z-index: 10;
                        min-width: 180px; max-height: 280px; overflow-y: auto; }
@@ -155,11 +153,10 @@
     .fq-skipped { background: #e5e7eb; color: #6b7280; }
     .fq-failed { background: #fef2f2; color: #dc2626; }
 
-    /* Admin / Reports tab */
+    /* Reports & Admin */
     .report-section { background: #fff; border: 1px solid var(--border); border-radius: 8px;
                       padding: 14px; margin-bottom: 12px; }
-    .report-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: flex;
-                    align-items: center; gap: 6px; }
+    .report-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
     .report-table { width: 100%; border-collapse: collapse; font-size: 11px; }
     .report-table th { text-align: left; padding: 6px 8px; background: var(--gray-light);
                        font-weight: 600; font-size: 10px; text-transform: uppercase;
@@ -168,22 +165,51 @@
     .report-table tr:hover td { background: #fafafa; }
     .report-table .num { text-align: right; font-variant-numeric: tabular-nums; }
     .report-table .money { color: #059669; font-weight: 600; }
-    .report-table .highlight { background: #f0fdf4; }
 
-    /* Funnel bar */
-    .funnel-bar { display: flex; align-items: flex-end; gap: 2px; height: 60px; margin-bottom: 10px; }
-    .funnel-bar-item { flex: 1; background: var(--teal); border-radius: 3px 3px 0 0; min-width: 20px;
-                       position: relative; transition: all .15s; cursor: pointer; }
-    .funnel-bar-item:hover { opacity: .8; }
-    .funnel-bar-label { position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%);
-                        font-size: 8px; color: var(--text-muted); white-space: nowrap; }
-    .funnel-bar-val { position: absolute; top: -14px; left: 50%; transform: translateX(-50%);
-                      font-size: 9px; font-weight: 700; color: var(--text); }
-
-    /* Admin actions */
     .admin-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+    .time-range { display: flex; gap: 4px; }
+    .time-range button { padding: 4px 8px; font-size: 10px; border: 1px solid var(--border); border-radius: 4px; background: #fff; cursor: pointer; }
+    .time-range button.active { background: var(--teal); color: #fff; border-color: var(--teal); }
 
-    /* Empty row message */
+    /* Campaign analytics expand panel */
+    .camp-analytics-row { background: #f8fafc; border-top: 1px solid var(--border); }
+    .camp-analytics-inner { padding: 12px 14px; }
+    .camp-analytics-grid { display: grid; grid-template-columns: repeat(5,1fr); gap: 8px; margin-bottom: 12px; }
+    .camp-kpi { background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; text-align: center; }
+    .camp-kpi-val { font-size: 16px; font-weight: 700; color: var(--teal); }
+    .camp-kpi-label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .3px; margin-top: 1px; }
+    .date-filter-bar { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+    .date-filter-bar label { font-size: 10px; color: var(--text-muted); }
+    .date-input { padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 10px; }
+    .date-input:focus { outline: none; border-color: var(--teal); }
+    .btn-expand { padding: 2px 7px; font-size: 10px; border: 1px solid var(--border); border-radius: 4px; background: #fff; cursor: pointer; color: var(--text-muted); }
+    .btn-expand:hover { border-color: var(--teal); color: var(--teal); }
+    .btn-expand.active { background: var(--teal-light); border-color: var(--teal); color: var(--teal); }
+
+    /* Memory module */
+    .memory-row { display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px; border-bottom: 1px solid #f5f5f5; font-size: 11px; }
+    .memory-category { padding: 2px 6px; border-radius: 3px; font-size: 9px; font-weight: 600; white-space: nowrap; }
+    .mem-cat-override { background: #fef3c7; color: #92400e; }
+    .mem-cat-classification { background: #dbeafe; color: #1d4ed8; }
+    .mem-cat-rule { background: #d1fae5; color: #065f46; }
+    .mem-cat-general { background: #f3f4f6; color: #374151; }
+    .memory-key { font-weight: 600; flex: 1; }
+    .memory-value { color: var(--teal); font-weight: 600; }
+    .memory-reason { font-size: 10px; color: var(--text-muted); flex: 2; }
+    .memory-author { font-size: 9px; color: var(--text-muted); white-space: nowrap; }
+
+    .ai-chat { display: flex; flex-direction: column; height: 300px; }
+    .ai-messages { flex: 1; overflow-y: auto; padding: 8px; border: 1px solid var(--border); border-radius: 5px;
+                   background: #f9f9f9; margin-bottom: 8px; font-size: 11px; }
+    .ai-message { padding: 6px; margin-bottom: 4px; border-radius: 4px; background: #fff; border: 1px solid var(--border); }
+    .ai-input-area { display: flex; gap: 4px; }
+    .ai-input-area textarea { flex: 1; padding: 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 11px; font-family: inherit; resize: none; }
+    .ai-input-area button { padding: 6px 10px; background: var(--teal); color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 10px; }
+
+    .feature-list { font-size: 10px; color: var(--text-muted); margin: 6px 0; }
+    .feature-list li { margin-left: 14px; }
+    .coming-soon-badge { display: inline-block; background: #fef9c3; color: #854d0e; padding: 2px 6px; border-radius: 3px; font-size: 9px; font-weight: 600; margin-top: 4px; }
+
     .empty-row { font-size: 10px; color: var(--text-muted); font-style: italic; }
   </style>
 </head>
@@ -195,21 +221,16 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const ADMIN_PW = 'GDC-pipeline-2026!';
 const API = window.location.origin;
 
-const STAGES = [
-  'new','engaged','smile_completed','nurturing','scheduled',
-  'confirmed','showed','treatment_presented','treatment_accepted','treatment_completed','cold'
-];
+const STAGES = ['new','auto_nurture','scheduled','no_show','showed','treatment_presented','treatment_accepted','treatment_completed'];
 const STAGE_LABELS = {
-  new:'New Lead', engaged:'Engaged', smile_completed:'Smile Done',
-  nurturing:'Nurturing', scheduled:'Scheduled', confirmed:'Confirmed',
-  showed:'Showed', treatment_presented:'Tx Presented',
-  treatment_accepted:'Tx Accepted', treatment_completed:'Tx Completed', cold:'Cold',
+  new:'New Lead', auto_nurture:'Auto-Nurture', scheduled:'Scheduled',
+  no_show:'No-Show', showed:'Showed', treatment_presented:'Tx Presented',
+  treatment_accepted:'Tx Accepted', treatment_completed:'Tx Completed',
 };
 const STAGE_COLORS = {
-  new:'#3b82f6', engaged:'#f59e0b', smile_completed:'#8b5cf6',
-  nurturing:'#ea580c', scheduled:'#059669', confirmed:'#047857',
-  showed:'#16a34a', treatment_presented:'#0891b2', treatment_accepted:'#0d9488',
-  treatment_completed:'#059669', cold:'#9ca3af',
+  new:'#3b82f6', auto_nurture:'#f59e0b', scheduled:'#059669',
+  no_show:'#dc2626', showed:'#16a34a', treatment_presented:'#0891b2',
+  treatment_accepted:'#0d9488', treatment_completed:'#059669',
 };
 
 async function api(path, opts = {}) {
@@ -225,7 +246,7 @@ function timeAgo(iso) {
   if (!iso) return '';
   const d = Date.now() - new Date(iso).getTime();
   const m = Math.floor(d/60000);
-  if (m < 1) return 'just now'; if (m < 60) return m+'m';
+  if (m < 1) return 'now'; if (m < 60) return m+'m';
   const h = Math.floor(m/60);
   if (h < 24) return h+'h'; const dy = Math.floor(h/24);
   if (dy < 30) return dy+'d'; return Math.floor(dy/30)+'mo';
@@ -246,32 +267,24 @@ function srcClass(s) {
   return 'src-default';
 }
 
-// Is a lead needing staff follow-up?
-// Logic: lead is in early stages (new/engaged/smile_completed/nurturing) AND has been
-// around for > 1 day but hasn't advanced to scheduled+
 function isStaffFollowUp(lead) {
-  const earlyStages = ['new','engaged','smile_completed','nurturing'];
-  if (!earlyStages.includes(lead.stage)) return false;
-  const created = new Date(lead.created_at);
-  const daysSince = (Date.now() - created.getTime()) / (1000*60*60*24);
-  return daysSince >= 1;
+  if (!['new','auto_nurture'].includes(lead.stage)) return false;
+  // Must be older than 1 day
+  const daysSince = (Date.now() - new Date(lead.created_at).getTime()) / (1000*60*60*24);
+  if (daysSince < 1) return false;
+  // Clear from this row if staff has contacted within the last 7 days
+  if (lead.last_staff_contact_at) {
+    const daysSinceContact = (Date.now() - new Date(lead.last_staff_contact_at).getTime()) / (1000*60*60*24);
+    if (daysSinceContact < 7) return false;
+  }
+  return true;
 }
-
-// Is a lead in long-term nurture?
-// Logic: lead is nurturing and has been around for > 21 days (past most automated follow-ups)
-function isLongTermNurture(lead) {
-  if (lead.stage !== 'nurturing') return false;
-  const created = new Date(lead.created_at);
-  const daysSince = (Date.now() - created.getTime()) / (1000*60*60*24);
-  return daysSince >= 21;
-}
-
-// ─── Lead Chip (compact inline badge like lab case manager) ────────────────
 
 function LeadChip({ lead, isSelected, onClick, onDragStart }) {
   const name = [lead.first_name,lead.last_name].filter(Boolean).join(' ') || lead.email || 'Unknown';
   const camp = lead.campaign_name || '';
   const shortCamp = camp.replace(/^grafton_nxtsmile_/,'');
+  const apptDate = lead.appointment_date ? fmtDate(lead.appointment_date) : null;
   return (
     <span className={'lead-chip' + (isSelected?' selected':'') + (lead.next_follow_up?' has-priority':'')}
       onClick={()=>onClick(lead.id)}
@@ -279,6 +292,7 @@ function LeadChip({ lead, isSelected, onClick, onDragStart }) {
       <span className="chip-name">{name}</span>
       <span className={'chip-source '+srcClass(lead.source)}>{lead.source||'?'}</span>
       {lead.phone && <span className="chip-phone">{lead.phone}</span>}
+      {apptDate && <span className="chip-appt">{apptDate}</span>}
       {shortCamp && <span className="chip-campaign" title={camp}>{shortCamp}</span>}
       {(lead.notes_count||0)>0 && <span className="chip-notes">{lead.notes_count}</span>}
       {lead.attributed_production>0 && <span className="chip-revenue">{fmtMoney(lead.attributed_production)}</span>}
@@ -287,11 +301,8 @@ function LeadChip({ lead, isSelected, onClick, onDragStart }) {
   );
 }
 
-// ─── Stage Row (flat, always open, no chevrons — like lab case manager) ─────
-
 function StageRow({ stage, label, leads, selectedId, onCardClick, onDrop, onDragStart, color, className }) {
   const [dragOver, setDragOver] = useState(false);
-
   return (
     <div className={'stage-row' + (dragOver?' drag-over':'') + (className?' '+className:'')}
       onDragOver={e=>{e.preventDefault();e.dataTransfer.dropEffect='move';setDragOver(true);}}
@@ -310,8 +321,6 @@ function StageRow({ stage, label, leads, selectedId, onCardClick, onDrop, onDrag
   );
 }
 
-// ─── Detail Panel ───────────────────────────────────────────────────────────
-
 function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
   const [detail, setDetail] = useState(null);
   const [notes, setNotes] = useState([]);
@@ -324,7 +333,7 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
     if (!lead) return;
     api('/api/lead/' + lead.id).then(setDetail);
     api('/api/admin/lead/' + lead.id + '/notes').then(d=>setNotes(d.notes||[]));
-  }, [lead?.id, lead?.stage]);
+  }, [lead?.id]);
 
   if (!lead) return null;
   const name = [lead.first_name,lead.last_name].filter(Boolean).join(' ')||lead.email||'Unknown';
@@ -379,88 +388,140 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
             )}
           </div>
         </div>
-        <div style={{display:'flex',borderBottom:'1px solid var(--border)',flexShrink:0}}>
-          {[['info','Info'],['notes','Notes'],['timeline','Timeline'],['followups','Follow-ups']].map(([k,lbl])=>(
-            <button key={k} onClick={()=>setTab(k)}
-              style={{flex:1,padding:'6px',fontSize:10,fontWeight:tab===k?600:400,
-                border:'none',background:tab===k?'var(--teal-light)':'#fff',
-                borderBottom:tab===k?'2px solid var(--teal)':'2px solid transparent',
-                cursor:'pointer',color:tab===k?'var(--teal)':'var(--text-muted)'}}>
-              {lbl}{k==='notes'&&notes.length>0?(' ('+notes.length+')'):''}
-            </button>
+        <div style={{display:'flex',gap:0,borderBottom:'1px solid var(--border)'}}>
+          {[{k:'info',l:'Info'},{k:'notes',l:'Notes'},{k:'communication',l:'Communication'},{k:'staff',l:'Staff Actions'}].map(t=>(
+            <button key={t.k} style={{flex:1,padding:'6px 0',fontSize:10,fontWeight:500,cursor:'pointer',
+              background:'none',border:'none',borderBottom:tab===t.k?'2px solid var(--teal)':'none',
+              color:tab===t.k?'var(--teal)':'var(--text-muted)'}}
+              onClick={()=>setTab(t.k)}>{t.l}</button>
           ))}
         </div>
         <div className="detail-body">
-          {tab==='info'&&(
-            <React.Fragment>
-              {lead.attributed_production>0&&(
-                <div style={{background:'#f0fdf4',padding:8,borderRadius:6,marginBottom:10}}>
-                  <div style={{fontSize:10,color:'#16a34a',fontWeight:600}}>REVENUE</div>
-                  <div style={{fontSize:20,fontWeight:700,color:'#059669'}}>{fmtMoney(lead.attributed_production)}</div>
-                  {lead.od_patient_num&&<div style={{fontSize:10,color:'var(--text-muted)'}}>OD #{lead.od_patient_num}</div>}
-                </div>
-              )}
+          {tab==='info' && (
+            <div>
+              <div className="detail-section">
+                <div className="detail-section-title">Contact</div>
+                {lead.email&&<div className="detail-row"><div className="detail-row-label">Email</div><div className="detail-row-value">{lead.email}</div></div>}
+                {lead.phone&&<div className="detail-row"><div className="detail-row-label">Phone</div><div className="detail-row-value">{lead.phone}</div></div>}
+              </div>
               <div className="detail-section">
                 <div className="detail-section-title">Lead Info</div>
-                {[['Source',lead.source],['Created',fmtDate(lead.created_at)],['Updated',timeAgo(lead.updated_at)],
-                  ['Campaign',lead.campaign_name||lead.utm_campaign],['Ad Group',lead.ad_group_name],
-                  ['Keyword',lead.keyword_text],['Search Term',lead.search_term],
-                  ['Click Cost',lead.click_cost>0?'$'+Number(lead.click_cost).toFixed(2):''],
-                  ['UTM Source',lead.utm_source],['UTM Campaign',lead.utm_campaign],
-                  ['GCLID',lead.gclid],['Booking ID',lead.booking_id],
-                  ['Goals',(()=>{try{const g=JSON.parse(lead.goals);return Array.isArray(g)?g.join(', '):lead.goals}catch(e){return lead.goals}})()],
-                ].filter(([,v])=>v).map(([k,v])=>(
-                  <div className="detail-row" key={k}><span className="detail-row-label">{k}</span><span className="detail-row-value">{v}</span></div>
-                ))}
+                {lead.source&&<div className="detail-row"><div className="detail-row-label">Source</div><div className="detail-row-value">{lead.source}</div></div>}
+                <div className="detail-row"><div className="detail-row-label">Created</div><div className="detail-row-value">{fmtDate(lead.created_at)}</div></div>
+                {lead.goals&&<div className="detail-row"><div className="detail-row-label">Goals</div><div className="detail-row-value">{lead.goals}</div></div>}
               </div>
-            </React.Fragment>
+              {(lead.campaign_name||lead.keyword_text||lead.gclid||lead.utm_source) && (
+                <div className="detail-section">
+                  <div className="detail-section-title">Ad Attribution</div>
+                  {lead.campaign_name&&<div className="detail-row"><div className="detail-row-label">Campaign</div><div className="detail-row-value">{lead.campaign_name}</div></div>}
+                  {lead.ad_group_name&&<div className="detail-row"><div className="detail-row-label">Ad Group</div><div className="detail-row-value">{lead.ad_group_name}</div></div>}
+                  {lead.keyword_text&&<div className="detail-row"><div className="detail-row-label">Keyword</div><div className="detail-row-value">{lead.keyword_text}</div></div>}
+                  {lead.search_term&&<div className="detail-row"><div className="detail-row-label">Search Term</div><div className="detail-row-value">{lead.search_term}</div></div>}
+                  {lead.click_cost>0&&<div className="detail-row"><div className="detail-row-label">Click Cost</div><div className="detail-row-value">${Number(lead.click_cost).toFixed(2)}</div></div>}
+                  {lead.gclid&&<div className="detail-row"><div className="detail-row-label">GCLID</div><div className="detail-row-value" style={{fontSize:9}}>{lead.gclid.substring(0,20)}...</div></div>}
+                  {lead.utm_source&&<div className="detail-row"><div className="detail-row-label">UTM Source</div><div className="detail-row-value">{lead.utm_source}</div></div>}
+                  {lead.utm_medium&&<div className="detail-row"><div className="detail-row-label">UTM Medium</div><div className="detail-row-value">{lead.utm_medium}</div></div>}
+                  {lead.utm_term&&<div className="detail-row"><div className="detail-row-label">UTM Term</div><div className="detail-row-value">{lead.utm_term}</div></div>}
+                  {lead.landing_url&&<div className="detail-row"><div className="detail-row-label">Landing URL</div><div className="detail-row-value" style={{fontSize:9}}>{lead.landing_url.substring(0,30)}...</div></div>}
+                </div>
+              )}
+              {(lead.appointment_date||lead.od_patient_num||lead.attributed_production>0) && (
+                <div className="detail-section">
+                  <div className="detail-section-title">Treatment & Revenue</div>
+                  {lead.appointment_date&&<div className="detail-row"><div className="detail-row-label">Appointment</div><div className="detail-row-value">{fmtDate(lead.appointment_date)}{lead.appointment_status&&(' ('+lead.appointment_status+')')}</div></div>}
+                  {lead.no_show_count>0&&<div className="detail-row"><div className="detail-row-label">No-Shows</div><div className="detail-row-value" style={{color:'var(--red)'}}>{lead.no_show_count}</div></div>}
+                  {lead.od_patient_num&&<div className="detail-row"><div className="detail-row-label">OD PatNum</div><div className="detail-row-value">{lead.od_patient_num}</div></div>}
+                  {lead.treatment_plan_value>0&&<div className="detail-row"><div className="detail-row-label">Tx Plan Value</div><div className="detail-row-value">{fmtMoney(lead.treatment_plan_value)}</div></div>}
+                  {lead.attributed_production>0&&<div className="detail-row"><div className="detail-row-label">Production</div><div className="detail-row-value">{fmtMoney(lead.attributed_production)}</div></div>}
+                  {lead.attributed_income>0&&<div className="detail-row"><div className="detail-row-label">Collections</div><div className="detail-row-value">{fmtMoney(lead.attributed_income)}</div></div>}
+                </div>
+              )}
+            </div>
           )}
-          {tab==='notes'&&(
-            <div className="detail-section">
-              <div style={{marginBottom:8}}>
-                <textarea className="note-input" placeholder="Add a note..." value={newNote}
-                  onChange={e=>setNewNote(e.target.value)}
-                  onKeyDown={e=>{if(e.key==='Enter'&&e.metaKey)addNote();}} />
-                <button className="btn btn-teal btn-sm" style={{marginTop:4}} onClick={addNote}
-                  disabled={saving||!newNote.trim()}>{saving?'...':'Add Note'}</button>
+          {tab==='notes' && (
+            <div>
+              <div className="detail-section">
+                <textarea className="note-input" value={newNote} onChange={e=>setNewNote(e.target.value)} placeholder="Add a note..." />
+                <button className="btn btn-teal btn-sm" onClick={addNote} style={{marginTop:6}} disabled={saving}>Save</button>
               </div>
-              {notes.length===0&&<div style={{color:'var(--text-muted)',fontSize:11}}>No notes yet</div>}
               {notes.map(n=>(
-                <div className="note-item" key={n.id}>
-                  <div className="note-header"><span className="note-author">{n.author}</span><span className="note-time">{timeAgo(n.created_at)}</span></div>
-                  <div style={{fontSize:11}}>{n.note_text}</div>
-                  <button style={{fontSize:9,color:'#dc2626',background:'none',border:'none',cursor:'pointer',marginTop:2}}
-                    onClick={()=>delNote(n.id)}>Delete</button>
-                </div>
-              ))}
-            </div>
-          )}
-          {tab==='timeline'&&(
-            <div className="detail-section">
-              {events.slice().reverse().slice(0,30).map((ev,i)=>(
-                <div className="timeline-item" key={i}>
-                  <span className="timeline-dot"/>
-                  <div style={{flex:1}}>
-                    <span className="timeline-type">{ev.event_type}</span>
-                    {ev.stage_from&&ev.stage_to&&<span style={{color:'var(--text-muted)'}}> {ev.stage_from}→{ev.stage_to}</span>}
+                <div key={n.id} className="note-item">
+                  <div className="note-header">
+                    <div className="note-author">{n.author||'Unknown'}</div>
+                    <button style={{background:'none',border:'none',cursor:'pointer',color:'var(--text-muted)',fontSize:10}} onClick={()=>delNote(n.id)}>×</button>
                   </div>
-                  <span className="timeline-time">{timeAgo(ev.created_at)}</span>
+                  <div className="note-header" style={{marginBottom:0}}>
+                    <div className="note-time">{timeAgo(n.created_at)}</div>
+                  </div>
+                  <div style={{marginTop:4}}>{n.note_text}</div>
                 </div>
               ))}
-              {events.length===0&&<div style={{color:'var(--text-muted)',fontSize:11}}>No events</div>}
             </div>
           )}
-          {tab==='followups'&&(
-            <div className="detail-section">
-              {queue.map((fq,i)=>(
-                <div className="fq-item" key={i}>
-                  <span>{fq.channel==='email'?'📧':'💬'}</span>
-                  <span style={{flex:1,fontWeight:500}}>{fq.template}</span>
-                  <span className={'fq-status fq-'+fq.status}>{fq.status}</span>
-                  <span style={{fontSize:9,color:'var(--text-muted)'}}>{fmtDate(fq.scheduled_at)}</span>
+          {tab==='communication' && (
+            <div>
+              <div className="detail-section-title">Automated Communications</div>
+              {queue.map((q,i)=>(
+                <div key={i} className="fq-item">
+                  <span className={'fq-status fq-'+q.status}>{q.status}</span>
+                  <div style={{flex:1,marginLeft:4,fontSize:10}}>
+                    <strong>{q.channel==='sms'?'SMS':'Email'}</strong> — {q.template||q.description||('Day '+q.sequence_day)}
+                  </div>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginLeft:'auto',whiteSpace:'nowrap'}}>
+                    {q.sent_at ? fmtDate(q.sent_at) : fmtDate(q.scheduled_at)}
+                  </div>
                 </div>
               ))}
-              {queue.length===0&&<div style={{color:'var(--text-muted)',fontSize:11}}>No follow-ups</div>}
+              {queue.length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No communications yet</div>}
+              <div className="detail-section-title" style={{marginTop:14}}>Event Log</div>
+              {events.filter(e=>['email_sent','sms_sent','stage_changed','lead_created','smile_completed','booking_confirmed','od_matched','image_deleted'].includes(e.event_type)).map((e,i)=>(
+                <div key={i} className="timeline-item">
+                  <div className="timeline-dot" style={{background:e.event_type.includes('email')?'#3b82f6':e.event_type.includes('sms')?'#22c55e':'var(--teal)'}} />
+                  <div style={{flex:1}}>
+                    <div className="timeline-type">{e.event_type.replace(/_/g,' ')}</div>
+                    {e.stage_to&&<div style={{fontSize:9,color:'var(--text-muted)'}}>→ {STAGE_LABELS[e.stage_to]||e.stage_to}</div>}
+                  </div>
+                  <div className="timeline-time">{fmtDate(e.created_at)}</div>
+                </div>
+              ))}
+              {events.length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No events</div>}
+            </div>
+          )}
+          {tab==='staff' && (
+            <div>
+              <div className="detail-section-title">Log Staff Action</div>
+              <div style={{display:'flex',gap:4,marginBottom:8}}>
+                <button className="btn btn-ghost btn-sm" onClick={()=>{
+                  const note = 'Staff called patient';
+                  api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:note,author:'staff'})}).then(()=>{onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
+                }}>Log Call</button>
+                <button className="btn btn-ghost btn-sm" onClick={()=>{
+                  const note = 'Staff sent email';
+                  api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:note,author:'staff'})}).then(()=>{onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
+                }}>Log Email</button>
+                <button className="btn btn-ghost btn-sm" onClick={()=>{
+                  const note = 'Staff sent text';
+                  api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:note,author:'staff'})}).then(()=>{onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
+                }}>Log Text</button>
+              </div>
+              <textarea className="note-input" placeholder="Add details about the action..." id="staffNote" />
+              <button className="btn btn-teal btn-sm" style={{marginTop:6}} onClick={()=>{
+                const el = document.getElementById('staffNote');
+                const text = el.value.trim();
+                if(!text) return;
+                api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:text,author:'staff'})}).then(()=>{el.value='';onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
+              }}>Save Note</button>
+              <div className="detail-section-title" style={{marginTop:14}}>Staff Action Log</div>
+              {notes.filter(n=>n.author==='staff').map(n=>(
+                <div key={n.id} className="note-item">
+                  <div className="note-header">
+                    <div className="note-author">{n.note_text.startsWith('Staff ')?n.note_text.split(' ').slice(0,3).join(' '):'Staff action'}</div>
+                    <div className="note-time">{fmtDate(n.created_at)} {timeAgo(n.created_at)}</div>
+                  </div>
+                  {!n.note_text.startsWith('Staff ')&&<div style={{marginTop:4}}>{n.note_text}</div>}
+                </div>
+              ))}
+              {notes.filter(n=>n.author==='staff').length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No staff actions logged</div>}
             </div>
           )}
         </div>
@@ -469,167 +530,370 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
   );
 }
 
-// ─── Reports Tab ────────────────────────────────────────────────────────────
+function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh }) {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [sourceFilter, setSourceFilter] = useState('all');
+  const [showCold, setShowCold] = useState(false);
 
-function ReportsTab({ stats, campaignData }) {
-  const campaigns = campaignData?.campaigns || [];
-  const keywords = campaignData?.keywords || [];
-  const byStage = stats?.by_stage || {};
+  const filtered = useMemo(() => {
+    let items = pipeline.filter(l => {
+      if (!showCold && l.stage === 'cold') return false;
+      if (sourceFilter !== 'all' && l.source !== sourceFilter) return false;
+      if (searchTerm) {
+        const term = searchTerm.toLowerCase();
+        const name = (l.first_name + ' ' + l.last_name).toLowerCase();
+        const email = (l.email||'').toLowerCase();
+        const phone = (l.phone||'').toLowerCase();
+        if (!name.includes(term) && !email.includes(term) && !phone.includes(term)) return false;
+      }
+      return true;
+    });
+    return items;
+  }, [pipeline, searchTerm, sourceFilter, showCold]);
 
-  // Split campaigns: Google Ads vs other sources
-  const adsCampaigns = campaigns.filter(c => {
-    const name = (c.campaign || '').toLowerCase();
-    return name.includes('grafton_nxtsmile') || name.includes('google') || (c.total_ad_spend > 0);
-  });
-  const otherSources = campaigns.filter(c => {
-    const name = (c.campaign || '').toLowerCase();
-    return !name.includes('grafton_nxtsmile') && !name.includes('google') && !(c.total_ad_spend > 0);
-  });
+  const byStage = useMemo(() => {
+    const map = {};
+    STAGES.forEach(s => map[s] = []);
+    map['cold'] = [];
+    filtered.forEach(l => {
+      if (map[l.stage] !== undefined) map[l.stage].push(l);
+    });
+    return map;
+  }, [filtered]);
 
-  // Funnel data
-  const funnelStages = ['new','engaged','smile_completed','nurturing','scheduled','showed',
-                        'treatment_presented','treatment_accepted','treatment_completed'];
-  const maxCount = Math.max(...funnelStages.map(s=>byStage[s]||0), 1);
+  const staffFollowUps = filtered.filter(isStaffFollowUp);
+
+  const sources = useMemo(() => {
+    const set = new Set(pipeline.filter(l=>l.source).map(l=>l.source));
+    return ['all', ...Array.from(set).sort()];
+  }, [pipeline]);
+
+  async function handleDrop(leadId, newStage) {
+    await api('/api/admin/lead/' + leadId + '/force-stage',{method:'PUT',body:JSON.stringify({stage:newStage,reason:'drag-drop'})});
+    onStageChange(leadId, newStage);
+  }
 
   return (
     <div>
-      {/* Funnel visualization */}
-      <div className="report-section">
-        <div className="report-title">Lead Funnel</div>
-        <div className="funnel-bar">
-          {funnelStages.map(s=>{
-            const c = byStage[s]||0;
-            const h = Math.max(c/maxCount*100, 4);
-            return (
-              <div key={s} className="funnel-bar-item"
-                style={{height:h+'%',background:STAGE_COLORS[s]}}>
-                <span className="funnel-bar-val">{c}</span>
-                <span className="funnel-bar-label">{STAGE_LABELS[s]}</span>
-              </div>
-            );
-          })}
-        </div>
-        <div style={{display:'flex',gap:16,marginTop:20,fontSize:11}}>
-          <div><strong>Lead→Scheduled:</strong> {pct((byStage.scheduled||0)+(byStage.confirmed||0)+(byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0), stats?.total_leads)}</div>
-          <div><strong>Scheduled→Showed:</strong> {pct((byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0), (byStage.scheduled||0)+(byStage.confirmed||0)+(byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0))}</div>
-          <div><strong>Showed→Treated:</strong> {pct((byStage.treatment_accepted||0)+(byStage.treatment_completed||0), (byStage.showed||0)+(byStage.treatment_presented||0)+(byStage.treatment_accepted||0)+(byStage.treatment_completed||0))}</div>
-        </div>
+      <div className="kpi-strip">
+        <div className="kpi"><div className="kpi-val">{stats?.total_leads||0}</div><div className="kpi-label">Total</div></div>
+        <div className="kpi"><div className="kpi-val">{filtered.length}</div><div className="kpi-label">Active</div></div>
+        <div className="kpi"><div className="kpi-val">{byStage.scheduled.length}</div><div className="kpi-label">Scheduled</div></div>
+        <div className="kpi"><div className="kpi-val">{byStage.no_show.length}</div><div className="kpi-label">No-Shows</div></div>
+        <div className="kpi"><div className="kpi-val">{byStage.treatment_completed.length}</div><div className="kpi-label">Treated</div></div>
+        <div className="kpi"><div className="kpi-val">{fmtMoney(stats?.attributed_revenue||0)}</div><div className="kpi-label">Revenue</div></div>
       </div>
 
-      {/* Google Ads Campaign performance */}
+      <div className="filter-bar">
+        <select className="filter-select" value={sourceFilter} onChange={e=>setSourceFilter(e.target.value)}>
+          {sources.map(s => (
+            <option key={s} value={s}>{s === 'all' ? 'All Sources' : s}</option>
+          ))}
+        </select>
+        <input type="text" className="search-box" placeholder="Search name, email, phone..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} />
+        <label style={{fontSize:11,display:'flex',gap:6,alignItems:'center',cursor:'pointer'}}>
+          <input type="checkbox" checked={showCold} onChange={e=>setShowCold(e.target.checked)} />
+          Show Cold
+        </label>
+      </div>
+
+      {staffFollowUps.length > 0 && (
+        <StageRow stage="followup" label="Staff Follow-Up" leads={staffFollowUps} selectedId={selectedId}
+          onCardClick={onCardClick} onDrop={handleDrop} color="#f59e0b" className="special followup-row" />
+      )}
+
+      {STAGES.map(s => (
+        <StageRow key={s} stage={s} label={STAGE_LABELS[s]} leads={byStage[s]} selectedId={selectedId}
+          onCardClick={onCardClick} onDrop={handleDrop} color={STAGE_COLORS[s]} />
+      ))}
+      {showCold && byStage.cold.length > 0 && (
+        <StageRow stage="cold" label="Cold" leads={byStage.cold} selectedId={selectedId}
+          onCardClick={onCardClick} onDrop={handleDrop} color="#9ca3af" />
+      )}
+    </div>
+  );
+}
+
+// Default date range helpers
+function defaultDateRange(days) {
+  const end = new Date();
+  const start = new Date();
+  start.setDate(end.getDate() - days);
+  const fmt = d => d.toISOString().split('T')[0];
+  return { start: fmt(start), end: fmt(end) };
+}
+
+function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
+  const [panelTab, setPanelTab] = useState('analytics');
+  const campName = (campaign.campaign||'').toLowerCase();
+
+  // Filter keywords for this campaign
+  const campKeywords = keywordStats.filter(k =>
+    (k.campaign_name||'').toLowerCase() === campName ||
+    (k.campaign_name||'').toLowerCase().includes(campName.replace(/^grafton_nxtsmile_/,''))
+  );
+
+  // GA4 data
+  const ov = ga4Data?.overview || {};
+  const ev = ga4Data?.events || {};
+  const sources = (ga4Data?.traffic_sources || []).filter(s =>
+    s.source_medium && s.source_medium.toLowerCase().includes('google')
+  );
+  const hasGa4 = ov.configured === true && !ov.error && !ov.no_data;
+
+  // Treatment acceptance rate: presented vs accepted
+  const presented = campaign.treatment_presented_count || 0;
+  const accepted = campaign.treatment_accepted_count || 0;
+  const txAcceptPct = presented > 0 ? Math.round(accepted / presented * 100) : null;
+
+  return (
+    <tr className="camp-analytics-row">
+      <td colSpan={colSpan} style={{padding:0}}>
+        <div className="camp-analytics-inner">
+          {/* Sub-tab bar */}
+          <div style={{display:'flex',gap:0,borderBottom:'1px solid var(--border)',marginBottom:12}}>
+            {[['analytics','Analytics'],['keywords','Keywords']].map(([k,l])=>(
+              <button key={k} onClick={()=>setPanelTab(k)}
+                style={{padding:'5px 16px',fontSize:11,fontWeight:500,cursor:'pointer',
+                  background:'none',border:'none',
+                  borderBottom:panelTab===k?'2px solid var(--teal)':'2px solid transparent',
+                  color:panelTab===k?'var(--teal)':'var(--text-muted)'}}>
+                {l}
+              </button>
+            ))}
+          </div>
+
+          {/* ── Analytics tab ── */}
+          {panelTab==='analytics' && (
+            <div>
+              {hasGa4 ? (
+                <div>
+                  <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:6,marginBottom:12}}>
+                    {[
+                      ['Sessions', Math.round(ov.sessions||0).toLocaleString()],
+                      ['Engagement', (ov.engagement_rate||0)+'%'],
+                      ['Avg Duration', ov.avg_session_duration_formatted||'—'],
+                      ['Bounce Rate', (ov.bounce_rate_pct||0)+'%'],
+                      ['Smile Starts', ev.smile_started||0],
+                      ['Smile Submitted', ev.smile_submitted||0],
+                      ['Form Submits', ev.form_submit||0],
+                      ['Chat Leads', ev.chat_lead_captured||0],
+                    ].map(([label,val])=>(
+                      <div key={label} style={{background:'#fff',border:'1px solid var(--border)',borderRadius:5,padding:'6px 10px',textAlign:'center'}}>
+                        <div style={{fontSize:14,fontWeight:700,color:'var(--teal)'}}>{val}</div>
+                        <div style={{fontSize:9,color:'var(--text-muted)',marginTop:1}}>{label}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {sources.length > 0 && (
+                    <table className="report-table" style={{fontSize:10}}>
+                      <thead>
+                        <tr>
+                          <th>Source / Medium</th>
+                          <th className="num">Sessions</th>
+                          <th className="num">New Users</th>
+                          <th className="num">Engagement</th>
+                          <th className="num">Avg Duration</th>
+                          <th className="num">Conversions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sources.slice(0,5).map((s,i)=>(
+                          <tr key={i}>
+                            <td>{s.source_medium}</td>
+                            <td className="num">{s.sessions}</td>
+                            <td className="num">{s.new_users}</td>
+                            <td className="num">{s.engagement_rate}%</td>
+                            <td className="num">{s.avg_duration}</td>
+                            <td className="num">{s.conversions}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  <p style={{fontSize:9,color:'var(--text-muted)',marginTop:6,fontStyle:'italic'}}>
+                    Site-wide data shown · campaign-level GA4 breakdown available once utm_campaign propagates
+                  </p>
+                </div>
+              ) : (
+                <div style={{padding:12,background:'#f3f4f6',borderRadius:6,fontSize:10,color:'var(--text-muted)'}}>
+                  GA4 not configured. Set GA4_PROPERTY_ID and GA4_SERVICE_ACCOUNT_JSON in .env.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Keywords tab ── */}
+          {panelTab==='keywords' && (
+            <div>
+              {campKeywords.length === 0 ? (
+                <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',padding:'8px 0'}}>
+                  No keywords matched to this campaign yet. Run Google Ads Sync.
+                </div>
+              ) : (
+                <table className="report-table" style={{fontSize:10}}>
+                  <thead>
+                    <tr>
+                      <th>Keyword</th>
+                      <th className="num">Impr.</th>
+                      <th className="num">Clicks</th>
+                      <th className="num">Cost</th>
+                      <th className="num">Leads</th>
+                      <th className="num">CPL</th>
+                      <th className="num">Scheduled</th>
+                      <th className="num">Treated</th>
+                      <th className="num">Revenue</th>
+                      <th className="num">ROAS</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {campKeywords.map((k,i)=>(
+                      <tr key={i} style={{opacity:(!k.lead_count&&!k.total_cost)?0.55:1}}>
+                        <td style={{fontStyle:'italic'}}>{k.keyword}</td>
+                        <td className="num">{(k.impressions||0).toLocaleString()}</td>
+                        <td className="num">{(k.gads_clicks||0).toLocaleString()}</td>
+                        <td className="num">{fmtMoney(k.total_cost||0)}</td>
+                        <td className="num">{k.lead_count||0}</td>
+                        <td className="num">{k.cpl ? '$'+Number(k.cpl).toFixed(0) : '—'}</td>
+                        <td className="num">{k.scheduled_count||0}</td>
+                        <td className="num">{k.treated_count||0}</td>
+                        <td className="num money">{fmtMoney(k.revenue||0)}</td>
+                        <td className="num">{k.roas ? k.roas.toFixed(1)+'x' : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
+  const [dateRange, setDateRange] = useState(() => defaultDateRange(30));
+  const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords'
+  const [ga4Refreshing, setGa4Refreshing] = useState(false);
+
+  const presets = [
+    { label: '7d', days: 7 },
+    { label: '30d', days: 30 },
+    { label: '90d', days: 90 },
+    { label: 'All', days: 365 },
+  ];
+
+  async function refreshGA4() {
+    setGa4Refreshing(true);
+    try { await api('/api/admin/ga4/refresh', {method:'POST'}); window.location.reload(); }
+    catch(e) { alert('GA4 refresh failed: '+e.message); }
+    setGa4Refreshing(false);
+  }
+
+  function togglePanel(campKey, tab) {
+    // If same campaign + same tab → close. Otherwise open that tab.
+    setExpanded(prev =>
+      prev && prev.key === campKey && prev.tab === tab ? null : { key: campKey, tab }
+    );
+  }
+
+  const COLS = 8; // number of columns in campaign table
+
+  return (
+    <div>
       <div className="report-section">
-        <div className="report-title">Google Ads Campaign Performance</div>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:12}}>
+          <div className="report-title" style={{marginBottom:0}}>Campaign Performance</div>
+          <div style={{display:'flex',gap:4,alignItems:'center',flexWrap:'wrap'}}>
+            {presets.map(p=>(
+              <button key={p.label}
+                style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                  background:dateRange.start===defaultDateRange(p.days).start?'var(--teal)':'#fff',
+                  color:dateRange.start===defaultDateRange(p.days).start?'#fff':'var(--text-muted)'}}
+                onClick={()=>setDateRange(defaultDateRange(p.days))}>
+                {p.label}
+              </button>
+            ))}
+            <label style={{fontSize:10,color:'var(--text-muted)',marginLeft:4}}>From</label>
+            <input type="date" className="date-input" value={dateRange.start} onChange={e=>setDateRange(r=>({...r,start:e.target.value}))} />
+            <label style={{fontSize:10,color:'var(--text-muted)'}}>To</label>
+            <input type="date" className="date-input" value={dateRange.end} onChange={e=>setDateRange(r=>({...r,end:e.target.value}))} />
+            <button className="btn btn-ghost btn-sm" onClick={refreshGA4} disabled={ga4Refreshing} style={{marginLeft:4}}>
+              {ga4Refreshing?'Refreshing...':'Refresh GA4'}
+            </button>
+          </div>
+        </div>
+
         <table className="report-table">
           <thead>
             <tr>
               <th>Campaign</th>
               <th className="num">Leads</th>
-              <th className="num">Scheduled</th>
-              <th className="num">Showed</th>
-              <th className="num">Treated</th>
-              <th className="num">Conv %</th>
-              <th className="num">Revenue</th>
-              <th className="num">Ad Spend</th>
-              <th className="num">ROAS</th>
-            </tr>
-          </thead>
-          <tbody>
-            {adsCampaigns.map((c,i)=>{
-              const roas = c.total_ad_spend>0 ? (c.revenue/c.total_ad_spend).toFixed(1)+'x' : '—';
-              const conv = c.lead_count>0 ? Math.round(c.scheduled_count/c.lead_count*100)+'%' : '0%';
-              const displayName = (c.campaign||'').replace(/^grafton_nxtsmile_/,'');
-              return (
-                <tr key={i} className={c.revenue>0?'highlight':''}>
-                  <td><strong>{displayName || c.campaign}</strong></td>
-                  <td className="num">{c.lead_count}</td>
-                  <td className="num">{c.scheduled_count}</td>
-                  <td className="num">{c.showed_count||0}</td>
-                  <td className="num">{c.treated_count}</td>
-                  <td className="num">{conv}</td>
-                  <td className="num money">{fmtMoney(c.revenue)}</td>
-                  <td className="num">{c.total_ad_spend>0?fmtMoney(c.total_ad_spend):'—'}</td>
-                  <td className="num" style={{fontWeight:600}}>{roas}</td>
-                </tr>
-              );
-            })}
-            {adsCampaigns.length===0&&<tr><td colSpan={9} style={{textAlign:'center',color:'var(--text-muted)',padding:20}}>No Google Ads campaign data yet. Run Google Ads Sync.</td></tr>}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Keyword performance */}
-      <div className="report-section">
-        <div className="report-title">Keyword Performance</div>
-        <table className="report-table">
-          <thead>
-            <tr>
-              <th>Keyword</th>
-              <th>Ad Group</th>
-              <th className="num">Leads</th>
-              <th className="num">Scheduled</th>
-              <th className="num">Treated</th>
-              <th className="num">Revenue</th>
-              <th className="num">Avg CPC</th>
               <th className="num">Cost</th>
-              <th className="num">ROAS</th>
+              <th className="num">CPL</th>
+              <th className="num">Collections</th>
+              <th className="num">ROI</th>
+              <th className="num">Tx Accept %</th>
+              <th style={{width:160}}></th>
             </tr>
           </thead>
           <tbody>
-            {keywords.map((k,i)=>{
-              const roas = k.total_cost>0 ? (k.revenue/k.total_cost).toFixed(1)+'x' : '—';
+            {campaignStats.map((c,i)=>{
+              const campKey = c.campaign||String(i);
+              const isOpen = expanded?.key === campKey;
+              const openTab = isOpen ? expanded.tab : null;
+
+              // Treatment acceptance: presented vs accepted
+              const presented = c.treatment_presented_count || 0;
+              const accepted  = c.treatment_accepted_count  || 0;
+              const txPct = presented > 0 ? Math.round(accepted/presented*100)+'%' : '—';
+
+              // ROI = (collections - cost) / cost
+              const collections = c.attributed_income || c.revenue || 0;
+              const cost = c.total_ad_spend || c.total_cost || 0;
+              const roi = cost > 0 ? ((collections - cost) / cost * 100).toFixed(0)+'%' : '—';
+
               return (
-                <tr key={i} className={k.revenue>0?'highlight':''}>
-                  <td style={{fontStyle:'italic'}}>{k.keyword}</td>
-                  <td style={{fontSize:10,color:'var(--text-muted)'}}>{k.ad_group_name}</td>
-                  <td className="num">{k.lead_count}</td>
-                  <td className="num">{k.scheduled_count}</td>
-                  <td className="num">{k.treated_count}</td>
-                  <td className="num money">{fmtMoney(k.revenue)}</td>
-                  <td className="num">{k.avg_cpc>0?'$'+Number(k.avg_cpc).toFixed(2):'—'}</td>
-                  <td className="num">{k.total_cost>0?fmtMoney(k.total_cost):'—'}</td>
-                  <td className="num" style={{fontWeight:600}}>{roas}</td>
-                </tr>
+                <React.Fragment key={campKey}>
+                  <tr>
+                    <td style={{fontWeight:600}}>{(c.campaign||'').replace(/^grafton_nxtsmile_/,'')||'(unknown)'}</td>
+                    <td className="num">{c.lead_count||0}</td>
+                    <td className="num">{fmtMoney(cost)}</td>
+                    <td className="num">{c.cpl ? '$'+Number(c.cpl).toFixed(0) : '—'}</td>
+                    <td className="num money">{fmtMoney(collections)}</td>
+                    <td className="num" style={{color:parseFloat(roi)>0?'#059669':parseFloat(roi)<0?'var(--red)':'var(--text-muted)'}}>{roi}</td>
+                    <td className="num">{txPct}</td>
+                    <td style={{textAlign:'right'}}>
+                      <button
+                        className={'btn-expand'+(openTab==='analytics'?' active':'')}
+                        style={{marginRight:4}}
+                        onClick={()=>togglePanel(campKey,'analytics')}>
+                        Analytics {openTab==='analytics'?'▲':'▼'}
+                      </button>
+                      <button
+                        className={'btn-expand'+(openTab==='keywords'?' active':'')}
+                        onClick={()=>togglePanel(campKey,'keywords')}>
+                        Keywords {openTab==='keywords'?'▲':'▼'}
+                      </button>
+                    </td>
+                  </tr>
+                  {isOpen && (
+                    <CampaignExpandedPanel
+                      campaign={c}
+                      keywordStats={keywordStats}
+                      ga4Data={ga4Data}
+                      colSpan={COLS}
+                    />
+                  )}
+                </React.Fragment>
               );
             })}
-            {keywords.length===0&&<tr><td colSpan={9} style={{textAlign:'center',color:'var(--text-muted)',padding:20}}>No keyword data yet. Run Google Ads Sync.</td></tr>}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Lead Sources (non-ads) */}
-      {otherSources.length>0 && (
-        <div className="report-section">
-          <div className="report-title">Lead Sources (Non-Ads)</div>
-          <table className="report-table">
-            <thead><tr><th>Source</th><th className="num">Leads</th><th className="num">Scheduled</th><th className="num">Treated</th><th className="num">Revenue</th></tr></thead>
-            <tbody>
-              {otherSources.map((c,i)=>(
-                <tr key={i}>
-                  <td>{c.campaign}</td>
-                  <td className="num">{c.lead_count}</td>
-                  <td className="num">{c.scheduled_count}</td>
-                  <td className="num">{c.treated_count}</td>
-                  <td className="num money">{fmtMoney(c.revenue)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Stage breakdown */}
-      <div className="report-section">
-        <div className="report-title">Stage Breakdown</div>
-        <table className="report-table">
-          <thead><tr><th>Stage</th><th className="num">Count</th><th className="num">% of Total</th></tr></thead>
-          <tbody>
-            {STAGES.map(s=>(
-              <tr key={s}>
-                <td><span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:STAGE_COLORS[s],marginRight:6}} />{STAGE_LABELS[s]}</td>
-                <td className="num">{byStage[s]||0}</td>
-                <td className="num">{pct(byStage[s]||0,stats?.total_leads)}</td>
-              </tr>
-            ))}
+            {campaignStats.length===0 && (
+              <tr><td colSpan={COLS} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
+                No campaign data yet — run Google Ads Sync to populate.
+              </td></tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -637,248 +901,474 @@ function ReportsTab({ stats, campaignData }) {
   );
 }
 
-// ─── Admin Tab ──────────────────────────────────────────────────────────────
+const MEMORY_CATEGORIES = [
+  { value: 'term_classification', label: 'Term Classification', desc: 'How to classify a search term (negative, good_keyword, irrelevant)' },
+  { value: 'keyword_override', label: 'Keyword Override', desc: 'Override optimizer decisions on specific keywords (never_pause, always_bid_up)' },
+  { value: 'campaign_rule', label: 'Campaign Rule', desc: 'Custom thresholds and rules (min_spend_before_pause, target_cpl)' },
+  { value: 'general', label: 'General Note', desc: 'Contextual notes the optimizer should know (attribution gaps, seasonal notes)' },
+];
 
-function AdminTab({ onAction, adminMsg }) {
+const CAT_STYLE = {
+  term_classification: 'mem-cat-classification',
+  keyword_override: 'mem-cat-override',
+  campaign_rule: 'mem-cat-rule',
+  general: 'mem-cat-general',
+};
+
+function MemorySection() {
+  const [memory, setMemory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ category: 'term_classification', key: '', value: '', reason: '' });
+  const [filterCat, setFilterCat] = useState('all');
+
+  async function loadMemory() {
+    setLoading(true);
+    try {
+      const r = await api('/api/admin/optimizer/memory');
+      setMemory(r.memory || []);
+    } catch(e) { alert('Failed to load memory: '+e.message); }
+    setLoading(false);
+  }
+
+  useEffect(() => { loadMemory(); }, []);
+
+  async function addEntry() {
+    if (!form.key.trim() || !form.value.trim() || !form.reason.trim()) {
+      alert('All fields required'); return;
+    }
+    setAdding(true);
+    try {
+      await api('/api/admin/optimizer/memory', {
+        method: 'POST',
+        body: JSON.stringify(form),
+      });
+      setForm({ category: 'term_classification', key: '', value: '', reason: '' });
+      setShowForm(false);
+      await loadMemory();
+    } catch(e) { alert('Failed to add: '+e.message); }
+    setAdding(false);
+  }
+
+  async function removeEntry(id) {
+    if (!confirm('Deactivate this memory entry?')) return;
+    await api('/api/admin/optimizer/memory/'+id, { method: 'DELETE' });
+    setMemory(memory.filter(m => m.id !== id));
+  }
+
+  const filtered = filterCat === 'all' ? memory : memory.filter(m => m.category === filterCat);
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8}}>
+        <div>
+          <div className="report-title" style={{marginBottom:2}}>Optimizer Memory</div>
+          <p style={{fontSize:10,color:'var(--text-muted)'}}>
+            Persistent knowledge the AI optimizer consults before every run. Corrections here override hardcoded rules.
+          </p>
+        </div>
+        <button className="btn btn-teal btn-sm" onClick={()=>setShowForm(!showForm)}>
+          {showForm ? 'Cancel' : '+ Add Memory'}
+        </button>
+      </div>
+
+      {showForm && (
+        <div style={{background:'#f8fafc',border:'1px solid var(--border)',borderRadius:6,padding:12,marginBottom:12}}>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}>
+            <div>
+              <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:3}}>Category</label>
+              <select className="filter-select" style={{width:'100%'}} value={form.category}
+                onChange={e=>setForm(f=>({...f,category:e.target.value}))}>
+                {MEMORY_CATEGORIES.map(c=>(
+                  <option key={c.value} value={c.value}>{c.label}</option>
+                ))}
+              </select>
+              <div style={{fontSize:9,color:'var(--text-muted)',marginTop:2}}>
+                {MEMORY_CATEGORIES.find(c=>c.value===form.category)?.desc}
+              </div>
+            </div>
+            <div>
+              <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:3}}>
+                {form.category==='term_classification' ? 'Search Term' :
+                 form.category==='keyword_override' ? 'Keyword' :
+                 form.category==='campaign_rule' ? 'Rule Name' : 'Note Key'}
+              </label>
+              <input type="text" className="search-box" style={{width:'100%'}} value={form.key}
+                placeholder={form.category==='term_classification' ? 'e.g. free dental implants' :
+                             form.category==='keyword_override' ? 'e.g. all on 4 dental implants' :
+                             'e.g. min_spend_before_pause'}
+                onChange={e=>setForm(f=>({...f,key:e.target.value}))} />
+            </div>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 2fr',gap:8,marginBottom:8}}>
+            <div>
+              <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:3}}>Decision / Value</label>
+              <input type="text" className="search-box" style={{width:'100%'}} value={form.value}
+                placeholder={form.category==='term_classification' ? 'negative / good_keyword / irrelevant' :
+                             form.category==='keyword_override' ? 'never_pause / always_bid_up' : 'value'}
+                onChange={e=>setForm(f=>({...f,value:e.target.value}))} />
+            </div>
+            <div>
+              <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:3}}>Reason (visible to AI agent)</label>
+              <input type="text" className="search-box" style={{width:'100%'}} value={form.reason}
+                placeholder="Explain why — the AI uses this to understand context"
+                onChange={e=>setForm(f=>({...f,reason:e.target.value}))} />
+            </div>
+          </div>
+          <button className="btn btn-teal btn-sm" onClick={addEntry} disabled={adding}>
+            {adding ? 'Saving...' : 'Save to Memory'}
+          </button>
+        </div>
+      )}
+
+      <div style={{display:'flex',gap:6,marginBottom:10,flexWrap:'wrap'}}>
+        {['all',...MEMORY_CATEGORIES.map(c=>c.value)].map(cat=>(
+          <button key={cat}
+            style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+              background:filterCat===cat?'var(--teal)':'#fff',
+              color:filterCat===cat?'#fff':'var(--text-muted)'}}
+            onClick={()=>setFilterCat(cat)}>
+            {cat==='all' ? 'All' : MEMORY_CATEGORIES.find(c=>c.value===cat)?.label}
+            {cat!=='all' && <span style={{marginLeft:4,opacity:.7}}>({memory.filter(m=>m.category===cat).length})</span>}
+          </button>
+        ))}
+      </div>
+
+      {loading ? (
+        <div style={{fontSize:11,color:'var(--text-muted)',padding:12}}>Loading memory...</div>
+      ) : filtered.length === 0 ? (
+        <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',padding:12}}>
+          No memory entries{filterCat!=='all'?' in this category':''}. Add entries above to teach the optimizer.
+        </div>
+      ) : (
+        <table className="report-table">
+          <thead>
+            <tr>
+              <th>Category</th>
+              <th>Key / Term</th>
+              <th>Decision</th>
+              <th>Reason</th>
+              <th>By</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(m=>(
+              <tr key={m.id}>
+                <td><span className={'memory-category '+(CAT_STYLE[m.category]||'mem-cat-general')}>
+                  {MEMORY_CATEGORIES.find(c=>c.value===m.category)?.label||m.category}
+                </span></td>
+                <td className="memory-key" style={{fontStyle:'italic'}}>{m.key}</td>
+                <td className="memory-value">{m.value}</td>
+                <td className="memory-reason" style={{fontSize:10,color:'var(--text-muted)'}}>{m.reason}</td>
+                <td className="memory-author">{m.author} · {timeAgo(m.created_at)}</td>
+                <td>
+                  <button style={{background:'none',border:'none',cursor:'pointer',color:'var(--text-muted)',fontSize:12}}
+                    onClick={()=>removeEntry(m.id)} title="Deactivate">×</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize }) {
+  const [loading, setLoading] = useState({});
+  const [chatMsg, setChatMsg] = useState('');
+  const [optimizerResult, setOptimizerResult] = useState(null);
+
+  async function handleAction(key, fn) {
+    setLoading(prev=>({...prev, [key]:true}));
+    try { const r = await fn(); if (key==='optimize') setOptimizerResult(r); }
+    catch (e) { alert('Error: '+e.message); }
+    setLoading(prev=>({...prev, [key]:false}));
+  }
+
   return (
     <div>
       <div className="report-section">
         <div className="report-title">Admin Actions</div>
         <div className="admin-actions">
-          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/sync','POST')}>Sync Firestore</button>
-          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/match','POST')}>Match OpenDental</button>
-          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/run-queue','POST')}>Run Follow-ups</button>
-          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/gads-sync','POST')}>Google Ads Sync</button>
-          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/upload-conversions','POST')}>Upload Conversions</button>
-          <button className="btn btn-ghost" onClick={()=>onAction('/api/admin/optimize?dry_run=true','POST')}>AI Optimizer (dry)</button>
+          <button className="btn btn-teal" onClick={()=>handleAction('sync', onSync)} disabled={loading.sync}>
+            {loading.sync?'Syncing...':'Sync Firestore'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>handleAction('match', onMatch)} disabled={loading.match}>
+            {loading.match?'Matching...':'Match OpenDental'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>handleAction('gads', onGAds)} disabled={loading.gads}>
+            {loading.gads?'Syncing...':'Google Ads Sync'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>handleAction('conv', onConversions)} disabled={loading.conv}>
+            {loading.conv?'Uploading...':'Upload Conversions'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>handleAction('ga4', onGA4Refresh)} disabled={loading.ga4}>
+            {loading.ga4?'Pulling...':'Refresh GA4 Data'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>handleAction('optimize', onOptimize)} disabled={loading.optimize}>
+            {loading.optimize?'Analyzing...':'Run AI Optimizer'}
+          </button>
         </div>
-        {adminMsg && <div style={{fontSize:11,color:adminMsg.startsWith('Error')?'var(--red)':'var(--teal)',padding:8,background:adminMsg.startsWith('Error')?'#fef2f2':'var(--teal-light)',borderRadius:6,marginTop:8,whiteSpace:'pre-wrap',maxHeight:200,overflow:'auto'}}>{adminMsg}</div>}
       </div>
+
+      {optimizerResult && (
+        <div className="report-section">
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8}}>
+            <div className="report-title">AI Optimizer Report — {optimizerResult.mode}</div>
+            <span style={{fontSize:10,color:'var(--text-muted)'}}>{new Date(optimizerResult.timestamp).toLocaleString()}</span>
+          </div>
+
+          {optimizerResult.error && (
+            <div style={{padding:12,background:'#fef2f2',borderRadius:6,color:'#dc2626',fontSize:12}}>
+              Error: {optimizerResult.error}
+            </div>
+          )}
+
+          {optimizerResult.summary && (
+            <>
+              <div style={{display:'grid',gridTemplateColumns:'repeat(6,1fr)',gap:8,marginBottom:12}}>
+                {[
+                  ['Total Spend',`$${optimizerResult.summary.total_spend}`],
+                  ['Total Clicks',optimizerResult.summary.total_clicks],
+                  ['Total Leads',optimizerResult.summary.total_leads],
+                  ['ROAS',optimizerResult.summary.overall_roas+'x'],
+                  ['CPL',`$${optimizerResult.summary.cost_per_lead}`],
+                  ['Production',`$${optimizerResult.summary.total_production}`],
+                ].map(([label,val])=>(
+                  <div key={label} style={{background:'var(--gray-light)',borderRadius:6,padding:'8px 10px',textAlign:'center'}}>
+                    <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:2}}>{label}</div>
+                    <div style={{fontSize:14,fontWeight:700,color:'var(--teal)'}}>{val}</div>
+                  </div>
+                ))}
+              </div>
+
+              {optimizerResult.actions?.pause?.length > 0 && (
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:11,fontWeight:600,color:'#dc2626',marginBottom:4}}>⛔ Pause ({optimizerResult.actions.pause.length} keywords)</div>
+                  {optimizerResult.actions.pause.map((k,i)=>(
+                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#fef2f2',borderRadius:4,marginBottom:3}}>
+                      <strong>"{k.keyword}"</strong> — {k.reason}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {optimizerResult.actions?.increase_bid?.length > 0 && (
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:11,fontWeight:600,color:'#16a34a',marginBottom:4}}>⬆️ Bid Up ({optimizerResult.actions.increase_bid.length} keywords)</div>
+                  {optimizerResult.actions.increase_bid.map((k,i)=>(
+                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#f0fdf4',borderRadius:4,marginBottom:3}}>
+                      <strong>"{k.keyword}"</strong> — {k.reason}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {optimizerResult.actions?.decrease_bid?.length > 0 && (
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:11,fontWeight:600,color:'#f59e0b',marginBottom:4}}>⬇️ Bid Down ({optimizerResult.actions.decrease_bid.length} keywords)</div>
+                  {optimizerResult.actions.decrease_bid.map((k,i)=>(
+                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#fffbeb',borderRadius:4,marginBottom:3}}>
+                      <strong>"{k.keyword}"</strong> — {k.reason}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {optimizerResult.actions?.new_exact?.length > 0 && (
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:11,fontWeight:600,color:'#0891b2',marginBottom:4}}>✨ Add as Exact Match ({optimizerResult.actions.new_exact.length} terms)</div>
+                  {optimizerResult.actions.new_exact.map((k,i)=>(
+                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#f0f9ff',borderRadius:4,marginBottom:3}}>
+                      <strong>"{k.search_term}"</strong> — {k.clicks} clicks, {k.conversions} conversions
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {optimizerResult.actions?.new_negatives?.length > 0 && (
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:11,fontWeight:600,color:'#6b7280',marginBottom:4}}>🚫 Add as Negative ({optimizerResult.actions.new_negatives.length} terms)</div>
+                  {optimizerResult.actions.new_negatives.slice(0,10).map((k,i)=>(
+                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'var(--gray-light)',borderRadius:4,marginBottom:3}}>
+                      <strong>"{k.search_term}"</strong> — {k.reason}
+                    </div>
+                  ))}
+                  {optimizerResult.actions.new_negatives.length > 10 && (
+                    <div style={{fontSize:10,color:'var(--text-muted)',padding:'2px 8px'}}>+{optimizerResult.actions.new_negatives.length-10} more</div>
+                  )}
+                </div>
+              )}
+
+              {optimizerResult.memory_applied?.length > 0 && (
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:11,fontWeight:600,color:'#8b5cf6',marginBottom:4}}>🧠 Memory Overrides Applied ({optimizerResult.memory_applied.length})</div>
+                  {optimizerResult.memory_applied.map((m,i)=>(
+                    <div key={i} style={{fontSize:10,padding:'3px 8px',background:'#f5f3ff',borderRadius:4,marginBottom:2,color:'#6d28d9'}}>
+                      {m}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {optimizerResult.summary.keywords_to_pause === 0 &&
+               optimizerResult.summary.keywords_to_bid_up === 0 &&
+               optimizerResult.summary.new_negatives === 0 && (
+                <div style={{fontSize:12,color:'var(--text-muted)',textAlign:'center',padding:12}}>
+                  Not enough data yet for recommendations. Needs gclid attribution from new leads.
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      <MemorySection />
 
       <div className="report-section">
         <div className="report-title">Scheduled Jobs</div>
         <table className="report-table">
-          <thead><tr><th>Job</th><th>Schedule</th><th>Description</th></tr></thead>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Schedule</th>
+              <th>Description</th>
+            </tr>
+          </thead>
           <tbody>
-            <tr><td>Firestore Sync</td><td>Every 15 min</td><td>Pull new leads from nxtsmile.com</td></tr>
-            <tr><td>Follow-up Engine</td><td>Every 15 min</td><td>Send due emails/SMS</td></tr>
-            <tr><td>Google Ads Sync</td><td>6:00 AM</td><td>Resolve gclid → keyword, campaign, CPC</td></tr>
-            <tr><td>AI Optimizer</td><td>7:00 AM</td><td>Analyze keywords, pause losers, boost winners</td></tr>
-            <tr><td>OD Matcher</td><td>10:00 PM</td><td>Match leads to OD patients, sync treatment stages</td></tr>
-            <tr><td>Conversion Upload</td><td>11:00 PM</td><td>Upload offline conversions to Google Ads</td></tr>
+            <tr><td>Firestore Sync</td><td>Every 15 min</td><td style={{color:'var(--text-muted)'}}>Pull new leads from nxtsmile.com</td></tr>
+            <tr><td>Follow-up Engine</td><td>Every 15 min</td><td style={{color:'var(--text-muted)'}}>Send due emails/SMS</td></tr>
+            <tr><td>GA4 Analytics Pull</td><td>5:30 AM</td><td style={{color:'var(--text-muted)'}}>Pull website engagement data from Google Analytics</td></tr>
+            <tr><td>Google Ads Sync</td><td>6:00 AM</td><td style={{color:'var(--text-muted)'}}>Resolve gclid → keyword, campaign, CPC</td></tr>
+            <tr><td>AI Optimizer</td><td>7:00 AM</td><td style={{color:'var(--text-muted)'}}>Analyze keywords, recommend optimizations</td></tr>
+            <tr><td>OD Matcher</td><td>10:00 PM</td><td style={{color:'var(--text-muted)'}}>Match leads to patients, sync treatment stages</td></tr>
+            <tr><td>Conversion Upload</td><td>11:00 PM</td><td style={{color:'var(--text-muted)'}}>Upload offline conversions to Google Ads</td></tr>
           </tbody>
         </table>
+      </div>
+
+      <div className="report-section">
+        <div className="report-title">AI Report Engine</div>
+        <p style={{fontSize:11,marginBottom:10}}>Ask questions about your pipeline data</p>
+        <div className="ai-chat">
+          <div className="ai-messages">
+            <div className="ai-message">AI chat coming soon. Upload CSV files for ROI analysis.</div>
+          </div>
+          <div className="ai-input-area">
+            <textarea placeholder="Ask a question..." value={chatMsg} onChange={e=>setChatMsg(e.target.value)} style={{maxHeight:80}}></textarea>
+            <button disabled>Send</button>
+          </div>
+        </div>
+        <button className="btn btn-ghost btn-sm" style={{marginTop:8}}>Upload CSV</button>
+      </div>
+
+      <div className="report-section">
+        <div className="report-title">Campaign Email/SMS Builder</div>
+        <p style={{fontSize:11}}>Create custom email and SMS sequences for campaigns like Invisalign, Cosmetic, etc.</p>
+        <div style={{marginTop:8}}>
+          <div className="coming-soon-badge">Coming Soon</div>
+          <ul className="feature-list">
+            <li>Custom drip sequences</li>
+            <li>AI-assisted copy generation</li>
+            <li>Template library</li>
+            <li>A/B testing</li>
+          </ul>
+        </div>
       </div>
     </div>
   );
 }
 
-// ─── Main App ───────────────────────────────────────────────────────────────
-
 function App() {
-  const [leads, setLeads] = useState([]);
-  const [stats, setStats] = useState({});
-  const [campaignData, setCampaignData] = useState({});
+  const [tab, setTab] = useState('pipeline');
+  const [pipeline, setPipeline] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [campaignStats, setCampaignStats] = useState([]);
+  const [keywordStats, setKeywordStats] = useState([]);
+  const [ga4Data, setGa4Data] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
-  const [search, setSearch] = useState('');
-  const [campaignFilter, setCampaignFilter] = useState('');
-  const [sourceFilter, setSourceFilter] = useState('');
-  const [activeTab, setActiveTab] = useState('pipeline');
-  const [lastRefresh, setLastRefresh] = useState(null);
-  const [adminMsg, setAdminMsg] = useState('');
-  const [showCold, setShowCold] = useState(false);
-  const [draggingId, setDraggingId] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-  const load = useCallback(async()=>{
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  async function loadData() {
     try {
-      const params = new URLSearchParams({limit:'500'});
-      if (campaignFilter) params.set('campaign',campaignFilter);
-      const [pipe, st, camp] = await Promise.all([
-        api('/api/pipeline/enriched?'+params),
+      const [p, s, c, g] = await Promise.all([
+        api('/api/pipeline/enriched'),
         api('/api/admin/stats'),
         api('/api/admin/campaigns'),
+        api('/api/admin/ga4').catch(()=>null),
       ]);
-      setLeads(pipe.leads||[]);
-      setStats(st);
-      setCampaignData(camp);
-      setLastRefresh(new Date());
-    } catch(e) { console.error('Load failed:',e); }
-  },[campaignFilter]);
-
-  useEffect(()=>{load();const t=setInterval(load,60000);return()=>clearInterval(t);},[load]);
-
-  const filtered = useMemo(()=>{
-    let out = leads;
-    if (search) {
-      const q = search.toLowerCase();
-      out = out.filter(l=>
-        (l.first_name||'').toLowerCase().includes(q)||
-        (l.last_name||'').toLowerCase().includes(q)||
-        (l.email||'').toLowerCase().includes(q)||
-        (l.phone||'').includes(q)||
-        (l.keyword_text||'').toLowerCase().includes(q)
-      );
-    }
-    if (sourceFilter) out = out.filter(l=>l.source===sourceFilter);
-    return out;
-  },[leads,search,sourceFilter]);
-
-  // Compute special rows
-  const staffFollowUp = useMemo(()=>filtered.filter(isStaffFollowUp),[filtered]);
-  const longTermNurture = useMemo(()=>filtered.filter(isLongTermNurture),[filtered]);
-
-  // Leads that appear in the special rows should NOT also appear in their normal stage row
-  const staffFUIds = useMemo(()=>new Set(staffFollowUp.map(l=>l.id)),[staffFollowUp]);
-  const ltnIds = useMemo(()=>new Set(longTermNurture.map(l=>l.id)),[longTermNurture]);
-
-  const byStage = useMemo(()=>{
-    const m={}; STAGES.forEach(s=>m[s]=[]);
-    filtered.forEach(l=>{
-      // Skip leads in special rows
-      if (staffFUIds.has(l.id) || ltnIds.has(l.id)) return;
-      const s=l.stage||'new';
-      if(m[s])m[s].push(l); else m['new'].push(l);
-    });
-    return m;
-  },[filtered, staffFUIds, ltnIds]);
-
-  // Pipeline stages to show (without cold unless toggled)
-  const pipelineStages = showCold ? STAGES : STAGES.filter(s=>s!=='cold');
-  const selectedLead = leads.find(l=>l.id===selectedId);
-
-  async function handleDrop(leadId,newStage) {
-    const lead = leads.find(l=>l.id===leadId);
-    if (!lead||lead.stage===newStage) return;
-    setLeads(prev=>prev.map(l=>l.id===leadId?{...l,stage:newStage}:l));
-    try {
-      await api('/api/admin/lead/'+leadId+'/force-stage',{method:'PUT',body:JSON.stringify({stage:newStage,reason:'drag-and-drop'})});
-    } catch(e) {
-      setLeads(prev=>prev.map(l=>l.id===leadId?{...l,stage:lead.stage}:l));
+      setPipeline(p.leads||[]);
+      setStats(s);
+      setCampaignStats(c.campaigns||[]);
+      setKeywordStats(c.keywords||[]);
+      if (g) setGa4Data(g);
+    } catch (e) {
+      console.error('Load error:', e);
+    } finally {
+      setLoading(false);
     }
   }
 
-  function handleStageChange(id,s) {
-    setLeads(prev=>prev.map(l=>l.id===id?{...l,stage:s}:l)); load();
+  function handleStageChange(leadId, newStage) {
+    setPipeline(pipeline.map(l => l.id === leadId ? {...l, stage:newStage} : l));
   }
-
-  async function adminAction(endpoint, method) {
-    setAdminMsg('Running...');
-    try {
-      const res = await fetch(API + endpoint, {
-        method: method||'POST',
-        headers: { 'Content-Type':'application/json', 'X-Admin-Password':ADMIN_PW },
-      });
-      const body = await res.json().catch(()=>({detail: res.statusText}));
-      if (!res.ok) {
-        setAdminMsg('Error ' + res.status + ': ' + (body.detail || JSON.stringify(body)));
-        setTimeout(()=>setAdminMsg(''),8000);
-        return;
-      }
-      setAdminMsg(JSON.stringify(body.result||body,null,2).slice(0,500));
-      setTimeout(()=>{setAdminMsg('');load();},4000);
-    } catch(e) { setAdminMsg('Error: '+e.message); setTimeout(()=>setAdminMsg(''),5000); }
-  }
-
-  const byStageStats = stats.by_stage||{};
-  const totalActive = Object.entries(byStageStats).filter(([s])=>s!=='cold').reduce((s,[,c])=>s+c,0);
-  const gAdsCampaigns = campaignData?.google_ads_campaigns||[];
-  const sources = campaignData?.sources||[];
 
   return (
-    <React.Fragment>
+    <div>
       <div className="header">
-        <div className="header-logo">✨ <span>nXtsmile</span> Pipeline</div>
+        <div className="header-logo">nXt<span>smile</span> Pipeline</div>
         <div className="header-right">
-          <span className="header-dot"/>
-          <span>{lastRefresh?timeAgo(lastRefresh.toISOString()):''}</span>
-          <button className="btn btn-white btn-sm" onClick={load}>↻</button>
+          <div className="header-dot" />
+          Live
         </div>
       </div>
-
       <div className="tab-bar">
-        <button className={'tab'+(activeTab==='pipeline'?' active':'')} onClick={()=>setActiveTab('pipeline')}>Pipeline</button>
-        <button className={'tab'+(activeTab==='reports'?' active':'')} onClick={()=>setActiveTab('reports')}>Reports & Campaigns</button>
-        <button className={'tab'+(activeTab==='admin'?' active':'')} onClick={()=>setActiveTab('admin')}>Admin</button>
+        <button className={'tab' + (tab==='pipeline'?' active':'')} onClick={()=>setTab('pipeline')}>Pipeline</button>
+        <button className={'tab' + (tab==='reports'?' active':'')} onClick={()=>setTab('reports')}>Reports & Campaigns</button>
+        <button className={'tab' + (tab==='admin'?' active':'')} onClick={()=>setTab('admin')}>Admin</button>
       </div>
-
-      {/* KPI strip — always visible */}
-      <div style={{padding:'10px 16px 0'}}>
-        <div className="kpi-strip">
-          <div className="kpi"><div className="kpi-val">{stats.total_leads||0}</div><div className="kpi-label">Total Leads</div></div>
-          <div className="kpi"><div className="kpi-val">{totalActive}</div><div className="kpi-label">Active</div></div>
-          <div className="kpi"><div className="kpi-val">{(byStageStats.scheduled||0)+(byStageStats.confirmed||0)}</div><div className="kpi-label">Scheduled</div></div>
-          <div className="kpi"><div className="kpi-val">{(byStageStats.showed||0)}</div><div className="kpi-label">Showed</div></div>
-          <div className="kpi"><div className="kpi-val">{(byStageStats.treatment_accepted||0)+(byStageStats.treatment_completed||0)}</div><div className="kpi-label">Treated</div></div>
-          <div className="kpi"><div className="kpi-val" style={{color:'#059669'}}>{fmtMoney(stats.attributed_revenue)}</div><div className="kpi-label">Revenue</div></div>
-          <div className="kpi"><div className="kpi-val" style={{color:byStageStats.cold>0?'var(--red)':'var(--text-muted)'}}>{byStageStats.cold||0}</div><div className="kpi-label">Cold</div></div>
-        </div>
-      </div>
-
       <div className="main">
-        {/* ─── Pipeline Tab ─── */}
-        {activeTab==='pipeline'&&(
-          <React.Fragment>
-            <div className="filter-bar">
-              {gAdsCampaigns.length>0&&(
-                <select className="filter-select" value={campaignFilter} onChange={e=>setCampaignFilter(e.target.value)}>
-                  <option value="">All Google Ads Campaigns</option>
-                  {gAdsCampaigns.map(c=><option key={c} value={c}>{c.replace(/^grafton_nxtsmile_/,'')}</option>)}
-                </select>
-              )}
-              <select className="filter-select" value={sourceFilter} onChange={e=>setSourceFilter(e.target.value)}>
-                <option value="">All Sources</option>
-                {sources.map(s=><option key={s} value={s}>{s}</option>)}
-              </select>
-              <input className="search-box" placeholder="Search name, phone, keyword..." value={search} onChange={e=>setSearch(e.target.value)} />
-              <label style={{fontSize:10,display:'flex',alignItems:'center',gap:3,cursor:'pointer',color:'var(--text-muted)'}}>
-                <input type="checkbox" checked={showCold} onChange={e=>setShowCold(e.target.checked)} /> Show Cold
-              </label>
-              <span style={{marginLeft:'auto',fontSize:10,color:'var(--text-muted)'}}>{filtered.length} leads</span>
-            </div>
-
-            {/* Staff Follow-Up row (top) */}
-            <StageRow stage="nurturing" label="Staff Follow-Up" leads={staffFollowUp}
-              selectedId={selectedId} onCardClick={id=>setSelectedId(id===selectedId?null:id)}
-              onDrop={handleDrop} onDragStart={id=>setDraggingId(id)}
-              color="#f59e0b" className="special followup-row" />
-
-            {/* Normal stage rows */}
-            {pipelineStages.map(stage=>(
-              <StageRow key={stage} stage={stage} label={STAGE_LABELS[stage]}
-                leads={byStage[stage]||[]} selectedId={selectedId}
-                onCardClick={id=>setSelectedId(id===selectedId?null:id)}
-                onDrop={handleDrop} onDragStart={id=>setDraggingId(id)}
-                color={STAGE_COLORS[stage]} />
-            ))}
-
-            {/* Long-Term Nurture row (bottom) */}
-            <StageRow stage="nurturing" label="Long-Term Nurture" leads={longTermNurture}
-              selectedId={selectedId} onCardClick={id=>setSelectedId(id===selectedId?null:id)}
-              onDrop={handleDrop} onDragStart={id=>setDraggingId(id)}
-              color="#8b5cf6" className="special nurture-row" />
-          </React.Fragment>
-        )}
-
-        {/* ─── Reports Tab ─── */}
-        {activeTab==='reports'&&(
-          <ReportsTab stats={stats} campaignData={campaignData} />
-        )}
-
-        {/* ─── Admin Tab ─── */}
-        {activeTab==='admin'&&(
-          <AdminTab onAction={adminAction} adminMsg={adminMsg} />
+        {loading ? (
+          <div style={{textAlign:'center',padding:20,color:'var(--text-muted)'}}>Loading...</div>
+        ) : (
+          <>
+            {tab==='pipeline' && (
+              <>
+                <PipelineTab pipeline={pipeline} stats={stats} selectedId={selectedId}
+                  onCardClick={setSelectedId} onStageChange={handleStageChange} onRefresh={loadData} />
+                {selectedId && (
+                  <DetailPanel lead={pipeline.find(l=>l.id===selectedId)} onClose={()=>setSelectedId(null)}
+                    onStageChange={handleStageChange} onRefresh={loadData} />
+                )}
+              </>
+            )}
+            {tab==='reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} />}
+            {tab==='admin' && (
+              <AdminTab
+                onSync={()=>api('/api/admin/sync', {method:'POST'})}
+                onMatch={()=>api('/api/admin/match', {method:'POST'})}
+                onGAds={()=>api('/api/admin/gads-sync', {method:'POST'})}
+                onConversions={()=>api('/api/admin/upload-conversions', {method:'POST'})}
+                onGA4Refresh={()=>api('/api/admin/ga4/refresh', {method:'POST'})}
+                onOptimize={()=>api('/api/admin/optimize?dry_run=true', {method:'POST'})} />
+            )}
+          </>
         )}
       </div>
-
-      {selectedLead&&(
-        <DetailPanel lead={selectedLead} onClose={()=>setSelectedId(null)}
-          onStageChange={handleStageChange} onRefresh={load} />
-      )}
-    </React.Fragment>
+    </div>
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+ReactDOM.render(<App />, document.getElementById('root'));
 </script>
 </body>
 </html>

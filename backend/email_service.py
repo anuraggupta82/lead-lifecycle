@@ -647,6 +647,42 @@ def send_day30_cold_email(lead: dict, unsubscribe_url: str) -> bool:
     return _send_msg(msg)
 
 
+def send_no_show_email(lead: dict, unsub_url: str) -> bool:
+    """No-show follow-up — encourage rebooking with a deposit after missed appointment."""
+    settings = get_settings()
+    name = lead.get("first_name") or "there"
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+    delete_url = f"http://localhost:{settings.port}/delete-image/{lead_id}"
+    booking_link = f"{settings.practice_url}/#consult"
+
+    html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0 auto">
+    <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0">
+      <h2 style="color:#fff;margin:0">We Missed You, {name}!</h2>
+    </div>
+    <div style="background:#f9fafb;padding:28px 32px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
+      <p>We noticed you weren't able to make it to your appointment at Grafton Dental Care. Life happens — we completely understand!</p>
+
+      <p>Your consultation with Dr. Gupta is still available. To secure your spot, we ask for a small
+      refundable deposit when you rebook — it helps us reserve the time just for you.</p>
+
+      <div style="text-align:center;margin:28px 0">
+        <a href="{booking_link}" style="background:#0d7a7f;color:#fff;padding:14px 32px;
+           border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;display:inline-block">
+           Rebook My Consultation</a>
+      </div>
+
+      <p>Or call us directly at <strong>{settings.office_phone}</strong> — we're happy to help find a time that works.</p>
+
+      <p style="color:#999;font-size:12px;margin-top:28px;border-top:1px solid #e5e7eb;padding-top:16px">
+        {settings.practice_name} · {settings.practice_url}<br>
+        <a href="{unsub_url}" style="color:#999">Unsubscribe</a>
+        {f' · <a href="{delete_url}" style="color:#999">Delete my smile image</a>' if lead.get("smile_image_url") else ""}
+      </p>
+    </div></body></html>"""
+
+    return _send(lead.get("email", ""), f"We missed you, {name}! Let's reschedule", html)
+
+
 def send_office_new_lead(lead: dict) -> bool:
     """Notify office when a new lead arrives."""
     settings = get_settings()

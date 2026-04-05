@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     ga4_measurement_id: str = "G-B3G7NKS06D"
     ga4_api_secret: str = ""  # Create in GA4 Admin → Data Streams → Measurement Protocol API Secrets
 
+    # GA4 Data API (for pulling analytics reports)
+    ga4_property_id: str = ""  # Numeric property ID (not G-xxx), e.g. "123456789"
+    ga4_service_account_json: str = ""  # Path to service account JSON file
+
     # Google Ads API
     google_ads_client_id: str = ""
     google_ads_client_secret: str = ""

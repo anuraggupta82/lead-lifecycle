@@ -27,11 +27,10 @@ logger = logging.getLogger(__name__)
 
 # Map lead stages to conversion action names
 STAGE_TO_CONVERSION = {
-    "engaged":              "Qualified Lead",
-    "smile_completed":      "Qualified Lead",
-    "nurturing":            "Qualified Lead",
+    "new":                  "Qualified Lead",
+    "auto_nurture":         "Qualified Lead",
     "scheduled":            "Appointment Booked",
-    "confirmed":            "Appointment Booked",
+    "no_show":              "Appointment Booked",
     "showed":               "Appointment Booked",
     "treatment_presented":  "Treatment Accepted",
     "treatment_accepted":   "Treatment Accepted",

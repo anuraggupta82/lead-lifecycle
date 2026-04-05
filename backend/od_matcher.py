@@ -14,8 +14,11 @@ import hashlib
 import logging
 import json
 from datetime import datetime, timezone
-from database import get_all_leads, get_lead, add_event, update_stage
+from database import get_all_leads, get_lead, add_event, update_stage, enqueue_follow_ups
 from config import get_settings
+from ga4_events import (
+    track_treatment_presented, track_treatment_accepted, track_treatment_completed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +171,8 @@ def sync_treatment_stages() -> dict:
       - Has a treatment plan with implant codes → "treatment_presented"
       - Has scheduled procedures (ProcStatus=1 with future AptNum) → "treatment_accepted"
       - Has completed procedures (ProcStatus=2) → "treatment_completed"
-    Also refreshes attributed_production for all matched leads.
+      - Has broken appointment (AptStatus=5) → "no_show"
+    Also refreshes attributed_production, income, and appointment info.
     """
     conn = _get_db()
     if not conn:
@@ -193,35 +197,57 @@ def sync_treatment_stages() -> dict:
                 # Check treatment plan status
                 tp_status = _get_treatment_plan_status(conn, pat_num)
                 production = _get_patient_production(conn, pat_num)
+                income = _get_patient_income(conn, pat_num)
+                apt_info = _get_appointment_info(conn, pat_num)
 
                 # Determine what stage the lead should be in based on OD data
                 new_stage = None
 
                 if production["total"] > 0:
-                    # Completed procedures exist
                     new_stage = "treatment_completed"
                 elif tp_status["has_scheduled_procedures"]:
-                    # Procedures are scheduled (accepted and on the books)
                     new_stage = "treatment_accepted"
                 elif tp_status["has_treatment_plan"]:
-                    # Treatment plan exists but nothing scheduled yet
                     new_stage = "treatment_presented"
+                elif apt_info["has_showed"]:
+                    new_stage = "showed"
+                elif apt_info["has_broken"] and current_stage in ("scheduled", "new", "auto_nurture"):
+                    new_stage = "no_show"
+                elif apt_info["has_scheduled"]:
+                    new_stage = "scheduled"
 
-                # Update production amount (always refresh)
-                if production["total"] != lead.get("attributed_production", 0):
-                    lconn = _get_sqlite()
-                    now = datetime.now(timezone.utc).isoformat()
-                    lconn.execute("""
-                        UPDATE leads SET attributed_production=?, updated_at=? WHERE id=?
-                    """, (production["total"], now, lead["id"]))
-                    lconn.commit()
-                    lconn.close()
+                # Update production, income, appointment info, and treatment_plan_value
+                lconn = _get_sqlite()
+                now = datetime.now(timezone.utc).isoformat()
+                lconn.execute("""
+                    UPDATE leads SET
+                        attributed_production=?,
+                        attributed_income=?,
+                        treatment_plan_value=?,
+                        appointment_date=?,
+                        appointment_status=?,
+                        no_show_count=?,
+                        updated_at=?
+                    WHERE id=?
+                """, (
+                    production["total"],
+                    income,
+                    tp_status["plan_value"],
+                    apt_info.get("next_apt_date", ""),
+                    apt_info.get("status", ""),
+                    apt_info.get("broken_count", 0),
+                    now,
+                    lead["id"],
+                ))
+                lconn.commit()
+                lconn.close()
 
                 # Advance stage if appropriate
                 if new_stage and new_stage != current_stage:
                     update_stage(lead["id"], new_stage, source="od_matcher",
                                  detail=json.dumps({
                                      "production": production["total"],
+                                     "income": income,
                                      "tp_value": tp_status["plan_value"],
                                      "codes": production["codes"],
                                  }))
@@ -230,13 +256,34 @@ def sync_treatment_stages() -> dict:
                                   "from_stage": current_stage,
                                   "to_stage": new_stage,
                                   "production": production["total"],
+                                  "income": income,
                                   "tp_value": tp_status["plan_value"],
                               }))
+
+                    # Fire GA4 events for treatment milestones
+                    try:
+                        if new_stage == "treatment_presented":
+                            track_treatment_presented(lead["id"], plan_value=tp_status["plan_value"])
+                        elif new_stage == "treatment_accepted":
+                            track_treatment_accepted(lead["id"], plan_value=tp_status["plan_value"])
+                        elif new_stage == "treatment_completed":
+                            track_treatment_completed(lead["id"], production=production["total"])
+                    except Exception as e:
+                        logger.debug(f"GA4 event failed for {lead['id']} (non-fatal): {e}")
+
+                    # Trigger no-show follow-up sequence (email + SMS)
+                    if new_stage == "no_show":
+                        try:
+                            _send_no_show_follow_ups(lead)
+                        except Exception as e:
+                            logger.warning(f"No-show follow-up failed for {lead['id']}: {e}")
+
                     updated += 1
                     logger.info(
                         f"Lead {lead['id']} (PatNum {pat_num}): "
                         f"{current_stage} → {new_stage}, "
                         f"production=${production['total']:.2f}, "
+                        f"income=${income:.2f}, "
                         f"TP value=${tp_status['plan_value']:.2f}"
                     )
 
@@ -266,15 +313,14 @@ def _get_treatment_plan_status(conn, pat_num: str) -> dict:
 
         with conn.cursor() as cur:
             # Check for treatment plan entries with implant codes
-            # proctp = treatment plan procedures
+            # proctp has ProcCode directly (no CodeNum in this OD version)
             cur.execute(f"""
                 SELECT SUM(pt.FeeAmt) as plan_total, COUNT(*) as plan_count
                 FROM proctp pt
                 JOIN treatplan tp ON pt.TreatPlanNum = tp.TreatPlanNum
-                JOIN procedurecode pc ON pt.CodeNum = pc.CodeNum
                 WHERE tp.PatNum = %s
                   AND tp.TPStatus IN (0, 1)
-                  AND pc.ProcCode IN ({placeholders})
+                  AND pt.ProcCode IN ({placeholders})
             """, [int(pat_num)] + list(CDT_IMPLANT_CODES))
             row = cur.fetchone()
 
@@ -324,6 +370,108 @@ def _get_patient_production(conn, pat_num: str) -> dict:
             return {"total": total, "codes": codes}
     except Exception:
         return {"total": 0.0, "codes": []}
+
+
+def _send_no_show_follow_ups(lead: dict):
+    """Send immediate no-show email + SMS when broken appointment is detected."""
+    from email_service import send_no_show_email
+    from sms_service import send_no_show_sms
+
+    lead_id = lead["id"]
+
+    # Build unsub URL
+    settings = get_settings()
+    unsub_url = f"http://localhost:{settings.port}/unsubscribe/{lead_id}/email"
+
+    # Send email if not unsubscribed
+    if not lead.get("unsubscribed_email") and lead.get("email"):
+        try:
+            success = send_no_show_email(lead, unsub_url)
+            if success:
+                add_event(lead_id, "email_sent", source="od_matcher",
+                          detail=json.dumps({"template": "no_show_email"}))
+                logger.info(f"No-show email sent to lead {lead_id}")
+        except Exception as e:
+            logger.warning(f"No-show email failed for {lead_id}: {e}")
+
+    # Send SMS if not unsubscribed
+    if not lead.get("unsubscribed_sms") and lead.get("phone"):
+        try:
+            success = send_no_show_sms(lead)
+            if success:
+                add_event(lead_id, "sms_sent", source="od_matcher",
+                          detail=json.dumps({"template": "no_show_sms"}))
+                logger.info(f"No-show SMS sent to lead {lead_id}")
+        except Exception as e:
+            logger.warning(f"No-show SMS failed for {lead_id}: {e}")
+
+
+def _get_patient_income(conn, pat_num: str) -> float:
+    """Get total payments (income/collections) for a patient — actual money received."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT SUM(SplitAmt) as total
+                FROM paysplit
+                WHERE PatNum = %s
+            """, [int(pat_num)])
+            row = cur.fetchone()
+            return float(row[0] or 0) if row else 0.0
+    except Exception as e:
+        logger.warning(f"Error getting income for PatNum {pat_num}: {e}")
+        return 0.0
+
+
+def _get_appointment_info(conn, pat_num: str) -> dict:
+    """
+    Get appointment status for a patient.
+    AptStatus: 1=Scheduled, 2=Complete, 3=UnschedList, 4=ASAP, 5=Broken
+    """
+    result = {
+        "has_scheduled": False,
+        "has_showed": False,      # Complete appointment exists
+        "has_broken": False,
+        "broken_count": 0,
+        "next_apt_date": "",
+        "status": "",
+    }
+    try:
+        with conn.cursor() as cur:
+            # Get all appointments for this patient
+            cur.execute("""
+                SELECT AptStatus, AptDateTime
+                FROM appointment
+                WHERE PatNum = %s
+                ORDER BY AptDateTime DESC
+            """, [int(pat_num)])
+            rows = cur.fetchall()
+
+            for row in rows:
+                status = int(row[0])
+                apt_date = row[1]
+
+                if status == 5:  # Broken
+                    result["has_broken"] = True
+                    result["broken_count"] += 1
+                elif status == 2:  # Complete
+                    result["has_showed"] = True
+                elif status == 1:  # Scheduled
+                    result["has_scheduled"] = True
+                    if apt_date:
+                        result["next_apt_date"] = str(apt_date)[:10]  # YYYY-MM-DD
+
+            # Determine overall status string
+            if result["has_scheduled"]:
+                result["status"] = "scheduled"
+            elif result["has_showed"]:
+                result["status"] = "complete"
+            elif result["has_broken"]:
+                result["status"] = "broken"
+
+    except Exception as e:
+        logger.warning(f"Error getting appointment info for PatNum {pat_num}: {e}")
+
+    return result
 
 
 # ── Combined runner ──────────────────────────────────────────────────────────

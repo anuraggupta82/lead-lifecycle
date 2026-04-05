@@ -62,7 +62,7 @@ def _normalize_firestore_lead(doc: dict) -> dict:
         "id": lead_id,
         "created_at": raw.get("timestamp") or raw.get("created_at") or "",
         "source": source,
-        "stage": "nurturing" if raw.get("smile_url") else "engaged",
+        "stage": "new",
         "first_name": first,
         "last_name": last,
         "email": raw.get("email") or "",
@@ -75,6 +75,8 @@ def _normalize_firestore_lead(doc: dict) -> dict:
         "utm_medium": tracking.get("utm_medium") or raw.get("utm_medium") or "",
         "utm_campaign": tracking.get("utm_campaign") or raw.get("utm_campaign") or "",
         "utm_term": tracking.get("utm_term") or raw.get("utm_term") or "",
+        "utm_content": tracking.get("utm_content") or raw.get("utm_content") or "",
+        "landing_url": tracking.get("landing_url") or raw.get("landing_url") or "",
         "smile_image_url": raw.get("smile_url") or raw.get("smile_image_url") or "",
         "notes": raw.get("message") or raw.get("notes") or "",
     }

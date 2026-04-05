@@ -41,6 +41,9 @@ from database import (
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
+from ga4_events import (
+    track_lead_created, track_smile_completed, track_appointment_booked,
+)
 from firestore_sync import sync_from_firestore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -70,6 +73,20 @@ async def lifespan(app: FastAPI):
 
     # Start Google Ads scheduled jobs
     ads_scheduler = BackgroundScheduler(timezone="America/New_York")
+
+    # 5:30 AM — Pull GA4 analytics data
+    def _ga4_pull_job():
+        try:
+            from ga4_reporting import fetch_all_ga4_data
+            from database import save_ga4_cache
+            data = fetch_all_ga4_data(days=30)
+            if not data.get("overview", {}).get("error"):
+                save_ga4_cache("full_report", 30, data)
+                logger.info(f"GA4 data cached: {data['overview'].get('sessions', 0):.0f} sessions")
+            else:
+                logger.warning(f"GA4 pull returned error: {data['overview'].get('error')}")
+        except Exception as e:
+            logger.error(f"Scheduled GA4 pull failed: {e}")
 
     # 6 AM — Resolve gclids to keywords
     def _gads_sync_job():
@@ -107,6 +124,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Scheduled conversion upload failed: {e}")
 
+    ads_scheduler.add_job(_ga4_pull_job, CronTrigger(hour=5, minute=30),
+                          id="ga4_pull", name="GA4 Analytics Data Pull", replace_existing=True)
     ads_scheduler.add_job(_gads_sync_job, CronTrigger(hour=6, minute=0),
                           id="gads_sync", name="Google Ads GCLID Sync", replace_existing=True)
     ads_scheduler.add_job(_optimizer_job, CronTrigger(hour=7, minute=0),
@@ -117,7 +136,7 @@ async def lifespan(app: FastAPI):
                           id="conversion_upload", name="Google Ads Conversion Upload", replace_existing=True)
 
     ads_scheduler.start()
-    logger.info("Google Ads scheduled jobs started (6AM sync, 7AM optimizer, 10PM OD, 11PM conversions)")
+    logger.info("Scheduled jobs started (5:30AM GA4, 6AM gads sync, 7AM optimizer, 10PM OD, 11PM conversions)")
 
     yield
 
@@ -194,6 +213,8 @@ class EventPayload(BaseModel):
     utm_medium: Optional[str] = None
     utm_campaign: Optional[str] = None
     utm_term: Optional[str] = None
+    utm_content: Optional[str] = None
+    landing_url: Optional[str] = None
     smile_image_url: Optional[str] = None
     booking_id: Optional[str] = None
     created_at: Optional[str] = None
@@ -227,7 +248,7 @@ async def receive_event(payload: EventPayload):
             "id": payload.lead_id,
             "created_at": payload.created_at or now,
             "source": payload.source,
-            "stage": "engaged",
+            "stage": "new",
             "first_name": payload.first_name or "",
             "last_name": payload.last_name or "",
             "email": payload.email or "",
@@ -240,10 +261,12 @@ async def receive_event(payload: EventPayload):
             "utm_medium": payload.utm_medium or "",
             "utm_campaign": payload.utm_campaign or "",
             "utm_term": payload.utm_term or "",
+            "utm_content": payload.utm_content or "",
+            "landing_url": payload.landing_url or "",
         }
         lead = upsert_lead(lead_data)
         enqueue_follow_ups(payload.lead_id, lead_data["created_at"])
-        add_event(payload.lead_id, "lead_created", stage_to="engaged", source=payload.source,
+        add_event(payload.lead_id, "lead_created", stage_to="new", source=payload.source,
                   detail=detail_str)
 
         # Notify office
@@ -252,6 +275,12 @@ async def receive_event(payload: EventPayload):
         except Exception as e:
             logger.warning(f"Office notification failed: {e}")
 
+        # Fire GA4 event
+        try:
+            track_lead_created(payload.lead_id, source=payload.source, gclid=payload.gclid or "")
+        except Exception as e:
+            logger.debug(f"GA4 lead_created event failed (non-fatal): {e}")
+
         return {"status": "ok", "lead_id": payload.lead_id, "action": "created"}
 
     elif event_type == "smile_completed":
@@ -259,8 +288,15 @@ async def receive_event(payload: EventPayload):
             raise HTTPException(status_code=404, detail="Lead not found")
         upsert_lead({"id": lead["id"], "smile_image_url": payload.smile_image_url or "",
                      "smile_generated_at": now})
-        update_stage(lead["id"], "smile_completed", source=payload.source)
+        # Smile completion is just an event — no stage change (stays as 'new' until first email)
         add_event(lead["id"], "smile_completed", source=payload.source, detail=detail_str)
+
+        # Fire GA4 event
+        try:
+            track_smile_completed(lead["id"])
+        except Exception as e:
+            logger.debug(f"GA4 smile_completed event failed (non-fatal): {e}")
+
         return {"status": "ok", "lead_id": lead["id"], "action": "smile_noted"}
 
     elif event_type == "booking_confirmed":
@@ -272,12 +308,19 @@ async def receive_event(payload: EventPayload):
                      detail=f"booking_id={payload.booking_id}")
         add_event(lead["id"], "booking_confirmed", stage_to="scheduled", source="scheduler",
                   detail=detail_str)
+
+        # Fire GA4 event
+        try:
+            track_appointment_booked(lead["id"])
+        except Exception as e:
+            logger.debug(f"GA4 appointment_booked event failed (non-fatal): {e}")
+
         return {"status": "ok", "lead_id": lead["id"], "action": "booking_noted"}
 
     elif event_type == "booking_cancelled":
         if not lead:
             raise HTTPException(status_code=404, detail="Lead not found")
-        update_stage(lead["id"], "nurturing", source="scheduler")
+        update_stage(lead["id"], "auto_nurture", source="scheduler")
         add_event(lead["id"], "booking_cancelled", source="scheduler", detail=detail_str)
         return {"status": "ok", "lead_id": lead["id"], "action": "cancellation_noted"}
 
@@ -286,7 +329,7 @@ async def receive_event(payload: EventPayload):
             raise HTTPException(status_code=404, detail="Lead not found")
         add_event(lead["id"], "call_matched", source="mango", detail=detail_str)
         # Advance to showed if they were scheduled
-        if lead["stage"] in ("scheduled", "confirmed"):
+        if lead["stage"] in ("scheduled",):
             update_stage(lead["id"], "showed", source="mango")
         return {"status": "ok", "lead_id": lead["id"], "action": "call_noted"}
 
@@ -559,6 +602,41 @@ def admin_delete_note(note_id: int):
     return {"status": "ok"}
 
 
+# ─── GA4 Analytics ───────────────────────────────────────────────────────────
+
+@app.get("/api/admin/ga4", dependencies=[Depends(_require_admin)])
+def admin_ga4(days: int = 30, force_refresh: bool = False):
+    """Return GA4 analytics data (cached or fresh)."""
+    from database import get_ga4_cache, save_ga4_cache
+
+    # Try cache first (unless force refresh)
+    if not force_refresh:
+        cached = get_ga4_cache("full_report", days, max_age_hours=12)
+        if cached:
+            cached["from_cache"] = True
+            return cached
+
+    # Pull fresh data
+    try:
+        from ga4_reporting import fetch_all_ga4_data
+        data = fetch_all_ga4_data(days=days)
+        if not data.get("overview", {}).get("error"):
+            save_ga4_cache("full_report", days, data)
+        data["from_cache"] = False
+        return data
+    except ImportError:
+        return {"error": "google-analytics-data not installed", "configured": False}
+    except Exception as e:
+        logger.error(f"GA4 data fetch failed: {e}")
+        return {"error": str(e), "configured": True}
+
+
+@app.post("/api/admin/ga4/refresh", dependencies=[Depends(_require_admin)])
+def admin_ga4_refresh(days: int = 30):
+    """Force refresh GA4 data."""
+    return admin_ga4(days=days, force_refresh=True)
+
+
 # ─── Campaign stats ──────────────────────────────────────────────────────────
 
 @app.get("/api/admin/campaigns", dependencies=[Depends(_require_admin)])
@@ -596,6 +674,63 @@ def get_pipeline_enriched(stage: Optional[str] = None, campaign: Optional[str] =
         rows = conn.execute(query, params).fetchall()
         leads = [dict(r) for r in rows]
     return {"leads": leads, "total": len(leads)}
+
+
+# ─── Optimizer Memory ────────────────────────────────────────────────────────
+
+@app.get("/api/admin/optimizer/memory", dependencies=[Depends(_require_admin)])
+def get_memory(category: Optional[str] = None, include_inactive: bool = False):
+    """Return all optimizer memory entries."""
+    from database import get_optimizer_memory
+    entries = get_optimizer_memory(category=category, active_only=not include_inactive)
+    return {"memory": entries, "total": len(entries)}
+
+
+class MemoryCreate(BaseModel):
+    category: str   # 'term_classification', 'keyword_override', 'campaign_rule', 'general'
+    key: str
+    value: str      # 'negative', 'good_keyword', 'irrelevant', 'never_pause', etc.
+    reason: str
+    author: str = "admin"
+
+
+class MemoryUpdate(BaseModel):
+    value: str
+    reason: str
+
+
+@app.post("/api/admin/optimizer/memory", dependencies=[Depends(_require_admin)])
+def add_memory(body: MemoryCreate):
+    """Add a new optimizer memory entry."""
+    from database import add_optimizer_memory
+    entry = add_optimizer_memory(
+        category=body.category,
+        key=body.key,
+        value=body.value,
+        reason=body.reason,
+        author=body.author,
+    )
+    logger.info(f"Optimizer memory added: [{body.category}] '{body.key}' = '{body.value}'")
+    return {"status": "ok", "entry": entry}
+
+
+@app.put("/api/admin/optimizer/memory/{memory_id}", dependencies=[Depends(_require_admin)])
+def update_memory(memory_id: int, body: MemoryUpdate):
+    """Update value and reason for an existing memory entry."""
+    from database import update_optimizer_memory
+    entry = update_optimizer_memory(memory_id, body.value, body.reason)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Memory entry not found or inactive")
+    return {"status": "ok", "entry": entry}
+
+
+@app.delete("/api/admin/optimizer/memory/{memory_id}", dependencies=[Depends(_require_admin)])
+def delete_memory(memory_id: int):
+    """Soft-delete (deactivate) a memory entry."""
+    from database import deactivate_optimizer_memory
+    deactivate_optimizer_memory(memory_id)
+    logger.info(f"Optimizer memory deactivated: id={memory_id}")
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
