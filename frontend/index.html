@@ -121,9 +121,9 @@
     .detail-row-value { font-weight: 500; text-align: right; max-width: 200px; word-break: break-all; }
 
     /* Stage move menu */
-    .stage-move-menu { position: absolute; top: 100%; left: 0; background: #fff; border: 1px solid var(--border);
-                       border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,.1); z-index: 10;
-                       min-width: 180px; max-height: 280px; overflow-y: auto; }
+    .stage-move-menu { position: absolute; top: 100%; right: 0; background: #fff; border: 1px solid var(--border);
+                       border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,.1); z-index: 100;
+                       min-width: 180px; max-height: 280px; overflow-y: auto; white-space: nowrap; }
     .stage-move-item { padding: 6px 10px; font-size: 11px; cursor: pointer; display: flex;
                        align-items: center; gap: 6px; }
     .stage-move-item:hover { background: var(--teal-light); }
@@ -225,7 +225,7 @@ const STAGES = ['new','auto_nurture','scheduled','no_show','showed','treatment_p
 const STAGE_LABELS = {
   new:'New Lead', auto_nurture:'Auto-Nurture', scheduled:'Scheduled',
   no_show:'No-Show', showed:'Showed', treatment_presented:'Tx Presented',
-  treatment_accepted:'Tx Accepted', treatment_completed:'Tx Completed',
+  treatment_accepted:'Tx Accepted', treatment_completed:'Tx Completed', cold:'Cold',
 };
 const STAGE_COLORS = {
   new:'#3b82f6', auto_nurture:'#f59e0b', scheduled:'#059669',
@@ -321,13 +321,15 @@ function StageRow({ stage, label, leads, selectedId, onCardClick, onDrop, onDrag
   );
 }
 
-function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
+function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const [detail, setDetail] = useState(null);
   const [notes, setNotes] = useState([]);
   const [newNote, setNewNote] = useState('');
   const [showMove, setShowMove] = useState(false);
   const [tab, setTab] = useState('info');
   const [saving, setSaving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [testEmailStatus, setTestEmailStatus] = useState('');
 
   useEffect(() => {
     if (!lead) return;
@@ -356,6 +358,12 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
     onStageChange(lead.id,s);
   }
 
+  async function deleteLead() {
+    await api('/api/admin/lead/' + lead.id, {method:'DELETE'});
+    onDelete(lead.id);
+    onClose();
+  }
+
   const events = detail?.events||[];
   const queue = detail?.follow_up_queue||[];
 
@@ -371,9 +379,23 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
               {lead.email}{lead.phone&&(' · '+lead.phone)}
             </div>
           </div>
+          {confirmDelete ? (
+            <div style={{display:'flex',gap:4,alignItems:'center'}}>
+              <span style={{fontSize:10,color:'var(--red)',fontWeight:600}}>Delete?</span>
+              <button className="btn btn-sm" style={{background:'var(--red)',color:'#fff',padding:'3px 8px',fontSize:11}}
+                onClick={deleteLead}>Yes</button>
+              <button className="btn btn-sm" style={{background:'var(--border)',color:'var(--text)',padding:'3px 8px',fontSize:11}}
+                onClick={()=>setConfirmDelete(false)}>No</button>
+            </div>
+          ) : (
+            <button title="Delete lead" onClick={()=>setConfirmDelete(true)}
+              style={{background:'none',border:'none',cursor:'pointer',color:'var(--text-muted)',fontSize:14,padding:'2px 6px'}}
+              onMouseOver={e=>e.target.style.color='var(--red)'}
+              onMouseOut={e=>e.target.style.color='var(--text-muted)'}>🗑</button>
+          )}
           <div style={{position:'relative'}}>
             <button className="btn btn-teal btn-sm" onClick={()=>setShowMove(!showMove)}>
-              {STAGE_LABELS[lead.stage]} ▾
+              {STAGE_LABELS[lead.stage]||lead.stage} ▾
             </button>
             {showMove && (
               <div className="stage-move-menu">
@@ -511,6 +533,27 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh }) {
                 if(!text) return;
                 api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:text,author:'staff'})}).then(()=>{el.value='';onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
               }}>Save Note</button>
+              <div className="detail-section-title" style={{marginTop:14}}>Test Nurture Emails</div>
+              <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
+                Sends to your override address — does not affect real nurture queue.
+              </div>
+              <div style={{display:'flex',gap:4,flexWrap:'wrap',marginBottom:6}}>
+                {['day1','day7','day14','day30','noshow'].map(t=>(
+                  <button key={t} className="btn btn-ghost btn-sm" onClick={()=>{
+                    setTestEmailStatus('Sending '+t+'...');
+                    api('/api/admin/test-email',{method:'POST',body:JSON.stringify({
+                      lead_id: lead.id,
+                      template: t,
+                      override_email: 'anuraggupta@graftondentalcare.com'
+                    })}).then(r=>{
+                      setTestEmailStatus(r.status==='sent'? '✅ '+t+' sent to '+r.to : '❌ '+t+' failed');
+                      setTimeout(()=>setTestEmailStatus(''),5000);
+                    }).catch(()=>{ setTestEmailStatus('❌ Error'); setTimeout(()=>setTestEmailStatus(''),3000); });
+                  }}>{t}</button>
+                ))}
+              </div>
+              {testEmailStatus && <div style={{fontSize:11,color:'var(--teal)',marginBottom:8}}>{testEmailStatus}</div>}
+
               <div className="detail-section-title" style={{marginTop:14}}>Staff Action Log</div>
               {notes.filter(n=>n.author==='staff').map(n=>(
                 <div key={n.id} className="note-item">
@@ -1587,7 +1630,8 @@ function App() {
                   onCardClick={setSelectedId} onStageChange={handleStageChange} onRefresh={loadData} />
                 {selectedId && (
                   <DetailPanel lead={pipeline.find(l=>l.id===selectedId)} onClose={()=>setSelectedId(null)}
-                    onStageChange={handleStageChange} onRefresh={loadData} />
+                    onStageChange={handleStageChange} onRefresh={loadData}
+                    onDelete={(id)=>{setPipeline(p=>p.filter(l=>l.id!==id));setSelectedId(null);}} />
                 )}
               </>
             )}

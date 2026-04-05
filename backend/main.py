@@ -619,6 +619,43 @@ def admin_delete_note(note_id: int):
     return {"status": "ok"}
 
 
+@app.delete("/api/admin/lead/{lead_id}", dependencies=[Depends(_require_admin)])
+def admin_delete_lead(lead_id: str):
+    """
+    Permanently delete a lead and all associated data (events, queue, notes).
+    Also deletes smile image from GCS if present.
+    Use with care — this is irreversible.
+    """
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    # Delete smile image from GCS first if present
+    image_url = lead.get("smile_image_url", "")
+    if image_url and "storage.googleapis.com" in image_url:
+        try:
+            from google.cloud import storage as gcs_storage
+            path = image_url.split("storage.googleapis.com/")[1].split("?")[0]
+            bucket_name, blob_name = path.split("/", 1)
+            client = gcs_storage.Client()
+            client.bucket(bucket_name).blob(blob_name).delete()
+            logger.info(f"Deleted GCS smile image for deleted lead {lead_id}")
+        except Exception as e:
+            logger.warning(f"Could not delete GCS image for lead {lead_id}: {e}")
+
+    # Delete all associated records then the lead itself
+    from database import _conn
+    with _conn() as conn:
+        conn.execute("DELETE FROM lifecycle_events WHERE lead_id = ?", (lead_id,))
+        conn.execute("DELETE FROM follow_up_queue WHERE lead_id = ?", (lead_id,))
+        conn.execute("DELETE FROM lead_notes WHERE lead_id = ?", (lead_id,))
+        conn.execute("DELETE FROM conversion_uploads WHERE lead_id = ?", (lead_id,))
+        conn.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
+
+    logger.info(f"Lead {lead_id} ({lead.get('email','')}) permanently deleted by admin")
+    return {"status": "deleted", "lead_id": lead_id}
+
+
 # ─── Test Email ──────────────────────────────────────────────────────────────
 
 class TestEmailRequest(BaseModel):

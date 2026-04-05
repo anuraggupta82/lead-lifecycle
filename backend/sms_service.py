@@ -43,7 +43,7 @@ def send_day3_sms(lead: dict) -> bool:
     settings = get_settings()
     name = lead.get("first_name") or "there"
     # TODO: Update booking link once short URL / SMS tracking link is set up
-    booking_link = settings.practice_url + "/#consult"
+    booking_link = settings.booking_url
     body = (
         f"Hi {name}, it's nXtsmile at Grafton Dental Care \U0001f60a "
         f"Did you get a chance to look at your smile preview? "
@@ -60,7 +60,7 @@ def send_no_show_sms(lead: dict) -> bool:
     """No-show follow-up — encourage rebooking after missed appointment."""
     settings = get_settings()
     name = lead.get("first_name") or "there"
-    booking_link = settings.practice_url + "/#consult"
+    booking_link = settings.booking_url
     body = (
         f"Hi {name}, we missed you at your appointment at Grafton Dental Care. "
         f"We know things come up! We'd love to get you rescheduled. "
@@ -76,7 +76,7 @@ def send_day21_sms(lead: dict) -> bool:
     settings = get_settings()
     name = lead.get("first_name") or "there"
     # TODO: Update booking link once short URL / SMS tracking link is set up
-    booking_link = settings.practice_url + "/#consult"
+    booking_link = settings.booking_url
     body = (
         f"Hi {name}, just checking in from nXtsmile \U0001f60a "
         f"Life gets busy, but your dream smile is still waiting. "
