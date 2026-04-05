@@ -172,14 +172,17 @@ def _get_keyword_attribution() -> dict:
 
 # ── Rule-Based Optimization ──────────────────────────────────────────────────
 
-def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list) -> dict:
+def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list, campaign: str = "") -> dict:
     """
     Apply optimization rules. Returns recommended actions.
+    campaign: name of the campaign being evaluated — used to scope memory lookups.
+              Empty string = global memory only.
     """
     # Load persistent memory — what the optimizer has been taught
+    # Two-pass: global entries first, campaign-specific overrides second
     try:
         from database import get_optimizer_memory_dict
-        mem = get_optimizer_memory_dict()
+        mem = get_optimizer_memory_dict(campaign=campaign)
     except Exception as e:
         logger.warning(f"Could not load optimizer memory: {e}")
         mem = {'term_classifications': {}, 'keyword_overrides': {}, 'campaign_rules': {}, 'general': {}}
@@ -483,9 +486,19 @@ def optimize_campaign(dry_run: bool = True) -> dict:
     logger.info("Building lead attribution...")
     attribution = _get_keyword_attribution()
 
+    # Determine the primary campaign name for memory scoping
+    # (derive from keyword data — use the campaign with the most spend)
+    campaign_spend: dict = {}
+    for kw in keyword_perf:
+        camp = kw.get("campaign", "")
+        if camp:
+            campaign_spend[camp] = campaign_spend.get(camp, 0) + kw.get("cost", 0)
+    primary_campaign = max(campaign_spend, key=campaign_spend.get) if campaign_spend else ""
+    logger.info(f"Primary campaign for memory scoping: '{primary_campaign}'")
+
     # Analyze
     logger.info("Analyzing and generating recommendations...")
-    actions = _analyze_keywords(keyword_perf, attribution, search_terms)
+    actions = _analyze_keywords(keyword_perf, attribution, search_terms, campaign=primary_campaign)
 
     # Report
     summary = actions["summary"]

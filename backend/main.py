@@ -38,6 +38,7 @@ from database import (
     add_event, unsubscribe, get_follow_up_queue, get_due_follow_ups,
     add_note, get_notes, delete_note, force_stage,
     get_campaign_stats, get_google_ads_campaigns, get_distinct_sources, get_keyword_stats,
+    get_search_term_stats, get_geo_stats, get_schedule_stats,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -54,9 +55,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Module-level scheduler reference so endpoints can inspect job state
+ads_scheduler = None
+# Tracks last successful run time per job id
+_job_last_run: dict = {}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global ads_scheduler
     # Startup
     init_db()
     logger.info("Database initialized")
@@ -72,10 +79,16 @@ async def lifespan(app: FastAPI):
     start_scheduler()
 
     # Start Google Ads scheduled jobs
-    ads_scheduler = BackgroundScheduler(timezone="America/New_York")
+    ads_scheduler = BackgroundScheduler(timezone="America/New_York")  # also stored at module level above
+
+    from datetime import datetime as _dt
+
+    def _stamp(job_id):
+        _job_last_run[job_id] = _dt.now().isoformat()
 
     # 5:30 AM — Pull GA4 analytics data
     def _ga4_pull_job():
+        _stamp("ga4_pull")
         try:
             from ga4_reporting import fetch_all_ga4_data
             from database import save_ga4_cache
@@ -90,6 +103,7 @@ async def lifespan(app: FastAPI):
 
     # 6 AM — Resolve gclids to keywords
     def _gads_sync_job():
+        _stamp("gads_sync")
         try:
             from google_ads_sync import sync_gclids_to_keywords
             result = sync_gclids_to_keywords(days_back=7)
@@ -99,6 +113,7 @@ async def lifespan(app: FastAPI):
 
     # 7 AM — AI optimizer (after fresh data)
     def _optimizer_job():
+        _stamp("ai_optimizer")
         try:
             from ai_optimizer import optimize_campaign
             result = optimize_campaign(dry_run=True)  # Start in dry-run mode
@@ -108,6 +123,7 @@ async def lifespan(app: FastAPI):
 
     # 10 PM — OpenDental matcher + treatment stages
     def _od_sync_job():
+        _stamp("od_sync")
         try:
             from od_matcher import run_full_od_sync
             result = run_full_od_sync()
@@ -117,6 +133,7 @@ async def lifespan(app: FastAPI):
 
     # 11 PM — Upload offline conversions
     def _conversion_upload_job():
+        _stamp("conversion_upload")
         try:
             from google_ads_conversions import upload_offline_conversions
             result = upload_offline_conversions()
@@ -602,6 +619,68 @@ def admin_delete_note(note_id: int):
     return {"status": "ok"}
 
 
+# ─── Test Email ──────────────────────────────────────────────────────────────
+
+class TestEmailRequest(BaseModel):
+    lead_id: str
+    template: str          # day1, day7, day14, day30, noshow
+    override_email: str = ""  # if set, send to this address instead of lead's email
+
+@app.post("/api/admin/test-email", dependencies=[Depends(_require_admin)])
+def admin_test_email(body: TestEmailRequest):
+    """
+    Fire a specific nurture email template to a lead immediately.
+    Use override_email to redirect to your own inbox for testing.
+    Templates: day1, day7, day14, day30, noshow
+    """
+    from database import get_lead
+    from email_service import (
+        send_day1_email, send_day7_email, send_day14_email,
+        send_day30_cold_email, send_no_show_email,
+    )
+    from config import get_settings
+
+    lead = get_lead(body.lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail=f"Lead {body.lead_id} not found")
+
+    # Override email for testing without spamming real patients
+    test_lead = dict(lead)
+    if body.override_email:
+        test_lead["email"] = body.override_email
+
+    settings = get_settings()
+    unsubscribe_url = f"http://localhost:{settings.port}/unsubscribe/{body.lead_id}"
+
+    template = body.template.lower()
+    try:
+        if template == "day1":
+            result = send_day1_email(test_lead, unsubscribe_url)
+        elif template == "day7":
+            result = send_day7_email(test_lead, unsubscribe_url)
+        elif template == "day14":
+            result = send_day14_email(test_lead, unsubscribe_url)
+        elif template == "day30":
+            result = send_day30_cold_email(test_lead, unsubscribe_url)
+        elif template == "noshow":
+            result = send_no_show_email(test_lead, unsubscribe_url)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown template '{template}'. Use: day1, day7, day14, day30, noshow")
+
+        return {
+            "status": "sent" if result else "failed",
+            "template": template,
+            "to": test_lead["email"],
+            "lead_id": body.lead_id,
+            "has_smile_image": bool(lead.get("smile_image_url")),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Test email failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── GA4 Analytics ───────────────────────────────────────────────────────────
 
 @app.get("/api/admin/ga4", dependencies=[Depends(_require_admin)])
@@ -676,6 +755,44 @@ def get_pipeline_enriched(stage: Optional[str] = None, campaign: Optional[str] =
     return {"leads": leads, "total": len(leads)}
 
 
+# ─── Scheduled Jobs Status ───────────────────────────────────────────────────
+
+@app.get("/api/admin/jobs", dependencies=[Depends(_require_admin)])
+def get_job_status():
+    """Return status of all scheduled jobs including last_run and next_run times."""
+
+    def _fmt(dt):
+        if dt is None:
+            return None
+        try:
+            return dt.isoformat()
+        except Exception:
+            return str(dt)
+
+    job_list = []
+
+    # Ads + optimizer scheduler jobs (ga4_pull, gads_sync, ai_optimizer, od_sync, conversion_upload)
+    if ads_scheduler:
+        for job in ads_scheduler.get_jobs():
+            job_list.append({
+                "id": job.id,
+                "name": job.name or job.id,
+                "next_run": _fmt(job.next_run_time),
+                "last_run": _job_last_run.get(job.id),
+            })
+
+    # Follow-up engine runs on its own internal scheduler; add as static entry
+    job_list.insert(0, {
+        "id": "follow_up_engine",
+        "name": "Follow-up Engine",
+        "next_run": None,
+        "last_run": _job_last_run.get("follow_up_engine"),
+        "schedule": "Every 15 min",
+    })
+
+    return {"jobs": job_list}
+
+
 # ─── Optimizer Memory ────────────────────────────────────────────────────────
 
 @app.get("/api/admin/optimizer/memory", dependencies=[Depends(_require_admin)])
@@ -692,6 +809,7 @@ class MemoryCreate(BaseModel):
     value: str      # 'negative', 'good_keyword', 'irrelevant', 'never_pause', etc.
     reason: str
     author: str = "admin"
+    campaign: str = ""  # empty = global, campaign name = scoped to that campaign
 
 
 class MemoryUpdate(BaseModel):
@@ -709,8 +827,10 @@ def add_memory(body: MemoryCreate):
         value=body.value,
         reason=body.reason,
         author=body.author,
+        campaign=body.campaign,
     )
-    logger.info(f"Optimizer memory added: [{body.category}] '{body.key}' = '{body.value}'")
+    scope = f"campaign:{body.campaign}" if body.campaign else "global"
+    logger.info(f"Optimizer memory added: [{body.category}] '{body.key}' = '{body.value}' (scope={scope})")
     return {"status": "ok", "entry": entry}
 
 
@@ -731,6 +851,60 @@ def delete_memory(memory_id: int):
     deactivate_optimizer_memory(memory_id)
     logger.info(f"Optimizer memory deactivated: id={memory_id}")
     return {"status": "ok"}
+
+
+# ── Google Ads Intelligence Endpoints ────────────────────────────────────────
+
+@app.get("/api/admin/search-terms", dependencies=[Depends(_require_admin)])
+def get_search_terms(campaign: str = "", days: int = 30):
+    """Return cached search terms with lead attribution."""
+    return {
+        "search_terms": get_search_term_stats(campaign_name=campaign, days=days),
+        "days": days,
+        "campaign_filter": campaign,
+    }
+
+
+@app.get("/api/admin/geo-performance", dependencies=[Depends(_require_admin)])
+def get_geo_performance(days: int = 30):
+    """Return cached geographic performance data."""
+    return {"geo": get_geo_stats(days=days), "days": days}
+
+
+@app.get("/api/admin/schedule-performance", dependencies=[Depends(_require_admin)])
+def get_schedule_performance(days: int = 30):
+    """Return cached hour-of-day / day-of-week / device performance."""
+    return {**get_schedule_stats(days=days), "days": days}
+
+
+class KeywordResearchRequest(BaseModel):
+    seed_keywords: list         # e.g. ["dental implants", "all on 4 near me"]
+    budget: Optional[float] = None
+    geo_target_ids: Optional[list] = None   # e.g. ["geoTargetConstants/1020615"]
+
+
+@app.post("/api/admin/keyword-research", dependencies=[Depends(_require_admin)])
+def keyword_research(body: KeywordResearchRequest):
+    """
+    Run Google Keyword Planner on seed keywords.
+    Returns search volume, competition, CPC range, and 12-month trend.
+    Use this before launching a new campaign to validate keyword demand.
+    """
+    try:
+        from keyword_planner import get_keyword_ideas
+        ideas = get_keyword_ideas(
+            seed_keywords=body.seed_keywords,
+            geo_target_ids=body.geo_target_ids or [],
+        )
+        logger.info(f"Keyword research: {len(ideas)} ideas for {body.seed_keywords}")
+        return {
+            "ideas": ideas,
+            "seed_keywords": body.seed_keywords,
+            "total": len(ideas),
+        }
+    except Exception as e:
+        logger.error(f"Keyword research failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

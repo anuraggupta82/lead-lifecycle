@@ -16,7 +16,10 @@ from typing import Optional
 
 from google.ads.googleads.client import GoogleAdsClient
 from config import get_settings
-from database import get_all_leads, upsert_lead, save_gads_keywords_cache
+from database import (
+    get_all_leads, upsert_lead, save_gads_keywords_cache,
+    save_gads_geo_cache, save_gads_schedule_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,13 +137,22 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
             ad_group_criterion.keyword.text,
             ad_group_criterion.keyword.match_type,
             ad_group_criterion.status,
+            ad_group_criterion.quality_info.quality_score,
+            ad_group_criterion.quality_info.creative_quality_score,
+            ad_group_criterion.quality_info.post_click_quality_score,
+            ad_group_criterion.quality_info.search_predicted_ctr,
             ad_group.name,
             campaign.name,
             metrics.impressions,
             metrics.clicks,
             metrics.cost_micros,
             metrics.conversions,
-            metrics.average_cpc
+            metrics.average_cpc,
+            metrics.search_impression_share,
+            metrics.search_top_impression_percentage,
+            metrics.search_absolute_top_impression_percentage,
+            metrics.search_budget_lost_impression_share,
+            metrics.search_rank_lost_impression_share
         FROM keyword_view
         WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
             AND campaign.status = 'ENABLED'
@@ -166,6 +178,9 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
             conversions = row.metrics.conversions or 0.0
 
             if keyword not in agg:
+                # Quality info fields — not segmentable, take first non-zero value seen
+                qi = row.ad_group_criterion.quality_info
+                qs_map = {0: "", 1: "UNKNOWN", 2: "BELOW_AVERAGE", 3: "AVERAGE", 4: "ABOVE_AVERAGE"}
                 agg[keyword] = {
                     "keyword_text": keyword,
                     "match_type": str(row.ad_group_criterion.keyword.match_type),
@@ -175,15 +190,41 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
                     "clicks": 0,
                     "cost": 0.0,
                     "conversions": 0.0,
+                    # Quality score fields (set once from first row — not day-segmentable)
+                    "quality_score": qi.quality_score or 0,
+                    "creative_quality_score": qs_map.get(int(qi.creative_quality_score) if qi.creative_quality_score else 0, ""),
+                    "post_click_quality": qs_map.get(int(qi.post_click_quality_score) if qi.post_click_quality_score else 0, ""),
+                    "search_predicted_ctr": qs_map.get(int(qi.search_predicted_ctr) if qi.search_predicted_ctr else 0, ""),
+                    # Impression share — average across rows
+                    "_is_rows": 0,
+                    "impression_share": 0.0,
+                    "top_impression_pct": 0.0,
+                    "abs_top_impression_pct": 0.0,
+                    "budget_lost_is": 0.0,
+                    "rank_lost_is": 0.0,
                 }
             agg[keyword]["impressions"] += impressions
             agg[keyword]["clicks"] += clicks
             agg[keyword]["cost"] += cost
             agg[keyword]["conversions"] += conversions
+            # Impression share — accumulate for averaging
+            agg[keyword]["_is_rows"] += 1
+            agg[keyword]["impression_share"] += float(row.metrics.search_impression_share or 0)
+            agg[keyword]["top_impression_pct"] += float(row.metrics.search_top_impression_percentage or 0)
+            agg[keyword]["abs_top_impression_pct"] += float(row.metrics.search_absolute_top_impression_percentage or 0)
+            agg[keyword]["budget_lost_is"] += float(row.metrics.search_budget_lost_impression_share or 0)
+            agg[keyword]["rank_lost_is"] += float(row.metrics.search_rank_lost_impression_share or 0)
 
         for kw_data in agg.values():
             clicks = kw_data["clicks"] or 1
             kw_data["avg_cpc"] = round(kw_data["cost"] / clicks, 4) if kw_data["cost"] > 0 else 0.0
+            # Average impression share over number of rows seen
+            n = kw_data.pop("_is_rows") or 1
+            kw_data["impression_share"] = round(kw_data["impression_share"] / n, 4)
+            kw_data["top_impression_pct"] = round(kw_data["top_impression_pct"] / n, 4)
+            kw_data["abs_top_impression_pct"] = round(kw_data["abs_top_impression_pct"] / n, 4)
+            kw_data["budget_lost_is"] = round(kw_data["budget_lost_is"] / n, 4)
+            kw_data["rank_lost_is"] = round(kw_data["rank_lost_is"] / n, 4)
             results.append(kw_data)
 
         logger.info(f"Found {len(results)} unique keywords in keyword_view")
@@ -278,6 +319,41 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
             logger.error(f"Error syncing lead {lead.get('id', '?')}: {e}")
             errors += 1
 
+    # Pass 3: Search terms (actual user queries) — persist to cache for reports + AI
+    logger.info("Fetching search terms report...")
+    try:
+        from keyword_planner import fetch_search_terms, fetch_geo_performance, fetch_schedule_performance
+        search_terms = fetch_search_terms(days=30)
+        logger.info(f"Search terms synced: {len(search_terms)} terms cached")
+    except Exception as e:
+        logger.warning(f"Search terms fetch failed (non-fatal): {e}")
+        search_terms = []
+
+    # Pass 4: Geographic performance — cache for analysis
+    logger.info("Fetching geo performance...")
+    try:
+        geo_data = fetch_geo_performance(days=30)
+        if geo_data:
+            save_gads_geo_cache(geo_data, days=30)
+            logger.info(f"Geo performance synced: {len(geo_data)} locations cached")
+    except Exception as e:
+        logger.warning(f"Geo performance fetch failed (non-fatal): {e}")
+        geo_data = []
+
+    # Pass 5: Schedule / device / hour-of-day performance
+    logger.info("Fetching schedule performance...")
+    try:
+        schedule_data = fetch_schedule_performance(days=30)
+        hours = len(schedule_data.get("by_hour", []))
+        days_data = len(schedule_data.get("by_day", []))
+        devices = len(schedule_data.get("by_device", []))
+        if hours or days_data or devices:
+            save_gads_schedule_cache(schedule_data, days=30)
+            logger.info(f"Schedule performance synced: {hours}h, {days_data}d, {devices} devices")
+    except Exception as e:
+        logger.warning(f"Schedule performance fetch failed (non-fatal): {e}")
+        schedule_data = {}
+
     result = {
         "synced": synced,
         "skipped": skipped,
@@ -285,6 +361,9 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         "errors": errors,
         "gclids_in_google": len(gclid_map),
         "keywords_with_cost": len(keyword_costs),
+        "search_terms_cached": len(search_terms),
+        "geo_locations_cached": len(geo_data),
+        "schedule_hours_cached": len(schedule_data.get("by_hour", [])),
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result

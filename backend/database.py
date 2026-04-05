@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS optimizer_memory (
     key         TEXT NOT NULL,   -- the term or rule name (lowercase for matching)
     value       TEXT NOT NULL,   -- decision: 'negative', 'good_keyword', 'irrelevant', 'never_pause', etc.
     reason      TEXT NOT NULL,   -- human-readable explanation
+    campaign    TEXT DEFAULT '',  -- NULL/empty = global; campaign name = scoped to that campaign only
     author      TEXT NOT NULL DEFAULT 'admin',  -- 'admin' or 'ai_agent'
     active      INTEGER NOT NULL DEFAULT 1,     -- 1=active, 0=deactivated (soft delete)
     created_at  TEXT NOT NULL,
@@ -187,21 +188,80 @@ CREATE INDEX IF NOT EXISTS idx_optimizer_memory_category ON optimizer_memory(cat
 CREATE INDEX IF NOT EXISTS idx_optimizer_memory_key ON optimizer_memory(key, active);
 
 CREATE TABLE IF NOT EXISTS gads_keywords_cache (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword_text            TEXT NOT NULL,
+    match_type              TEXT DEFAULT '',
+    ad_group_name           TEXT DEFAULT '',
+    campaign_name           TEXT DEFAULT '',
+    impressions             INTEGER DEFAULT 0,
+    clicks                  INTEGER DEFAULT 0,
+    cost                    REAL DEFAULT 0.0,
+    avg_cpc                 REAL DEFAULT 0.0,
+    conversions             REAL DEFAULT 0.0,
+    quality_score           INTEGER DEFAULT 0,
+    creative_quality_score  TEXT DEFAULT '',
+    post_click_quality      TEXT DEFAULT '',
+    search_predicted_ctr    TEXT DEFAULT '',
+    impression_share        REAL DEFAULT 0.0,
+    top_impression_pct      REAL DEFAULT 0.0,
+    abs_top_impression_pct  REAL DEFAULT 0.0,
+    budget_lost_is          REAL DEFAULT 0.0,
+    rank_lost_is            REAL DEFAULT 0.0,
+    days                    INTEGER DEFAULT 30,
+    synced_at               TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key ON gads_keywords_cache(keyword_text, days);
+
+CREATE TABLE IF NOT EXISTS gads_search_terms_cache (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    keyword_text    TEXT NOT NULL,
-    match_type      TEXT DEFAULT '',
-    ad_group_name   TEXT DEFAULT '',
+    search_term     TEXT NOT NULL,
+    status          TEXT DEFAULT 'NONE',    -- ADDED / EXCLUDED / NONE
     campaign_name   TEXT DEFAULT '',
+    ad_group_name   TEXT DEFAULT '',
     impressions     INTEGER DEFAULT 0,
     clicks          INTEGER DEFAULT 0,
     cost            REAL DEFAULT 0.0,
-    avg_cpc         REAL DEFAULT 0.0,
     conversions     REAL DEFAULT 0.0,
+    cpc             REAL DEFAULT 0.0,
     days            INTEGER DEFAULT 30,
     synced_at       TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key ON gads_keywords_cache(keyword_text, days);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_st_cache_key ON gads_search_terms_cache(search_term, campaign_name, days);
+
+CREATE TABLE IF NOT EXISTS gads_geo_cache (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_name   TEXT NOT NULL,
+    location_type   TEXT DEFAULT '',
+    campaign_name   TEXT DEFAULT '',
+    impressions     INTEGER DEFAULT 0,
+    clicks          INTEGER DEFAULT 0,
+    cost            REAL DEFAULT 0.0,
+    conversions     REAL DEFAULT 0.0,
+    cpc             REAL DEFAULT 0.0,
+    conversion_rate REAL DEFAULT 0.0,
+    days            INTEGER DEFAULT 30,
+    synced_at       TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_geo_cache_key ON gads_geo_cache(location_name, campaign_name, days);
+
+CREATE TABLE IF NOT EXISTS gads_schedule_cache (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    segment_type    TEXT NOT NULL,  -- 'hour' / 'day' / 'device'
+    segment_value   TEXT NOT NULL,  -- hour 0-23, day name, device name
+    impressions     INTEGER DEFAULT 0,
+    clicks          INTEGER DEFAULT 0,
+    cost            REAL DEFAULT 0.0,
+    conversions     REAL DEFAULT 0.0,
+    cpc             REAL DEFAULT 0.0,
+    conversion_rate REAL DEFAULT 0.0,
+    days            INTEGER DEFAULT 30,
+    synced_at       TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_schedule_cache_key ON gads_schedule_cache(segment_type, segment_value, days);
 """
 
 LIFECYCLE_STAGES = [
@@ -344,6 +404,7 @@ def _migrate(conn):
             key         TEXT NOT NULL,
             value       TEXT NOT NULL,
             reason      TEXT NOT NULL,
+            campaign    TEXT DEFAULT '',
             author      TEXT NOT NULL DEFAULT 'admin',
             active      INTEGER NOT NULL DEFAULT 1,
             created_at  TEXT NOT NULL,
@@ -352,6 +413,12 @@ def _migrate(conn):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_optimizer_memory_category ON optimizer_memory(category, active)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_optimizer_memory_key ON optimizer_memory(key, active)")
+    # Add campaign column to existing optimizer_memory tables (migration)
+    try:
+        conn.execute("ALTER TABLE optimizer_memory ADD COLUMN campaign TEXT DEFAULT ''")
+    except Exception:
+        pass  # column already exists
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_optimizer_memory_campaign ON optimizer_memory(campaign, active)")
 
     # Google Ads keywords cache
     conn.execute("""
@@ -372,24 +439,106 @@ def _migrate(conn):
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key ON gads_keywords_cache(keyword_text, days)")
 
+    # Add quality score and impression share columns to keywords cache (migration)
+    kw_cache_cols = {row[1] for row in conn.execute("PRAGMA table_info(gads_keywords_cache)").fetchall()}
+    kw_new_cols = [
+        ("quality_score",           "INTEGER DEFAULT 0"),
+        ("creative_quality_score",  "TEXT DEFAULT ''"),    # BELOW_AVERAGE / AVERAGE / ABOVE_AVERAGE
+        ("post_click_quality",      "TEXT DEFAULT ''"),
+        ("search_predicted_ctr",    "TEXT DEFAULT ''"),
+        ("impression_share",        "REAL DEFAULT 0.0"),   # 0.0–1.0 (fraction, not percent)
+        ("top_impression_pct",      "REAL DEFAULT 0.0"),
+        ("abs_top_impression_pct",  "REAL DEFAULT 0.0"),
+        ("budget_lost_is",          "REAL DEFAULT 0.0"),   # lost IS due to budget
+        ("rank_lost_is",            "REAL DEFAULT 0.0"),   # lost IS due to rank/quality
+    ]
+    for col_name, col_type in kw_new_cols:
+        if col_name not in kw_cache_cols:
+            try:
+                conn.execute(f"ALTER TABLE gads_keywords_cache ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+
+    # Search terms cache table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_search_terms_cache (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_term     TEXT NOT NULL,
+            status          TEXT DEFAULT 'NONE',
+            campaign_name   TEXT DEFAULT '',
+            ad_group_name   TEXT DEFAULT '',
+            impressions     INTEGER DEFAULT 0,
+            clicks          INTEGER DEFAULT 0,
+            cost            REAL DEFAULT 0.0,
+            conversions     REAL DEFAULT 0.0,
+            cpc             REAL DEFAULT 0.0,
+            days            INTEGER DEFAULT 30,
+            synced_at       TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_st_cache_key ON gads_search_terms_cache(search_term, campaign_name, days)")
+
+    # Geo performance cache
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_geo_cache (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_name   TEXT NOT NULL,
+            location_type   TEXT DEFAULT '',
+            campaign_name   TEXT DEFAULT '',
+            impressions     INTEGER DEFAULT 0,
+            clicks          INTEGER DEFAULT 0,
+            cost            REAL DEFAULT 0.0,
+            conversions     REAL DEFAULT 0.0,
+            cpc             REAL DEFAULT 0.0,
+            conversion_rate REAL DEFAULT 0.0,
+            days            INTEGER DEFAULT 30,
+            synced_at       TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_geo_cache_key ON gads_geo_cache(location_name, campaign_name, days)")
+
+    # Schedule / device / hour-of-day cache
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_schedule_cache (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            segment_type    TEXT NOT NULL,
+            segment_value   TEXT NOT NULL,
+            impressions     INTEGER DEFAULT 0,
+            clicks          INTEGER DEFAULT 0,
+            cost            REAL DEFAULT 0.0,
+            conversions     REAL DEFAULT 0.0,
+            cpc             REAL DEFAULT 0.0,
+            conversion_rate REAL DEFAULT 0.0,
+            days            INTEGER DEFAULT 30,
+            synced_at       TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_schedule_cache_key ON gads_schedule_cache(segment_type, segment_value, days)")
+
     # Seed default memories if table is empty
     existing = conn.execute("SELECT COUNT(*) FROM optimizer_memory").fetchone()[0]
     if existing == 0:
         now = datetime.now(timezone.utc).isoformat()
+        # (category, key, value, reason, campaign, author)
+        # campaign='' means global (applies to all campaigns)
         seeds = [
             ('keyword_override', 'all on 4 dental implants', 'never_pause',
-             'Core campaign keyword — zero leads is gclid attribution gap, not actual performance', 'admin'),
+             'Core campaign keyword — zero leads is gclid attribution gap, not actual performance',
+             '', 'admin'),
             ('term_classification', 'free gingival graft', 'irrelevant',
-             'Periodontal procedure name — patient already has implant, not a new full-arch case buyer', 'admin'),
+             'Periodontal procedure — not a buyer for implants/cosmetics. NOTE: valid for gum grafting campaigns.',
+             'grafton_nxtsmile_all_on_x', 'admin'),
             ('term_classification', 'free connective tissue graft', 'irrelevant',
-             'Periodontal procedure name — not relevant to implant/cosmetic campaign', 'admin'),
+             'Periodontal procedure — not relevant to implant or cosmetic campaigns.',
+             'grafton_nxtsmile_all_on_x', 'admin'),
             ('general', 'attribution_note', 'gclid_tracking_started_apr_2026',
-             'All leads before April 2026 have no keyword attribution. Zero leads on a keyword before this date is not real data.', 'admin'),
+             'All leads before April 2026 have no keyword attribution. Zero leads on a keyword before this date is not real data.',
+             '', 'admin'),
         ]
-        for category, key, value, reason, author in seeds:
+        for category, key, value, reason, campaign, author in seeds:
             conn.execute(
-                "INSERT INTO optimizer_memory (category, key, value, reason, author, active, created_at, updated_at) VALUES (?,?,?,?,?,1,?,?)",
-                (category, key, value, reason, author, now, now)
+                "INSERT INTO optimizer_memory (category, key, value, reason, campaign, author, active, created_at, updated_at) VALUES (?,?,?,?,?,?,1,?,?)",
+                (category, key, value, reason, campaign, author, now, now)
             )
 
 
@@ -810,45 +959,6 @@ def get_ga4_cache(report_type: str, days: int, max_age_hours: int = 24) -> Optio
             return None
 
 
-def save_gads_keywords_cache(keywords: list, days: int = 30):
-    """
-    Save Google Ads keyword performance to cache.
-    keywords: list of dicts with keyword_text, match_type, ad_group_name, campaign_name,
-              impressions, clicks, cost, avg_cpc, conversions
-    """
-    now = _now()
-    with _conn() as conn:
-        for kw in keywords:
-            conn.execute("""
-                INSERT INTO gads_keywords_cache
-                    (keyword_text, match_type, ad_group_name, campaign_name,
-                     impressions, clicks, cost, avg_cpc, conversions, days, synced_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(keyword_text, days) DO UPDATE SET
-                    match_type=excluded.match_type,
-                    ad_group_name=excluded.ad_group_name,
-                    campaign_name=excluded.campaign_name,
-                    impressions=excluded.impressions,
-                    clicks=excluded.clicks,
-                    cost=excluded.cost,
-                    avg_cpc=excluded.avg_cpc,
-                    conversions=excluded.conversions,
-                    synced_at=excluded.synced_at
-            """, (
-                kw.get("keyword_text", ""),
-                kw.get("match_type", ""),
-                kw.get("ad_group_name", ""),
-                kw.get("campaign_name", ""),
-                kw.get("impressions", 0),
-                kw.get("clicks", 0),
-                kw.get("cost", 0.0),
-                kw.get("avg_cpc", 0.0),
-                kw.get("conversions", 0.0),
-                days,
-                now,
-            ))
-
-
 def get_keyword_stats() -> list:
     """
     Return keyword performance joined with lead/revenue attribution.
@@ -863,10 +973,20 @@ def get_keyword_stats() -> list:
                 COALESCE(k.campaign_name, l.campaign_name) AS campaign_name,
                 COALESCE(k.match_type, '')                 AS match_type,
                 -- Google Ads metrics (from cache)
-                COALESCE(k.impressions, 0)  AS impressions,
-                COALESCE(k.clicks, 0)       AS gads_clicks,
-                COALESCE(k.cost, 0.0)       AS total_cost,
-                COALESCE(k.avg_cpc, 0.0)    AS avg_cpc,
+                COALESCE(k.impressions, 0)          AS impressions,
+                COALESCE(k.clicks, 0)               AS gads_clicks,
+                COALESCE(k.cost, 0.0)               AS total_cost,
+                COALESCE(k.avg_cpc, 0.0)            AS avg_cpc,
+                -- Quality & competitive signals
+                COALESCE(k.quality_score, 0)        AS quality_score,
+                COALESCE(k.creative_quality_score,'') AS creative_quality_score,
+                COALESCE(k.post_click_quality,'')   AS post_click_quality,
+                COALESCE(k.search_predicted_ctr,'') AS search_predicted_ctr,
+                COALESCE(k.impression_share, 0.0)   AS impression_share,
+                COALESCE(k.top_impression_pct, 0.0) AS top_impression_pct,
+                COALESCE(k.abs_top_impression_pct, 0.0) AS abs_top_impression_pct,
+                COALESCE(k.budget_lost_is, 0.0)     AS budget_lost_is,
+                COALESCE(k.rank_lost_is, 0.0)       AS rank_lost_is,
                 -- Lead attribution (from leads table)
                 COUNT(l.id)  AS lead_count,
                 SUM(CASE WHEN l.stage IN ('scheduled','showed','no_show',
@@ -902,6 +1022,16 @@ def get_keyword_stats() -> list:
                 0                       AS gads_clicks,
                 SUM(l.click_cost)       AS total_cost,
                 AVG(NULLIF(l.click_cost,0)) AS avg_cpc,
+                -- Quality & competitive signals (not available for non-cached keywords)
+                0                       AS quality_score,
+                ''                      AS creative_quality_score,
+                ''                      AS post_click_quality,
+                ''                      AS search_predicted_ctr,
+                0.0                     AS impression_share,
+                0.0                     AS top_impression_pct,
+                0.0                     AS abs_top_impression_pct,
+                0.0                     AS budget_lost_is,
+                0.0                     AS rank_lost_is,
                 COUNT(l.id)             AS lead_count,
                 SUM(CASE WHEN l.stage IN ('scheduled','showed','no_show',
                     'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS scheduled_count,
@@ -928,70 +1058,350 @@ def get_keyword_stats() -> list:
         return [dict(r) for r in rows]
 
 
+# ─── Google Ads Extended Caches ───────────────────────────────────────────────
+
+def save_gads_keywords_cache(keywords: list, days: int = 30):
+    """
+    Save Google Ads keyword performance to cache (overwrites on conflict).
+    Accepts the expanded field set including quality score and impression share.
+    """
+    now = _now()
+    with _conn() as conn:
+        for kw in keywords:
+            conn.execute("""
+                INSERT INTO gads_keywords_cache
+                    (keyword_text, match_type, ad_group_name, campaign_name,
+                     impressions, clicks, cost, avg_cpc, conversions,
+                     quality_score, creative_quality_score, post_click_quality,
+                     search_predicted_ctr, impression_share, top_impression_pct,
+                     abs_top_impression_pct, budget_lost_is, rank_lost_is,
+                     days, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(keyword_text, days) DO UPDATE SET
+                    match_type=excluded.match_type,
+                    ad_group_name=excluded.ad_group_name,
+                    campaign_name=excluded.campaign_name,
+                    impressions=excluded.impressions,
+                    clicks=excluded.clicks,
+                    cost=excluded.cost,
+                    avg_cpc=excluded.avg_cpc,
+                    conversions=excluded.conversions,
+                    quality_score=excluded.quality_score,
+                    creative_quality_score=excluded.creative_quality_score,
+                    post_click_quality=excluded.post_click_quality,
+                    search_predicted_ctr=excluded.search_predicted_ctr,
+                    impression_share=excluded.impression_share,
+                    top_impression_pct=excluded.top_impression_pct,
+                    abs_top_impression_pct=excluded.abs_top_impression_pct,
+                    budget_lost_is=excluded.budget_lost_is,
+                    rank_lost_is=excluded.rank_lost_is,
+                    synced_at=excluded.synced_at
+            """, (
+                kw.get("keyword_text", ""),
+                kw.get("match_type", ""),
+                kw.get("ad_group_name", ""),
+                kw.get("campaign_name", ""),
+                kw.get("impressions", 0),
+                kw.get("clicks", 0),
+                kw.get("cost", 0.0),
+                kw.get("avg_cpc", 0.0),
+                kw.get("conversions", 0.0),
+                kw.get("quality_score", 0),
+                kw.get("creative_quality_score", ""),
+                kw.get("post_click_quality", ""),
+                kw.get("search_predicted_ctr", ""),
+                kw.get("impression_share", 0.0),
+                kw.get("top_impression_pct", 0.0),
+                kw.get("abs_top_impression_pct", 0.0),
+                kw.get("budget_lost_is", 0.0),
+                kw.get("rank_lost_is", 0.0),
+                days,
+                now,
+            ))
+
+
+def save_gads_search_terms_cache(terms: list, days: int = 30):
+    """Save search terms from search_term_view to cache."""
+    now = _now()
+    with _conn() as conn:
+        for t in terms:
+            conn.execute("""
+                INSERT INTO gads_search_terms_cache
+                    (search_term, status, campaign_name, ad_group_name,
+                     impressions, clicks, cost, conversions, cpc, days, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(search_term, campaign_name, days) DO UPDATE SET
+                    status=excluded.status,
+                    ad_group_name=excluded.ad_group_name,
+                    impressions=excluded.impressions,
+                    clicks=excluded.clicks,
+                    cost=excluded.cost,
+                    conversions=excluded.conversions,
+                    cpc=excluded.cpc,
+                    synced_at=excluded.synced_at
+            """, (
+                t.get("search_term", ""),
+                t.get("status", "NONE"),
+                t.get("campaign_name", ""),
+                t.get("ad_group_name", ""),
+                t.get("impressions", 0),
+                t.get("clicks", 0),
+                t.get("cost", 0.0),
+                t.get("conversions", 0.0),
+                t.get("cpc", 0.0),
+                days,
+                now,
+            ))
+
+
+def get_search_term_stats(campaign_name: str = "", days: int = 30) -> list:
+    """
+    Return cached search terms joined with lead attribution.
+    campaign_name: filter to a specific campaign, or '' for all.
+    """
+    with _conn() as conn:
+        where = "WHERE s.days = ?"
+        params: list = [days]
+        if campaign_name:
+            where += " AND LOWER(s.campaign_name) LIKE ?"
+            params.append(f"%{campaign_name.lower()}%")
+
+        rows = conn.execute(f"""
+            SELECT
+                s.search_term,
+                s.status,
+                s.campaign_name,
+                s.ad_group_name,
+                s.impressions,
+                s.clicks,
+                s.cost,
+                s.conversions  AS gads_conversions,
+                s.cpc,
+                COUNT(l.id)    AS lead_count,
+                COALESCE(SUM(l.attributed_production), 0) AS revenue,
+                s.synced_at
+            FROM gads_search_terms_cache s
+            LEFT JOIN leads l ON LOWER(l.search_term) = LOWER(s.search_term)
+            {where}
+            GROUP BY s.search_term, s.campaign_name
+            ORDER BY s.cost DESC, s.clicks DESC
+        """, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_gads_geo_cache(geo_data: list, days: int = 30):
+    """Save geographic performance data to cache."""
+    now = _now()
+    with _conn() as conn:
+        for g in geo_data:
+            conn.execute("""
+                INSERT INTO gads_geo_cache
+                    (location_name, location_type, campaign_name,
+                     impressions, clicks, cost, conversions, cpc, conversion_rate, days, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(location_name, campaign_name, days) DO UPDATE SET
+                    location_type=excluded.location_type,
+                    impressions=excluded.impressions,
+                    clicks=excluded.clicks,
+                    cost=excluded.cost,
+                    conversions=excluded.conversions,
+                    cpc=excluded.cpc,
+                    conversion_rate=excluded.conversion_rate,
+                    synced_at=excluded.synced_at
+            """, (
+                g.get("location_name", ""),
+                g.get("location_type", ""),
+                g.get("campaign_name", ""),
+                g.get("impressions", 0),
+                g.get("clicks", 0),
+                g.get("cost", 0.0),
+                g.get("conversions", 0.0),
+                g.get("cpc", 0.0),
+                g.get("conversion_rate", 0.0),
+                days,
+                now,
+            ))
+
+
+def get_geo_stats(days: int = 30) -> list:
+    """Return cached geographic performance data."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT location_name, location_type, campaign_name,
+                   impressions, clicks, cost, conversions, cpc, conversion_rate, synced_at
+            FROM gads_geo_cache
+            WHERE days = ?
+            ORDER BY conversions DESC, clicks DESC
+        """, (days,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_gads_schedule_cache(schedule_data: dict, days: int = 30):
+    """
+    Save hour/day/device performance data to cache.
+    schedule_data: {"by_hour": [...], "by_day": [...], "by_device": [...]}
+    """
+    now = _now()
+    entries = []
+    for item in schedule_data.get("by_hour", []):
+        entries.append(("hour", str(item.get("hour", "")), item))
+    for item in schedule_data.get("by_day", []):
+        entries.append(("day", item.get("day", ""), item))
+    for item in schedule_data.get("by_device", []):
+        entries.append(("device", item.get("device", ""), item))
+
+    with _conn() as conn:
+        for seg_type, seg_val, d in entries:
+            conn.execute("""
+                INSERT INTO gads_schedule_cache
+                    (segment_type, segment_value, impressions, clicks, cost,
+                     conversions, cpc, conversion_rate, days, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(segment_type, segment_value, days) DO UPDATE SET
+                    impressions=excluded.impressions,
+                    clicks=excluded.clicks,
+                    cost=excluded.cost,
+                    conversions=excluded.conversions,
+                    cpc=excluded.cpc,
+                    conversion_rate=excluded.conversion_rate,
+                    synced_at=excluded.synced_at
+            """, (
+                seg_type, seg_val,
+                d.get("impressions", 0),
+                d.get("clicks", 0),
+                d.get("cost", 0.0),
+                d.get("conversions", 0.0),
+                d.get("cpc", 0.0),
+                d.get("conversion_rate", 0.0),
+                days,
+                now,
+            ))
+
+
+def get_schedule_stats(days: int = 30) -> dict:
+    """Return cached schedule / device performance data."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT segment_type, segment_value, impressions, clicks,
+                   cost, conversions, cpc, conversion_rate
+            FROM gads_schedule_cache
+            WHERE days = ?
+            ORDER BY segment_type, segment_value
+        """, (days,)).fetchall()
+        result: dict = {"by_hour": [], "by_day": [], "by_device": []}
+        for r in rows:
+            d = dict(r)
+            seg_type = d.pop("segment_type")
+            seg_val = d.pop("segment_value")
+            if seg_type == "hour":
+                d["hour"] = int(seg_val) if seg_val.isdigit() else 0
+                result["by_hour"].append(d)
+            elif seg_type == "day":
+                d["day"] = seg_val
+                result["by_day"].append(d)
+            elif seg_type == "device":
+                d["device"] = seg_val
+                result["by_device"].append(d)
+        return result
+
+
 # ─── Optimizer Memory ─────────────────────────────────────────────────────────
 
 def get_optimizer_memory(category: Optional[str] = None, active_only: bool = True) -> list:
     """Return all optimizer memory entries, optionally filtered by category."""
     with _conn() as conn:
+        base = "WHERE active=1" if active_only else "WHERE 1=1"
         if category:
             rows = conn.execute(
-                "SELECT * FROM optimizer_memory WHERE category=? AND active=? ORDER BY category, key",
-                (category, 1 if active_only else 0)
-            ).fetchall()
-        elif active_only:
-            rows = conn.execute(
-                "SELECT * FROM optimizer_memory WHERE active=1 ORDER BY category, key"
+                f"SELECT * FROM optimizer_memory {base} AND category=? ORDER BY campaign DESC, category, key",
+                (category,)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM optimizer_memory ORDER BY category, key"
+                f"SELECT * FROM optimizer_memory {base} ORDER BY campaign DESC, category, key"
             ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_optimizer_memory_dict() -> dict:
+def get_optimizer_memory_dict(campaign: str = '') -> dict:
     """
     Return memory as a structured dict for fast lookup in the optimizer.
-    {
-      'term_classifications': {'search term': 'value', ...},
-      'keyword_overrides': {'keyword': 'value', ...},
-      'campaign_rules': {'rule_name': 'value', ...},
-    }
+    Scoping rules:
+      - Global entries (campaign='') apply to ALL campaigns.
+      - Campaign-specific entries (campaign=X) apply ONLY to campaign X and OVERRIDE globals.
+
+    Returns:
+      {
+        'term_classifications': {'search term': {'value': ..., 'reason': ..., 'scope': 'global'|'campaign'}},
+        'keyword_overrides': {...},
+        'campaign_rules': {...},
+        'general': {...},
+      }
     """
     entries = get_optimizer_memory(active_only=True)
+    campaign_lower = (campaign or '').lower().strip()
+
     result = {
         'term_classifications': {},
         'keyword_overrides': {},
         'campaign_rules': {},
         'general': {},
     }
+
+    def _bucket(cat):
+        if cat == 'term_classification': return 'term_classifications'
+        if cat == 'keyword_override':    return 'keyword_overrides'
+        if cat == 'campaign_rule':       return 'campaign_rules'
+        return 'general'
+
+    # First pass: load global entries (campaign='')
     for e in entries:
+        entry_camp = (e.get('campaign') or '').lower().strip()
+        if entry_camp:
+            continue  # skip campaign-specific on first pass
         key = e['key'].lower()
-        val = e['value']
-        if e['category'] == 'term_classification':
-            result['term_classifications'][key] = val
-        elif e['category'] == 'keyword_override':
-            result['keyword_overrides'][key] = val
-        elif e['category'] == 'campaign_rule':
-            result['campaign_rules'][key] = val
-        elif e['category'] == 'general':
-            result['general'][key] = val
+        bucket = _bucket(e['category'])
+        result[bucket][key] = {
+            'value': e['value'],
+            'reason': e['reason'],
+            'scope': 'global',
+        }
+
+    # Second pass: apply campaign-specific overrides (these win)
+    if campaign_lower:
+        for e in entries:
+            entry_camp = (e.get('campaign') or '').lower().strip()
+            if not entry_camp:
+                continue  # already handled globals
+            # Match if campaign_lower contains the entry's campaign fragment or exact match
+            if entry_camp not in campaign_lower and campaign_lower not in entry_camp:
+                continue
+            key = e['key'].lower()
+            bucket = _bucket(e['category'])
+            result[bucket][key] = {
+                'value': e['value'],
+                'reason': e['reason'],
+                'scope': f'campaign:{e["campaign"]}',
+            }
+
     return result
 
 
-def add_optimizer_memory(category: str, key: str, value: str, reason: str, author: str = 'admin') -> dict:
-    """Add a new memory entry. Returns the created record."""
+def add_optimizer_memory(category: str, key: str, value: str, reason: str,
+                         campaign: str = '', author: str = 'admin') -> dict:
+    """Add a new memory entry. Campaign='' means global."""
     now = _now()
     key_lower = key.strip().lower()
+    campaign_lower = (campaign or '').strip().lower()
     with _conn() as conn:
-        # Deactivate any existing entry with same category+key
+        # Deactivate existing entry with same category+key+campaign scope
         conn.execute(
-            "UPDATE optimizer_memory SET active=0, updated_at=? WHERE category=? AND key=? AND active=1",
-            (now, category, key_lower)
+            "UPDATE optimizer_memory SET active=0, updated_at=? WHERE category=? AND key=? AND LOWER(COALESCE(campaign,''))=? AND active=1",
+            (now, category, key_lower, campaign_lower)
         )
         cursor = conn.execute(
-            "INSERT INTO optimizer_memory (category, key, value, reason, author, active, created_at, updated_at) VALUES (?,?,?,?,?,1,?,?)",
-            (category, key_lower, value, reason, author, now, now)
+            "INSERT INTO optimizer_memory (category, key, value, reason, campaign, author, active, created_at, updated_at) VALUES (?,?,?,?,?,?,1,?,?)",
+            (category, key_lower, value, reason, campaign.strip(), author, now, now)
         )
         row = conn.execute("SELECT * FROM optimizer_memory WHERE id=?", (cursor.lastrowid,)).fetchone()
         return dict(row)

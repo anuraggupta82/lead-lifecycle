@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     office_phone: str = "508-318-4477"
     practice_name: str = "Grafton Dental Care"
     practice_url: str = "https://nxtsmile.com"
+    booking_url: str = "https://patient.rocks/Dashboard/PatientDashboard/N2NiNzM4ZGUtM2IxYS00YjZhLWJjMGItMjAxZjBl"
 
     # GA4 Measurement Protocol
     ga4_measurement_id: str = "G-B3G7NKS06D"
@@ -75,6 +76,10 @@ class Settings(BaseSettings):
     google_ads_customer_id: str = "2498049505"
     google_ads_login_customer_id: str = "2498049505"
     google_ads_manager_id: str = "4814239317"
+    # Comma-separated Google geo target constant resource names for Keyword Planner
+    # e.g. "geoTargetConstants/1020615" for Worcester MA metro area
+    # Find IDs at: https://developers.google.com/google-ads/api/data/geotargets
+    google_ads_geo_target_ids: str = ""
 
     class Config:
         env_file = ".env"

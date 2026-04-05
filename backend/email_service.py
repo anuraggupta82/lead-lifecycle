@@ -154,7 +154,7 @@ def _fetch_smile_image(url: str) -> bytes:
 
 def send_day1_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
-    name = lead.get("first_name") or "there"
+    name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
     smile_url = lead.get("smile_image_url", "")
 
@@ -219,7 +219,7 @@ def send_day1_email(lead: dict, unsubscribe_url: str) -> bool:
         </p>
 
         <p style="text-align:center;margin:0 0 12px;">
-          <a href="{settings.practice_url}#consult"
+          <a href="{settings.booking_url}"
              style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
                     font-weight:700;text-decoration:none;font-size:16px;">
             Book My Free Consultation
@@ -279,7 +279,7 @@ def send_day1_email(lead: dict, unsubscribe_url: str) -> bool:
 
 def send_day7_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
-    name = lead.get("first_name") or "there"
+    name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
     goals = lead.get("goals", "")
     # Parse goals if stored as JSON string
@@ -352,7 +352,7 @@ def send_day7_email(lead: dict, unsubscribe_url: str) -> bool:
         {case_photo_block}
 
         <p style="text-align:center;margin:0 0 12px;">
-          <a href="{settings.practice_url}#consult"
+          <a href="{settings.booking_url}"
              style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
                     font-weight:700;text-decoration:none;font-size:16px;">
             Book My Free Consultation
@@ -412,7 +412,7 @@ def send_day7_email(lead: dict, unsubscribe_url: str) -> bool:
 
 def send_day14_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
-    name = lead.get("first_name") or "there"
+    name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
     smile_url = lead.get("smile_image_url", "")
 
@@ -474,7 +474,7 @@ def send_day14_email(lead: dict, unsubscribe_url: str) -> bool:
         </p>
 
         <p style="text-align:center;margin:0 0 12px;">
-          <a href="{settings.practice_url}#consult"
+          <a href="{settings.booking_url}"
              style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
                     font-weight:700;text-decoration:none;font-size:16px;">
             Book My Free Consultation
@@ -535,7 +535,7 @@ def send_day14_email(lead: dict, unsubscribe_url: str) -> bool:
 def send_day30_cold_email(lead: dict, unsubscribe_url: str) -> bool:
     """Final email — marks cold, leaves door open, deletes smile image."""
     settings = get_settings()
-    name = lead.get("first_name") or "there"
+    name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
     smile_url = lead.get("smile_image_url", "")
 
@@ -589,7 +589,7 @@ def send_day30_cold_email(lead: dict, unsubscribe_url: str) -> bool:
         </div>
 
         <p style="text-align:center;margin:0 0 4px;">
-          <a href="{settings.practice_url}#consult"
+          <a href="{settings.booking_url}"
              style="display:inline-block;background:#0d7a7f;color:#fff;padding:14px 32px;border-radius:10px;
                     font-weight:700;text-decoration:none;font-size:16px;">
             I'm Ready!
@@ -650,10 +650,10 @@ def send_day30_cold_email(lead: dict, unsubscribe_url: str) -> bool:
 def send_no_show_email(lead: dict, unsub_url: str) -> bool:
     """No-show follow-up — encourage rebooking with a deposit after missed appointment."""
     settings = get_settings()
-    name = lead.get("first_name") or "there"
+    name = (lead.get("first_name") or "there").title()
     lead_id = lead.get("lead_id") or lead.get("id", "")
     delete_url = f"http://localhost:{settings.port}/delete-image/{lead_id}"
-    booking_link = f"{settings.practice_url}/#consult"
+    booking_link = settings.booking_url
 
     html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0 auto">
     <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0">
@@ -686,7 +686,7 @@ def send_no_show_email(lead: dict, unsub_url: str) -> bool:
 def send_office_new_lead(lead: dict) -> bool:
     """Notify office when a new lead arrives."""
     settings = get_settings()
-    name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip() or "Unknown"
+    name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip().title() or "Unknown"
     source = lead.get("source", "unknown")
     email = lead.get("email", "")
     phone = lead.get("phone", "")

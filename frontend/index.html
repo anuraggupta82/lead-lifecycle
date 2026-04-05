@@ -735,6 +735,8 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
                   <thead>
                     <tr>
                       <th>Keyword</th>
+                      <th className="num" title="Quality Score (1-10). Below 5 = fix ad relevance or landing page.">QS</th>
+                      <th className="num" title="Impression Share — % of eligible impressions you're winning. Low = raise bid or improve quality.">Imp.Share</th>
                       <th className="num">Impr.</th>
                       <th className="num">Clicks</th>
                       <th className="num">Cost</th>
@@ -747,9 +749,25 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
                     </tr>
                   </thead>
                   <tbody>
-                    {campKeywords.map((k,i)=>(
+                    {campKeywords.map((k,i)=>{
+                      const qs = k.quality_score || 0;
+                      const qsColor = qs === 0 ? '#94a3b8' : qs >= 7 ? '#16a34a' : qs >= 5 ? '#d97706' : '#dc2626';
+                      const isRaw = k.impression_share || 0;
+                      const isPct = isRaw > 0 ? Math.round(isRaw * 100) : 0;
+                      const isColor = isPct === 0 ? '#94a3b8' : isPct >= 60 ? '#16a34a' : isPct >= 30 ? '#d97706' : '#dc2626';
+                      return (
                       <tr key={i} style={{opacity:(!k.lead_count&&!k.total_cost)?0.55:1}}>
                         <td style={{fontStyle:'italic'}}>{k.keyword}</td>
+                        <td className="num">
+                          {qs > 0 ? (
+                            <span style={{fontWeight:700,color:qsColor}}>{qs}</span>
+                          ) : <span style={{color:'#94a3b8'}}>—</span>}
+                        </td>
+                        <td className="num">
+                          {isPct > 0 ? (
+                            <span style={{fontWeight:600,color:isColor}}>{isPct}%</span>
+                          ) : <span style={{color:'#94a3b8'}}>—</span>}
+                        </td>
                         <td className="num">{(k.impressions||0).toLocaleString()}</td>
                         <td className="num">{(k.gads_clicks||0).toLocaleString()}</td>
                         <td className="num">{fmtMoney(k.total_cost||0)}</td>
@@ -760,7 +778,8 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
                         <td className="num money">{fmtMoney(k.revenue||0)}</td>
                         <td className="num">{k.roas ? k.roas.toFixed(1)+'x' : '—'}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
@@ -901,6 +920,79 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   );
 }
 
+// Static metadata for known jobs
+const JOB_META = {
+  follow_up_engine:  { label: 'Follow-up Engine',      schedule: 'Every 15 min', desc: 'Send due emails/SMS to leads' },
+  ga4_pull:          { label: 'GA4 Analytics Pull',     schedule: '5:30 AM',      desc: 'Pull website engagement from Google Analytics' },
+  gads_sync:         { label: 'Google Ads Sync',        schedule: '6:00 AM',      desc: 'Resolve gclid → keyword, campaign, CPC' },
+  ai_optimizer:      { label: 'AI Optimizer',           schedule: '7:00 AM',      desc: 'Analyze keywords, generate recommendations' },
+  od_sync:           { label: 'OD Matcher',             schedule: '10:00 PM',     desc: 'Match leads to patients, sync treatment stages' },
+  conversion_upload: { label: 'Conversion Upload',      schedule: '11:00 PM',     desc: 'Upload offline conversions to Google Ads' },
+};
+
+function ScheduledJobsSection() {
+  const [jobs, setJobs] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    api('/api/admin/jobs')
+      .then(r => { setJobs(r.jobs || []); setLoaded(true); })
+      .catch(() => setLoaded(true));
+  }, []);
+
+  // Merge API data with static metadata so all jobs always appear
+  const merged = Object.keys(JOB_META).map(id => {
+    const live = jobs.find(j => j.id === id) || {};
+    const meta = JOB_META[id];
+    return { id, ...meta, ...live, label: meta.label, schedule: meta.schedule, desc: meta.desc };
+  });
+
+  function fmtRunTime(iso) {
+    if (!iso) return <span style={{color:'var(--text-muted)',fontStyle:'italic'}}>not yet</span>;
+    const d = new Date(iso);
+    const ago = timeAgo(iso);
+    return <span title={d.toLocaleString()}>{d.toLocaleDateString('en-US',{month:'short',day:'numeric'})} {d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} <span style={{color:'var(--text-muted)',fontSize:9}}>({ago})</span></span>;
+  }
+
+  function fmtNextRun(iso) {
+    if (!iso) return <span style={{color:'var(--text-muted)'}}>—</span>;
+    const d = new Date(iso);
+    const inMs = d - Date.now();
+    const inH = Math.floor(inMs / 3600000);
+    const inM = Math.floor((inMs % 3600000) / 60000);
+    const label = inMs < 0 ? 'overdue' : inH > 0 ? `in ${inH}h ${inM}m` : `in ${inM}m`;
+    return <span title={d.toLocaleString()}>{d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} <span style={{color:'var(--text-muted)',fontSize:9}}>({label})</span></span>;
+  }
+
+  return (
+    <div className="report-section">
+      <div className="report-title">Scheduled Jobs</div>
+      <table className="report-table">
+        <thead>
+          <tr>
+            <th>Job</th>
+            <th>Schedule</th>
+            <th>Description</th>
+            <th className="num">Last Ran</th>
+            <th className="num">Next Run</th>
+          </tr>
+        </thead>
+        <tbody>
+          {merged.map(job => (
+            <tr key={job.id}>
+              <td style={{fontWeight:500}}>{job.label}</td>
+              <td style={{color:'var(--text-muted)'}}>{job.schedule}</td>
+              <td style={{color:'var(--text-muted)',fontSize:10}}>{job.desc}</td>
+              <td className="num" style={{fontSize:10}}>{fmtRunTime(job.last_run)}</td>
+              <td className="num" style={{fontSize:10}}>{fmtNextRun(job.next_run)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 const MEMORY_CATEGORIES = [
   { value: 'term_classification', label: 'Term Classification', desc: 'How to classify a search term (negative, good_keyword, irrelevant)' },
   { value: 'keyword_override', label: 'Keyword Override', desc: 'Override optimizer decisions on specific keywords (never_pause, always_bid_up)' },
@@ -920,7 +1012,7 @@ function MemorySection() {
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ category: 'term_classification', key: '', value: '', reason: '' });
+  const [form, setForm] = useState({ category: 'term_classification', key: '', value: '', reason: '', campaign: '' });
   const [filterCat, setFilterCat] = useState('all');
 
   async function loadMemory() {
@@ -944,7 +1036,7 @@ function MemorySection() {
         method: 'POST',
         body: JSON.stringify(form),
       });
-      setForm({ category: 'term_classification', key: '', value: '', reason: '' });
+      setForm({ category: 'term_classification', key: '', value: '', reason: '', campaign: '' });
       setShowForm(false);
       await loadMemory();
     } catch(e) { alert('Failed to add: '+e.message); }
@@ -1016,6 +1108,14 @@ function MemorySection() {
                 onChange={e=>setForm(f=>({...f,reason:e.target.value}))} />
             </div>
           </div>
+          <div style={{marginBottom:8}}>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:3}}>
+              Campaign Scope <span style={{fontStyle:'italic',opacity:.7}}>(optional — leave blank for global / applies to all campaigns)</span>
+            </label>
+            <input type="text" className="search-box" style={{width:'100%',maxWidth:360}} value={form.campaign}
+              placeholder="e.g. grafton_nxtsmile_all_on_x — blank = applies to ALL campaigns"
+              onChange={e=>setForm(f=>({...f,campaign:e.target.value}))} />
+          </div>
           <button className="btn btn-teal btn-sm" onClick={addEntry} disabled={adding}>
             {adding ? 'Saving...' : 'Save to Memory'}
           </button>
@@ -1048,6 +1148,7 @@ function MemorySection() {
               <th>Category</th>
               <th>Key / Term</th>
               <th>Decision</th>
+              <th>Scope</th>
               <th>Reason</th>
               <th>By</th>
               <th></th>
@@ -1061,6 +1162,20 @@ function MemorySection() {
                 </span></td>
                 <td className="memory-key" style={{fontStyle:'italic'}}>{m.key}</td>
                 <td className="memory-value">{m.value}</td>
+                <td style={{whiteSpace:'nowrap'}}>
+                  {(m.campaign||'').trim() ? (
+                    <span style={{background:'#e8f4fd',color:'#1a6fa0',border:'1px solid #b3d9f5',
+                      borderRadius:4,padding:'2px 6px',fontSize:9,fontWeight:600,display:'inline-block',maxWidth:140,
+                      overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={m.campaign}>
+                      📌 {m.campaign}
+                    </span>
+                  ) : (
+                    <span style={{background:'#f0fdf4',color:'#166534',border:'1px solid #bbf7d0',
+                      borderRadius:4,padding:'2px 6px',fontSize:9,fontWeight:600}}>
+                      🌐 Global
+                    </span>
+                  )}
+                </td>
                 <td className="memory-reason" style={{fontSize:10,color:'var(--text-muted)'}}>{m.reason}</td>
                 <td className="memory-author">{m.author} · {timeAgo(m.created_at)}</td>
                 <td>
@@ -1075,6 +1190,149 @@ function MemorySection() {
     </div>
   );
 }
+
+function KeywordResearchSection() {
+  const [seeds, setSeeds] = useState('');
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [sortCol, setSortCol] = useState('avg_monthly_searches');
+  const [sortDir, setSortDir] = useState('desc');
+
+  async function runResearch() {
+    const kws = seeds.split('\n').map(s=>s.trim()).filter(Boolean);
+    if (!kws.length) { alert('Enter at least one keyword'); return; }
+    setLoading(true);
+    try {
+      const r = await api('/api/admin/keyword-research', {
+        method: 'POST',
+        body: JSON.stringify({ seed_keywords: kws }),
+      });
+      setResults(r.ideas || []);
+      setSearched(true);
+    } catch(e) { alert('Research failed: '+e.message); }
+    setLoading(false);
+  }
+
+  function toggleSort(col) {
+    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortCol(col); setSortDir('desc'); }
+  }
+
+  const sorted = [...results].sort((a,b) => {
+    const av = a[sortCol] ?? 0, bv = b[sortCol] ?? 0;
+    return sortDir === 'asc' ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
+  });
+
+  const compColor = c => c==='HIGH'?'#dc2626':c==='MEDIUM'?'#d97706':'#16a34a';
+
+  function SortTh({col, label, title}) {
+    const active = sortCol === col;
+    return (
+      <th className="num" title={title||''} style={{cursor:'pointer',userSelect:'none'}}
+        onClick={()=>toggleSort(col)}>
+        {label}{active ? (sortDir==='asc'?' ↑':' ↓') : ''}
+      </th>
+    );
+  }
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
+        <div>
+          <div className="report-title" style={{marginBottom:2}}>🔍 Keyword Research</div>
+          <p style={{fontSize:10,color:'var(--text-muted)'}}>
+            Google Keyword Planner — search volume, competition &amp; CPC for your market.
+            Use before launching a new campaign to validate keyword demand.
+          </p>
+        </div>
+      </div>
+
+      <div style={{display:'flex',gap:8,alignItems:'flex-start',marginBottom:12}}>
+        <textarea
+          style={{flex:1,minHeight:70,maxHeight:140,padding:'6px 8px',fontSize:11,
+            border:'1px solid var(--border)',borderRadius:6,fontFamily:'inherit',resize:'vertical'}}
+          placeholder={"One keyword per line:\ngum grafting near me\nfree gingival graft cost\ngum graft dentist worcester"}
+          value={seeds}
+          onChange={e=>setSeeds(e.target.value)}
+        />
+        <button className="btn btn-teal" onClick={runResearch} disabled={loading}
+          style={{whiteSpace:'nowrap',alignSelf:'flex-end'}}>
+          {loading ? 'Researching...' : 'Get Volume & CPCs'}
+        </button>
+      </div>
+
+      {searched && results.length === 0 && !loading && (
+        <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',padding:8}}>
+          No results returned. Check that Google Ads API credentials are configured.
+        </div>
+      )}
+
+      {sorted.length > 0 && (
+        <>
+          <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
+            {sorted.length} keywords — click column headers to sort
+          </div>
+          <div style={{overflowX:'auto'}}>
+          <table className="report-table" style={{fontSize:10}}>
+            <thead>
+              <tr>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleSort('keyword')}>
+                  Keyword {sortCol==='keyword'?(sortDir==='asc'?'↑':'↓'):''}
+                </th>
+                <SortTh col="avg_monthly_searches" label="Searches/mo"
+                  title="Average monthly searches in your target area" />
+                <th className="num" title="LOW = less competition, cheaper clicks. HIGH = more competition, expensive.">Competition</th>
+                <th className="num" title="Competition index 0-100. Higher = more advertisers bidding.">Comp. Index</th>
+                <SortTh col="low_cpc" label="Low CPC" title="Low end of top-of-page bid range" />
+                <SortTh col="high_cpc" label="High CPC" title="High end of top-of-page bid range" />
+                <th className="num" title="12-month search trend">Trend</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((kw,i)=>{
+                // Sparkline: last 6 months volumes
+                const trend = (kw.trend_monthly||[]).slice(0,6).reverse();
+                const maxVol = Math.max(...trend.map(t=>t.searches||0), 1);
+                return (
+                  <tr key={i}>
+                    <td style={{fontWeight:500}}>{kw.keyword}</td>
+                    <td className="num" style={{fontWeight:700}}>
+                      {(kw.avg_monthly_searches||0).toLocaleString()}
+                    </td>
+                    <td className="num">
+                      <span style={{fontWeight:700,color:compColor(kw.competition)}}>
+                        {kw.competition||'—'}
+                      </span>
+                    </td>
+                    <td className="num">{kw.competition_index||0}</td>
+                    <td className="num">{kw.low_cpc > 0 ? '$'+kw.low_cpc.toFixed(2) : '—'}</td>
+                    <td className="num">{kw.high_cpc > 0 ? '$'+kw.high_cpc.toFixed(2) : '—'}</td>
+                    <td className="num">
+                      {trend.length > 0 ? (
+                        <span style={{display:'inline-flex',gap:1,alignItems:'flex-end',height:14}}>
+                          {trend.map((t,ti)=>{
+                            const h = Math.max(2, Math.round((t.searches/maxVol)*14));
+                            return <span key={ti} style={{
+                              width:4,height:h+'px',borderRadius:1,
+                              background: h > 8 ? 'var(--teal)' : '#94a3b8',
+                              display:'inline-block'}} />;
+                          })}
+                        </span>
+                      ) : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 
 function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize }) {
   const [loading, setLoading] = useState({});
@@ -1226,29 +1484,11 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
         </div>
       )}
 
+      <KeywordResearchSection />
+
       <MemorySection />
 
-      <div className="report-section">
-        <div className="report-title">Scheduled Jobs</div>
-        <table className="report-table">
-          <thead>
-            <tr>
-              <th>Job</th>
-              <th>Schedule</th>
-              <th>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Firestore Sync</td><td>Every 15 min</td><td style={{color:'var(--text-muted)'}}>Pull new leads from nxtsmile.com</td></tr>
-            <tr><td>Follow-up Engine</td><td>Every 15 min</td><td style={{color:'var(--text-muted)'}}>Send due emails/SMS</td></tr>
-            <tr><td>GA4 Analytics Pull</td><td>5:30 AM</td><td style={{color:'var(--text-muted)'}}>Pull website engagement data from Google Analytics</td></tr>
-            <tr><td>Google Ads Sync</td><td>6:00 AM</td><td style={{color:'var(--text-muted)'}}>Resolve gclid → keyword, campaign, CPC</td></tr>
-            <tr><td>AI Optimizer</td><td>7:00 AM</td><td style={{color:'var(--text-muted)'}}>Analyze keywords, recommend optimizations</td></tr>
-            <tr><td>OD Matcher</td><td>10:00 PM</td><td style={{color:'var(--text-muted)'}}>Match leads to patients, sync treatment stages</td></tr>
-            <tr><td>Conversion Upload</td><td>11:00 PM</td><td style={{color:'var(--text-muted)'}}>Upload offline conversions to Google Ads</td></tr>
-          </tbody>
-        </table>
-      </div>
+      <ScheduledJobsSection />
 
       <div className="report-section">
         <div className="report-title">AI Report Engine</div>
