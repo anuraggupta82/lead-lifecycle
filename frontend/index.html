@@ -99,26 +99,27 @@
                      overflow: hidden; text-overflow: ellipsis; }
     .chip-appt { font-size: 8px; color: #059669; font-weight: 600; }
 
-    /* Detail panel */
-    .detail-overlay { position: fixed; top: 0; right: 0; bottom: 0; width: 400px;
-                      background: #fff; border-left: 1px solid var(--border);
-                      box-shadow: -4px 0 20px rgba(0,0,0,.08); z-index: 100;
-                      display: flex; flex-direction: column;
-                      transform: translateX(100%); transition: transform .2s ease; }
-    .detail-overlay.open { transform: translateX(0); }
+    /* Detail modal */
     .detail-backdrop { position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-                       background: rgba(0,0,0,.1); z-index: 99; }
-    .detail-header { padding: 12px 14px; border-bottom: 1px solid var(--border);
-                     display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-    .detail-close { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-muted); }
-    .detail-body { flex: 1; overflow-y: auto; padding: 12px 14px; }
+                       background: rgba(0,0,0,.45); z-index: 99;
+                       display: flex; align-items: center; justify-content: center; }
+    .detail-overlay { position: relative; width: 620px; max-width: 95vw;
+                      max-height: 88vh; background: #fff; border-radius: 12px;
+                      box-shadow: 0 8px 40px rgba(0,0,0,.18); z-index: 100;
+                      display: flex; flex-direction: column;
+                      opacity: 0; transform: scale(.96); transition: opacity .18s ease, transform .18s ease; }
+    .detail-overlay.open { opacity: 1; transform: scale(1); }
+    .detail-header { padding: 14px 18px; border-bottom: 1px solid var(--border);
+                     display: flex; align-items: center; gap: 8px; flex-shrink: 0; border-radius: 12px 12px 0 0; }
+    .detail-close { background: none; border: none; font-size: 18px; cursor: pointer; color: var(--text-muted); }
+    .detail-body { flex: 1; overflow-y: auto; padding: 14px 18px; }
     .detail-section { margin-bottom: 14px; }
     .detail-section-title { font-size: 10px; font-weight: 600; text-transform: uppercase;
                             color: var(--text-muted); letter-spacing: .4px; margin-bottom: 6px; }
-    .detail-row { display: flex; justify-content: space-between; padding: 3px 0;
-                  font-size: 11px; border-bottom: 1px solid #f5f5f5; }
-    .detail-row-label { color: var(--text-muted); }
-    .detail-row-value { font-weight: 500; text-align: right; max-width: 200px; word-break: break-all; }
+    .detail-row { display: flex; justify-content: space-between; align-items: flex-start;
+                  padding: 4px 0; font-size: 11px; border-bottom: 1px solid #f5f5f5; gap: 12px; }
+    .detail-row-label { color: var(--text-muted); flex-shrink: 0; }
+    .detail-row-value { font-weight: 500; text-align: right; word-break: break-word; white-space: normal; }
 
     /* Stage move menu */
     .stage-move-menu { position: absolute; top: 100%; right: 0; background: #fff; border: 1px solid var(--border);
@@ -368,9 +369,8 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const queue = detail?.follow_up_queue||[];
 
   return (
-    <React.Fragment>
-      <div className="detail-backdrop" onClick={onClose} />
-      <div className="detail-overlay open">
+    <div className="detail-backdrop" onClick={onClose}>
+      <div className="detail-overlay open" onClick={e=>e.stopPropagation()}>
         <div className="detail-header">
           <button className="detail-close" onClick={onClose}>✕</button>
           <div style={{flex:1}}>
@@ -569,7 +569,7 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
           )}
         </div>
       </div>
-    </React.Fragment>
+    </div>
   );
 }
 

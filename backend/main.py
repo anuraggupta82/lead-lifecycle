@@ -654,17 +654,23 @@ def admin_delete_lead(lead_id: str):
             logger.warning(f"Could not delete GCS image for lead {lead_id}: {e}")
 
     # Delete from Firestore via nxtsmile API
+    # Pass email in X-Lead-Email header so old docs (no 'id' field) can be found by email
     try:
         import requests as _req
         resp = _req.delete(
             f"{settings.nxtsmile_api}/api/leads/{lead_id}",
-            headers={"X-Secret": settings.firestore_secret},
+            headers={
+                "X-Secret": settings.firestore_secret,
+                "X-Lead-Email": lead.get("email", ""),
+            },
             timeout=10,
         )
+        result_body = resp.json() if resp.content else {}
         if resp.status_code in (200, 204, 404):
-            logger.info(f"Deleted lead {lead_id} from Firestore (status {resp.status_code})")
+            docs_deleted = result_body.get("firestore_docs_deleted", "?")
+            logger.info(f"Firestore delete for {lead_id}: {docs_deleted} doc(s) removed (status {resp.status_code})")
         else:
-            logger.warning(f"Firestore delete returned {resp.status_code} for lead {lead_id}")
+            logger.warning(f"Firestore delete returned {resp.status_code} for lead {lead_id}: {result_body}")
     except Exception as e:
         logger.warning(f"Could not delete lead {lead_id} from Firestore: {e}")
 
