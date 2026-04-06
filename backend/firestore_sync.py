@@ -20,18 +20,21 @@ def _normalize_firestore_lead(doc: dict) -> dict:
     lead_id = (
         raw.get("id") or
         raw.get("lead_id") or
-        raw.get("firestore_id") or
-        doc.get("firestore_id") or
         None
     )
 
-    # Firestore leads often lack an ID field — generate one from email
+    # Firestore leads may lack a proper ID field — generate deterministic one
+    # from email (matching save_lead logic: lead_<sha256[:16]>)
     if not lead_id:
         email = raw.get("email", "").strip().lower()
         if email:
-            lead_id = "fs_" + hashlib.sha256(email.encode()).hexdigest()[:12]
+            lead_id = "lead_" + hashlib.sha256(email.encode()).hexdigest()[:16]
         else:
-            return None
+            phone = (raw.get("phone") or raw.get("phone_number") or "").strip()
+            if phone:
+                lead_id = "lead_" + hashlib.sha256(phone.encode()).hexdigest()[:16]
+            else:
+                return None
 
     # Parse name — may be combined "full_name" or split
     first = raw.get("first_name") or raw.get("firstName") or ""
@@ -146,30 +149,67 @@ def sync_from_firestore() -> dict:
             logger.error(f"Error syncing lead {doc}: {e}")
             errors += 1
 
-    # Purge local Firestore-sourced leads (id starts with "fs_") that no longer
-    # exist in Firestore. This handles the case where a lead is deleted from
-    # Firestore (via admin delete) but the stale record remains in SQLite.
-    purged = 0
-    firestore_emails = {(d.get("email") or "").strip().lower() for d in docs if d.get("email")}
+    # --- Dedup: remove duplicate leads that have a canonical lead_ version ----
+    # Previous syncs may have created entries under fs_<hash>, random Firestore
+    # doc IDs (e.g. hpSVJzZBOX1SrT3MmF8X), or other non-canonical IDs.
+    # Keep the lead_ version, purge any other ID for the same email.
+    deduped = 0
     try:
         from database import get_all_leads, _conn
         local_leads = get_all_leads(limit=5000)
+        # Build email→lead_ canonical ID map
+        canonical_by_email = {}
         for lead in local_leads:
             lid = lead.get("id", "")
-            if not lid.startswith("fs_"):
-                continue  # not a Firestore-sourced lead
-            local_email = (lead.get("email") or "").strip().lower()
-            if local_email and local_email not in firestore_emails:
-                # This lead was from Firestore but its email is no longer there — purge
+            if lid.startswith("lead_"):
+                em = (lead.get("email") or "").strip().lower()
+                if em:
+                    canonical_by_email[em] = lid
+        # Purge any non-canonical lead whose email has a lead_ version
+        for lead in local_leads:
+            lid = lead.get("id", "")
+            if lid.startswith("lead_"):
+                continue  # this IS the canonical version — keep it
+            em = (lead.get("email") or "").strip().lower()
+            if em and em in canonical_by_email:
                 with _conn() as conn:
                     conn.execute("DELETE FROM lifecycle_events WHERE lead_id = ?", (lid,))
                     conn.execute("DELETE FROM follow_up_queue WHERE lead_id = ?", (lid,))
                     conn.execute("DELETE FROM lead_notes WHERE lead_id = ?", (lid,))
                     conn.execute("DELETE FROM leads WHERE id = ?", (lid,))
-                purged += 1
-                logger.info(f"Purged stale local lead {lid} ({local_email}) — no longer in Firestore")
+                deduped += 1
+                logger.info(f"Deduped non-canonical lead {lid} ({em}) — canonical is {canonical_by_email[em]}")
+    except Exception as e:
+        logger.warning(f"Dedup step failed (non-fatal): {e}")
+
+    # --- Purge: remove local leads deleted from Firestore --------------------
+    purged = 0
+    firestore_ids = {(d.get("id") or "").strip() for d in docs if d.get("id")}
+    firestore_emails = {(d.get("email") or "").strip().lower() for d in docs if d.get("email")}
+    try:
+        # Re-fetch after dedup to avoid stale references
+        local_leads = get_all_leads(limit=5000)
+        for lead in local_leads:
+            lid = lead.get("id", "")
+            if not (lid.startswith("fs_") or lid.startswith("lead_")):
+                continue
+            # Keep if the lead ID matches a current Firestore record
+            if lid in firestore_ids:
+                continue
+            # Keep if the email matches a current Firestore record
+            local_email = (lead.get("email") or "").strip().lower()
+            if local_email and local_email in firestore_emails:
+                continue
+            # This lead is gone from Firestore — purge it locally
+            with _conn() as conn:
+                conn.execute("DELETE FROM lifecycle_events WHERE lead_id = ?", (lid,))
+                conn.execute("DELETE FROM follow_up_queue WHERE lead_id = ?", (lid,))
+                conn.execute("DELETE FROM lead_notes WHERE lead_id = ?", (lid,))
+                conn.execute("DELETE FROM leads WHERE id = ?", (lid,))
+            purged += 1
+            logger.info(f"Purged stale local lead {lid} ({local_email}) — no longer in Firestore")
     except Exception as e:
         logger.warning(f"Purge step failed (non-fatal): {e}")
 
-    logger.info(f"Firestore sync complete: synced={synced} skipped={skipped} errors={errors} purged={purged}")
-    return {"synced": synced, "skipped": skipped, "errors": errors, "purged": purged}
+    logger.info(f"Firestore sync complete: synced={synced} skipped={skipped} errors={errors} deduped={deduped} purged={purged}")
+    return {"synced": synced, "skipped": skipped, "errors": errors, "deduped": deduped, "purged": purged}

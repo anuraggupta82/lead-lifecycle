@@ -655,20 +655,24 @@ def admin_delete_lead(lead_id: str):
 
     # Delete from Firestore via nxtsmile API
     # Pass email in X-Lead-Email header so old docs (no 'id' field) can be found by email
+    firestore_deleted = False
     try:
         import requests as _req
+        delete_url = f"{settings.nxtsmile_api}/api/leads/{lead_id}"
+        logger.info(f"Calling Firestore delete: DELETE {delete_url}")
         resp = _req.delete(
-            f"{settings.nxtsmile_api}/api/leads/{lead_id}",
+            delete_url,
             headers={
                 "X-Secret": settings.firestore_secret,
                 "X-Lead-Email": lead.get("email", ""),
             },
-            timeout=10,
+            timeout=15,
         )
         result_body = resp.json() if resp.content else {}
         if resp.status_code in (200, 204, 404):
             docs_deleted = result_body.get("firestore_docs_deleted", "?")
             logger.info(f"Firestore delete for {lead_id}: {docs_deleted} doc(s) removed (status {resp.status_code})")
+            firestore_deleted = True
         else:
             logger.warning(f"Firestore delete returned {resp.status_code} for lead {lead_id}: {result_body}")
     except Exception as e:
@@ -683,8 +687,8 @@ def admin_delete_lead(lead_id: str):
         conn.execute("DELETE FROM conversion_uploads WHERE lead_id = ?", (lead_id,))
         conn.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
 
-    logger.info(f"Lead {lead_id} ({lead.get('email','')}) permanently deleted by admin")
-    return {"status": "deleted", "lead_id": lead_id}
+    logger.info(f"Lead {lead_id} ({lead.get('email','')}) permanently deleted by admin (firestore={'yes' if firestore_deleted else 'FAILED'})")
+    return {"status": "deleted", "lead_id": lead_id, "firestore_deleted": firestore_deleted}
 
 
 # ─── Test Email ──────────────────────────────────────────────────────────────

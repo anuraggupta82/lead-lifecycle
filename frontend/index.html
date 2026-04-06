@@ -222,7 +222,7 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const ADMIN_PW = 'GDC-pipeline-2026!';
 const API = window.location.origin;
 
-const STAGES = ['new','auto_nurture','scheduled','no_show','showed','treatment_presented','treatment_accepted','treatment_completed'];
+const STAGES = ['new','auto_nurture','scheduled','no_show','showed','treatment_presented','treatment_accepted','treatment_completed','cold'];
 const STAGE_LABELS = {
   new:'New Lead', auto_nurture:'Auto-Nurture', scheduled:'Scheduled',
   no_show:'No-Show', showed:'Showed', treatment_presented:'Tx Presented',
@@ -366,7 +366,10 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   }
 
   async function deleteLead() {
-    await api('/api/admin/lead/' + lead.id, {method:'DELETE'});
+    const res = await api('/api/admin/lead/' + lead.id, {method:'DELETE'});
+    if (res && res.firestore_deleted === false) {
+      alert('Warning: Lead deleted locally but Firestore delete failed. The lead may reappear after sync.');
+    }
     onDelete(lead.id);
     onClose();
   }

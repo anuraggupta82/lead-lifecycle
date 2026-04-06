@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     # Database
     db_path: str = os.path.expanduser("~/grafton_pipeline/pipeline.db")
 
+    # Kill switch — set EMAILS_DISABLED=true in .env to block all outbound email
+    emails_disabled: bool = True
+
     # Email (Zoho SMTP — marketing emails from nXtsmile)
     smtp_host: str = "smtp.zoho.com"
     smtp_port: int = 587

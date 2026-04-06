@@ -170,6 +170,7 @@ def fetch_geo_performance(days: int = 30) -> list:
             geographic_view.location_type,
             geographic_view.country_criterion_id,
             campaign.name,
+            campaign.status,
             metrics.impressions,
             metrics.clicks,
             metrics.cost_micros,
@@ -255,18 +256,18 @@ def fetch_schedule_performance(days: int = 30) -> dict:
             logger.error(f"Schedule query failed: {e}")
             return []
 
-    # Hour of day
+    # Hour of day — use segments.hour (not hour_of_day) with ad_group resource
     hour_query = f"""
         SELECT
-            segments.hour_of_day,
+            segments.hour,
             metrics.impressions,
             metrics.clicks,
             metrics.cost_micros,
             metrics.conversions
-        FROM campaign
+        FROM ad_group
         WHERE {date_filter}
             AND campaign.status = 'ENABLED'
-        ORDER BY segments.hour_of_day
+        ORDER BY segments.hour
     """
 
     # Day of week
@@ -321,11 +322,10 @@ def fetch_schedule_performance(days: int = 30) -> dict:
     by_day_raw = _run_query(dow_query)
     by_device_raw = _run_query(device_query)
 
-    by_hour = _agg_rows(by_hour_raw, "hour_of_day")
-    by_hour.sort(key=lambda x: int(x.get("hour_of_day", 0)))
-    # Rename key for clarity
+    by_hour = _agg_rows(by_hour_raw, "hour")
+    by_hour.sort(key=lambda x: int(x.get("hour", 0)))
     for h in by_hour:
-        h["hour"] = int(h.pop("hour_of_day", 0))
+        h["hour"] = int(h.get("hour", 0))
 
     by_day = _agg_rows(by_day_raw, "day_of_week")
     DAY_ORDER = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]

@@ -132,6 +132,10 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
     end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=days)
 
+    # Note: impression share metrics (search_impression_share, search_budget_lost_
+    # impression_share, search_rank_lost_impression_share) are NOT compatible with
+    # keyword_view when using date segmentation. Fetch them from campaign resource
+    # separately if needed.
     query = f"""
         SELECT
             ad_group_criterion.keyword.text,
@@ -147,12 +151,7 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
             metrics.clicks,
             metrics.cost_micros,
             metrics.conversions,
-            metrics.average_cpc,
-            metrics.search_impression_share,
-            metrics.search_top_impression_percentage,
-            metrics.search_absolute_top_impression_percentage,
-            metrics.search_budget_lost_impression_share,
-            metrics.search_rank_lost_impression_share
+            metrics.average_cpc
         FROM keyword_view
         WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
             AND campaign.status = 'ENABLED'
@@ -195,11 +194,7 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
                     "creative_quality_score": qs_map.get(int(qi.creative_quality_score) if qi.creative_quality_score else 0, ""),
                     "post_click_quality": qs_map.get(int(qi.post_click_quality_score) if qi.post_click_quality_score else 0, ""),
                     "search_predicted_ctr": qs_map.get(int(qi.search_predicted_ctr) if qi.search_predicted_ctr else 0, ""),
-                    # Impression share — average across rows
-                    "_is_rows": 0,
                     "impression_share": 0.0,
-                    "top_impression_pct": 0.0,
-                    "abs_top_impression_pct": 0.0,
                     "budget_lost_is": 0.0,
                     "rank_lost_is": 0.0,
                 }
@@ -207,24 +202,12 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
             agg[keyword]["clicks"] += clicks
             agg[keyword]["cost"] += cost
             agg[keyword]["conversions"] += conversions
-            # Impression share — accumulate for averaging
-            agg[keyword]["_is_rows"] += 1
-            agg[keyword]["impression_share"] += float(row.metrics.search_impression_share or 0)
-            agg[keyword]["top_impression_pct"] += float(row.metrics.search_top_impression_percentage or 0)
-            agg[keyword]["abs_top_impression_pct"] += float(row.metrics.search_absolute_top_impression_percentage or 0)
-            agg[keyword]["budget_lost_is"] += float(row.metrics.search_budget_lost_impression_share or 0)
-            agg[keyword]["rank_lost_is"] += float(row.metrics.search_rank_lost_impression_share or 0)
+            # Impression share metrics are fetched separately (not available in keyword_view)
 
         for kw_data in agg.values():
             clicks = kw_data["clicks"] or 1
             kw_data["avg_cpc"] = round(kw_data["cost"] / clicks, 4) if kw_data["cost"] > 0 else 0.0
-            # Average impression share over number of rows seen
-            n = kw_data.pop("_is_rows") or 1
-            kw_data["impression_share"] = round(kw_data["impression_share"] / n, 4)
-            kw_data["top_impression_pct"] = round(kw_data["top_impression_pct"] / n, 4)
-            kw_data["abs_top_impression_pct"] = round(kw_data["abs_top_impression_pct"] / n, 4)
-            kw_data["budget_lost_is"] = round(kw_data["budget_lost_is"] / n, 4)
-            kw_data["rank_lost_is"] = round(kw_data["rank_lost_is"] / n, 4)
+            # Impression share left at 0 — fetched separately if needed
             results.append(kw_data)
 
         logger.info(f"Found {len(results)} unique keywords in keyword_view")

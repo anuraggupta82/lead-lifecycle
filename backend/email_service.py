@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 def _send(to_email: str, subject: str, html: str, plain: str = "") -> bool:
     settings = get_settings()
+    if getattr(settings, "emails_disabled", False):
+        logger.info(f"EMAILS DISABLED — skipped sending to {to_email}: {subject}")
+        return False
     if not settings.smtp_password:
         logger.warning("SMTP password not set — email not sent")
         return False
@@ -41,6 +44,9 @@ def _send(to_email: str, subject: str, html: str, plain: str = "") -> bool:
 def _send_msg(msg: MIMEMultipart) -> bool:
     """Send a pre-built MIME message via Zoho SMTP."""
     settings = get_settings()
+    if getattr(settings, "emails_disabled", False):
+        logger.info(f"EMAILS DISABLED — skipped sending to {msg.get('To', '?')}: {msg.get('Subject', '?')}")
+        return False
     if not settings.smtp_password:
         logger.warning("SMTP password not set — email not sent")
         return False
