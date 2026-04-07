@@ -26,12 +26,12 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/anurag/Documents/Projects/Applications/lead-lifecycle/backend/venv/bin/python3</string>
-    <string>/Users/anurag/Documents/Projects/Applications/lead-lifecycle/backend/main.py</string>
+    <string>/Users/anurag/Documents/Projects/gdc-apps/marketing/lead-lifecycle/backend/venv/bin/python3</string>
+    <string>/Users/anurag/Documents/Projects/gdc-apps/marketing/lead-lifecycle/backend/main.py</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/anurag/Documents/Projects/Applications/lead-lifecycle/backend</string>
+  <string>/Users/anurag/Documents/Projects/gdc-apps/marketing/lead-lifecycle/backend</string>
 
   <key>EnvironmentVariables</key>
   <dict>
