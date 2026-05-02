@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # Kill switch — set SMS_DISABLED=true in .env to block all outbound SMS
     sms_disabled: bool = True
 
+    # Kill switch — must be True in .env AND runtime DB toggle must be 'true'
+    # for any Google Ads WRITE operation to execute. Reads are always allowed.
+    # See campaign_safety.py for the two-layer check logic.
+    campaign_write_ops_enabled: bool = False
+
     # Environment + test redirect (dev mode reroutes mail/SMS to these)
     env: str = "dev"                              # "dev" or "prod"
     test_redirect_email: str = "anurag82@gmail.com"

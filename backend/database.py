@@ -341,6 +341,63 @@ CREATE TABLE IF NOT EXISTS gads_daily_stats (
 
 CREATE INDEX IF NOT EXISTS idx_gads_daily_date ON gads_daily_stats(date);
 CREATE INDEX IF NOT EXISTS idx_gads_daily_campaign ON gads_daily_stats(campaign_id, date);
+
+-- ── Phase 1: Google Ads Campaign Management ────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS gads_optimizer_runs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           TEXT UNIQUE NOT NULL,           -- UUID
+    started_at       TEXT NOT NULL,
+    completed_at     TEXT DEFAULT '',
+    mode             TEXT NOT NULL DEFAULT 'pending_approval',  -- 'pending_approval' | 'errored'
+    trigger          TEXT NOT NULL DEFAULT 'scheduler_7am',     -- 'scheduler_7am' | 'admin_manual'
+    primary_campaign TEXT DEFAULT '',
+    summary_json     TEXT NOT NULL DEFAULT '{}',    -- report['summary'] dict
+    report_json      TEXT NOT NULL DEFAULT '{}',    -- full report dict
+    actions_pending  INTEGER DEFAULT 0,
+    actions_executed INTEGER DEFAULT 0,
+    actions_blocked  INTEGER DEFAULT 0,
+    actions_errored  INTEGER DEFAULT 0,
+    error            TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_started ON gads_optimizer_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS gads_audit_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_id         TEXT UNIQUE NOT NULL,          -- UUID
+    operation         TEXT NOT NULL,                 -- 'pause_keyword','set_budget','add_keyword',etc.
+    entity_type       TEXT NOT NULL,                 -- 'keyword','campaign','ad_group','ad','budget'
+    entity_id         TEXT NOT NULL,                 -- resource_name or campaign_id
+    entity_name       TEXT NOT NULL,                 -- human-readable name
+    before_state_json TEXT NOT NULL DEFAULT '{}',    -- JSON snapshot before change
+    after_state_json  TEXT NOT NULL DEFAULT '{}',    -- JSON intended state after change
+    executed          INTEGER NOT NULL DEFAULT 0,    -- 0=not executed, 1=executed
+    execution_result  TEXT NOT NULL,                 -- 'pending_approval'|'success'|'blocked'|'error'|'rejected'|'expired'
+    actor             TEXT NOT NULL DEFAULT 'ai_optimizer',  -- 'admin' | 'ai_optimizer' | 'system'
+    reason            TEXT DEFAULT '',               -- why this action was recommended
+    error_detail      TEXT DEFAULT '',               -- error message if execution_result='error'
+    optimizer_run_id  TEXT DEFAULT '',               -- FK to gads_optimizer_runs.run_id
+    approval_by       TEXT DEFAULT '',               -- who approved (admin)
+    approved_at       TEXT DEFAULT '',               -- when approved
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created ON gads_audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_entity  ON gads_audit_log(entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_result  ON gads_audit_log(execution_result);
+CREATE INDEX IF NOT EXISTS idx_audit_run     ON gads_audit_log(optimizer_run_id);
+
+CREATE TABLE IF NOT EXISTS gads_spend_guardrails (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id      TEXT NOT NULL UNIQUE,
+    campaign_name    TEXT NOT NULL DEFAULT '',
+    daily_cap_usd    REAL NOT NULL,                  -- max allowed daily budget in dollars
+    is_active        INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
 """
 
 LIFECYCLE_STAGES = [
@@ -712,6 +769,66 @@ def _migrate(conn):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_daily_date ON gads_daily_stats(date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_daily_campaign ON gads_daily_stats(campaign_id, date)")
+
+    # ── Phase 1: Campaign management — audit log + guardrails + optimizer runs ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_optimizer_runs (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id           TEXT UNIQUE NOT NULL,
+            started_at       TEXT NOT NULL,
+            completed_at     TEXT DEFAULT '',
+            mode             TEXT NOT NULL DEFAULT 'pending_approval',
+            trigger          TEXT NOT NULL DEFAULT 'scheduler_7am',
+            primary_campaign TEXT DEFAULT '',
+            summary_json     TEXT NOT NULL DEFAULT '{}',
+            report_json      TEXT NOT NULL DEFAULT '{}',
+            actions_pending  INTEGER DEFAULT 0,
+            actions_executed INTEGER DEFAULT 0,
+            actions_blocked  INTEGER DEFAULT 0,
+            actions_errored  INTEGER DEFAULT 0,
+            error            TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_started ON gads_optimizer_runs(started_at DESC)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_audit_log (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id         TEXT UNIQUE NOT NULL,
+            operation         TEXT NOT NULL,
+            entity_type       TEXT NOT NULL,
+            entity_id         TEXT NOT NULL,
+            entity_name       TEXT NOT NULL,
+            before_state_json TEXT NOT NULL DEFAULT '{}',
+            after_state_json  TEXT NOT NULL DEFAULT '{}',
+            executed          INTEGER NOT NULL DEFAULT 0,
+            execution_result  TEXT NOT NULL,
+            actor             TEXT NOT NULL DEFAULT 'ai_optimizer',
+            reason            TEXT DEFAULT '',
+            error_detail      TEXT DEFAULT '',
+            optimizer_run_id  TEXT DEFAULT '',
+            approval_by       TEXT DEFAULT '',
+            approved_at       TEXT DEFAULT '',
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON gads_audit_log(created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_entity  ON gads_audit_log(entity_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_result  ON gads_audit_log(execution_result)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_run     ON gads_audit_log(optimizer_run_id)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_spend_guardrails (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id      TEXT NOT NULL UNIQUE,
+            campaign_name    TEXT NOT NULL DEFAULT '',
+            daily_cap_usd    REAL NOT NULL,
+            is_active        INTEGER NOT NULL DEFAULT 1,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        )
+    """)
 
     # Seed default memories if table is empty
     existing = conn.execute("SELECT COUNT(*) FROM optimizer_memory").fetchone()[0]
@@ -2317,3 +2434,242 @@ def get_lead_messages(lead_id: str) -> list:
             ORDER BY m.received_at ASC, m.id ASC
         """, (lead_id,)).fetchall()
         return [dict(r) for r in rows]
+
+
+# ─── Phase 1: Google Ads Campaign Management — Audit + Safety ────────────────
+
+def log_gads_action(
+    action_id: str,
+    operation: str,
+    entity_type: str,
+    entity_id: str,
+    entity_name: str,
+    before_state_json: str,
+    after_state_json: str,
+    executed: bool,
+    execution_result: str,
+    actor: str,
+    reason: str = "",
+    error_detail: str = "",
+    optimizer_run_id: str = "",
+) -> None:
+    """Insert a Google Ads audit log row. Called from campaign_audit.py."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO gads_audit_log
+                (action_id, operation, entity_type, entity_id, entity_name,
+                 before_state_json, after_state_json, executed, execution_result,
+                 actor, reason, error_detail, optimizer_run_id,
+                 created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            action_id, operation, entity_type, entity_id, entity_name,
+            before_state_json, after_state_json,
+            1 if executed else 0, execution_result,
+            actor, reason, error_detail, optimizer_run_id,
+            now, now,
+        ))
+
+
+def update_gads_action_result(
+    action_id: str,
+    executed: bool,
+    execution_result: str,
+    error_detail: str = "",
+) -> None:
+    """Update an audit log row after the Google Ads API call returns."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE gads_audit_log
+               SET executed=?, execution_result=?, error_detail=?, updated_at=?
+             WHERE action_id=?
+        """, (1 if executed else 0, execution_result, error_detail, now, action_id))
+
+
+def set_audit_approval(action_id: str, approver: str) -> None:
+    """Stamp who approved and when — called after Apply button triggers execution."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE gads_audit_log
+               SET approval_by=?, approved_at=?, updated_at=?
+             WHERE action_id=?
+        """, (approver, now, now, action_id))
+
+
+def get_audit_row(action_id: str) -> Optional[dict]:
+    """Fetch a single audit log row by action_id."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM gads_audit_log WHERE action_id=?", (action_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_audit_log(limit: int = 100, entity_id: str = "", operation: str = "") -> list:
+    """Fetch audit entries, most recent first. Optional filters."""
+    with _conn() as conn:
+        if entity_id and operation:
+            rows = conn.execute("""
+                SELECT * FROM gads_audit_log
+                 WHERE entity_id=? AND operation=?
+                 ORDER BY created_at DESC LIMIT ?
+            """, (entity_id, operation, limit)).fetchall()
+        elif entity_id:
+            rows = conn.execute("""
+                SELECT * FROM gads_audit_log
+                 WHERE entity_id=?
+                 ORDER BY created_at DESC LIMIT ?
+            """, (entity_id, limit)).fetchall()
+        elif operation:
+            rows = conn.execute("""
+                SELECT * FROM gads_audit_log
+                 WHERE operation=?
+                 ORDER BY created_at DESC LIMIT ?
+            """, (operation, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM gads_audit_log
+                 ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_pending_approvals() -> list:
+    """Fetch audit entries awaiting admin approval."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT a.*, r.primary_campaign, r.started_at AS run_started_at
+            FROM gads_audit_log a
+            LEFT JOIN gads_optimizer_runs r ON r.run_id = a.optimizer_run_id
+            WHERE a.execution_result = 'pending_approval'
+            ORDER BY a.created_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def expire_stale_audit_rows(max_age_hours: int = 48) -> int:
+    """
+    Mark pending_approval rows older than max_age_hours as 'expired'.
+    Returns count of rows expired.
+    """
+    now = _now()
+    with _conn() as conn:
+        cursor = conn.execute("""
+            UPDATE gads_audit_log
+               SET execution_result='expired', updated_at=?
+             WHERE execution_result='pending_approval'
+               AND created_at < datetime('now', ? || ' hours')
+        """, (now, f"-{max_age_hours}"))
+        return cursor.rowcount
+
+
+def create_optimizer_run(
+    run_id: str,
+    trigger: str = "scheduler_7am",
+    primary_campaign: str = "",
+) -> None:
+    """Create a new optimizer run record at the start of optimize_campaign()."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO gads_optimizer_runs
+                (run_id, started_at, mode, trigger, primary_campaign,
+                 summary_json, report_json)
+            VALUES (?,?,?,?,?,'{}','{}')
+        """, (run_id, now, "pending_approval", trigger, primary_campaign))
+
+
+def update_optimizer_run(
+    run_id: str,
+    summary_json: str = "",
+    report_json: str = "",
+    actions_pending: int = 0,
+    actions_executed: int = 0,
+    actions_blocked: int = 0,
+    actions_errored: int = 0,
+    mode: str = "",
+    error: str = "",
+) -> None:
+    """Update an optimizer run record when it completes."""
+    now = _now()
+    with _conn() as conn:
+        sets = []
+        params = []
+        if summary_json:
+            sets.append("summary_json=?"); params.append(summary_json)
+        if report_json:
+            sets.append("report_json=?"); params.append(report_json)
+        if mode:
+            sets.append("mode=?"); params.append(mode)
+        if error:
+            sets.append("error=?"); params.append(error)
+        sets += ["actions_pending=?", "actions_executed=?",
+                 "actions_blocked=?", "actions_errored=?",
+                 "completed_at=?"]
+        params += [actions_pending, actions_executed, actions_blocked, actions_errored, now]
+        params.append(run_id)
+        conn.execute(
+            f"UPDATE gads_optimizer_runs SET {', '.join(sets)} WHERE run_id=?",
+            params
+        )
+
+
+def get_optimizer_runs(limit: int = 20) -> list:
+    """Return recent optimizer runs, newest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM gads_optimizer_runs ORDER BY started_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_optimizer_run(run_id: str) -> Optional[dict]:
+    """Fetch a single optimizer run by run_id."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM gads_optimizer_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ─── Spend Guardrails ────────────────────────────────────────────────────────
+
+def get_spend_guardrail(campaign_id: str) -> Optional[float]:
+    """Return daily_cap_usd for a campaign, or None if no guardrail set."""
+    with _conn() as conn:
+        row = conn.execute("""
+            SELECT daily_cap_usd FROM gads_spend_guardrails
+            WHERE campaign_id=? AND is_active=1
+        """, (campaign_id,)).fetchone()
+        return row["daily_cap_usd"] if row else None
+
+
+def get_all_spend_guardrails() -> list:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM gads_spend_guardrails ORDER BY campaign_name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_spend_guardrail(campaign_id: str, campaign_name: str, daily_cap_usd: float) -> dict:
+    now = _now()
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO gads_spend_guardrails
+                (campaign_id, campaign_name, daily_cap_usd, is_active, created_at, updated_at)
+            VALUES (?,?,?,1,?,?)
+            ON CONFLICT(campaign_id) DO UPDATE SET
+                campaign_name=excluded.campaign_name,
+                daily_cap_usd=excluded.daily_cap_usd,
+                is_active=1,
+                updated_at=excluded.updated_at
+        """, (campaign_id, campaign_name, daily_cap_usd, now, now))
+        row = conn.execute(
+            "SELECT * FROM gads_spend_guardrails WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()
+        return dict(row)

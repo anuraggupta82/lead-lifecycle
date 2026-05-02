@@ -134,8 +134,9 @@ async def lifespan(app: FastAPI):
         _stamp("ai_optimizer")
         try:
             from ai_optimizer import optimize_campaign
-            result = optimize_campaign(dry_run=True)  # Start in dry-run mode
-            logger.info(f"Scheduled optimizer: {result.get('summary', {})}")
+            result = optimize_campaign(trigger="scheduler_7am")
+            logger.info(f"Scheduled optimizer: run_id={result.get('run_id','?')} "
+                        f"pending={result.get('summary', {}).get('keywords_to_pause', 0)} pauses")
         except Exception as e:
             logger.error(f"Scheduled optimizer failed: {e}")
 
@@ -587,13 +588,171 @@ def admin_upload_conversions():
 def admin_optimize(dry_run: bool = True):
     try:
         from ai_optimizer import optimize_campaign
-        result = optimize_campaign(dry_run=dry_run)
+        result = optimize_campaign(dry_run=dry_run, trigger="admin_manual")
         return {"status": "ok", "result": result}
     except ImportError as e:
         raise HTTPException(status_code=503, detail=f"AI optimizer dependencies not installed: {e}")
     except Exception as e:
         logger.error(f"AI optimizer failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Phase 1: Google Ads Campaign Management ───────────────────────────────��─
+
+@app.get("/api/admin/gads/audit-log", dependencies=[Depends(_require_admin)])
+def gads_audit_log(limit: int = 100, entity_id: str = "", operation: str = ""):
+    """Return recent Google Ads audit log entries."""
+    from database import get_audit_log
+    entries = get_audit_log(limit=limit, entity_id=entity_id, operation=operation)
+    return {"entries": entries, "total": len(entries)}
+
+
+@app.get("/api/admin/gads/pending-approvals", dependencies=[Depends(_require_admin)])
+def gads_pending_approvals():
+    """Return all audit rows awaiting admin approval (Apply button)."""
+    from database import get_pending_approvals
+    rows = get_pending_approvals()
+    return {"pending": rows, "total": len(rows)}
+
+
+@app.post("/api/admin/gads/approve/{action_id}", dependencies=[Depends(_require_admin)])
+async def gads_approve_action(action_id: str, request: Request):
+    """
+    Execute an approved recommendation against Google Ads.
+    Idempotent: already-approved rows return 409.
+    """
+    from database import get_audit_row, update_gads_action_result, set_audit_approval
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from ai_optimizer import _build_client, _execute_single_pause
+
+    row = get_audit_row(action_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Action not found")
+    if row["execution_result"] != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Action already in state '{row['execution_result']}' — cannot re-apply"
+        )
+
+    # Kill switch check
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        update_gads_action_result(action_id, executed=False,
+            execution_result="blocked", error_detail=str(e))
+        raise HTTPException(status_code=403, detail=str(e))
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id
+
+    operation = row["operation"]
+    try:
+        if operation == "pause_keyword":
+            client = _build_client()
+            _execute_single_pause(client, customer_id, resource_name=row["entity_id"])
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed pause_keyword: {row['entity_name']} ({action_id[:8]})")
+
+        elif operation in ("increase_bid", "decrease_bid"):
+            # Phase 1: not yet wired — log as pending for future Phase 2
+            raise HTTPException(
+                status_code=501,
+                detail=f"'{operation}' execution not yet implemented in Phase 1. "
+                       f"Please apply this bid change manually in Google Ads."
+            )
+
+        elif operation in ("add_exact_keyword", "add_negative_keyword"):
+            raise HTTPException(
+                status_code=501,
+                detail=f"'{operation}' execution not yet implemented in Phase 1. "
+                       f"Please add this keyword manually in Google Ads."
+            )
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        update_gads_action_result(action_id, executed=False,
+            execution_result="error", error_detail=str(e))
+        logger.error(f"Approve action failed for {action_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"status": "ok", "action_id": action_id, "operation": operation}
+
+
+@app.post("/api/admin/gads/reject/{action_id}", dependencies=[Depends(_require_admin)])
+async def gads_reject_action(action_id: str, request: Request):
+    """Dismiss a recommendation without executing it."""
+    from database import get_audit_row, update_gads_action_result, set_audit_approval
+    row = get_audit_row(action_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Action not found")
+    if row["execution_result"] != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Action already in state '{row['execution_result']}'"
+        )
+    update_gads_action_result(action_id, executed=False, execution_result="rejected")
+    set_audit_approval(action_id, approver="admin")
+    return {"status": "ok", "action_id": action_id}
+
+
+@app.get("/api/admin/gads/writes-status", dependencies=[Depends(_require_admin)])
+def gads_writes_status():
+    """Return the current state of the Google Ads write kill switch."""
+    from campaign_safety import get_writes_status
+    return get_writes_status()
+
+
+@app.post("/api/admin/gads/writes-enabled", dependencies=[Depends(_require_admin)])
+async def gads_set_writes_enabled(request: Request):
+    """
+    Toggle the runtime Google Ads write kill switch.
+    Body: {"enabled": true|false}
+    Note: env-var CAMPAIGN_WRITE_OPS_ENABLED must also be True for writes to work.
+    """
+    from database import save_setting
+    from campaign_safety import get_writes_status
+    body = await request.json()
+    enabled = bool(body.get("enabled", False))
+    save_setting("gads_writes_enabled", "true" if enabled else "false")
+    logger.info(f"Google Ads writes {'ENABLED' if enabled else 'DISABLED'} via admin UI")
+    return {"status": "ok", "writes_enabled": enabled, **get_writes_status()}
+
+
+@app.get("/api/admin/gads/spend-guardrails", dependencies=[Depends(_require_admin)])
+def gads_get_guardrails():
+    """Return all spend guardrails."""
+    from database import get_all_spend_guardrails
+    rows = get_all_spend_guardrails()
+    return {"guardrails": rows}
+
+
+class SpendGuardrailBody(BaseModel):
+    campaign_id: str
+    campaign_name: str
+    daily_cap_usd: float
+
+
+@app.post("/api/admin/gads/spend-guardrails", dependencies=[Depends(_require_admin)])
+def gads_upsert_guardrail(body: SpendGuardrailBody):
+    """Create or update a spend guardrail for a campaign."""
+    from database import upsert_spend_guardrail
+    if body.daily_cap_usd <= 0:
+        raise HTTPException(status_code=400, detail="daily_cap_usd must be > 0")
+    row = upsert_spend_guardrail(body.campaign_id, body.campaign_name, body.daily_cap_usd)
+    return {"status": "ok", "guardrail": row}
+
+
+@app.get("/api/admin/gads/optimizer-runs", dependencies=[Depends(_require_admin)])
+def gads_optimizer_runs(limit: int = 20):
+    """Return recent optimizer run records."""
+    from database import get_optimizer_runs
+    runs = get_optimizer_runs(limit=limit)
+    return {"runs": runs, "total": len(runs)}
 
 
 @app.post("/api/admin/run-queue", dependencies=[Depends(_require_admin)])

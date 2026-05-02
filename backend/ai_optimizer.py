@@ -9,15 +9,24 @@ Pulls keyword performance, joins with lead/production data, then:
   4. Adds negative keywords for irrelevant search terms
   5. Generates a daily optimization report
 
+Phase 1 changes:
+  - Every optimizer run creates a gads_optimizer_runs record.
+  - Every recommendation creates a gads_audit_log row with execution_result='pending_approval'.
+  - Each recommendation row includes an 'action_id' field for the Apply button.
+  - Stale pending rows (>48h) are expired at the start of each run.
+  - _execute_pause uses partial_failure=True, logs per-keyword, checks kill switch.
+  - dry_run parameter is deprecated — optimizer always produces pending rows.
+    Use the Apply button in the admin UI to execute individual actions.
+
 Uses Claude API for analysis when ANTHROPIC_API_KEY is set.
 Falls back to rule-based optimization otherwise.
 
 Manual trigger: POST /api/admin/optimize
-Dry-run mode: POST /api/admin/optimize?dry_run=true
 """
 
 import logging
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -425,8 +434,35 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
 # ── Execute Actions ──────────────────────────────────────────────────────────
 
 def _execute_pause(client, customer_id: str, keywords: list) -> int:
-    """Pause keywords via Google Ads API."""
+    """
+    Pause keywords via Google Ads API.
+
+    Phase 1: each keyword in the list must have an 'action_id' field (UUID).
+    Checks the kill switch first — if blocked, marks all action rows as 'blocked'.
+    Uses partial_failure=True so one bad keyword doesn't fail the whole batch.
+    Returns count of successfully paused keywords.
+    """
     if not keywords:
+        return 0
+
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from campaign_audit import mark_executed
+
+    # Kill switch check
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        for kw in keywords:
+            aid = kw.get("action_id")
+            if aid:
+                from database import update_gads_action_result
+                update_gads_action_result(
+                    action_id=aid,
+                    executed=False,
+                    execution_result="blocked",
+                    error_detail=str(e),
+                )
+        logger.warning(f"Keyword pause BLOCKED by kill switch: {e}")
         return 0
 
     service = client.get_service("AdGroupCriterionService")
@@ -447,34 +483,100 @@ def _execute_pause(client, customer_id: str, keywords: list) -> int:
         response = service.mutate_ad_group_criteria(
             customer_id=customer_id,
             operations=operations,
+            partial_failure=True,   # don't fail-all on one bad op
         )
-        return len(response.results)
+        success_count = 0
+        # Walk results — one entry per operation in order
+        results = list(response.results) if response.results else []
+        for i, kw in enumerate(keywords):
+            aid = kw.get("action_id")
+            if i < len(results) and results[i].resource_name:
+                if aid:
+                    mark_executed(aid, success=True)
+                success_count += 1
+            else:
+                if aid:
+                    mark_executed(aid, success=False, error_detail="partial_failure or no result")
+        logger.info(f"Paused {success_count}/{len(keywords)} keywords")
+        return success_count
     except Exception as e:
         logger.error(f"Failed to pause keywords: {e}")
+        for kw in keywords:
+            aid = kw.get("action_id")
+            if aid:
+                mark_executed(aid, success=False, error_detail=str(e))
         return 0
+
+
+def _execute_single_pause(client, customer_id: str, resource_name: str) -> bool:
+    """
+    Pause a single keyword by resource_name.
+    Used by the /approve endpoint for individual Apply-button execution.
+    Does NOT check kill switch — caller must check first.
+    Returns True on success.
+    """
+    service = client.get_service("AdGroupCriterionService")
+    operation = client.get_type("AdGroupCriterionOperation")
+    criterion = operation.update
+    criterion.resource_name = resource_name
+    criterion.status = client.enums.AdGroupCriterionStatusEnum.PAUSED
+    client.copy_from(
+        operation.update_mask,
+        client.get_type("FieldMask")(paths=["status"])
+    )
+    try:
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Single pause failed for {resource_name}: {e}")
+        raise
 
 
 # ── Main Entry Point ─────────────────────────────────────────────────────────
 
-def optimize_campaign(dry_run: bool = True) -> dict:
+def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> dict:
     """
     Run the full optimization cycle.
-    Set dry_run=False to actually execute changes in Google Ads.
+
+    Phase 1 behavior:
+    - Creates a gads_optimizer_runs record at the start.
+    - Expires stale pending_approval rows (>48h old) before generating new ones.
+    - Every recommendation generates a gads_audit_log row with
+      execution_result='pending_approval' and an 'action_id' embedded in the
+      returned report dict. The frontend Apply button references this action_id.
+    - dry_run parameter kept for backward compatibility but no longer changes
+      behavior — use Apply buttons in admin UI to execute individual actions.
     """
+    from campaign_audit import log_pending, expire_stale_pending
+    from database import (
+        create_optimizer_run, update_optimizer_run, get_setting
+    )
+
     settings = get_settings()
+    run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+
+    # Expire recommendations older than 48h before generating new ones
+    expired = expire_stale_pending(max_age_hours=48)
 
     try:
         client = _build_client()
     except Exception as e:
         logger.error(f"Failed to create Google Ads client: {e}")
-        return {"error": str(e)}
+        create_optimizer_run(run_id, trigger=trigger)
+        update_optimizer_run(run_id, mode="errored", error=str(e))
+        return {"error": str(e), "run_id": run_id}
 
     customer_id = settings.google_ads_customer_id
 
     logger.info("=" * 60)
-    logger.info("AI Campaign Optimizer — Starting daily evaluation")
+    logger.info(f"AI Campaign Optimizer — run_id={run_id}")
     logger.info("=" * 60)
+    if expired:
+        logger.info(f"Expired {expired} stale pending rows before this run")
 
     # Collect data
     logger.info("Collecting keyword performance...")
@@ -487,7 +589,6 @@ def optimize_campaign(dry_run: bool = True) -> dict:
     attribution = _get_keyword_attribution()
 
     # Determine the primary campaign name for memory scoping
-    # (derive from keyword data — use the campaign with the most spend)
     campaign_spend: dict = {}
     for kw in keyword_perf:
         camp = kw.get("campaign", "")
@@ -496,15 +597,93 @@ def optimize_campaign(dry_run: bool = True) -> dict:
     primary_campaign = max(campaign_spend, key=campaign_spend.get) if campaign_spend else ""
     logger.info(f"Primary campaign for memory scoping: '{primary_campaign}'")
 
+    # Create run record now that we have the primary campaign
+    create_optimizer_run(run_id, trigger=trigger, primary_campaign=primary_campaign)
+
     # Analyze
     logger.info("Analyzing and generating recommendations...")
     actions = _analyze_keywords(keyword_perf, attribution, search_terms, campaign=primary_campaign)
 
+    # ── Create pending_approval audit rows for each recommendation ────────────
+    actions_pending = 0
+
+    for kw in actions["pause"]:
+        aid = log_pending(
+            operation="pause_keyword",
+            entity_type="keyword",
+            entity_id=kw["resource_name"],
+            entity_name=kw["keyword"],
+            before_state={"status": "ENABLED", "match_type": kw.get("match_type", "")},
+            after_state={"status": "PAUSED"},
+            optimizer_run_id=run_id,
+            reason=kw.get("reason", ""),
+        )
+        kw["action_id"] = aid
+        actions_pending += 1
+
+    for kw in actions["increase_bid"]:
+        aid = log_pending(
+            operation="increase_bid",
+            entity_type="keyword",
+            entity_id=kw.get("resource_name", ""),
+            entity_name=kw["keyword"],
+            before_state={"match_type": kw.get("match_type", ""), "roas": kw.get("roas", 0)},
+            after_state={"bid_change": "+10%"},
+            optimizer_run_id=run_id,
+            reason=kw.get("reason", ""),
+        )
+        kw["action_id"] = aid
+        actions_pending += 1
+
+    for kw in actions["decrease_bid"]:
+        aid = log_pending(
+            operation="decrease_bid",
+            entity_type="keyword",
+            entity_id=kw.get("resource_name", ""),
+            entity_name=kw["keyword"],
+            before_state={"match_type": kw.get("match_type", "")},
+            after_state={"bid_change": "-10%"},
+            optimizer_run_id=run_id,
+            reason=kw.get("reason", ""),
+        )
+        kw["action_id"] = aid
+        actions_pending += 1
+
+    for st in actions["new_exact"]:
+        aid = log_pending(
+            operation="add_exact_keyword",
+            entity_type="keyword",
+            entity_id=st["search_term"],
+            entity_name=st["search_term"],
+            before_state={"type": "search_term", "clicks": st.get("clicks", 0), "conversions": st.get("conversions", 0)},
+            after_state={"match_type": "EXACT"},
+            optimizer_run_id=run_id,
+            reason=st.get("reason", ""),
+        )
+        st["action_id"] = aid
+        actions_pending += 1
+
+    for st in actions["new_negatives"]:
+        aid = log_pending(
+            operation="add_negative_keyword",
+            entity_type="keyword",
+            entity_id=st["search_term"],
+            entity_name=st["search_term"],
+            before_state={"type": "search_term", "cost": st.get("cost", 0)},
+            after_state={"status": "NEGATIVE"},
+            optimizer_run_id=run_id,
+            reason=st.get("reason", ""),
+        )
+        st["action_id"] = aid
+        actions_pending += 1
+
     # Report
     summary = actions["summary"]
     report = {
+        "run_id": run_id,
         "timestamp": now,
-        "mode": "DRY RUN" if dry_run else "LIVE",
+        "mode": "pending_approval",
+        "primary_campaign": primary_campaign,
         "summary": summary,
         "actions": {
             "pause": actions["pause"],
@@ -514,11 +693,19 @@ def optimize_campaign(dry_run: bool = True) -> dict:
             "new_negatives": actions["new_negatives"],
         },
         "memory_applied": actions.get("memory_applied", []),
-        "executed": {},
     }
 
+    # Update run record with results
+    update_optimizer_run(
+        run_id,
+        summary_json=json.dumps(summary, default=str),
+        report_json=json.dumps(report, default=str),
+        actions_pending=actions_pending,
+        mode="pending_approval",
+    )
+
     logger.info(f"\n{'='*60}")
-    logger.info(f"OPTIMIZATION REPORT — {'DRY RUN' if dry_run else 'LIVE'}")
+    logger.info(f"OPTIMIZATION REPORT — run_id={run_id}")
     logger.info(f"{'='*60}")
     logger.info(f"  Total spend (30d):    ${summary['total_spend']}")
     logger.info(f"  Total clicks:         {summary['total_clicks']}")
@@ -531,33 +718,18 @@ def optimize_campaign(dry_run: bool = True) -> dict:
     logger.info(f"  Keywords to bid down: {summary['keywords_to_bid_down']}")
     logger.info(f"  New exact-match:      {summary['new_exact_match']}")
     logger.info(f"  New negatives:        {summary['new_negatives']}")
+    logger.info(f"  Total pending actions: {actions_pending}")
 
     for kw in actions["pause"]:
-        logger.info(f"  PAUSE: '{kw['keyword']}' — {kw['reason']}")
+        logger.info(f"  PAUSE [{kw.get('action_id','?')[:8]}]: '{kw['keyword']}' — {kw['reason']}")
     for kw in actions["increase_bid"]:
         logger.info(f"  BID UP: '{kw['keyword']}' — {kw['reason']}")
     for kw in actions["decrease_bid"]:
         logger.info(f"  BID DOWN: '{kw['keyword']}' — {kw['reason']}")
     for st in actions["new_exact"]:
-        logger.info(f"  NEW EXACT: '{st['search_term']}' — {st['clicks']} clicks, {st['conversions']} conversions")
+        logger.info(f"  NEW EXACT: '{st['search_term']}' — {st.get('clicks',0)} clicks")
     for st in actions["new_negatives"]:
         logger.info(f"  NEW NEGATIVE: '{st['search_term']}' — {st['reason']}")
-
-    # Execute (only if not dry run)
-    if not dry_run:
-        logger.info("\nExecuting changes...")
-
-        paused = _execute_pause(client, customer_id, actions["pause"])
-        report["executed"]["paused"] = paused
-        logger.info(f"  Paused {paused} keywords")
-
-        # Note: bid adjustments and new keywords require more complex API calls
-        # For now, these are reported but not auto-executed
-        report["executed"]["bid_changes"] = "reported_only"
-        report["executed"]["new_keywords"] = "reported_only"
-        report["executed"]["new_negatives"] = "reported_only"
-    else:
-        logger.info("\nDry run — no changes made")
 
     logger.info("=" * 60)
     return report
