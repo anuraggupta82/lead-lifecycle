@@ -604,6 +604,56 @@ def _migrate(conn):
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_schedule_cache_key ON gads_schedule_cache(segment_type, segment_value, days)")
 
+    # ── Workflows + WorkflowSteps tables (Step 9 — campaign-specific sequences) ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS workflows (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            campaign_tag TEXT NOT NULL DEFAULT '',  -- '' = default; 'all_on_x', 'aligners', etc.
+            description TEXT DEFAULT '',
+            active      INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_campaign_tag ON workflows(campaign_tag)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS workflow_steps (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id  INTEGER NOT NULL,
+            sequence_day INTEGER NOT NULL,
+            channel      TEXT NOT NULL,         -- 'email' or 'sms'
+            template_name TEXT NOT NULL,        -- unique slug, e.g. 'default_day1_email'
+            subject      TEXT DEFAULT '',       -- email subject (blank for SMS)
+            body         TEXT NOT NULL DEFAULT '',
+            terminal     INTEGER NOT NULL DEFAULT 0,  -- 1 = side-effect step (marks cold, deletes GCS)
+            active       INTEGER NOT NULL DEFAULT 1,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            FOREIGN KEY (workflow_id) REFERENCES workflows(id),
+            UNIQUE(template_name)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow ON workflow_steps(workflow_id, sequence_day)")
+
+    # Add workflow_step_id column to follow_up_queue (Step 9 migration)
+    fq_cols = {row[1] for row in conn.execute("PRAGMA table_info(follow_up_queue)").fetchall()}
+    if "workflow_step_id" not in fq_cols:
+        conn.execute("ALTER TABLE follow_up_queue ADD COLUMN workflow_step_id INTEGER DEFAULT NULL")
+
+    # Add UNIQUE(lead_id, template) to follow_up_queue if not present
+    # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_follow_up_queue_lead_template
+        ON follow_up_queue(lead_id, template)
+    """)
+
+    # Seed default workflow if no workflows exist
+    existing_workflows = conn.execute("SELECT COUNT(*) FROM workflows").fetchone()[0]
+    if existing_workflows == 0:
+        _seed_default_workflow(conn)
+
     # ── Conversations + Messages tables (Step 5 — bi-directional email inbox) ──
     conn.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
@@ -688,6 +738,62 @@ def _migrate(conn):
                 "INSERT INTO optimizer_memory (category, key, value, reason, campaign, author, active, created_at, updated_at) VALUES (?,?,?,?,?,?,1,?,?)",
                 (category, key, value, reason, campaign, author, now, now)
             )
+
+
+def _seed_default_workflow(conn):
+    """Seed the default nXtsmile follow-up workflow into the DB."""
+    from config import get_settings
+    settings = get_settings()
+    booking_link = getattr(settings, "booking_url", "https://graftondentalcare.com/book")
+    office_phone = getattr(settings, "office_phone", "(508) 839-9900")
+
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO workflows (name, campaign_tag, description, active, created_at, updated_at) VALUES (?,?,?,1,?,?)",
+        ("nXtsmile Default", "", "Default 30-day nurture sequence for all leads", now, now),
+    )
+    wf_id = cur.lastrowid
+
+    steps = [
+        (1,  "email", "default_day1_email",  "Your Smile Preview Is Ready 🦷",
+         "Hi {first_name},\n\nThank you for using our nXtsmile preview tool! We hope you love what you saw.\n\n"
+         "Dr. Gupta and the team at Grafton Dental Care are ready to help make that smile a reality. "
+         "Your free consultation is completely pressure-free — we'll review your goals and walk you through your options.\n\n"
+         f"Book online: {booking_link}\nOr call us: {office_phone}\n\n"
+         "We look forward to meeting you!\n\n— Dr. Gupta's Team at Grafton Dental Care\n\n"
+         "To unsubscribe: {unsub_url}", False),
+        (3,  "sms",   "default_day3_sms",    "",
+         f"Hi {{first_name}}, it's nXtsmile at Grafton Dental Care 😊 Did you get a chance to look at your smile preview? "
+         f"We'd love to help make it a reality. Book your free consultation: {booking_link} "
+         f"or call us at {office_phone}. - Dr. Gupta's Team\nReply STOP to opt out.", False),
+        (7,  "email", "default_day7_email",  "Still thinking about your new smile?",
+         "Hi {first_name},\n\nJust checking in! Your smile preview is still saved and Dr. Gupta would love to "
+         "chat about how we can help. Whether you're ready to schedule or just have questions, we're here.\n\n"
+         f"Book your free consult: {booking_link}\nOr reply to this email.\n\n"
+         "— Dr. Gupta's Team\n\nTo unsubscribe: {unsub_url}", False),
+        (14, "email", "default_day14_email", "We saved a spot for you 🦷",
+         "Hi {first_name},\n\nWe know life gets busy! We just wanted to remind you that your free smile consultation "
+         "at Grafton Dental Care is just a click away.\n\n"
+         "Our patients consistently tell us their only regret is waiting so long to come in.\n\n"
+         f"Book now: {booking_link} | Call: {office_phone}\n\n"
+         "— Dr. Gupta's Team\n\nTo unsubscribe: {unsub_url}", False),
+        (21, "sms",   "default_day21_sms",   "",
+         f"Hi {{first_name}}, just checking in from nXtsmile 😊 Life gets busy, but your dream smile is still waiting. "
+         f"Your free consultation with Dr. Gupta is just a call away — {office_phone} or book online: {booking_link}. "
+         f"We're here whenever you're ready!\nReply STOP to opt out.", False),
+        (30, "email", "default_day30_cold",  "Last check-in from Grafton Dental Care",
+         "Hi {first_name},\n\nThis will be our last outreach for now — we don't want to crowd your inbox! "
+         "But if you ever decide you're ready to transform your smile, Dr. Gupta and the team are here.\n\n"
+         f"Book anytime: {booking_link} | {office_phone}\n\n"
+         "Wishing you all the best!\n\n— Dr. Gupta's Team at Grafton Dental Care\n\nTo unsubscribe: {unsub_url}", True),
+    ]
+
+    for day, channel, template_name, subject, body, terminal in steps:
+        conn.execute(
+            "INSERT INTO workflow_steps (workflow_id, sequence_day, channel, template_name, subject, body, terminal, active, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,1,?,?)",
+            (wf_id, day, channel, template_name, subject, body, 1 if terminal else 0, now, now),
+        )
 
 
 def _now() -> str:
@@ -845,39 +951,173 @@ def get_events(lead_id: str) -> list:
         return [dict(r) for r in rows]
 
 
+# ─── Workflows ───────────────────────────────────────────────────────────────
+
+def _normalize_campaign_tag(tag: str) -> str:
+    """Lower + strip campaign tag for consistent lookup."""
+    return (tag or "").strip().lower()
+
+
+def _get_workflow_steps_for_lead(conn, lead: dict) -> list:
+    """Return active workflow steps for a lead.
+    Resolves campaign tag from utm_campaign / campaign_name, then falls back to
+    the default workflow (campaign_tag='').
+    """
+    raw_tag = lead.get("utm_campaign") or lead.get("campaign_name") or ""
+    tag = _normalize_campaign_tag(raw_tag)
+
+    # Try campaign-specific workflow first (if tag is non-empty)
+    if tag:
+        row = conn.execute(
+            "SELECT id FROM workflows WHERE campaign_tag=? AND active=1 LIMIT 1", (tag,)
+        ).fetchone()
+        if row:
+            steps = conn.execute(
+                "SELECT * FROM workflow_steps WHERE workflow_id=? AND active=1 ORDER BY sequence_day",
+                (row[0],)
+            ).fetchall()
+            if steps:
+                return [dict(s) for s in steps]
+
+    # Fall back to default workflow (campaign_tag='')
+    row = conn.execute(
+        "SELECT id FROM workflows WHERE campaign_tag='' AND active=1 LIMIT 1"
+    ).fetchone()
+    if not row:
+        return []
+    steps = conn.execute(
+        "SELECT * FROM workflow_steps WHERE workflow_id=? AND active=1 ORDER BY sequence_day",
+        (row[0],)
+    ).fetchall()
+    return [dict(s) for s in steps]
+
+
+def get_all_workflows() -> list:
+    with _conn() as conn:
+        rows = conn.execute("SELECT * FROM workflows ORDER BY campaign_tag").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_workflow(workflow_id: int) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_workflow_steps(workflow_id: int) -> list:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM workflow_steps WHERE workflow_id=? ORDER BY sequence_day",
+            (workflow_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_workflow_step(step_id: int) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM workflow_steps WHERE id=?", (step_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_workflow_step_by_template(template_name: str) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM workflow_steps WHERE template_name=? LIMIT 1", (template_name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_workflow(workflow_id: Optional[int], name: str, campaign_tag: str,
+                    description: str = "") -> dict:
+    now = _now()
+    tag = _normalize_campaign_tag(campaign_tag)
+    with _conn() as conn:
+        if workflow_id:
+            conn.execute(
+                "UPDATE workflows SET name=?, campaign_tag=?, description=?, updated_at=? WHERE id=?",
+                (name, tag, description, now, workflow_id)
+            )
+            return dict(conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone())
+        else:
+            cur = conn.execute(
+                "INSERT INTO workflows (name, campaign_tag, description, active, created_at, updated_at) "
+                "VALUES (?,?,?,1,?,?)",
+                (name, tag, description, now, now)
+            )
+            return dict(conn.execute("SELECT * FROM workflows WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+def upsert_workflow_step(step_id: Optional[int], workflow_id: int, sequence_day: int,
+                         channel: str, template_name: str, subject: str, body: str,
+                         terminal: bool = False) -> dict:
+    now = _now()
+    with _conn() as conn:
+        if step_id:
+            conn.execute(
+                "UPDATE workflow_steps SET workflow_id=?, sequence_day=?, channel=?, template_name=?, "
+                "subject=?, body=?, terminal=?, updated_at=? WHERE id=?",
+                (workflow_id, sequence_day, channel, template_name, subject, body,
+                 1 if terminal else 0, now, step_id)
+            )
+            return dict(conn.execute("SELECT * FROM workflow_steps WHERE id=?", (step_id,)).fetchone())
+        else:
+            cur = conn.execute(
+                "INSERT INTO workflow_steps (workflow_id, sequence_day, channel, template_name, subject, body, "
+                "terminal, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,1,?,?)",
+                (workflow_id, sequence_day, channel, template_name, subject, body,
+                 1 if terminal else 0, now, now)
+            )
+            return dict(conn.execute("SELECT * FROM workflow_steps WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+def delete_workflow_step(step_id: int) -> bool:
+    with _conn() as conn:
+        conn.execute("DELETE FROM workflow_steps WHERE id=?", (step_id,))
+        return True
+
+
+def delete_workflow(workflow_id: int) -> bool:
+    with _conn() as conn:
+        conn.execute("DELETE FROM workflow_steps WHERE workflow_id=?", (workflow_id,))
+        conn.execute("DELETE FROM workflows WHERE id=?", (workflow_id,))
+        return True
+
+
 # ─── Follow-up Queue ─────────────────────────────────────────────────────────
 
-def enqueue_follow_ups(lead_id: str, created_at: str):
-    """Schedule the full follow-up sequence for a new lead."""
+def enqueue_follow_ups(lead: dict, created_at: str):
+    """Schedule the follow-up sequence for a lead using their campaign workflow.
+
+    Reads steps from workflow_steps DB. Falls back to default workflow if no
+    campaign-specific workflow exists. Uses INSERT OR IGNORE to be idempotent.
+    ``lead`` must be the full lead dict (needs id, utm_campaign, campaign_name).
+    """
     from datetime import timedelta
     import dateutil.parser
 
+    lead_id = lead["id"]
+
     try:
         base = dateutil.parser.parse(created_at)
+        # Ensure timezone-aware for consistent arithmetic
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
     except Exception:
         base = datetime.now(timezone.utc)
 
-    sequence = [
-        (1,  "email", "day1_email"),
-        (3,  "sms",   "day3_sms"),
-        (7,  "email", "day7_email"),
-        (14, "email", "day14_email"),
-        (21, "sms",   "day21_sms"),
-        (30, "email", "day30_cold"),   # marks cold; GCS lifecycle is 31 days so blob still exists
-    ]
-
     with _conn() as conn:
-        # Don't double-enqueue
-        existing = conn.execute("SELECT COUNT(*) FROM follow_up_queue WHERE lead_id=?", (lead_id,)).fetchone()[0]
-        if existing > 0:
-            return
+        steps = _get_workflow_steps_for_lead(conn, lead)
+        if not steps:
+            return  # No workflow configured — nothing to enqueue
 
-        for day, channel, template in sequence:
-            send_at = (base + timedelta(days=day)).isoformat()
+        for step in steps:
+            send_at = (base + timedelta(days=step["sequence_day"])).isoformat()
             conn.execute("""
-                INSERT INTO follow_up_queue (lead_id, sequence_day, channel, template, scheduled_at, status)
-                VALUES (?,?,?,?,?,'pending')
-            """, (lead_id, day, channel, template, send_at))
+                INSERT OR IGNORE INTO follow_up_queue
+                    (lead_id, sequence_day, channel, template, scheduled_at, status, workflow_step_id)
+                VALUES (?,?,?,?,?,'pending',?)
+            """, (lead_id, step["sequence_day"], step["channel"],
+                  step["template_name"], send_at, step["id"]))
 
 
 def get_due_follow_ups() -> list:
@@ -886,7 +1126,8 @@ def get_due_follow_ups() -> list:
     with _conn() as conn:
         rows = conn.execute("""
             SELECT fq.*, l.email, l.phone, l.first_name, l.last_name,
-                   l.goals, l.smile_image_url, l.smile_blob_name, l.stage, l.unsubscribed_email, l.unsubscribed_sms,
+                   l.goals, l.smile_image_url, l.smile_blob_name, l.stage,
+                   l.unsubscribed_email, l.unsubscribed_sms,
                    l.source, l.gclid, l.utm_campaign
             FROM follow_up_queue fq
             JOIN leads l ON fq.lead_id = l.id

@@ -43,6 +43,9 @@ from database import (
     get_or_create_conversation, get_conversation, get_messages, get_all_conversations,
     get_daily_stats, get_ad_group_stats,
     save_outbound_message, get_lead_messages,
+    # Step 9: workflows
+    get_all_workflows, get_workflow, get_workflow_steps, get_workflow_step,
+    upsert_workflow, upsert_workflow_step, delete_workflow_step, delete_workflow,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -310,7 +313,7 @@ async def receive_event(payload: EventPayload):
             "landing_url": payload.landing_url or "",
         }
         lead = upsert_lead(lead_data)
-        enqueue_follow_ups(payload.lead_id, lead_data["created_at"])
+        enqueue_follow_ups(lead, lead_data["created_at"])
         add_event(payload.lead_id, "lead_created", stage_to="new", source=payload.source,
                   detail=detail_str)
 
@@ -1239,6 +1242,216 @@ def admin_send_manual_email(lead_id: str, body: ManualEmailRequest):
         raise HTTPException(status_code=502, detail="Email send failed — check logs")
     msg_id = save_outbound_message(lead_id, "email", subject, email_body, sent_by="admin")
     return {"ok": True, "message_id": msg_id}
+
+
+# ─── Step 9: Workflow CRUD + AI Generate ─────────────────────────────────────
+
+class WorkflowCreate(BaseModel):
+    name: str
+    campaign_tag: str = ""
+    description: str = ""
+
+
+class WorkflowStepCreate(BaseModel):
+    workflow_id: int
+    sequence_day: int
+    channel: str           # 'email' | 'sms'
+    template_name: str
+    subject: str = ""
+    body: str
+    terminal: bool = False
+
+
+class WorkflowStepUpdate(BaseModel):
+    workflow_id: Optional[int] = None
+    sequence_day: Optional[int] = None
+    channel: Optional[str] = None
+    template_name: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    terminal: Optional[bool] = None
+
+
+class AIGenerateRequest(BaseModel):
+    prompt: str              # Free-text description of the campaign / goals
+    num_steps: int = 6       # How many steps to generate
+
+
+@app.get("/api/admin/workflows", dependencies=[Depends(_require_admin)])
+def admin_list_workflows():
+    workflows = get_all_workflows()
+    result = []
+    for wf in workflows:
+        steps = get_workflow_steps(wf["id"])
+        result.append({**wf, "steps": steps})
+    return {"workflows": result}
+
+
+@app.get("/api/admin/workflows/{workflow_id}", dependencies=[Depends(_require_admin)])
+def admin_get_workflow(workflow_id: int):
+    wf = get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    steps = get_workflow_steps(workflow_id)
+    return {**wf, "steps": steps}
+
+
+@app.post("/api/admin/workflows", dependencies=[Depends(_require_admin)])
+def admin_create_workflow(body: WorkflowCreate):
+    wf = upsert_workflow(None, body.name, body.campaign_tag, body.description)
+    return wf
+
+
+@app.put("/api/admin/workflows/{workflow_id}", dependencies=[Depends(_require_admin)])
+def admin_update_workflow(workflow_id: int, body: WorkflowCreate):
+    wf = get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return upsert_workflow(workflow_id, body.name, body.campaign_tag, body.description)
+
+
+@app.delete("/api/admin/workflows/{workflow_id}", dependencies=[Depends(_require_admin)])
+def admin_delete_workflow(workflow_id: int):
+    wf = get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    delete_workflow(workflow_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/workflow-steps", dependencies=[Depends(_require_admin)])
+def admin_create_workflow_step(body: WorkflowStepCreate):
+    wf = get_workflow(body.workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    step = upsert_workflow_step(
+        None, body.workflow_id, body.sequence_day, body.channel,
+        body.template_name, body.subject, body.body, body.terminal
+    )
+    return step
+
+
+@app.put("/api/admin/workflow-steps/{step_id}", dependencies=[Depends(_require_admin)])
+def admin_update_workflow_step(step_id: int, body: WorkflowStepUpdate):
+    existing = get_workflow_step(step_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Workflow step not found")
+    # Merge incoming fields with existing
+    merged = {
+        "workflow_id": body.workflow_id if body.workflow_id is not None else existing["workflow_id"],
+        "sequence_day": body.sequence_day if body.sequence_day is not None else existing["sequence_day"],
+        "channel": body.channel if body.channel is not None else existing["channel"],
+        "template_name": body.template_name if body.template_name is not None else existing["template_name"],
+        "subject": body.subject if body.subject is not None else existing["subject"],
+        "body": body.body if body.body is not None else existing["body"],
+        "terminal": body.terminal if body.terminal is not None else bool(existing["terminal"]),
+    }
+    return upsert_workflow_step(
+        step_id, merged["workflow_id"], merged["sequence_day"], merged["channel"],
+        merged["template_name"], merged["subject"], merged["body"], merged["terminal"]
+    )
+
+
+@app.delete("/api/admin/workflow-steps/{step_id}", dependencies=[Depends(_require_admin)])
+def admin_delete_workflow_step(step_id: int):
+    existing = get_workflow_step(step_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Workflow step not found")
+    delete_workflow_step(step_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/workflow/ai-generate", dependencies=[Depends(_require_admin)])
+def admin_ai_generate_workflow(body: AIGenerateRequest):
+    """Use Claude to generate a workflow step sequence from a natural-language prompt."""
+    import re
+    prompt_text = (body.prompt or "").strip()
+    if not prompt_text:
+        raise HTTPException(status_code=422, detail="Prompt is required")
+    if len(prompt_text) > 2000:
+        raise HTTPException(status_code=422, detail="Prompt too long (max 2000 chars)")
+
+    num_steps = max(1, min(body.num_steps, 12))
+
+    system_prompt = (
+        "You are a dental marketing expert helping design automated patient follow-up sequences. "
+        "Generate a JSON object with a 'steps' array. Each step must have these exact keys: "
+        "sequence_day (integer), channel ('email' or 'sms'), template_name (unique slug, e.g. 'aox_day1_email'), "
+        "subject (string, blank for SMS), body (string with {first_name} and {unsub_url} placeholders). "
+        "SMS bodies must end with '\\nReply STOP to opt out.' "
+        "Email bodies must include {unsub_url} near the end as an unsubscribe link. "
+        "Return ONLY the JSON object, no explanation."
+    )
+
+    user_prompt = (
+        f"Campaign description: {prompt_text}\n\n"
+        f"Generate exactly {num_steps} follow-up steps optimized for this campaign. "
+        "Make the messaging specific to the campaign goals. "
+        "Days should be spread naturally (e.g. 1, 3, 7, 14, 21, 30 for a 6-step sequence). "
+        "Return a JSON object with a 'steps' array."
+    )
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=4096,
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ],
+            system=system_prompt,
+        )
+        raw_text = message.content[0].text if message.content else ""
+    except Exception as e:
+        logger.error(f"AI generate workflow failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI generation failed: {e}")
+
+    # Extract JSON — handle code fences or bare JSON
+    json_text = raw_text.strip()
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", json_text, re.DOTALL)
+    if match:
+        json_text = match.group(1)
+    # If still looks like it has outer text, try to find the first { ... }
+    if not json_text.startswith("{"):
+        brace_match = re.search(r"\{.*\}", json_text, re.DOTALL)
+        if brace_match:
+            json_text = brace_match.group(0)
+
+    try:
+        result = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"AI generate — JSON parse failed: {e}\nRaw: {raw_text[:500]}")
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
+
+    # Schema validation
+    steps = result.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise HTTPException(status_code=502, detail="AI response missing 'steps' array")
+
+    required_keys = {"sequence_day", "channel", "template_name", "body"}
+    for i, step in enumerate(steps):
+        missing = required_keys - set(step.keys())
+        if missing:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Step {i+1} missing required fields: {missing}"
+            )
+        if step["channel"] not in ("email", "sms"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Step {i+1} has invalid channel: {step['channel']}"
+            )
+        if not isinstance(step.get("sequence_day"), int):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Step {i+1} sequence_day must be an integer"
+            )
+        # Ensure subject key exists
+        if "subject" not in step:
+            step["subject"] = ""
+
+    return {"steps": steps}
 
 
 if __name__ == "__main__":

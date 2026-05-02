@@ -2188,6 +2188,393 @@ function KeywordResearchSection() {
 }
 
 
+// ─── WorkflowsSection ────────────────────────────────────────────────────────
+
+function WorkflowsSection() {
+  const [workflows, setWorkflows] = React.useState([]);
+  const [selectedWfId, setSelectedWfId] = React.useState(null);
+  const [steps, setSteps] = React.useState([]);
+  const [loading, setLoading] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState('');
+  const [success, setSuccess] = React.useState('');
+
+  // New workflow form
+  const [showNewWf, setShowNewWf] = React.useState(false);
+  const [newWfName, setNewWfName] = React.useState('');
+  const [newWfTag, setNewWfTag] = React.useState('');
+  const [newWfDesc, setNewWfDesc] = React.useState('');
+
+  // Edit step state
+  const [editingStep, setEditingStep] = React.useState(null); // step object or null
+  const [stepDraft, setStepDraft] = React.useState({});
+
+  // AI Generate
+  const [aiPrompt, setAiPrompt] = React.useState('');
+  const [aiGenerating, setAiGenerating] = React.useState('');
+  const [aiPreview, setAiPreview] = React.useState(null);
+  const [applyingAi, setApplyingAi] = React.useState(false);
+
+  React.useEffect(() => { loadWorkflows(); }, []);
+
+  async function loadWorkflows() {
+    setLoading(true);
+    try {
+      const data = await api('/api/admin/workflows');
+      setWorkflows(data.workflows || []);
+      if (!selectedWfId && data.workflows && data.workflows.length > 0) {
+        selectWorkflow(data.workflows[0]);
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function selectWorkflow(wf) {
+    setSelectedWfId(wf.id);
+    setSteps(wf.steps || []);
+    setEditingStep(null);
+    setAiPreview(null);
+    setError(''); setSuccess('');
+  }
+
+  async function createWorkflow() {
+    if (!newWfName.trim()) return;
+    setSaving(true); setError('');
+    try {
+      const wf = await api('/api/admin/workflows', {
+        method: 'POST',
+        body: JSON.stringify({ name: newWfName.trim(), campaign_tag: newWfTag.trim(), description: newWfDesc.trim() }),
+      });
+      setShowNewWf(false); setNewWfName(''); setNewWfTag(''); setNewWfDesc('');
+      await loadWorkflows();
+      setSelectedWfId(wf.id);
+      setSteps([]);
+      setSuccess('Workflow created');
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  async function deleteWorkflow() {
+    if (!selectedWfId) return;
+    if (!window.confirm('Delete this workflow and all its steps?')) return;
+    setSaving(true); setError('');
+    try {
+      await api(`/api/admin/workflows/${selectedWfId}`, { method: 'DELETE' });
+      setSelectedWfId(null); setSteps([]);
+      await loadWorkflows();
+      setSuccess('Workflow deleted');
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  function startEditStep(step) {
+    setEditingStep(step);
+    setStepDraft({ ...step });
+    setAiPreview(null);
+  }
+
+  function startNewStep() {
+    const blank = {
+      id: null, workflow_id: selectedWfId,
+      sequence_day: 1, channel: 'email',
+      template_name: '', subject: '', body: '', terminal: false,
+    };
+    setEditingStep(blank);
+    setStepDraft({ ...blank });
+    setAiPreview(null);
+  }
+
+  async function saveStep() {
+    if (!stepDraft.template_name || !stepDraft.body) {
+      setError('Template name and body are required');
+      return;
+    }
+    setSaving(true); setError('');
+    try {
+      const isNew = !stepDraft.id;
+      const url = isNew ? '/api/admin/workflow-steps' : `/api/admin/workflow-steps/${stepDraft.id}`;
+      const saved = await api(url, {
+        method: isNew ? 'POST' : 'PUT',
+        body: JSON.stringify({
+          workflow_id: stepDraft.workflow_id,
+          sequence_day: parseInt(stepDraft.sequence_day) || 1,
+          channel: stepDraft.channel,
+          template_name: stepDraft.template_name,
+          subject: stepDraft.subject || '',
+          body: stepDraft.body,
+          terminal: !!stepDraft.terminal,
+        }),
+      });
+      setEditingStep(null);
+      // Refresh steps
+      const wfData = await api(`/api/admin/workflows/${selectedWfId}`);
+      setSteps(wfData.steps || []);
+      setSuccess('Step saved');
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  async function deleteStep(stepId) {
+    if (!window.confirm('Delete this step?')) return;
+    setSaving(true); setError('');
+    try {
+      await api(`/api/admin/workflow-steps/${stepId}`, { method: 'DELETE' });
+      setSteps(s => s.filter(s => s.id !== stepId));
+      if (editingStep && editingStep.id === stepId) setEditingStep(null);
+      setSuccess('Step deleted');
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  async function generateAI() {
+    if (!aiPrompt.trim()) return;
+    if (!selectedWfId) { setError('Select a workflow first'); return; }
+    setAiGenerating('Generating with AI…');
+    setAiPreview(null); setError('');
+    try {
+      const result = await api('/api/admin/workflow/ai-generate', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: aiPrompt, num_steps: 6 }),
+      });
+      setAiPreview(result.steps || []);
+    } catch (e) { setError(e.message); }
+    finally { setAiGenerating(''); }
+  }
+
+  async function applyAiSteps() {
+    if (!aiPreview || !selectedWfId) return;
+    setApplyingAi(true); setError('');
+    try {
+      for (const step of aiPreview) {
+        await api('/api/admin/workflow-steps', {
+          method: 'POST',
+          body: JSON.stringify({
+            workflow_id: selectedWfId,
+            sequence_day: step.sequence_day,
+            channel: step.channel,
+            template_name: step.template_name,
+            subject: step.subject || '',
+            body: step.body,
+            terminal: false,
+          }),
+        });
+      }
+      setAiPreview(null); setAiPrompt('');
+      const wfData = await api(`/api/admin/workflows/${selectedWfId}`);
+      setSteps(wfData.steps || []);
+      setSuccess(`Added ${aiPreview.length} AI-generated steps`);
+    } catch (e) { setError(e.message); }
+    finally { setApplyingAi(false); }
+  }
+
+  const selectedWf = workflows.find(w => w.id === selectedWfId);
+
+  return (
+    <div style={{ display: 'flex', gap: 16, height: 'calc(100vh - 100px)', overflow: 'hidden' }}>
+      {/* Left: workflow list */}
+      <div style={{ width: 220, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 12, display: 'flex', flexDirection: 'column', gap: 6, overflow: 'hidden' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Workflows</span>
+          <button className="btn btn-teal btn-sm" onClick={() => setShowNewWf(v => !v)}>+ New</button>
+        </div>
+        {showNewWf && (
+          <div style={{ background: 'var(--gray-light)', borderRadius: 6, padding: 8, marginBottom: 4 }}>
+            <input placeholder="Name" value={newWfName} onChange={e => setNewWfName(e.target.value)}
+              style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 4 }} />
+            <input placeholder="Campaign tag (blank = default)" value={newWfTag} onChange={e => setNewWfTag(e.target.value)}
+              style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 4 }} />
+            <input placeholder="Description" value={newWfDesc} onChange={e => setNewWfDesc(e.target.value)}
+              style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 6 }} />
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button className="btn btn-teal btn-sm" onClick={createWorkflow} disabled={saving}>Create</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setShowNewWf(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
+        <div style={{ overflowY: 'auto', flex: 1 }}>
+          {loading && <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: 8 }}>Loading…</div>}
+          {workflows.map(wf => (
+            <div key={wf.id}
+              onClick={() => selectWorkflow(wf)}
+              style={{
+                padding: '6px 8px', borderRadius: 5, cursor: 'pointer', marginBottom: 2,
+                background: wf.id === selectedWfId ? 'var(--teal-light)' : 'transparent',
+                border: '1px solid ' + (wf.id === selectedWfId ? 'var(--teal)' : 'transparent'),
+              }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: wf.id === selectedWfId ? 'var(--teal-dark)' : 'var(--text)' }}>{wf.name}</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                {wf.campaign_tag ? wf.campaign_tag : <em>default</em>} · {(wf.steps || []).length} steps
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Right: step editor */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
+        {error && <div style={{ background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#dc2626' }}>{error}</div>}
+        {success && <div style={{ background: '#dcfce7', border: '1px solid #86efac', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#15803d' }}>{success}</div>}
+
+        {selectedWf ? (
+          <>
+            {/* Workflow header */}
+            <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>{selectedWf.name}</div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                  Tag: <strong>{selectedWf.campaign_tag || '(default)'}</strong>
+                  {selectedWf.description ? ' · ' + selectedWf.description : ''}
+                </div>
+              </div>
+              <button className="btn btn-sm" style={{ background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                onClick={deleteWorkflow} disabled={saving}>Delete Workflow</button>
+              <button className="btn btn-teal btn-sm" onClick={startNewStep} disabled={saving}>+ Add Step</button>
+            </div>
+
+            <div style={{ display: 'flex', gap: 10, flex: 1, overflow: 'hidden' }}>
+              {/* Timeline */}
+              <div style={{ width: 220, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, overflowY: 'auto', padding: 10 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 8 }}>Sequence ({steps.length} steps)</div>
+                {steps.length === 0 && (
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '12px 0' }}>No steps yet</div>
+                )}
+                {steps.sort((a,b) => a.sequence_day - b.sequence_day).map(step => (
+                  <div key={step.id}
+                    onClick={() => startEditStep(step)}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px', borderRadius: 5,
+                      cursor: 'pointer', marginBottom: 4, fontSize: 11,
+                      background: editingStep && editingStep.id === step.id ? 'var(--teal-light)' : 'var(--gray-light)',
+                      border: '1px solid ' + (editingStep && editingStep.id === step.id ? 'var(--teal)' : 'transparent'),
+                    }}>
+                    <div style={{
+                      width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
+                      background: step.channel === 'email' ? '#dbeafe' : '#fef9c3',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: 10, fontWeight: 700, color: step.channel === 'email' ? '#1d4ed8' : '#92400e',
+                    }}>D{step.sequence_day}</div>
+                    <div style={{ flex: 1, overflow: 'hidden' }}>
+                      <div style={{ fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {step.channel === 'email' ? '✉ ' : '💬 '}{step.subject || step.template_name}
+                      </div>
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{step.channel}{step.terminal ? ' · 🔚' : ''}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Step editor or AI generator */}
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
+                {editingStep ? (
+                  <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 14, overflowY: 'auto', flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 10, color: 'var(--teal-dark)' }}>
+                      {editingStep.id ? 'Edit Step' : 'New Step'}
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Day</label>
+                        <input type="number" value={stepDraft.sequence_day || 1} min="0" max="365"
+                          onChange={e => setStepDraft(d => ({...d, sequence_day: parseInt(e.target.value)||1}))}
+                          style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }} />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Channel</label>
+                        <select value={stepDraft.channel || 'email'}
+                          onChange={e => setStepDraft(d => ({...d, channel: e.target.value}))}
+                          style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }}>
+                          <option value="email">Email</option>
+                          <option value="sms">SMS</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div style={{ marginBottom: 8 }}>
+                      <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Template Name (unique slug)</label>
+                      <input value={stepDraft.template_name || ''} placeholder="e.g. aox_day1_email"
+                        onChange={e => setStepDraft(d => ({...d, template_name: e.target.value}))}
+                        style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }} />
+                    </div>
+                    {stepDraft.channel === 'email' && (
+                      <div style={{ marginBottom: 8 }}>
+                        <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Subject</label>
+                        <input value={stepDraft.subject || ''} placeholder="Email subject line"
+                          onChange={e => setStepDraft(d => ({...d, subject: e.target.value}))}
+                          style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }} />
+                      </div>
+                    )}
+                    <div style={{ marginBottom: 8 }}>
+                      <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Body — use {'{first_name}'}, {'{unsub_url}'}</label>
+                      <textarea value={stepDraft.body || ''} rows={8} placeholder="Message body..."
+                        onChange={e => setStepDraft(d => ({...d, body: e.target.value}))}
+                        style={{ display: 'block', width: '100%', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2, resize: 'vertical', fontFamily: 'inherit' }} />
+                    </div>
+                    <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <input type="checkbox" id="terminal-chk" checked={!!stepDraft.terminal}
+                        onChange={e => setStepDraft(d => ({...d, terminal: e.target.checked}))} />
+                      <label htmlFor="terminal-chk" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                        Terminal step (marks lead cold + deletes smile image)
+                      </label>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button className="btn btn-teal btn-sm" onClick={saveStep} disabled={saving}>{saving ? 'Saving…' : 'Save Step'}</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => setEditingStep(null)}>Cancel</button>
+                      {editingStep.id && (
+                        <button className="btn btn-sm" style={{ marginLeft: 'auto', background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                          onClick={() => deleteStep(editingStep.id)} disabled={saving}>Delete</button>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 14, flex: 1, overflowY: 'auto' }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal-dark)', marginBottom: 6 }}>✨ AI Generate Steps</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
+                      Describe your campaign goals and target patient. Claude will generate a complete follow-up sequence.
+                    </div>
+                    <textarea value={aiPrompt} rows={4}
+                      placeholder="Example: All-on-X dental implants campaign targeting adults 45+ who saw our smile preview. Goal: book a free consultation. Emphasize life-changing results, financing options, and Dr. Gupta's expertise."
+                      onChange={e => setAiPrompt(e.target.value)}
+                      style={{ width: '100%', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 12, resize: 'vertical', fontFamily: 'inherit', marginBottom: 8 }} />
+                    <button className="btn btn-teal btn-sm" onClick={generateAI} disabled={!!aiGenerating || !aiPrompt.trim()}>
+                      {aiGenerating || '✨ Generate with AI'}
+                    </button>
+                    {aiPreview && (
+                      <div style={{ marginTop: 12 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: 'var(--text)' }}>
+                          Preview — {aiPreview.length} steps generated
+                        </div>
+                        {aiPreview.map((s, i) => (
+                          <div key={i} style={{ background: 'var(--gray-light)', borderRadius: 5, padding: '6px 8px', marginBottom: 4, fontSize: 11 }}>
+                            <div style={{ fontWeight: 600 }}>Day {s.sequence_day} · {s.channel} {s.subject ? `· "${s.subject}"` : ''}</div>
+                            <div style={{ color: 'var(--text-muted)', marginTop: 2 }}>{s.template_name}</div>
+                            <div style={{ marginTop: 4, whiteSpace: 'pre-wrap', color: 'var(--text)', maxHeight: 60, overflow: 'hidden' }}>{s.body}</div>
+                          </div>
+                        ))}
+                        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                          <button className="btn btn-teal btn-sm" onClick={applyAiSteps} disabled={applyingAi}>
+                            {applyingAi ? 'Applying…' : `✅ Add ${aiPreview.length} Steps to Workflow`}
+                          </button>
+                          <button className="btn btn-ghost btn-sm" onClick={() => setAiPreview(null)}>Discard</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        ) : (
+          <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 32, textAlign: 'center', color: 'var(--text-muted)', fontSize: 12 }}>
+            {loading ? 'Loading workflows…' : 'Select or create a workflow on the left'}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
@@ -2429,6 +2816,7 @@ function App() {
         <button className={'tab' + (tab === 'dashboard' ? ' active' : '')} onClick={() => setTab('dashboard')}>Dashboard</button>
         <button className={'tab' + (tab === 'pipeline' ? ' active' : '')} onClick={() => setTab('pipeline')}>Pipeline</button>
         <button className={'tab' + (tab === 'reports' ? ' active' : '')} onClick={() => setTab('reports')}>Reports & Campaigns</button>
+        <button className={'tab' + (tab === 'workflows' ? ' active' : '')} onClick={() => setTab('workflows')}>Workflows</button>
         <button className={'tab' + (tab === 'admin' ? ' active' : '')} onClick={() => setTab('admin')}>Admin</button>
       </div>
       <div className="main">
@@ -2451,6 +2839,7 @@ function App() {
               </React.Fragment>
             )}
             {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} />}
+            {tab === 'workflows' && <WorkflowsSection />}
             {tab === 'admin' && (
               <AdminTab
                 onSync={() => api('/api/admin/sync', { method: 'POST' })}

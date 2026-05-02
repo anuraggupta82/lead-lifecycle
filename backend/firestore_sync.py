@@ -147,7 +147,8 @@ def sync_from_firestore() -> dict:
 
             if not existing:
                 # New lead — enqueue follow-ups from their original created_at
-                enqueue_follow_ups(normalized["id"], normalized.get("created_at") or "")
+                lead_row = get_lead(normalized["id"]) or normalized
+                enqueue_follow_ups(lead_row, normalized.get("created_at") or "")
                 add_event(normalized["id"], "lead_created", source="firestore_sync",
                           detail=json.dumps({"source": normalized["source"]}))
                 synced += 1
