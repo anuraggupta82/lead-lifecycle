@@ -48,6 +48,8 @@ from database import (
     upsert_workflow, upsert_workflow_step, delete_workflow_step, delete_workflow,
     # OD settings
     get_setting, save_setting, get_od_settings,
+    # Step 10: stop conditions helpers
+    add_lead_event,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -754,6 +756,209 @@ def gads_optimizer_runs(limit: int = 20):
     runs = get_optimizer_runs(limit=limit)
     return {"runs": runs, "total": len(runs)}
 
+
+# ─── Step 10: TCPA Stop Conditions ──────────────────────────────────────────
+
+# STOP keyword normalization
+_SMS_STOP_WORDS  = {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}
+_SMS_START_WORDS = {"start", "yes", "unstop"}
+_SMS_HELP_WORDS  = {"help", "info"}
+
+TWIML_STOP_REPLY  = "<?xml version='1.0' encoding='UTF-8'?><Response><Message>You have been unsubscribed. Reply START to resubscribe.</Message></Response>"
+TWIML_START_REPLY = "<?xml version='1.0' encoding='UTF-8'?><Response><Message>You have been resubscribed. Reply STOP to unsubscribe.</Message></Response>"
+TWIML_HELP_REPLY  = "<?xml version='1.0' encoding='UTF-8'?><Response><Message>Grafton Dental Care: Reply STOP to unsubscribe. Call 508-318-4477 for help.</Message></Response>"
+TWIML_EMPTY       = "<?xml version='1.0' encoding='UTF-8'?><Response/>"
+
+
+def _verify_twilio_signature(request_url: str, post_params: dict,
+                              signature: str, auth_token: str) -> bool:
+    """Validate Twilio request signature."""
+    try:
+        from twilio.request_validator import RequestValidator
+        validator = RequestValidator(auth_token)
+        return validator.validate(request_url, post_params, signature)
+    except Exception:
+        return False
+
+
+@app.post("/webhooks/twilio/inbound")
+async def twilio_inbound_webhook(request: Request):
+    """
+    Handle inbound SMS from Twilio.
+
+    Signature verification has three modes (controlled by DB setting
+    'twilio_sig_mode'):
+      enforce   — reject invalid signatures (HTTP 403)
+      log_only  — log mismatch but continue (default in dev)
+      skip      — skip verification entirely (test/CI only)
+    """
+    from fastapi.responses import Response as _Resp
+    from database import (
+        get_lead_by_phone, set_lead_dnd, insert_sms_message,
+        add_lead_event, cancel_queue_rows, get_setting as _get_setting,
+    )
+    from stop_engine import handle_event as _stop_handle
+
+    settings = get_settings()
+
+    # Parse form body
+    form = await request.form()
+    post_params = dict(form)
+
+    from_number = post_params.get("From", "")
+    to_number   = post_params.get("To", "")
+    body_raw    = post_params.get("Body", "")
+    twilio_sid  = post_params.get("MessageSid", "")
+    body_clean  = body_raw.strip()
+
+    # ── Twilio signature verification ────────────────────────────────────────
+    sig_mode = _get_setting("twilio_sig_mode", "log_only")
+    if sig_mode != "skip" and settings.twilio_auth_token:
+        x_sig = request.headers.get("X-Twilio-Signature", "")
+        request_url = str(request.url)
+        valid = _verify_twilio_signature(request_url, post_params,
+                                         x_sig, settings.twilio_auth_token)
+        if not valid:
+            logger.warning(
+                f"Twilio signature mismatch from={from_number} url={request_url}"
+            )
+            if sig_mode == "enforce":
+                return _Resp(content=TWIML_EMPTY, media_type="application/xml",
+                             status_code=403)
+            # log_only: fall through
+
+    # ── Match lead by phone number ────────────────────────────────────────────
+    lead = get_lead_by_phone(from_number)
+    lead_id = lead["id"] if lead else None
+
+    # ── Store inbound message ─────────────────────────────────────────────────
+    insert_sms_message(
+        lead_id=lead_id,
+        direction="inbound",
+        from_number=from_number,
+        to_number=to_number,
+        body=body_clean,
+        twilio_sid=twilio_sid,
+    )
+
+    # ── Parse first word for keyword handling ─────────────────────────────────
+    words = body_clean.split()
+    first_word = words[0].lower().strip(".,!?") if words else ""
+
+    if first_word in _SMS_STOP_WORDS:
+        if lead_id:
+            # Set DND flag (reuses unsubscribed_sms) and log event
+            set_lead_dnd(lead_id, "sms", reason="STOP keyword")
+            # Cancel queued SMS rows via stop engine
+            _stop_handle(lead_id, "sms_stop", reason="STOP keyword")
+        else:
+            # Unknown number — log but don't send confirmation (Twilio CTIA guidance)
+            logger.info(f"STOP from unmatched number {from_number} — no confirmation sent")
+            return _Resp(content=TWIML_EMPTY, media_type="application/xml")
+        return _Resp(content=TWIML_STOP_REPLY, media_type="application/xml")
+
+    elif first_word in _SMS_START_WORDS:
+        if lead_id:
+            from database import resume_lead
+            # Clear unsubscribed_sms flag
+            from database import _conn as _dbc
+            import sqlite3 as _sq
+            _now_ts = datetime.now(timezone.utc).isoformat()
+            with _dbc() as _c:
+                _c.execute(
+                    "UPDATE leads SET unsubscribed_sms=0, dnd_reason='', dnd_set_at='', updated_at=? WHERE id=?",
+                    (_now_ts, lead_id)
+                )
+            add_lead_event(lead_id, "sms_resubscribed", source="twilio_webhook")
+        return _Resp(content=TWIML_START_REPLY, media_type="application/xml")
+
+    elif first_word in _SMS_HELP_WORDS:
+        return _Resp(content=TWIML_HELP_REPLY, media_type="application/xml")
+
+    else:
+        # Regular reply — log the event (stop_engine handles replied as log-only)
+        if lead_id:
+            _stop_handle(lead_id, "replied", reason=f"inbound_sms: {body_clean[:80]}")
+        return _Resp(content=TWIML_EMPTY, media_type="application/xml")
+
+
+# ── Admin stop-condition endpoints ────────────────────────────────────────────
+
+class PauseLeadRequest(BaseModel):
+    reason: str = "admin"
+    until: str = ""   # ISO timestamp or '' for indefinite
+
+
+class DndRequest(BaseModel):
+    channel: str    # 'sms' | 'email' | 'all'
+    reason: str = "admin"
+
+
+@app.post("/api/admin/lead/{lead_id}/pause", dependencies=[Depends(_require_admin)])
+def admin_pause_lead(lead_id: str, body: PauseLeadRequest):
+    """Pause a lead's follow-up sequence (indefinitely or until a timestamp)."""
+    from database import pause_lead
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    pause_lead(lead_id, reason=body.reason, until=body.until)
+    from stop_engine import handle_event as _stop_handle
+    _stop_handle(lead_id, "manual_pause", reason=body.reason)
+    return {"status": "ok", "lead_id": lead_id, "paused": True}
+
+
+@app.post("/api/admin/lead/{lead_id}/resume", dependencies=[Depends(_require_admin)])
+def admin_resume_lead(lead_id: str):
+    """Resume a paused lead."""
+    from database import resume_lead
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    resume_lead(lead_id)
+    return {"status": "ok", "lead_id": lead_id, "paused": False}
+
+
+@app.post("/api/admin/lead/{lead_id}/dnd", dependencies=[Depends(_require_admin)])
+def admin_set_dnd(lead_id: str, body: DndRequest):
+    """Set DND (do-not-disturb) for a lead on one or all channels."""
+    from database import set_lead_dnd
+    from stop_engine import handle_event as _stop_handle
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    channels = ["sms", "email"] if body.channel == "all" else [body.channel]
+    for ch in channels:
+        set_lead_dnd(lead_id, ch, reason=body.reason)
+    _stop_handle(lead_id, "dnd_set", reason=body.reason)
+    return {"status": "ok", "lead_id": lead_id, "dnd_channels": channels}
+
+
+@app.post("/api/admin/lead/{lead_id}/clear-dnd", dependencies=[Depends(_require_admin)])
+async def admin_clear_dnd(lead_id: str, request: Request):
+    """Clear DND flags for a lead (admin override — re-enables future messages)."""
+    body = await request.json()
+    channel = body.get("channel", "all")
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    _now_ts = datetime.now(timezone.utc).isoformat()
+    from database import _conn as _dbc
+    with _dbc() as _c:
+        if channel in ("sms", "all"):
+            _c.execute(
+                "UPDATE leads SET unsubscribed_sms=0, dnd_reason='', dnd_set_at='', updated_at=? WHERE id=?",
+                (_now_ts, lead_id)
+            )
+        if channel in ("email", "all"):
+            _c.execute(
+                "UPDATE leads SET unsubscribed_email=0, dnd_reason='', dnd_set_at='', updated_at=? WHERE id=?",
+                (_now_ts, lead_id)
+            )
+    add_lead_event(lead_id, "dnd_cleared", detail=json.dumps({"channel": channel}), source="admin")
+    return {"status": "ok", "lead_id": lead_id, "channel": channel}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/admin/run-queue", dependencies=[Depends(_require_admin)])
 def admin_run_queue():

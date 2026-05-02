@@ -398,6 +398,24 @@ CREATE TABLE IF NOT EXISTS gads_spend_guardrails (
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
+
+-- ── Step 10: TCPA Stop Conditions ─────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS sms_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id     TEXT DEFAULT NULL,             -- NULL if number not matched to a lead
+    direction   TEXT NOT NULL,                 -- 'inbound' | 'outbound'
+    from_number TEXT NOT NULL DEFAULT '',
+    to_number   TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL DEFAULT '',
+    twilio_sid  TEXT NOT NULL DEFAULT '',
+    received_at TEXT NOT NULL,
+    FOREIGN KEY (lead_id) REFERENCES leads(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sms_messages_lead ON sms_messages(lead_id);
+CREATE INDEX IF NOT EXISTS idx_sms_messages_from ON sms_messages(from_number);
+CREATE INDEX IF NOT EXISTS idx_sms_messages_received ON sms_messages(received_at DESC);
 """
 
 LIFECYCLE_STAGES = [
@@ -829,6 +847,48 @@ def _migrate(conn):
             updated_at       TEXT NOT NULL
         )
     """)
+
+    # ── Step 10: TCPA Stop Conditions ─────────────────────────────────────────
+    # New columns on leads table
+    leads_cols = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
+    step10_lead_cols = [
+        ("dnd_reason",    "TEXT DEFAULT ''"),
+        ("dnd_set_at",    "TEXT DEFAULT ''"),
+        ("paused_at",     "TEXT DEFAULT ''"),
+        ("paused_reason", "TEXT DEFAULT ''"),
+        ("paused_until",  "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_def in step10_lead_cols:
+        if col_name not in leads_cols:
+            conn.execute(f"ALTER TABLE leads ADD COLUMN {col_name} {col_def}")
+
+    # New columns on follow_up_queue
+    fq_cols2 = {row[1] for row in conn.execute("PRAGMA table_info(follow_up_queue)").fetchall()}
+    step10_fq_cols = [
+        ("cancelled_at",         "TEXT DEFAULT ''"),
+        ("cancellation_reason",  "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_def in step10_fq_cols:
+        if col_name not in fq_cols2:
+            conn.execute(f"ALTER TABLE follow_up_queue ADD COLUMN {col_name} {col_def}")
+
+    # sms_messages table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sms_messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id     TEXT DEFAULT NULL,
+            direction   TEXT NOT NULL,
+            from_number TEXT NOT NULL DEFAULT '',
+            to_number   TEXT NOT NULL DEFAULT '',
+            body        TEXT NOT NULL DEFAULT '',
+            twilio_sid  TEXT NOT NULL DEFAULT '',
+            received_at TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_messages_lead ON sms_messages(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_messages_from ON sms_messages(from_number)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_messages_received ON sms_messages(received_at DESC)")
 
     # Seed default memories if table is empty
     existing = conn.execute("SELECT COUNT(*) FROM optimizer_memory").fetchone()[0]
@@ -2673,3 +2733,133 @@ def upsert_spend_guardrail(campaign_id: str, campaign_name: str, daily_cap_usd: 
             "SELECT * FROM gads_spend_guardrails WHERE campaign_id=?", (campaign_id,)
         ).fetchone()
         return dict(row)
+
+
+# ─── Step 10: TCPA Stop Conditions ───────────────────────────────────────────
+
+def get_lead_by_phone(phone: str) -> Optional[dict]:
+    """Look up a lead by normalized phone number (digits only, last 10)."""
+    if not phone:
+        return None
+    digits = "".join(c for c in phone if c.isdigit())
+    if not digits:
+        return None
+    # Match last 10 digits for E.164 vs local number flexibility
+    suffix = digits[-10:] if len(digits) >= 10 else digits
+    with _conn() as conn:
+        # Try exact phone_hash match first (most reliable)
+        phone_hash = _hash(digits)
+        row = conn.execute(
+            "SELECT * FROM leads WHERE phone_hash=? ORDER BY created_at DESC LIMIT 1",
+            (phone_hash,)
+        ).fetchone()
+        if row:
+            return dict(row)
+        # Fallback: LIKE match on stored phone
+        row = conn.execute(
+            "SELECT * FROM leads WHERE phone LIKE ? ORDER BY created_at DESC LIMIT 1",
+            (f"%{suffix}",)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def set_lead_dnd(lead_id: str, channel: str, reason: str = "STOP keyword") -> None:
+    """
+    Mark a lead as DND for a channel. Reuses unsubscribed_sms / unsubscribed_email columns.
+    Also stamps dnd_reason / dnd_set_at for audit purposes.
+    Inserts a lifecycle_event of type 'sms_stop' or 'email_unsub'.
+    """
+    now = _now()
+    field = "unsubscribed_sms" if channel == "sms" else "unsubscribed_email"
+    event_type = "sms_stop" if channel == "sms" else "email_unsub"
+    with _conn() as conn:
+        conn.execute(
+            f"UPDATE leads SET {field}=1, dnd_reason=?, dnd_set_at=?, updated_at=? WHERE id=?",
+            (reason, now, now, lead_id)
+        )
+        conn.execute(
+            "INSERT INTO unsubscribes (lead_id, channel, reason, created_at) VALUES (?,?,?,?)",
+            (lead_id, channel, reason, now)
+        )
+    add_event(lead_id, event_type, detail=json.dumps({"channel": channel, "reason": reason}),
+              source="twilio_webhook")
+
+
+def pause_lead(lead_id: str, reason: str = "admin", until: str = "") -> None:
+    """Pause a lead's follow-up sequence. until='' means indefinite."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE leads SET paused_at=?, paused_reason=?, paused_until=?, updated_at=? WHERE id=?",
+            (now, reason, until, now, lead_id)
+        )
+    add_event(lead_id, "lead_paused", detail=json.dumps({"reason": reason, "until": until}),
+              source="admin")
+
+
+def resume_lead(lead_id: str) -> None:
+    """Resume a paused lead."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE leads SET paused_at='', paused_reason='', paused_until='', updated_at=? WHERE id=?",
+            (now, lead_id)
+        )
+    add_event(lead_id, "lead_resumed", source="admin")
+
+
+def cancel_queue_rows(lead_id: str, channels: Optional[list] = None, reason: str = "") -> int:
+    """
+    Cancel all pending follow-up queue rows for a lead (optionally filtered by channel).
+    Uses BEGIN IMMEDIATE to prevent concurrent dispatch from racing.
+    Returns count of rows cancelled.
+    """
+    now = _now()
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if channels:
+            placeholders = ",".join("?" * len(channels))
+            cursor = conn.execute(
+                f"UPDATE follow_up_queue SET status='cancelled', cancelled_at=?, cancellation_reason=? "
+                f"WHERE lead_id=? AND status='pending' AND channel IN ({placeholders})",
+                [now, reason, lead_id] + list(channels)
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE follow_up_queue SET status='cancelled', cancelled_at=?, cancellation_reason=? "
+                "WHERE lead_id=? AND status='pending'",
+                (now, reason, lead_id)
+            )
+        count = cursor.rowcount
+        conn.commit()
+        return count
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def insert_sms_message(
+    lead_id: Optional[str],
+    direction: str,
+    from_number: str,
+    to_number: str,
+    body: str,
+    twilio_sid: str = "",
+) -> int:
+    """Store an inbound or outbound SMS message. Returns the new row id."""
+    now = _now()
+    with _conn() as conn:
+        cursor = conn.execute("""
+            INSERT INTO sms_messages
+                (lead_id, direction, from_number, to_number, body, twilio_sid, received_at)
+            VALUES (?,?,?,?,?,?,?)
+        """, (lead_id, direction, from_number, to_number, body, twilio_sid, now))
+        return cursor.lastrowid
+
+
+def add_lead_event(lead_id: str, event_type: str, detail: str = "", source: str = "system") -> dict:
+    """Thin wrapper around add_event for use by stop_engine and webhooks."""
+    return add_event(lead_id, event_type, detail=detail, source=source)

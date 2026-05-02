@@ -20,6 +20,7 @@ from database import (
     already_sent, record_send,
     get_workflow_step,
 )
+from datetime import timezone as _tz
 from email_service import (
     send_day1_email, send_day7_email, send_day14_email,
     send_day30_cold_email, _send,
@@ -97,26 +98,67 @@ def _process_queue():
         channel = item["channel"]
         workflow_step_id = item.get("workflow_step_id")
 
-        # Skip if unsubscribed
-        if channel == "email" and item.get("unsubscribed_email"):
+        # ── Pre-dispatch status re-read ──────────────────────────────────────
+        # Re-read the queue row status — it may have been cancelled by the stop
+        # engine between the time get_due_follow_ups() ran and now.
+        fresh_lead = get_lead(lead_id)
+        if not fresh_lead:
+            mark_follow_up_sent(queue_id, "skipped", "lead_not_found")
+            continue
+
+        # Skip if queue row was cancelled while we were iterating
+        from database import _conn as _db_conn
+        with _db_conn() as _check_conn:
+            _qrow = _check_conn.execute(
+                "SELECT status FROM follow_up_queue WHERE id=?", (queue_id,)
+            ).fetchone()
+        if _qrow and _qrow["status"] == "cancelled":
+            logger.info(f"Queue item {queue_id} was cancelled mid-batch; skipping")
+            continue
+
+        # Check paused_until — skip if pause is still in effect
+        paused_until = fresh_lead.get("paused_until") or ""
+        if paused_until:
+            try:
+                from datetime import datetime
+                import dateutil.parser
+                pu = dateutil.parser.parse(paused_until)
+                if pu.tzinfo is None:
+                    pu = pu.replace(tzinfo=_tz.utc)
+                if datetime.now(_tz.utc) < pu:
+                    mark_follow_up_sent(queue_id, "skipped", f"lead_paused_until={paused_until}")
+                    continue
+            except Exception:
+                pass  # malformed paused_until — don't block
+
+        # Check indefinite pause (paused_at set but paused_until empty)
+        if fresh_lead.get("paused_at") and not paused_until:
+            mark_follow_up_sent(queue_id, "skipped", "lead_paused_indefinitely")
+            continue
+
+        # Use fresh lead data for the rest of the checks
+        channel = item["channel"]
+
+        # Skip if unsubscribed (re-check from fresh DB read)
+        if channel == "email" and fresh_lead.get("unsubscribed_email"):
             mark_follow_up_sent(queue_id, "skipped", "unsubscribed")
             continue
-        if channel == "sms" and item.get("unsubscribed_sms"):
+        if channel == "sms" and fresh_lead.get("unsubscribed_sms"):
             mark_follow_up_sent(queue_id, "skipped", "unsubscribed")
             continue
 
         # Skip if lead already booked or beyond nurturing
-        stage = item.get("stage", "new")
+        stage = fresh_lead.get("stage", "new")
         if stage in ("scheduled", "no_show", "showed", "treatment_presented",
                      "treatment_accepted", "treatment_completed", "cold"):
             mark_follow_up_sent(queue_id, "skipped", f"stage={stage}")
             continue
 
         # Skip if no contact info
-        if channel == "email" and not item.get("email"):
+        if channel == "email" and not fresh_lead.get("email"):
             mark_follow_up_sent(queue_id, "skipped", "no_email")
             continue
-        if channel == "sms" and not item.get("phone"):
+        if channel == "sms" and not fresh_lead.get("phone"):
             mark_follow_up_sent(queue_id, "skipped", "no_phone")
             continue
 
@@ -128,6 +170,8 @@ def _process_queue():
 
         try:
             success = False
+            # Merge fresh lead data into item for downstream dispatch functions
+            item = {**item, **{k: v for k, v in fresh_lead.items() if v not in (None, "")}}
             unsub_url = _unsubscribe_url(lead_id, channel)
             is_terminal = False
 

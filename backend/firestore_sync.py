@@ -143,6 +143,8 @@ def sync_from_firestore() -> dict:
                 continue
 
             existing = get_lead(normalized["id"])
+            old_stage = (existing or {}).get("stage", "")
+
             upsert_lead(normalized)
 
             if not existing:
@@ -153,6 +155,23 @@ def sync_from_firestore() -> dict:
                           detail=json.dumps({"source": normalized["source"]}))
                 synced += 1
             else:
+                # Detect booked transition — only fire stop engine on actual transition
+                new_stage = (get_lead(normalized["id"]) or {}).get("stage", "")
+                BOOKED_STAGES = {"scheduled", "showed", "no_show",
+                                 "treatment_presented", "treatment_accepted",
+                                 "treatment_completed"}
+                was_booked = old_stage in BOOKED_STAGES
+                now_booked = new_stage in BOOKED_STAGES
+                if not was_booked and now_booked:
+                    try:
+                        from stop_engine import handle_event
+                        handle_event(normalized["id"], "booked", reason=f"stage_transition:{old_stage}->{new_stage}")
+                        logger.info(
+                            f"Firestore sync: fired stop_engine 'booked' for lead {normalized['id']} "
+                            f"({old_stage} → {new_stage})"
+                        )
+                    except Exception as _se:
+                        logger.warning(f"stop_engine.handle_event(booked) failed (non-fatal): {_se}")
                 skipped += 1
 
         except Exception as e:
