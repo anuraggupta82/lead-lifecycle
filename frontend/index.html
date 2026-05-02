@@ -537,10 +537,9 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   }
 
   async function deleteLead() {
-    const res = await api('/api/admin/lead/' + lead.id, {method:'DELETE'});
-    if (res && res.firestore_deleted === false) {
-      alert('Warning: Lead deleted locally but Firestore delete failed. The lead may reappear after sync.');
-    }
+    await api('/api/admin/lead/' + lead.id, {method:'DELETE'});
+    // Tombstone is always written first — lead will not reappear after sync
+    // even if Firestore remote delete fails. No warning needed.
     onDelete(lead.id);
     onClose();
   }

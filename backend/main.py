@@ -670,6 +670,7 @@ def admin_delete_lead(lead_id: str):
 
     # Tombstone first — even if Firestore delete or GCS delete fails below,
     # the next Firestore sync will refuse to re-import this lead.
+    tombstone_written = False
     try:
         add_deleted_lead_tombstone(
             lead_id,
@@ -677,6 +678,7 @@ def admin_delete_lead(lead_id: str):
             deleted_by="admin",
             reason="admin_delete_lead",
         )
+        tombstone_written = True
         logger.info(f"Tombstone written for lead {lead_id} ({lead.get('email','')})")
     except Exception as e:
         logger.warning(f"Could not write tombstone for lead {lead_id}: {e}")
@@ -733,8 +735,8 @@ def admin_delete_lead(lead_id: str):
         conn.execute("DELETE FROM conversion_uploads WHERE lead_id = ?", (lead_id,))
         conn.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
 
-    logger.info(f"Lead {lead_id} ({lead.get('email','')}) permanently deleted by admin (firestore={'yes' if firestore_deleted else 'FAILED'})")
-    return {"status": "deleted", "lead_id": lead_id, "firestore_deleted": firestore_deleted}
+    logger.info(f"Lead {lead_id} ({lead.get('email','')}) permanently deleted by admin (tombstone={tombstone_written}, firestore={'yes' if firestore_deleted else 'FAILED'})")
+    return {"status": "deleted", "lead_id": lead_id, "tombstone_written": tombstone_written, "firestore_deleted": firestore_deleted}
 
 
 # ─── Test Email ──────────────────────────────────────────────────────────────
