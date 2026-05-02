@@ -21,15 +21,17 @@ Endpoints:
 import logging
 import os
 import json
+import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Header
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 from config import get_settings, Settings
 from database import (
@@ -50,6 +52,11 @@ from database import (
     get_setting, save_setting, get_od_settings,
     # Step 10: stop conditions helpers
     add_lead_event,
+    # Inbox / call log / next action helpers
+    get_unread_sms_count, get_unread_sms_leads, mark_sms_read,
+    log_call, get_calls, set_next_action, clear_next_action,
+    # Lead tags
+    get_lead_tags, set_lead_tags,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -554,6 +561,12 @@ def admin_stats():
 @app.get("/api/admin/queue", dependencies=[Depends(_require_admin)])
 def admin_queue():
     return {"items": get_due_follow_ups(), "total": len(get_due_follow_ups())}
+
+
+@app.get("/api/admin/hot-leads", dependencies=[Depends(_require_admin)])
+def admin_hot_leads():
+    from database import get_hot_leads
+    return {"leads": get_hot_leads()}
 
 
 @app.post("/api/admin/sync", dependencies=[Depends(_require_admin)])
@@ -1128,6 +1141,68 @@ def admin_delete_note(note_id: int):
     return {"status": "ok"}
 
 
+# ─── Lead Tags ────────────────────────────────────────────────────────────────
+
+class TagsUpdateRequest(BaseModel):
+    tags: list  # full replacement list
+
+@app.get("/api/admin/lead/{lead_id}/tags", dependencies=[Depends(_require_admin)])
+def admin_get_tags(lead_id: str):
+    if not get_lead(lead_id):
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"tags": get_lead_tags(lead_id)}
+
+
+@app.put("/api/admin/lead/{lead_id}/tags", dependencies=[Depends(_require_admin)])
+def admin_set_tags(lead_id: str, body: TagsUpdateRequest):
+    if not get_lead(lead_id):
+        raise HTTPException(status_code=404, detail="Lead not found")
+    updated = set_lead_tags(lead_id, body.tags)
+    return {"tags": updated}
+
+
+# ─── Manual Lead Creation ────────────────────────────────────────────────────
+
+class ManualLeadRequest(BaseModel):
+    first_name: str = ""
+    last_name: str = ""
+    email: str = ""
+    phone: str = ""
+    source: str = "manual"
+    notes: str = ""
+
+    @validator("first_name", "last_name", "email", "phone", "source", "notes", pre=True)
+    def coerce_str(cls, v):
+        return str(v).strip() if v is not None else ""
+
+    @validator("source")
+    def source_not_empty(cls, v):
+        return v if v.strip() else "manual"
+
+
+@app.post("/api/admin/leads/create", dependencies=[Depends(_require_admin)])
+def admin_create_lead(body: ManualLeadRequest):
+    if not body.first_name and not body.email and not body.phone:
+        raise HTTPException(status_code=400, detail="Provide at least a name, email, or phone")
+    lead_id = str(uuid.uuid4())
+    data = {
+        "id": lead_id,
+        "first_name": body.first_name,
+        "last_name": body.last_name,
+        "email": body.email,
+        "phone": body.phone,
+        "source": body.source,
+        "notes": body.notes,
+        "stage": "new",
+    }
+    lead = upsert_lead(data)
+    # Log a lead_created event so the timeline isn't empty
+    # Deliberately NOT enqueuing follow-ups — manual leads are staff-initiated contacts
+    add_event(lead_id, "lead_created", stage_to="new",
+              source=body.source, detail="manual entry")
+    return {"status": "ok", "lead": lead}
+
+
 @app.delete("/api/admin/lead/{lead_id}", dependencies=[Depends(_require_admin)])
 def admin_delete_lead(lead_id: str):
     """
@@ -1381,6 +1456,93 @@ def admin_campaigns():
         "sources": get_distinct_sources(),
         "keywords": get_keyword_stats(),
     }
+
+
+class CampaignCreateRequest(BaseModel):
+    campaign_name: str
+    campaign_type: str = "MANUAL"          # MANUAL, GOOGLE_ADS, META, EMAIL
+    campaign_id: Optional[str] = None      # Google Ads ID or custom; auto-generated if blank
+    service_focus: Optional[str] = ""      # Implants, Invisalign, Whitening, Emergency, etc.
+    promo_offer: Optional[str] = ""        # e.g. "$99 exam + X-ray"
+    target_audience: Optional[str] = ""
+    objective: Optional[str] = ""
+    monthly_budget: Optional[float] = 0.0
+    expected_cpl: Optional[float] = 0.0
+    start_date: Optional[str] = ""        # YYYY-MM-DD
+    end_date: Optional[str] = ""
+    landing_page: Optional[str] = ""
+    notes: Optional[str] = ""
+
+    @validator("campaign_name")
+    def name_not_empty(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Campaign name is required")
+        if len(v) > 200:
+            raise ValueError("Campaign name too long (max 200 chars)")
+        return v
+
+    @validator("campaign_type")
+    def type_valid(cls, v):
+        allowed = {"MANUAL", "GOOGLE_ADS", "META", "EMAIL"}
+        if v.upper() not in allowed:
+            raise ValueError(f"campaign_type must be one of {allowed}")
+        return v.upper()
+
+    @validator("monthly_budget", "expected_cpl", pre=True)
+    def budget_non_negative(cls, v):
+        if v is not None and float(v) < 0:
+            raise ValueError("Budget values must be >= 0")
+        return v
+
+    @validator("end_date")
+    def end_after_start(cls, v, values):
+        start = values.get("start_date") or ""
+        if v and start and v < start:
+            raise ValueError("end_date must be >= start_date")
+        return v
+
+    @validator("landing_page")
+    def url_format(cls, v):
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError("landing_page must start with http:// or https://")
+        return v
+
+
+@app.get("/api/admin/campaigns/list", dependencies=[Depends(_require_admin)])
+def admin_campaigns_list():
+    """Return all managed campaign rows from the campaigns table."""
+    from database import get_all_campaigns
+    return {"campaigns": get_all_campaigns()}
+
+
+@app.post("/api/admin/campaigns/create", dependencies=[Depends(_require_admin)])
+def admin_create_campaign(body: CampaignCreateRequest):
+    """Create a new managed campaign record."""
+    from database import create_campaign
+    try:
+        row = create_campaign(body.dict())
+        return {"ok": True, "campaign": row}
+    except Exception as e:
+        logger.error(f"create_campaign failed: {e}")
+        # Don't leak SQL internals; surface a clean message
+        detail = "A campaign with that name already exists" if "UNIQUE" in str(e) else "Failed to create campaign"
+        raise HTTPException(status_code=500, detail=detail)
+
+
+@app.patch("/api/admin/campaigns/{campaign_id}/status", dependencies=[Depends(_require_admin)])
+def admin_campaign_status(campaign_id: str, status: str = Body(..., embed=True)):
+    """Update a campaign's status (ACTIVE, PAUSED, COMPLETED, ARCHIVED).
+    Accepts JSON body: {"status": "PAUSED"}
+    """
+    from database import update_campaign_status
+    allowed = {"DRAFT", "ACTIVE", "PAUSED", "COMPLETED", "ARCHIVED"}
+    if status.upper() not in allowed:
+        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(allowed)}")
+    found = update_campaign_status(campaign_id, status.upper())
+    if not found:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"ok": True}
 
 
 # ─── Google Ads extended reporting ───────────────────────────────────────────
@@ -1759,12 +1921,94 @@ def admin_send_manual_email(lead_id: str, body: ManualEmailRequest):
     return {"ok": True, "message_id": msg_id}
 
 
+# ─── Inbox / Unread SMS ───────────────────────────────────────────────────────
+
+@app.get("/api/admin/inbox/unread", dependencies=[Depends(_require_admin)])
+def admin_inbox_unread():
+    """Return unread inbound SMS count + list of leads with unread messages."""
+    return {
+        "count": get_unread_sms_count(),
+        "leads": get_unread_sms_leads(),
+    }
+
+@app.post("/api/admin/lead/{lead_id}/mark-read", dependencies=[Depends(_require_admin)])
+def admin_mark_sms_read(lead_id: str):
+    """Mark all inbound SMS for a lead as read."""
+    if not get_lead(lead_id):
+        raise HTTPException(status_code=404, detail="Lead not found")
+    updated = mark_sms_read(lead_id)
+    return {"ok": True, "updated": updated}
+
+
+# ─── Call Log ─────────────────────────────────────────────────────────────────
+
+class LogCallRequest(BaseModel):
+    direction: str = "outbound"    # 'outbound' | 'inbound'
+    outcome: str                   # 'spoke' | 'left_vm' | 'no_answer' | 'callback_scheduled'
+    duration_sec: int = 0
+    notes: str = ""
+
+@app.post("/api/admin/lead/{lead_id}/log-call", dependencies=[Depends(_require_admin)])
+def admin_log_call(lead_id: str, body: LogCallRequest):
+    """Log a manual phone call attempt or received call."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    valid_outcomes = {"spoke", "left_vm", "no_answer", "callback_scheduled"}
+    if body.outcome not in valid_outcomes:
+        raise HTTPException(status_code=422, detail=f"outcome must be one of {sorted(valid_outcomes)}")
+    call_id = log_call(
+        lead_id=lead_id,
+        direction=body.direction,
+        outcome=body.outcome,
+        duration_sec=body.duration_sec,
+        notes=body.notes,
+    )
+    return {"ok": True, "call_id": call_id}
+
+@app.get("/api/admin/lead/{lead_id}/calls", dependencies=[Depends(_require_admin)])
+def admin_get_calls(lead_id: str):
+    """Return call log for a lead."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"calls": get_calls(lead_id)}
+
+
+# ─── Next Action ──────────────────────────────────────────────────────────────
+
+class NextActionRequest(BaseModel):
+    next_action_at: str    # ISO date string e.g. '2026-05-05'
+    next_action_note: str = ""
+
+@app.put("/api/admin/lead/{lead_id}/next-action", dependencies=[Depends(_require_admin)])
+def admin_set_next_action(lead_id: str, body: NextActionRequest):
+    """Set a next follow-up date and note on a lead."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    date_str = body.next_action_at.strip()
+    import re as _re
+    if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        raise HTTPException(status_code=422, detail="next_action_at must be YYYY-MM-DD")
+    set_next_action(lead_id, date_str, body.next_action_note.strip())
+    return {"ok": True}
+
+@app.delete("/api/admin/lead/{lead_id}/next-action", dependencies=[Depends(_require_admin)])
+def admin_clear_next_action(lead_id: str):
+    """Clear the next action on a lead."""
+    if not get_lead(lead_id):
+        raise HTTPException(status_code=404, detail="Lead not found")
+    clear_next_action(lead_id)
+    return {"ok": True}
+
+
 # ─── Step 9: Workflow CRUD + AI Generate ─────────────────────────────────────
 
 class WorkflowCreate(BaseModel):
     name: str
-    campaign_tag: str = ""
-    description: str = ""
+    campaign_tag: Optional[str] = ""
+    description: Optional[str] = ""
 
 
 class WorkflowStepCreate(BaseModel):
@@ -1790,6 +2034,59 @@ class WorkflowStepUpdate(BaseModel):
 class AIGenerateRequest(BaseModel):
     prompt: str              # Free-text description of the campaign / goals
     num_steps: int = 6       # How many steps to generate
+
+
+# ─── Practice Information Settings ──────────────────────────────────────────
+
+_PRACTICE_FIELDS = [
+    "name", "phone", "email", "doctor_name", "address", "hours", "review_link",
+    "booking_link_consult", "booking_link_exam", "booking_link_implant",
+    "booking_link_ortho", "booking_link_general",
+]
+
+class PracticeSettingsRequest(BaseModel):
+    name:                 str = ""
+    phone:                str = ""
+    email:                str = ""
+    doctor_name:          str = ""
+    address:              str = ""
+    hours:                str = ""
+    review_link:          str = ""
+    booking_link_consult: str = ""
+    booking_link_exam:    str = ""
+    booking_link_implant: str = ""
+    booking_link_ortho:   str = ""
+    booking_link_general: str = ""
+
+
+# ─── AI Generate single message ──────────────────────────────────────────────
+
+_APPT_TYPE_FIELD_MAP = {
+    "consult":  "booking_link_consult",
+    "exam":     "booking_link_exam",
+    "implant":  "booking_link_implant",
+    "ortho":    "booking_link_ortho",
+    "general":  "booking_link_general",
+}
+
+class AIGenerateMessageRequest(BaseModel):
+    channel:          str        # "email" or "sms"
+    appointment_type: str = "general"
+    prompt:           str
+
+
+def _extract_json_from_ai_response(raw_text: str) -> str:
+    """Extract JSON object from AI response that may have code fences or surrounding text."""
+    json_text = raw_text.strip()
+    # Use [\s\S]+ (greedy, matches newlines) so nested JSON objects are captured correctly.
+    match = re.search(r"```(?:json)?\s*(\{[\s\S]+\})\s*```", json_text)
+    if match:
+        return match.group(1)
+    if not json_text.startswith("{"):
+        brace_match = re.search(r"\{[\s\S]+\}", json_text)
+        if brace_match:
+            return brace_match.group(0)
+    return json_text
 
 
 @app.get("/api/admin/workflows", dependencies=[Depends(_require_admin)])
@@ -1832,6 +2129,123 @@ def admin_delete_workflow(workflow_id: int):
         raise HTTPException(status_code=404, detail="Workflow not found")
     delete_workflow(workflow_id)
     return {"ok": True}
+
+
+@app.post("/api/admin/workflows/{workflow_id}/copy", dependencies=[Depends(_require_admin)])
+def admin_copy_workflow(workflow_id: int):
+    """Duplicate a workflow and all its steps. Returns the new workflow with steps."""
+    src = get_workflow(workflow_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    src_steps = get_workflow_steps(workflow_id)
+
+    # Generate unique tag — append a short uuid suffix to avoid UNIQUE collision
+    suffix = uuid.uuid4().hex[:6]
+    orig_tag = (src.get("campaign_tag") or "").strip()
+    new_tag = f"{orig_tag}_cp{suffix}" if orig_tag else f"copy_{suffix}"
+    # Strip any trailing " (Copy)" before appending to avoid "Foo (Copy) (Copy)"
+    base_name = re.sub(r'\s*\(Copy\)\s*$', '', src['name']).strip()
+    new_name = f"{base_name} (Copy)"
+
+    new_wf = upsert_workflow(None, new_name, new_tag, src.get("description", ""))
+    new_wf_id = new_wf["id"]
+
+    # Duplicate steps with unique template names using new wf id
+    for step in src_steps:
+        new_tname = f"wf{new_wf_id}_d{step['sequence_day']}_{step['channel']}_{suffix}"
+        upsert_workflow_step(
+            None, new_wf_id,
+            step["sequence_day"], step["channel"],
+            new_tname, step.get("subject", ""), step["body"],
+            bool(step.get("terminal", False))
+        )
+
+    # Return new workflow with steps
+    new_steps = get_workflow_steps(new_wf_id)
+    return {**new_wf, "steps": new_steps}
+
+
+@app.post("/api/admin/workflows/{workflow_id}/seed-nxtsmile", dependencies=[Depends(_require_admin)])
+def admin_seed_nxtsmile(workflow_id: int):
+    """Seed the nXtSmile 4-email follow-up sequence into an empty workflow."""
+    wf = get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    existing_steps = get_workflow_steps(workflow_id)
+    if existing_steps:
+        raise HTTPException(status_code=409, detail="Workflow already has steps — clear them first")
+
+    # Load practice booking link from DB settings
+    booking_link = get_setting("practice_booking_link_consult") or get_setting("practice_booking_link_general") or "https://visitgdc.com"
+    office_phone = get_setting("practice_phone") or "(508) 839-9900"
+
+    seed_steps = [
+        (1, "email",
+         f"wf{workflow_id}_d1_email",
+         "Your new smile is closer than you think, {first_name} :)",
+         f"Hi {{first_name}},\n\nWe hope you loved your smile preview! Take another look — this could be you.\n\n"
+         f"Every smile transformation starts with a single step. Hundreds of patients walked into Grafton Dental Care "
+         f"feeling unsure — and walked out with a smile they couldn't stop showing off.\n\n"
+         f"You deserve to eat the foods you love, laugh without thinking twice, and feel proud every time you look in the mirror. "
+         f"Dr. Gupta and the nXtSmile team are here to make that happen.\n\n"
+         f"Your free consultation is waiting — no pressure, no obligation. Just a conversation about what's possible.\n\n"
+         f"📅 Book online: {booking_link}\n📞 Or call us: {office_phone}\n\n"
+         f"— Dr. Gupta's Team at Grafton Dental Care\n\n"
+         f"To unsubscribe: {{unsub_url}}",
+         False),
+        (7, "email",
+         f"wf{workflow_id}_d7_email",
+         "What's holding you back, {first_name}?",
+         f"Hi {{first_name}},\n\nWe've had a lot of people tell us the same things before they finally came in:\n\n"
+         f"\"I'm worried about the cost.\"\n"
+         f"We work with CareCredit, Cherry, and in-house financing — many patients pay as little as $300 a month.\n\n"
+         f"\"I'm not sure I'm a candidate.\"\n"
+         f"That's exactly what the free consultation is for. There's no commitment — just answers.\n\n"
+         f"\"I'm nervous.\"\n"
+         f"Dr. Gupta has helped hundreds of patients just like you. The consultation is relaxed and pressure-free.\n\n"
+         f"\"Would it hurt?\"\n"
+         f"Dr. Gupta is an expert in painless dentistry. You will be provided comfortable sedation to make the procedure as painless as possible.\n\n"
+         f"📅 Book your free consult: {booking_link}\n📞 Or call: {office_phone}\n\n"
+         f"— Dr. Gupta's Team at Grafton Dental Care\n\n"
+         f"To unsubscribe: {{unsub_url}}",
+         False),
+        (14, "email",
+         f"wf{workflow_id}_d14_email",
+         "Your new smile might cost less than you think, {first_name}",
+         f"Hi {{first_name}},\n\n"
+         f"We wanted to share something that surprises most people — All-on-X dental implants don't have to be a huge upfront expense. "
+         f"With our financing options, many patients pay as little as $300 a month — and they eat what they want, smile with confidence, "
+         f"and never worry about dentures slipping again.\n\n"
+         f"Your financing options:\n"
+         f"🏦 CareCredit — 0% interest available\n"
+         f"🍒 Cherry — instant approval, flexible monthly plans\n"
+         f"🏥 In-house financing — we'll work with your situation\n\n"
+         f"We'll discuss your financing options at your free consultation — a full treatment plan personalized to your budget. No surprises.\n\n"
+         f"📅 Book now: {booking_link}\n📞 Call: {office_phone}\n\n"
+         f"— Dr. Gupta's Team at Grafton Dental Care\n\n"
+         f"To unsubscribe: {{unsub_url}}",
+         False),
+        (30, "email",
+         f"wf{workflow_id}_d30_email",
+         "Still here whenever you're ready, {first_name}",
+         f"Hi {{first_name}},\n\n"
+         f"We know life gets busy and sometimes the timing just isn't right. That's completely okay.\n\n"
+         f"Whether it's next week, next month, or next year — you deserve a smile you're proud of, "
+         f"and we'd love to help make that happen. Whenever you're ready, reach out to us.\n\n"
+         f"🔒 Your smile preview will be deleted today as part of our privacy policy. "
+         f"If you'd like to start fresh in the future, we can always create a new one for you.\n\n"
+         f"📅 Book anytime: {booking_link}\n📞 Call: {office_phone}\n\n"
+         f"Wishing you a healthy, confident smile — whenever the time is right.\n\n"
+         f"— Dr. Gupta's Team at Grafton Dental Care\n\n"
+         f"To unsubscribe: {{unsub_url}}",
+         True),
+    ]
+
+    for day, channel, tname, subject, body, terminal in seed_steps:
+        upsert_workflow_step(None, workflow_id, day, channel, tname, subject, body, terminal)
+
+    steps = get_workflow_steps(workflow_id)
+    return {**wf, "steps": steps}
 
 
 @app.post("/api/admin/workflow-steps", dependencies=[Depends(_require_admin)])
@@ -1879,7 +2293,6 @@ def admin_delete_workflow_step(step_id: int):
 @app.post("/api/admin/workflow/ai-generate", dependencies=[Depends(_require_admin)])
 def admin_ai_generate_workflow(body: AIGenerateRequest):
     """Use Claude to generate a workflow step sequence from a natural-language prompt."""
-    import re
     prompt_text = (body.prompt or "").strip()
     if not prompt_text:
         raise HTTPException(status_code=422, detail="Prompt is required")
@@ -1908,7 +2321,10 @@ def admin_ai_generate_workflow(body: AIGenerateRequest):
 
     try:
         import anthropic
-        client = anthropic.Anthropic()
+        api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Anthropic API key not configured. Add it in Admin → AI Settings.")
+        client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=4096,
@@ -1923,15 +2339,7 @@ def admin_ai_generate_workflow(body: AIGenerateRequest):
         raise HTTPException(status_code=502, detail=f"AI generation failed: {e}")
 
     # Extract JSON — handle code fences or bare JSON
-    json_text = raw_text.strip()
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", json_text, re.DOTALL)
-    if match:
-        json_text = match.group(1)
-    # If still looks like it has outer text, try to find the first { ... }
-    if not json_text.startswith("{"):
-        brace_match = re.search(r"\{.*\}", json_text, re.DOTALL)
-        if brace_match:
-            json_text = brace_match.group(0)
+    json_text = _extract_json_from_ai_response(raw_text)
 
     try:
         result = json.loads(json_text)
@@ -1969,6 +2377,430 @@ def admin_ai_generate_workflow(body: AIGenerateRequest):
     return {"steps": steps}
 
 
+# ─── AI Campaign — Strategy + Implementation + Performance Analysis ─────────
+#
+# Two-tier model: Opus 4.6 acts as the strategist/analyst; Haiku 4.5 (default)
+# or Sonnet 4.6 acts as the implementer. The strategist gathers practice +
+# performance context and produces a structured plan with explicit
+# implementation_instructions; the implementer executes those instructions to
+# produce final ad copy, SMS/email sequences, or analysis writeups.
+
+OPUS_MODEL   = "claude-opus-4-6"
+HAIKU_MODEL  = "claude-haiku-4-5-20251001"
+SONNET_MODEL = "claude-sonnet-4-6"
+
+
+class CampaignStrategyRequest(BaseModel):
+    campaign_goal:      str
+    target_service:     str = "All-on-4 Implants"
+    budget_hint:        str = ""
+    additional_context: str = ""
+
+
+class CampaignImplementRequest(BaseModel):
+    strategy:    dict
+    deliverable: str         # 'ad_copy' | 'sms_sequence' | 'email_sequence' | 'full_package'
+    model:       str = "haiku"  # 'haiku' | 'sonnet'
+
+
+class PerformanceAnalysisRequest(BaseModel):
+    time_range_days: int = 30
+    focus:           str = "overall"  # 'overall' | 'google_ads' | 'leads' | 'conversions'
+
+
+def _get_anthropic_client():
+    """Resolve API key from settings/env and return an Anthropic client."""
+    import anthropic
+    api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Anthropic API key not configured. Add it in Admin → AI Settings.",
+        )
+    return anthropic.Anthropic(api_key=api_key)
+
+
+def _build_practice_context() -> dict:
+    """Read practice info from app_settings into a plain dict."""
+    return {f: get_setting(f"practice_{f}") or "" for f in _PRACTICE_FIELDS}
+
+
+def _format_practice_context(practice: dict) -> str:
+    """Compact text block describing the practice for the AI."""
+    lines = []
+    if practice.get("name"):         lines.append(f"Practice: {practice['name']}")
+    if practice.get("doctor_name"):  lines.append(f"Doctor: {practice['doctor_name']}")
+    if practice.get("phone"):        lines.append(f"Phone: {practice['phone']}")
+    if practice.get("address"):      lines.append(f"Address: {practice['address']}")
+    if practice.get("hours"):        lines.append(f"Hours: {practice['hours']}")
+    booking_links = []
+    for k in ("booking_link_consult", "booking_link_implant", "booking_link_ortho",
+              "booking_link_exam", "booking_link_general"):
+        if practice.get(k):
+            booking_links.append(f"  - {k.replace('booking_link_','')}: {practice[k]}")
+    if booking_links:
+        lines.append("Booking links:")
+        lines.extend(booking_links)
+    return "\n".join(lines) if lines else "(no practice info on file)"
+
+
+def _gather_performance_context(days: int = 30) -> dict:
+    """Pull a compact summary of pipeline + Google Ads performance."""
+    ctx = {}
+    try:
+        ctx["pipeline_stats"] = get_pipeline_stats()
+    except Exception as e:
+        logger.warning(f"AI campaign — pipeline_stats failed: {e}")
+        ctx["pipeline_stats"] = {}
+
+    try:
+        camps = get_campaign_stats() or []
+        # keep top 8 by lead_count for brevity
+        camps_sorted = sorted(camps, key=lambda c: c.get("lead_count", 0), reverse=True)[:8]
+        ctx["top_campaigns"] = [
+            {
+                "campaign":      c.get("campaign"),
+                "lead_count":    c.get("lead_count", 0),
+                "total_cost":    c.get("total_cost", 0),
+                "cpl":           c.get("cpl", 0),
+                "revenue":       c.get("revenue", 0),
+                "scheduled":     c.get("scheduled_count", 0),
+                "treated":       c.get("treated_count", 0),
+            }
+            for c in camps_sorted
+        ]
+    except Exception as e:
+        logger.warning(f"AI campaign — campaign_stats failed: {e}")
+        ctx["top_campaigns"] = []
+
+    try:
+        kws = get_keyword_stats() or []
+        # keep top 12 by lead_count
+        kws_sorted = sorted(kws, key=lambda k: k.get("lead_count", 0), reverse=True)[:12]
+        ctx["top_keywords"] = [
+            {
+                "keyword":     k.get("keyword"),
+                "campaign":    k.get("campaign_name"),
+                "impressions": k.get("impressions", 0),
+                "clicks":      k.get("gads_clicks", 0),
+                "cost":        k.get("total_cost", 0),
+                "leads":       k.get("lead_count", 0),
+                "cpl":         k.get("cpl", 0),
+                "conv_rate":   k.get("conversion_rate", 0),
+            }
+            for k in kws_sorted
+        ]
+    except Exception as e:
+        logger.warning(f"AI campaign — keyword_stats failed: {e}")
+        ctx["top_keywords"] = []
+
+    try:
+        daily = get_daily_stats(days=days) or []
+        # aggregate totals across the window
+        agg = {"impressions": 0, "clicks": 0, "cost": 0.0, "conversions": 0.0}
+        for d in daily:
+            agg["impressions"] += int(d.get("impressions") or 0)
+            agg["clicks"]      += int(d.get("clicks") or 0)
+            agg["cost"]        += float(d.get("cost") or 0.0)
+            agg["conversions"] += float(d.get("conversions") or 0.0)
+        ctx["window_totals"] = {
+            "days":        days,
+            "impressions": agg["impressions"],
+            "clicks":      agg["clicks"],
+            "cost":        round(agg["cost"], 2),
+            "conversions": round(agg["conversions"], 2),
+        }
+    except Exception as e:
+        logger.warning(f"AI campaign — daily_stats failed: {e}")
+        ctx["window_totals"] = {"days": days}
+
+    return ctx
+
+
+@app.post("/api/admin/ai/campaign-strategy", dependencies=[Depends(_require_admin)])
+def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
+    """Opus researches the practice + performance data and produces a campaign plan."""
+    goal = (body.campaign_goal or "").strip()
+    if not goal:
+        raise HTTPException(status_code=422, detail="campaign_goal is required")
+    if len(goal) > 2000:
+        raise HTTPException(status_code=422, detail="campaign_goal too long (max 2000 chars)")
+
+    target_service = (body.target_service or "All-on-4 Implants").strip()
+    budget_hint    = (body.budget_hint or "").strip()
+    extra          = (body.additional_context or "").strip()
+
+    practice = _build_practice_context()
+    perf     = _gather_performance_context(days=30)
+
+    practice_name = practice.get("name") or "this dental practice"
+    practice_location = ""
+    if practice.get("address"):
+        # Extract city/region from address for local angle.
+        # "123 Main St, Grafton, MA 01536" → 4 parts → take middle two → "Grafton, MA"
+        # "Grafton, MA 01536" → 3 parts → take last two → "MA 01536" (acceptable)
+        # "Grafton, MA" → 2 parts → take last two → "Grafton, MA" (ideal)
+        parts = [p.strip() for p in practice["address"].split(",")]
+        practice_location = ", ".join(parts[-3:-1]) if len(parts) >= 4 else ", ".join(parts[-2:])
+
+    system_prompt = (
+        f"You are a senior dental marketing strategist for {practice_name}. "
+        f"Your job is to RESEARCH the practice's data and produce a tightly-scoped "
+        f"campaign plan that a junior copywriter (Haiku) can execute without ambiguity. "
+        f"Prefer practical, locally-resonant angles"
+        + (f" ({practice_location})" if practice_location else "")
+        + " — weekend availability, financing options, and specific clinical strengths — over "
+        f"generic claims. Return ONLY a JSON object — no markdown, no commentary."
+    )
+
+    user_prompt = (
+        f"Campaign goal: {goal}\n"
+        f"Target service: {target_service}\n"
+        + (f"Budget context: {budget_hint}\n" if budget_hint else "")
+        + (f"Additional context: {extra}\n" if extra else "")
+        + "\n=== Practice ===\n" + _format_practice_context(practice)
+        + "\n\n=== Performance snapshot (last 30 days) ===\n"
+        + json.dumps(perf, indent=2, default=str)
+        + "\n\nReturn a JSON object with EXACTLY these keys:\n"
+        + "  campaign_name (string)\n"
+        + "  target_audience (string — concrete description)\n"
+        + "  objective (string — 1-2 sentence goal)\n"
+        + "  key_messages (array of 3-5 strings)\n"
+        + "  ad_headlines (array of 6-10 strings, each <= 30 chars)\n"
+        + "  ad_descriptions (array of 3-5 strings, each <= 90 chars)\n"
+        + "  sms_sequence_brief (string — what the SMS sequence should accomplish, tone, cadence)\n"
+        + "  email_sequence_brief (string — same, for email)\n"
+        + "  implementation_instructions (string — explicit instructions for the implementer "
+        + "    Haiku/Sonnet model, including voice, must-include details, and what to avoid)\n"
+        + "Return ONLY the JSON object."
+    )
+
+    try:
+        client = _get_anthropic_client()
+        message = client.messages.create(
+            model=OPUS_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+        )
+        raw_text = message.content[0].text if message.content else ""
+        model_used = message.model
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI campaign-strategy failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI strategy failed: {e}")
+
+    json_text = _extract_json_from_ai_response(raw_text)
+    try:
+        result = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"AI campaign-strategy — JSON parse failed: {e}\nRaw: {raw_text[:500]}")
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
+
+    required_keys = {
+        "campaign_name", "target_audience", "objective", "key_messages",
+        "ad_headlines", "ad_descriptions", "sms_sequence_brief",
+        "email_sequence_brief", "implementation_instructions",
+    }
+    missing = required_keys - set(result.keys())
+    if missing:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI strategy missing required fields: {sorted(missing)}",
+        )
+
+    return {"strategy": result, "model_used": model_used}
+
+
+@app.post("/api/admin/ai/campaign-implement", dependencies=[Depends(_require_admin)])
+def admin_ai_campaign_implement(body: CampaignImplementRequest):
+    """Haiku/Sonnet executes the Opus strategy to produce concrete deliverables."""
+    strategy = body.strategy or {}
+    if not isinstance(strategy, dict) or not strategy.get("implementation_instructions"):
+        raise HTTPException(
+            status_code=422,
+            detail="strategy must include 'implementation_instructions' from a strategy run",
+        )
+
+    deliverable = (body.deliverable or "").strip().lower()
+    if deliverable not in ("ad_copy", "sms_sequence", "email_sequence", "full_package"):
+        raise HTTPException(
+            status_code=422,
+            detail="deliverable must be one of: ad_copy, sms_sequence, email_sequence, full_package",
+        )
+
+    model_choice = (body.model or "haiku").strip().lower()
+    model_id = SONNET_MODEL if model_choice == "sonnet" else HAIKU_MODEL
+
+    practice = _build_practice_context()
+    practice_block = _format_practice_context(practice)
+
+    # Format-specific schema instructions
+    if deliverable == "ad_copy":
+        schema_instructions = (
+            "Return JSON with keys: "
+            "headlines (array of 10 strings, each <= 30 chars), "
+            "descriptions (array of 4 strings, each <= 90 chars), "
+            "final_url (string — best booking link from the practice info), "
+            "callouts (array of 4 short strings, each <= 25 chars)."
+        )
+    elif deliverable == "sms_sequence":
+        schema_instructions = (
+            "Return JSON with key 'steps' (array of objects). Each step has: "
+            "sequence_day (integer), body (string ending with '\\nReply STOP to opt out.'). "
+            "Keep each SMS body <= 280 chars before token expansion. "
+            "Use {first_name} as the only runtime token."
+        )
+    elif deliverable == "email_sequence":
+        schema_instructions = (
+            "Return JSON with key 'steps' (array of objects). Each step has: "
+            "sequence_day (integer), subject (string), body (string). "
+            "Body must include {first_name} and end with {unsub_url}. "
+            "2-4 short paragraphs each, conversational tone."
+        )
+    else:  # full_package
+        schema_instructions = (
+            "Return JSON with keys: "
+            "ad_copy (object with headlines [10 strings <=30 chars], descriptions [4 strings <=90 chars], callouts [4 strings <=25 chars]), "
+            "sms_sequence (object with 'steps' array — each step: sequence_day, body ending with '\\nReply STOP to opt out.'), "
+            "email_sequence (object with 'steps' array — each step: sequence_day, subject, body with {first_name} and {unsub_url})."
+        )
+
+    system_prompt = (
+        "You are a dental marketing copywriter executing instructions from a senior strategist. "
+        "Follow the strategist's implementation_instructions exactly. Voice should be warm, "
+        "specific, and locally grounded — use location, doctor name, and specific benefits "
+        "from the practice context. Avoid generic phrases like "
+        "'best dental care' — use specific benefits and proof points from the strategy. "
+        "Return ONLY the JSON object — no markdown, no commentary."
+    )
+
+    user_prompt = (
+        "=== Practice ===\n" + practice_block
+        + "\n\n=== Strategist's plan (from Opus) ===\n"
+        + json.dumps(strategy, indent=2, default=str)
+        + f"\n\n=== Deliverable requested ===\n{deliverable}\n"
+        + f"\n=== Output schema ===\n{schema_instructions}\n"
+        + "\nReturn ONLY the JSON object."
+    )
+
+    try:
+        client = _get_anthropic_client()
+        message = client.messages.create(
+            model=model_id,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+        )
+        raw_text = message.content[0].text if message.content else ""
+        model_used = message.model
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI campaign-implement failed (model={model_id}): {e}")
+        raise HTTPException(status_code=502, detail=f"AI implementation failed: {e}")
+
+    json_text = _extract_json_from_ai_response(raw_text)
+    try:
+        content = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"AI campaign-implement — JSON parse failed: {e}\nRaw: {raw_text[:500]}")
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
+
+    return {
+        "deliverable": deliverable,
+        "content":     content,
+        "model_used":  model_used,
+    }
+
+
+@app.post("/api/admin/ai/performance-analysis", dependencies=[Depends(_require_admin)])
+def admin_ai_performance_analysis(body: PerformanceAnalysisRequest):
+    """Opus analyzes pipeline + Google Ads data and returns actionable insights."""
+    days = max(1, min(int(body.time_range_days or 30), 90))
+    focus = (body.focus or "overall").strip().lower()
+    if focus not in ("overall", "google_ads", "leads", "conversions"):
+        raise HTTPException(
+            status_code=422,
+            detail="focus must be one of: overall, google_ads, leads, conversions",
+        )
+
+    practice = _build_practice_context()
+    perf     = _gather_performance_context(days=days)
+
+    focus_hint = {
+        "overall":     "the overall marketing pipeline health",
+        "google_ads":  "Google Ads spend efficiency, top/bottom keywords, and wasted spend",
+        "leads":       "lead volume by source and stage progression",
+        "conversions": "conversion rates from lead → scheduled → treated and where leakage occurs",
+    }[focus]
+
+    practice_name_for_analysis = practice.get("name") or "this dental practice"
+    system_prompt = (
+        f"You are a senior dental marketing analyst reviewing data from {practice_name_for_analysis}. "
+        "Be specific and quantitative — cite concrete numbers from the data. "
+        "Flag wasted spend, conversion leakage, and underused keywords. "
+        "Action items must be specific enough that a junior implementer (Haiku) could execute them. "
+        "Return ONLY a JSON object."
+    )
+
+    user_prompt = (
+        f"Analysis focus: {focus_hint}\n"
+        f"Time window: last {days} days\n\n"
+        + "=== Practice ===\n" + _format_practice_context(practice)
+        + "\n\n=== Performance data ===\n"
+        + json.dumps(perf, indent=2, default=str)
+        + "\n\nReturn a JSON object with EXACTLY these keys:\n"
+        + "  summary (string — 2-3 sentences citing concrete numbers)\n"
+        + "  wins (array of strings — what's working, with numbers)\n"
+        + "  concerns (array of strings — what's underperforming, with numbers)\n"
+        + "  action_items (array of objects, each with: priority ['high'|'medium'|'low'], "
+        + "    action [string], rationale [string])\n"
+        + "  implementation_prompt (string — explicit instructions for Haiku to produce "
+        + "    a follow-up implementation plan from these action items)\n"
+        + "Return ONLY the JSON object."
+    )
+
+    try:
+        client = _get_anthropic_client()
+        message = client.messages.create(
+            model=OPUS_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+        )
+        raw_text = message.content[0].text if message.content else ""
+        model_used = message.model
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI performance-analysis failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
+
+    json_text = _extract_json_from_ai_response(raw_text)
+    try:
+        result = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"AI performance-analysis — JSON parse failed: {e}\nRaw: {raw_text[:500]}")
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
+
+    required_keys = {"summary", "wins", "concerns", "action_items", "implementation_prompt"}
+    missing = required_keys - set(result.keys())
+    if missing:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI analysis missing required fields: {sorted(missing)}",
+        )
+
+    # Normalize action_items priority casing
+    for item in result.get("action_items") or []:
+        if isinstance(item, dict) and "priority" in item:
+            item["priority"] = str(item["priority"]).lower()
+
+    return {"analysis": result, "model_used": model_used, "time_range_days": days, "focus": focus}
+
+
 # ─── OD Connection Settings ──────────────────────────────────────────────────
 
 class ODSettingsRequest(BaseModel):
@@ -1994,6 +2826,136 @@ def admin_get_od_settings():
         "od_api_base":      s["od_api_base"],
         "od_developer_key": s["od_developer_key"],
         "od_customer_key":  "••••••••" if s["od_customer_key"] else "",
+    }
+
+
+@app.get("/api/admin/ai-settings", dependencies=[Depends(_require_admin)])
+def admin_get_ai_settings():
+    key = get_setting("anthropic_api_key") or ""
+    return {"anthropic_api_key": "••••••••" if key else ""}
+
+@app.post("/api/admin/ai-settings", dependencies=[Depends(_require_admin)])
+def admin_save_ai_settings(body: dict):
+    key = (body.get("anthropic_api_key") or "").strip()
+    if key and not key.startswith("•"):
+        save_setting("anthropic_api_key", key)
+    return {"ok": True}
+
+
+# ─── Practice Information Settings ──────────────────────────────────────────
+
+@app.get("/api/admin/practice-settings", dependencies=[Depends(_require_admin)])
+def admin_get_practice_settings():
+    return {f: get_setting(f"practice_{f}") or "" for f in _PRACTICE_FIELDS}
+
+@app.post("/api/admin/practice-settings", dependencies=[Depends(_require_admin)])
+def admin_save_practice_settings(body: PracticeSettingsRequest):
+    for f in _PRACTICE_FIELDS:
+        save_setting(f"practice_{f}", getattr(body, f).strip())
+    return {"ok": True}
+
+
+# ─── AI Generate Single Message ──────────────────────────────────────────────
+
+@app.post("/api/admin/workflow/ai-generate-message", dependencies=[Depends(_require_admin)])
+def admin_ai_generate_message(body: AIGenerateMessageRequest):
+    """Generate a single email or SMS message with AI, pre-filled with practice context."""
+    # Validate channel
+    channel = (body.channel or "").strip().lower()
+    if channel not in ("email", "sms"):
+        raise HTTPException(status_code=422, detail="channel must be 'email' or 'sms'")
+
+    # Validate appointment_type
+    appt_type = (body.appointment_type or "general").strip().lower()
+    if appt_type not in _APPT_TYPE_FIELD_MAP:
+        raise HTTPException(status_code=422,
+            detail=f"appointment_type must be one of: {list(_APPT_TYPE_FIELD_MAP.keys())}")
+
+    # Validate prompt
+    prompt_text = (body.prompt or "").strip()
+    if not prompt_text:
+        raise HTTPException(status_code=422, detail="prompt is required")
+    if len(prompt_text) > 2000:
+        raise HTTPException(status_code=422, detail="prompt too long (max 2000 chars)")
+
+    # Load practice info from DB
+    practice = {f: get_setting(f"practice_{f}") or "" for f in _PRACTICE_FIELDS}
+    practice_name = practice.get("name") or "Grafton Dental Care"
+    doctor_name   = practice.get("doctor_name") or "Dr. Gupta"
+    practice_phone = practice.get("phone") or ""
+    practice_address = practice.get("address") or ""
+    practice_hours = practice.get("hours") or ""
+    # Resolve booking link — fall back to general
+    booking_link = (practice.get(_APPT_TYPE_FIELD_MAP[appt_type])
+                    or practice.get("booking_link_general") or "")
+
+    # Build prompts — bake practice values directly (no runtime tokens except {first_name} and {unsub_url})
+    system_prompt = (
+        f"You are a dental marketing expert writing patient communication for {practice_name}. "
+        + (f"Practice phone: {practice_phone}. " if practice_phone else "")
+        + (f"Location: {practice_address}. " if practice_address else "")
+        + (f"Hours: {practice_hours}. " if practice_hours else "")
+        + (f"Doctor: {doctor_name}. " if doctor_name else "")
+        + (f"Booking link for this appointment type: {booking_link}. " if booking_link else "")
+        + "Write warm, professional, conversational dental patient messages. "
+        + "Use {{first_name}} as the ONLY runtime placeholder — this will be replaced with the patient's first name at send time. "
+        + ("Use {{unsub_url}} as the ONLY other runtime placeholder — include it near the end of email bodies as an unsubscribe link. " if channel == "email" else "Do NOT include {{unsub_url}} in SMS messages. ")
+        + "All other content (practice name, phone, URLs, doctor name) should be written as plain text, NOT as placeholders. "
+        + "Return a JSON object with "
+        + ("keys 'subject' (string) and 'body' (string)." if channel == "email"
+           else "key 'body' (string) only. SMS body must end with '\\nReply STOP to opt out.'")
+        + " Return ONLY the JSON object, no explanation."
+    )
+
+    user_prompt = (
+        f"Channel: {channel}\n"
+        f"Appointment type: {appt_type}\n"
+        f"Goal: {prompt_text}\n\n"
+        + ("Keep the SMS concise (ideally under 140 characters of content before token expansion). " if channel == "sms"
+           else "Write 2-4 short paragraphs. ")
+        + "Use the patient's first name at the start. "
+        + (f"Include the booking link naturally: {booking_link}" if booking_link else "")
+    )
+
+    try:
+        import anthropic
+        api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise HTTPException(status_code=400,
+                detail="Anthropic API key not configured. Add it in Admin → AI Settings.")
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+        )
+        raw_text = message.content[0].text if message.content else ""
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI generate message failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI generation failed: {e}")
+
+    json_text = _extract_json_from_ai_response(raw_text)
+    try:
+        result = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"AI generate message — JSON parse failed: {e}\nRaw: {raw_text[:300]}")
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
+
+    body_text = (result.get("body") or "").strip()
+    if not body_text:
+        raise HTTPException(status_code=502, detail="AI returned empty body — please try again")
+
+    # Warn in logs if SMS is unusually long
+    if channel == "sms" and len(body_text) > 320:
+        logger.warning(f"AI generated SMS body is {len(body_text)} chars — may fragment on delivery")
+
+    return {
+        "channel":  channel,
+        "subject":  result.get("subject", "") if channel == "email" else "",
+        "body":     body_text,
     }
 
 

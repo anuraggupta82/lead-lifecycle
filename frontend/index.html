@@ -103,8 +103,8 @@
     .detail-backdrop { position: fixed; top: 0; left: 0; right: 0; bottom: 0;
                        background: rgba(0,0,0,.45); z-index: 99;
                        display: flex; align-items: center; justify-content: center; }
-    .detail-overlay { position: relative; width: 620px; max-width: 95vw;
-                      max-height: 88vh; background: #fff; border-radius: 12px;
+    .detail-overlay { position: relative; width: 820px; max-width: 96vw;
+                      max-height: 90vh; background: #fff; border-radius: 12px;
                       box-shadow: 0 8px 40px rgba(0,0,0,.18); z-index: 100;
                       display: flex; flex-direction: column;
                       opacity: 0; transform: scale(.96); transition: opacity .18s ease, transform .18s ease; }
@@ -165,6 +165,18 @@
                padding: 1px 4px; border-radius: 3px; margin-bottom: 2px; letter-spacing: .4px; }
     .msg-tag.auto { background: #e0e7ff; color: #3730a3; }
     .msg-tag.manual { background: #d1fae5; color: #065f46; }
+    /* v2 two-channel thread */
+    .msg-day-sep { text-align:center; font-size:9px; color:var(--text-muted); margin:8px 0; display:flex; align-items:center; gap:6px; }
+    .msg-day-sep::before, .msg-day-sep::after { content:''; flex:1; height:1px; background:var(--border); }
+    .msg-inbound { background:#f3f4f6; color:var(--text); border-radius:12px 12px 12px 2px; align-self:flex-start; }
+    .msg-outbound-auto { background:var(--teal-light); color:var(--teal-dark); border-radius:12px 12px 2px 12px; align-self:flex-end; }
+    .msg-outbound-manual { background:var(--teal); color:#fff; border-radius:12px 12px 2px 12px; align-self:flex-end; }
+    .msg-thread-v2 { display:flex; flex-direction:column; gap:6px; padding:8px; overflow-y:auto; max-height:320px; }
+    .ch-pill { padding:4px 12px; border-radius:12px; font-size:10px; font-weight:600; cursor:pointer; border:1px solid var(--border); background:#fff; color:var(--text-muted); }
+    .ch-pill.active { background:var(--teal); color:#fff; border-color:var(--teal); }
+    .ch-tabs { display:flex; gap:6px; margin:6px 0; }
+    .ch-empty { font-size:10px; color:var(--text-muted); padding:12px; text-align:center; font-style:italic; }
+    .msg-show-more { display:inline-block; margin-top:3px; font-size:9px; color:var(--teal); cursor:pointer; text-decoration:underline; }
     .compose-bar { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 4px; }
     .compose-channel { display: flex; gap: 4px; margin-bottom: 7px; }
     .compose-channel button { padding: 3px 10px; border-radius: 12px; border: 1px solid var(--border);
@@ -314,7 +326,7 @@
     .dash-layout { display: grid; grid-template-columns: 1fr 260px; gap: 12px; align-items: start; }
     .dash-left { display: flex; flex-direction: column; gap: 12px; }
     .dash-right { display: flex; flex-direction: column; gap: 12px; }
-    .dash-kpi-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; }
+    .dash-kpi-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; }
     .dash-kpi { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
     .dash-kpi-val { font-size: 26px; font-weight: 700; color: var(--teal); line-height: 1.1; }
     .dash-kpi-label { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
@@ -438,6 +450,11 @@ function LeadChip({ lead, isSelected, onClick, onDragStart }) {
       {shortCamp && <span className="chip-campaign" title={camp}>{shortCamp}</span>}
       {(lead.notes_count||0)>0 && <span className="chip-notes">{lead.notes_count}</span>}
       {lead.attributed_production>0 && <span className="chip-revenue">{fmtMoney(lead.attributed_production)}</span>}
+      {lead.next_action_at && (
+        <span style={{fontSize:8,background:'#fef3c7',color:'#92400e',padding:'0 3px',borderRadius:3,fontWeight:700}}>
+          📅 {lead.next_action_at.slice(5)}
+        </span>
+      )}
       <span className="chip-time">{fmtDateTime(lead.created_at)}</span>
     </span>
   );
@@ -468,7 +485,7 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const [notes, setNotes] = useState([]);
   const [newNote, setNewNote] = useState('');
   const [showMove, setShowMove] = useState(false);
-  const [tab, setTab] = useState('info');
+  const [tab, setTab] = useState('conversation');
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [testEmailStatus, setTestEmailStatus] = useState('');
@@ -479,20 +496,140 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const [composeBody, setComposeBody] = useState('');
   const [sendingMsg, setSendingMsg] = useState(false);
   const [sendError, setSendError] = useState('');
+  // v2 thread: active channel pill (sms|email), expanded long emails, scroll ref
+  const [activeChannel, setActiveChannel] = useState(null); // null = pick automatically once messages load
+  const [expandedMsgs, setExpandedMsgs] = useState({});
+  const threadEndRef = React.useRef(null);
+  const channelInitedRef = React.useRef(false);
   // Step 10: pause / DND controls
   const [pauseWorking, setPauseWorking] = useState(false);
   const [dndWorking, setDndWorking] = useState(false);
   const [stopMsg, setStopMsg] = useState('');
+  // Call log + next action state
+  const [calls, setCalls] = useState([]);
+  const [callOutcome, setCallOutcome] = useState('no_answer');
+  const [callNotes, setCallNotes] = useState('');
+  const [callDirection, setCallDirection] = useState('outbound');
+  const [loggingCall, setLoggingCall] = useState(false);
+  const [nextActionAt, setNextActionAt] = useState('');
+  const [nextActionNote, setNextActionNote] = useState('');
+  const [savingNextAction, setSavingNextAction] = useState(false);
+  // Lead tags
+  const [tags, setTags] = useState([]);
+  const [tagInput, setTagInput] = useState('');
+  const [savingTags, setSavingTags] = useState(false);
 
   useEffect(() => {
     if (!lead) return;
     api('/api/lead/' + lead.id).then(setDetail);
     api('/api/admin/lead/' + lead.id + '/notes').then(d=>setNotes(d.notes||[]));
     api('/api/admin/lead/' + lead.id + '/messages').then(d=>setMessages(d.messages||[]));
+    api('/api/admin/lead/' + lead.id + '/calls').then(d=>setCalls(d.calls||[])).catch(()=>{});
+    api('/api/admin/lead/' + lead.id + '/tags').then(d=>setTags(d.tags||[])).catch(()=>setTags([]));
+    setNextActionAt(lead.next_action_at || '');
+    setNextActionNote(lead.next_action_note || '');
+    setTagInput('');
+    // Clear compose fields so previous lead's draft doesn't bleed into next lead
+    setComposeBody('');
+    setComposeSubject('');
   }, [lead?.id]);
+
+  async function saveTags(newTags) {
+    setSavingTags(true);
+    try {
+      const res = await api('/api/admin/lead/' + lead.id + '/tags', {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({tags: newTags}),
+      });
+      setTags(res.tags || newTags);
+    } finally {
+      setSavingTags(false);
+    }
+  }
+
+  function addTag() {
+    const t = tagInput.trim().toLowerCase();
+    if (!t || tags.includes(t)) { setTagInput(''); return; }
+    const next = [...tags, t];
+    setTags(next); // optimistic
+    setTagInput('');
+    saveTags(next);
+  }
+
+  function removeTag(tag) {
+    const next = tags.filter(t => t !== tag);
+    setTags(next); // optimistic
+    saveTags(next);
+  }
 
   function refreshMessages() {
     api('/api/admin/lead/' + lead.id + '/messages').then(d=>setMessages(d.messages||[]));
+  }
+
+  // Auto-select the channel with the most recent inbound (unread proxy) message
+  // once messages load. Only set once per lead — user can switch freely after.
+  useEffect(() => {
+    if (channelInitedRef.current) return;
+    if (!messages || messages.length === 0) return;
+    const inbound = messages.filter(m => m.direction === 'inbound');
+    let pick = 'sms';
+    if (inbound.length > 0) {
+      const latest = inbound.slice().sort((a,b) =>
+        new Date(b.received_at||0) - new Date(a.received_at||0))[0];
+      pick = latest.channel === 'email' ? 'email' : 'sms';
+    } else {
+      // No inbound — pick channel with most recent message overall
+      const latest = messages.slice().sort((a,b) =>
+        new Date(b.received_at||0) - new Date(a.received_at||0))[0];
+      if (latest) pick = latest.channel === 'email' ? 'email' : 'sms';
+    }
+    setActiveChannel(pick);
+    setComposeChannel(pick);
+    channelInitedRef.current = true;
+  }, [messages]);
+
+  // Reset channel-init flag when lead changes
+  useEffect(() => {
+    channelInitedRef.current = false;
+    setActiveChannel(null);
+    setExpandedMsgs({});
+  }, [lead?.id]);
+
+  // Auto-scroll thread to bottom when messages or active channel change
+  useEffect(() => {
+    if (tab !== 'conversation') return;
+    const el = threadEndRef.current;
+    if (el && el.scrollIntoView) {
+      try { el.scrollIntoView({block:'end'}); } catch(_) {}
+    }
+  }, [messages, activeChannel, tab]);
+
+  // When conversation tab opens, mark inbound messages as read and refresh inbox count
+  useEffect(() => {
+    if (tab !== 'conversation' || !lead) return;
+    api('/api/admin/lead/' + lead.id + '/mark-read', { method: 'POST' })
+      .then(() => {
+        try { onRefresh && onRefresh(); } catch(_) {}
+        try { window.dispatchEvent(new CustomEvent('inbox-unread-changed')); } catch(_) {}
+      })
+      .catch(() => {});
+  }, [tab, lead?.id]);
+
+  // Helper: switch channel pill — also keep compose channel in sync
+  function pickChannel(ch) {
+    setActiveChannel(ch);
+    setComposeChannel(ch);
+    if (ch === 'email' && !composeSubject) {
+      // Pre-fill "Re: ..." from latest email subject if available
+      const lastEmailWithSubj = messages
+        .filter(m => m.channel === 'email' && m.subject)
+        .slice().sort((a,b) => new Date(b.received_at||0) - new Date(a.received_at||0))[0];
+      if (lastEmailWithSubj && lastEmailWithSubj.subject) {
+        const s = lastEmailWithSubj.subject;
+        setComposeSubject(s.startsWith('Re:') ? s : ('Re: ' + s));
+      }
+    }
   }
 
   async function sendMessage() {
@@ -593,6 +730,41 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
     setDndWorking(false);
   }
 
+  async function logCallAction() {
+    setLoggingCall(true);
+    try {
+      await api('/api/admin/lead/' + lead.id + '/log-call', {
+        method: 'POST',
+        body: JSON.stringify({ direction: callDirection, outcome: callOutcome, notes: callNotes, duration_sec: 0 })
+      });
+      setCallNotes('');
+      const d = await api('/api/admin/lead/' + lead.id + '/calls');
+      setCalls(d.calls || []);
+      onRefresh();
+    } catch(e) { console.error('log call error', e); }
+    setLoggingCall(false);
+  }
+
+  async function saveNextAction() {
+    if (!nextActionAt) return;
+    setSavingNextAction(true);
+    try {
+      await api('/api/admin/lead/' + lead.id + '/next-action', {
+        method: 'PUT',
+        body: JSON.stringify({ next_action_at: nextActionAt, next_action_note: nextActionNote })
+      });
+      onRefresh();
+    } catch(e) { console.error('next action error', e); }
+    setSavingNextAction(false);
+  }
+
+  async function clearNextActionAction() {
+    await api('/api/admin/lead/' + lead.id + '/next-action', { method: 'DELETE' });
+    setNextActionAt('');
+    setNextActionNote('');
+    onRefresh();
+  }
+
   const events = detail?.events||[];
   const queue = detail?.follow_up_queue||[];
 
@@ -639,9 +811,9 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
           </div>
         </div>
         <div style={{display:'flex',gap:0,borderBottom:'1px solid var(--border)'}}>
-          {[{k:'info',l:'Info'},{k:'notes',l:'Notes'},{k:'communication',l:'Communication'},{k:'staff',l:'Staff Actions'}].map(t=>(
-            <button key={t.k} style={{flex:1,padding:'6px 0',fontSize:10,fontWeight:500,cursor:'pointer',
-              background:'none',border:'none',borderBottom:tab===t.k?'2px solid var(--teal)':'none',
+          {[{k:'info',l:'Info'},{k:'conversation',l:'Conversation'},{k:'activity',l:'Activity'}].map(t=>(
+            <button key={t.k} style={{flex:1,padding:'7px 0',fontSize:11,fontWeight:500,cursor:'pointer',
+              background:'none',border:'none',borderBottom:tab===t.k?'2px solid var(--teal)':'2px solid transparent',
               color:tab===t.k?'var(--teal)':'var(--text-muted)'}}
               onClick={()=>setTab(t.k)}>{t.l}</button>
           ))}
@@ -707,82 +879,221 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
                   {lead.attributed_income>0&&<div className="detail-row"><div className="detail-row-label">Collections</div><div className="detail-row-value">{fmtMoney(lead.attributed_income)}</div></div>}
                 </div>
               )}
-            </div>
-          )}
-          {tab==='notes' && (
-            <div>
+              {/* ── Tags ── */}
               <div className="detail-section">
-                <textarea className="note-input" value={newNote} onChange={e=>setNewNote(e.target.value)} placeholder="Add a note..." />
-                <button className="btn btn-teal btn-sm" onClick={addNote} style={{marginTop:6}} disabled={saving}>Save</button>
-              </div>
-              {notes.map(n=>(
-                <div key={n.id} className="note-item">
-                  <div className="note-header">
-                    <div className="note-author">{n.author||'Unknown'}</div>
-                    <button style={{background:'none',border:'none',cursor:'pointer',color:'var(--text-muted)',fontSize:10}} onClick={()=>delNote(n.id)}>×</button>
-                  </div>
-                  <div className="note-header" style={{marginBottom:0}}>
-                    <div className="note-time">{timeAgo(n.created_at)}</div>
-                  </div>
-                  <div style={{marginTop:4}}>{n.note_text}</div>
+                <div className="detail-section-title">Tags</div>
+                <div style={{display:'flex',flexWrap:'wrap',gap:4,marginBottom:6}}>
+                  {tags.length === 0 && <span style={{fontSize:11,color:'var(--text-muted)'}}>No tags yet</span>}
+                  {tags.map(tag => (
+                    <span key={tag} style={{display:'inline-flex',alignItems:'center',gap:3,
+                      background:'var(--teal)',color:'#fff',borderRadius:12,
+                      fontSize:10,fontWeight:600,padding:'2px 8px'}}>
+                      {tag}
+                      <button onClick={()=>removeTag(tag)} disabled={savingTags}
+                        style={{background:'none',border:'none',color:'#fff',cursor:'pointer',
+                          fontSize:11,lineHeight:1,padding:0,marginLeft:2,opacity:.8}}>×</button>
+                    </span>
+                  ))}
                 </div>
-              ))}
+                <div style={{display:'flex',gap:4}}>
+                  <input value={tagInput} onChange={e=>setTagInput(e.target.value)}
+                    onKeyDown={e=>e.key==='Enter'&&addTag()}
+                    placeholder="Add tag…"
+                    style={{flex:1,fontSize:11,padding:'4px 8px',borderRadius:4,
+                      border:'1px solid var(--border)',background:'var(--surface)',
+                      color:'var(--text)'}} />
+                  <button className="btn btn-teal btn-sm" onClick={addTag}
+                    disabled={savingTags||!tagInput.trim()}
+                    style={{fontSize:10,padding:'4px 10px'}}>
+                    {savingTags?'…':'Add'}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
-          {tab==='communication' && (
-            <div>
-              {/* Automated sequence schedule */}
-              <div className="detail-section-title">Sequence Schedule</div>
-              {queue.map((q,i)=>(
-                <div key={i} className="fq-item" style={{opacity:q.status==='cancelled'?0.55:1}}>
-                  <span className={'fq-status fq-'+q.status}>{q.status}</span>
-                  <div style={{flex:1,marginLeft:4,fontSize:10}}>
-                    <strong>{q.channel==='sms'?'SMS':'Email'}</strong> — {q.template||q.description||('Day '+q.sequence_day)}
-                    {q.status==='cancelled'&&q.cancellation_reason&&(
-                      <span style={{color:'var(--red)',marginLeft:4,fontSize:9}}>({q.cancellation_reason})</span>
-                    )}
-                  </div>
-                  <div style={{fontSize:9,color:'var(--text-muted)',marginLeft:'auto',whiteSpace:'nowrap'}}>
-                    {q.sent_at ? fmtDate(q.sent_at) : q.cancelled_at ? fmtDate(q.cancelled_at) : fmtDate(q.scheduled_at)}
-                  </div>
-                </div>
-              ))}
-              {queue.length===0&&<div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>No sequence scheduled</div>}
+          {/* ══ CONVERSATION TAB ══ */}
+          {tab==='conversation' && (
+            <div style={{display:'flex',flexDirection:'column',height:'100%'}}>
 
-              {/* Manual message thread */}
-              <div className="detail-section-title" style={{marginTop:12}}>Messages</div>
-              <div className="msg-thread">
-                {messages.map((m,i)=>(
-                  <div key={i} className={'msg-bubble ' + (m.direction==='outbound' ? 'outbound' : 'auto-item')}>
-                    <div>
-                      <span className={'msg-tag ' + (m.message_type==='manual' ? 'manual' : 'auto')}>
-                        {m.message_type==='manual' ? (m.direction==='outbound'?'Manual':'Reply') : 'Auto'}
-                        {' · '}{(m.channel||'').toUpperCase()}
-                      </span>
-                      {m.subject && <div style={{fontWeight:600,fontSize:10,marginBottom:2}}>{m.subject}</div>}
-                    </div>
-                    <div style={{whiteSpace:'pre-wrap'}}>{m.body}</div>
-                    <div className="msg-meta">
-                      {m.direction==='outbound' && m.sent_by ? (m.sent_by + ' · ') : ''}
-                      {fmtDate(m.received_at)}
-                    </div>
-                  </div>
-                ))}
-                {messages.length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No messages yet</div>}
+              {/* ── Sequence controls strip ── */}
+              <div style={{display:'flex',gap:4,flexWrap:'wrap',marginBottom:8,paddingBottom:8,borderBottom:'1px solid var(--border)'}}>
+                {lead.paused_at ? (
+                  <button className="btn btn-ghost btn-sm" disabled={pauseWorking} onClick={resumeLead}
+                    style={{background:'#ede9fe',color:'#7c3aed',border:'1px solid #c4b5fd'}}>
+                    {pauseWorking?'Working…':'▶ Resume'}
+                  </button>
+                ) : (
+                  <button className="btn btn-ghost btn-sm" disabled={pauseWorking} onClick={pauseLead}
+                    style={{background:'#fef3c7',color:'#b45309',border:'1px solid #fcd34d'}}>
+                    {pauseWorking?'Working…':'⏸ Pause'}
+                  </button>
+                )}
+                {lead.unsubscribed_sms ? (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking} onClick={()=>clearDnd('sms')}
+                    style={{background:'#dcfce7',color:'#166534',border:'1px solid #86efac'}}>
+                    {dndWorking?'…':'📵 Clear SMS DND'}
+                  </button>
+                ) : (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking} onClick={()=>setDnd('sms')}
+                    style={{background:'#fee2e2',color:'#991b1b',border:'1px solid #fca5a5'}}>
+                    {dndWorking?'…':'📵 Set SMS DND'}
+                  </button>
+                )}
+                {lead.unsubscribed_email ? (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking} onClick={()=>clearDnd('email')}
+                    style={{background:'#dcfce7',color:'#166534',border:'1px solid #86efac'}}>
+                    {dndWorking?'…':'📧 Clear Email DND'}
+                  </button>
+                ) : (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking} onClick={()=>setDnd('email')}
+                    style={{background:'#fee2e2',color:'#991b1b',border:'1px solid #fca5a5'}}>
+                    {dndWorking?'…':'📧 Set Email DND'}
+                  </button>
+                )}
+                {/* Next follow-up inline */}
+                {lead.next_action_at ? (
+                  <span style={{marginLeft:'auto',fontSize:10,fontWeight:600,color:'var(--teal)',display:'flex',alignItems:'center',gap:4}}>
+                    📅 {lead.next_action_at}{lead.next_action_note && <span style={{fontWeight:400,color:'var(--text)'}}>— {lead.next_action_note}</span>}
+                    <button className="btn btn-ghost btn-sm" style={{padding:'1px 6px',fontSize:9}} onClick={clearNextActionAction}>✕</button>
+                  </span>
+                ) : null}
+                {stopMsg && (
+                  <span style={{fontSize:10,padding:'2px 8px',borderRadius:4,marginLeft:4,
+                    background:stopMsg.startsWith('Error')?'#fee2e2':'#dcfce7',
+                    color:stopMsg.startsWith('Error')?'var(--red)':'#166534'}}>
+                    {stopMsg}
+                  </span>
+                )}
               </div>
 
-              {/* Compose bar */}
-              <div className="compose-bar">
-                <div className="compose-channel">
-                  <button className={composeChannel==='sms'?'active':''} onClick={()=>setComposeChannel('sms')}>SMS</button>
-                  <button className={composeChannel==='email'?'active':''} onClick={()=>setComposeChannel('email')}>Email</button>
+              {/* ── Channel tabs ── */}
+              <div className="ch-tabs" style={{marginBottom:6}}>
+                <button className={'ch-pill'+(activeChannel==='sms'?' active':'')} onClick={()=>pickChannel('sms')}>SMS</button>
+                <button className={'ch-pill'+(activeChannel==='email'?' active':'')} onClick={()=>pickChannel('email')}>Email</button>
+              </div>
+
+              {/* ── Unified thread ── */}
+              {(() => {
+                const ch = activeChannel || 'sms';
+                // All messages for this channel, sorted by time
+                const filtered = messages
+                  .filter(m => (m.channel || 'sms') === ch)
+                  .slice()
+                  .sort((a,b) => new Date(a.received_at||0) - new Date(b.received_at||0));
+                // Calls (all channels, interleave by time)
+                const callItems = calls.map(c => ({...c, _type:'call', _ts: new Date(c.logged_at||0)}));
+                // Staff notes
+                const noteItems = notes.map(n => ({...n, _type:'note', _ts: new Date(n.created_at||0)}));
+
+                if (filtered.length === 0 && callItems.length === 0 && noteItems.length === 0) {
+                  return (
+                    <div className="msg-thread-v2">
+                      <div className="ch-empty">No {ch === 'email' ? 'emails' : 'SMS messages'} yet</div>
+                      <div ref={threadEndRef} />
+                    </div>
+                  );
+                }
+                let lastDayKey = '';
+                const items = [];
+                filtered.forEach((m, i) => {
+                  const d = m.received_at ? new Date(m.received_at) : null;
+                  const dayKey = d ? d.toDateString() : 'unknown';
+                  if (dayKey !== lastDayKey) {
+                    items.push(<div key={'day-'+i} className="msg-day-sep"><span>{d ? fmtDate(m.received_at) : '—'}</span></div>);
+                    lastDayKey = dayKey;
+                  }
+                  const isInbound = m.direction === 'inbound';
+                  const isAuto = m.message_type === 'auto';
+                  let cls = 'msg-bubble ';
+                  if (isInbound) cls += 'msg-inbound';
+                  else if (isAuto) cls += 'msg-outbound-auto';
+                  else cls += 'msg-outbound-manual';
+                  const body = m.body || '';
+                  const isLong = ch === 'email' && body.length > 200;
+                  const expanded = !!expandedMsgs[m.id || ('idx-'+i)];
+                  const displayBody = isLong && !expanded ? (body.slice(0, 200) + '…') : body;
+                  items.push(
+                    <div key={'m-'+(m.id||i)} className={cls}>
+                      {!isInbound && (
+                        <span className="msg-tag" style={{
+                          background: isAuto ? 'rgba(255,255,255,.45)' : 'rgba(255,255,255,.25)',
+                          color: isAuto ? 'var(--teal-dark)' : '#fff'
+                        }}>{isAuto ? 'Auto' : 'Staff'}</span>
+                      )}
+                      {ch === 'email' && m.subject && <div style={{fontWeight:700,fontSize:10,marginBottom:3}}>{m.subject}</div>}
+                      <div style={{whiteSpace:'pre-wrap'}}>{displayBody}</div>
+                      {isLong && (
+                        <span className="msg-show-more" onClick={()=>setExpandedMsgs(s=>({...s,[m.id||('idx-'+i)]: !expanded}))}>
+                          {expanded ? 'Show less' : 'Show more'}
+                        </span>
+                      )}
+                      <div className="msg-meta">
+                        {!isInbound && m.sent_by ? (m.sent_by + ' · ') : ''}
+                        {m.received_at ? new Date(m.received_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ''}
+                      </div>
+                    </div>
+                  );
+                });
+                // Interleave calls + notes below thread
+                const extra = [...callItems, ...noteItems].sort((a,b) => a._ts - b._ts);
+                extra.forEach((x, xi) => {
+                  if (x._type === 'call') {
+                    const ol = {spoke:'✅ Spoke',left_vm:'📞 Left VM',no_answer:'📵 No Answer',callback_scheduled:'📅 Callback'}[x.outcome] || x.outcome;
+                    items.push(
+                      <div key={'call-'+xi} className="timeline-item" style={{marginTop:4}}>
+                        <div className="timeline-dot" style={{background:'#f59e0b'}} />
+                        <div style={{flex:1}}>
+                          <div className="timeline-type">📞 {ol} <span style={{fontWeight:400,color:'var(--text-muted)'}}>({x.direction})</span></div>
+                          {x.notes && <div style={{fontSize:9,color:'var(--text-muted)'}}>{x.notes}</div>}
+                        </div>
+                        <div className="timeline-time">{timeAgo(x.logged_at)}</div>
+                      </div>
+                    );
+                  } else {
+                    items.push(
+                      <div key={'note-'+xi} style={{margin:'6px 0',padding:'7px 10px',background:'#fffbeb',
+                        borderLeft:'3px solid #f59e0b',borderRadius:'0 4px 4px 0',fontSize:11}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:2}}>
+                          <span style={{fontSize:9,fontWeight:600,color:'#92400e',textTransform:'uppercase'}}>Staff Note</span>
+                          <span style={{fontSize:9,color:'var(--text-muted)'}}>{timeAgo(x.created_at)}</span>
+                        </div>
+                        <div style={{color:'var(--text)'}}>{x.note_text}</div>
+                      </div>
+                    );
+                  }
+                });
+                return <div className="msg-thread-v2">{items}<div ref={threadEndRef} /></div>;
+              })()}
+
+              {/* ── Compose bar (send message OR add note) ── */}
+              <div className="compose-bar" style={{marginTop:8}}>
+                <div style={{display:'flex',gap:4,marginBottom:6,alignItems:'center'}}>
+                  <div className="compose-channel">
+                    <button className={composeChannel==='sms'?'active':''} onClick={()=>pickChannel('sms')}>SMS</button>
+                    <button className={composeChannel==='email'?'active':''} onClick={()=>pickChannel('email')}>Email</button>
+                  </div>
+                  <button
+                    style={{marginLeft:'auto',fontSize:10,padding:'3px 10px',background:'#fffbeb',
+                      color:'#92400e',border:'1px solid #f59e0b',borderRadius:4,cursor:'pointer'}}
+                    onClick={async ()=>{
+                      const text = composeBody.trim();
+                      if (!text) return;
+                      await api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',
+                        body:JSON.stringify({note_text:text,author:'staff'})});
+                      setComposeBody('');
+                      const d = await api('/api/admin/lead/'+lead.id+'/notes');
+                      setNotes(d.notes||[]);
+                      onRefresh();
+                    }}>
+                    📝 Save as Note
+                  </button>
                 </div>
                 {composeChannel==='email' && (
                   <input className="compose-subject" placeholder="Subject..."
                     value={composeSubject} onChange={e=>setComposeSubject(e.target.value)} />
                 )}
                 <textarea className="compose-textarea"
-                  placeholder={composeChannel==='sms'?'Type an SMS message... (Reply STOP to opt out)':'Type your email message...'}
+                  placeholder={composeChannel==='sms'?'Type an SMS or write a staff note…':'Type your email or write a staff note…'}
                   value={composeBody} onChange={e=>setComposeBody(e.target.value)}
                   rows={composeChannel==='email'?4:2} />
                 <div className="compose-footer">
@@ -796,140 +1107,188 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
                 </div>
               </div>
 
-              {/* Event log */}
-              <div className="detail-section-title" style={{marginTop:14}}>Event Log</div>
-              {events.filter(e=>[
-                'email_sent','sms_sent','stage_changed','lead_created','smile_completed',
-                'booking_confirmed','od_matched','image_deleted',
-                // Step 10 events
-                'sms_stop','email_unsub','sms_resubscribed','lead_paused','lead_resumed',
-                'dnd_set','dnd_cleared','manual_pause','replied'
-              ].includes(e.event_type)).map((e,i)=>{
-                const isStop = ['sms_stop','email_unsub','lead_paused','dnd_set','manual_pause'].includes(e.event_type);
-                const isResume = ['sms_resubscribed','lead_resumed','dnd_cleared'].includes(e.event_type);
-                const dotColor = isStop ? 'var(--red)' : isResume ? '#22c55e' :
-                  e.event_type.includes('email') ? '#3b82f6' :
-                  e.event_type.includes('sms') ? '#22c55e' : 'var(--teal)';
-                return (
-                  <div key={i} className="timeline-item">
-                    <div className="timeline-dot" style={{background:dotColor}} />
-                    <div style={{flex:1}}>
-                      <div className="timeline-type">{e.event_type.replace(/_/g,' ')}</div>
-                      {e.stage_to&&<div style={{fontSize:9,color:'var(--text-muted)'}}>→ {STAGE_LABELS[e.stage_to]||e.stage_to}</div>}
-                    </div>
-                    <div className="timeline-time">{fmtDate(e.created_at)}</div>
-                  </div>
-                );
-              })}
-              {events.length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No events</div>}
+              {/* ── Log a call (collapsed form) ── */}
+              <details style={{marginTop:10,borderTop:'1px solid var(--border)',paddingTop:8}}>
+                <summary style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',cursor:'pointer',userSelect:'none',textTransform:'uppercase',letterSpacing:'.4px'}}>
+                  📞 Log a Call
+                </summary>
+                <div style={{marginTop:8,display:'flex',gap:4,flexWrap:'wrap'}}>
+                  <select style={{fontSize:11,padding:'3px 7px',border:'1px solid var(--border)',borderRadius:4}}
+                    value={callDirection} onChange={e=>setCallDirection(e.target.value)}>
+                    <option value="outbound">Outbound</option>
+                    <option value="inbound">Inbound</option>
+                  </select>
+                  <select style={{fontSize:11,padding:'3px 7px',border:'1px solid var(--border)',borderRadius:4}}
+                    value={callOutcome} onChange={e=>setCallOutcome(e.target.value)}>
+                    <option value="spoke">✅ Spoke</option>
+                    <option value="left_vm">📞 Left VM</option>
+                    <option value="no_answer">📵 No Answer</option>
+                    <option value="callback_scheduled">📅 Callback Scheduled</option>
+                  </select>
+                </div>
+                <textarea style={{width:'100%',fontSize:11,padding:'4px 8px',border:'1px solid var(--border)',borderRadius:4,resize:'vertical',marginTop:6,boxSizing:'border-box'}}
+                  rows={2} placeholder="Notes (optional)…" value={callNotes} onChange={e=>setCallNotes(e.target.value)} />
+                <button className="btn btn-teal btn-sm" style={{marginTop:4}} disabled={loggingCall} onClick={logCallAction}>
+                  {loggingCall ? 'Logging…' : 'Log Call'}
+                </button>
+              </details>
+
+              {/* ── Set next follow-up (collapsed) ── */}
+              <details style={{marginTop:6,borderTop:'1px solid var(--border)',paddingTop:8}}>
+                <summary style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',cursor:'pointer',userSelect:'none',textTransform:'uppercase',letterSpacing:'.4px'}}>
+                  📅 Set Next Follow-Up
+                </summary>
+                <div style={{marginTop:8,display:'flex',gap:4,alignItems:'center',flexWrap:'wrap'}}>
+                  <input type="date" style={{fontSize:11,padding:'3px 7px',border:'1px solid var(--border)',borderRadius:4}}
+                    value={nextActionAt} onChange={e=>setNextActionAt(e.target.value)} />
+                  <input style={{fontSize:11,padding:'3px 7px',border:'1px solid var(--border)',borderRadius:4,flex:1,minWidth:120}}
+                    placeholder="Note (e.g. call re: financing)…" value={nextActionNote} onChange={e=>setNextActionNote(e.target.value)} />
+                  <button className="btn btn-teal btn-sm" disabled={!nextActionAt||savingNextAction} onClick={saveNextAction}>
+                    {savingNextAction?'Saving…':'Set'}
+                  </button>
+                </div>
+              </details>
+
+              {/* ── Test nurture emails (collapsed) ── */}
+              <details style={{marginTop:6,borderTop:'1px solid var(--border)',paddingTop:8}}>
+                <summary style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',cursor:'pointer',userSelect:'none',textTransform:'uppercase',letterSpacing:'.4px'}}>
+                  🧪 Test Nurture Emails
+                </summary>
+                <div style={{fontSize:10,color:'var(--text-muted)',margin:'6px 0'}}>
+                  Sends to your override address — does not affect real nurture queue.
+                </div>
+                <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+                  {['day1','day7','day14','day30','noshow'].map(t=>(
+                    <button key={t} className="btn btn-ghost btn-sm" onClick={()=>{
+                      setTestEmailStatus('Sending '+t+'...');
+                      api('/api/admin/test-email',{method:'POST',body:JSON.stringify({
+                        lead_id: lead.id, template: t,
+                        override_email: 'anuraggupta@graftondentalcare.com'
+                      })}).then(r=>{
+                        setTestEmailStatus(r.status==='sent'? '✅ '+t+' sent to '+r.to : '❌ '+t+' failed');
+                        setTimeout(()=>setTestEmailStatus(''),5000);
+                      }).catch(()=>{ setTestEmailStatus('❌ Error'); setTimeout(()=>setTestEmailStatus(''),3000); });
+                    }}>{t}</button>
+                  ))}
+                </div>
+                {testEmailStatus && <div style={{fontSize:11,color:'var(--teal)',marginTop:6}}>{testEmailStatus}</div>}
+              </details>
             </div>
           )}
-          {tab==='staff' && (
+
+          {/* ══ ACTIVITY TAB ══ */}
+          {tab==='activity' && (
             <div>
-              {/* ── Step 10: Pause / DND controls ── */}
-              <div className="detail-section-title">Sequence Controls</div>
-              <div style={{display:'flex',gap:4,flexWrap:'wrap',marginBottom:6}}>
-                {lead.paused_at ? (
-                  <button className="btn btn-ghost btn-sm" disabled={pauseWorking}
-                    onClick={resumeLead}
-                    style={{background:'#ede9fe',color:'#7c3aed',border:'1px solid #c4b5fd'}}>
-                    {pauseWorking?'Working…':'▶ Resume Sequence'}
-                  </button>
-                ) : (
-                  <button className="btn btn-ghost btn-sm" disabled={pauseWorking}
-                    onClick={pauseLead}
-                    style={{background:'#fef3c7',color:'#b45309',border:'1px solid #fcd34d'}}>
-                    {pauseWorking?'Working…':'⏸ Pause Sequence'}
-                  </button>
-                )}
-                {lead.unsubscribed_sms ? (
-                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
-                    onClick={()=>clearDnd('sms')}
-                    style={{background:'#dcfce7',color:'#166534',border:'1px solid #86efac'}}>
-                    {dndWorking?'Working…':'📵 Clear SMS DND'}
-                  </button>
-                ) : (
-                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
-                    onClick={()=>setDnd('sms')}
-                    style={{background:'#fee2e2',color:'#991b1b',border:'1px solid #fca5a5'}}>
-                    {dndWorking?'Working…':'📵 Set SMS DND'}
-                  </button>
-                )}
-                {lead.unsubscribed_email ? (
-                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
-                    onClick={()=>clearDnd('email')}
-                    style={{background:'#dcfce7',color:'#166534',border:'1px solid #86efac'}}>
-                    {dndWorking?'Working…':'📧 Clear Email DND'}
-                  </button>
-                ) : (
-                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
-                    onClick={()=>setDnd('email')}
-                    style={{background:'#fee2e2',color:'#991b1b',border:'1px solid #fca5a5'}}>
-                    {dndWorking?'Working…':'📧 Set Email DND'}
-                  </button>
-                )}
+              <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:10}}>
+                Full lead journey — messages, calls, notes, stage changes, and automation events in one place.
               </div>
-              {stopMsg && (
-                <div style={{fontSize:10,padding:'4px 8px',borderRadius:4,marginBottom:8,
-                  background:stopMsg.startsWith('Error')?'#fee2e2':'#dcfce7',
-                  color:stopMsg.startsWith('Error')?'var(--red)':'#166534'}}>
-                  {stopMsg}
+
+              {/* Sequence queue */}
+              {queue.length > 0 && (
+                <div style={{marginBottom:12}}>
+                  <div className="detail-section-title">Sequence Schedule</div>
+                  {queue.map((q,i)=>(
+                    <div key={i} className="fq-item" style={{opacity:q.status==='cancelled'?0.55:1}}>
+                      <span className={'fq-status fq-'+q.status}>{q.status}</span>
+                      <div style={{flex:1,marginLeft:4,fontSize:10}}>
+                        <strong>{q.channel==='sms'?'SMS':'Email'}</strong> — {q.template||q.description||('Day '+q.sequence_day)}
+                        {q.status==='cancelled'&&q.cancellation_reason&&(
+                          <span style={{color:'var(--red)',marginLeft:4,fontSize:9}}>({q.cancellation_reason})</span>
+                        )}
+                      </div>
+                      <div style={{fontSize:9,color:'var(--text-muted)',marginLeft:'auto',whiteSpace:'nowrap'}}>
+                        {q.sent_at ? fmtDate(q.sent_at) : q.cancelled_at ? fmtDate(q.cancelled_at) : fmtDate(q.scheduled_at)}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
-              <div className="detail-section-title">Log Staff Action</div>
-              <div style={{display:'flex',gap:4,marginBottom:8}}>
-                <button className="btn btn-ghost btn-sm" onClick={()=>{
-                  const note = 'Staff called patient';
-                  api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:note,author:'staff'})}).then(()=>{onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
-                }}>Log Call</button>
-                <button className="btn btn-ghost btn-sm" onClick={()=>{
-                  const note = 'Staff sent email';
-                  api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:note,author:'staff'})}).then(()=>{onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
-                }}>Log Email</button>
-                <button className="btn btn-ghost btn-sm" onClick={()=>{
-                  const note = 'Staff sent text';
-                  api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:note,author:'staff'})}).then(()=>{onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
-                }}>Log Text</button>
-              </div>
-              <textarea className="note-input" placeholder="Add details about the action..." id="staffNote" />
-              <button className="btn btn-teal btn-sm" style={{marginTop:6}} onClick={()=>{
-                const el = document.getElementById('staffNote');
-                const text = el.value.trim();
-                if(!text) return;
-                api('/api/admin/lead/'+lead.id+'/notes',{method:'POST',body:JSON.stringify({note_text:text,author:'staff'})}).then(()=>{el.value='';onRefresh();api('/api/admin/lead/'+lead.id+'/notes').then(d=>setNotes(d.notes||[]))});
-              }}>Save Note</button>
-              <div className="detail-section-title" style={{marginTop:14}}>Test Nurture Emails</div>
-              <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
-                Sends to your override address — does not affect real nurture queue.
-              </div>
-              <div style={{display:'flex',gap:4,flexWrap:'wrap',marginBottom:6}}>
-                {['day1','day7','day14','day30','noshow'].map(t=>(
-                  <button key={t} className="btn btn-ghost btn-sm" onClick={()=>{
-                    setTestEmailStatus('Sending '+t+'...');
-                    api('/api/admin/test-email',{method:'POST',body:JSON.stringify({
-                      lead_id: lead.id,
-                      template: t,
-                      override_email: 'anuraggupta@graftondentalcare.com'
-                    })}).then(r=>{
-                      setTestEmailStatus(r.status==='sent'? '✅ '+t+' sent to '+r.to : '❌ '+t+' failed');
-                      setTimeout(()=>setTestEmailStatus(''),5000);
-                    }).catch(()=>{ setTestEmailStatus('❌ Error'); setTimeout(()=>setTestEmailStatus(''),3000); });
-                  }}>{t}</button>
-                ))}
-              </div>
-              {testEmailStatus && <div style={{fontSize:11,color:'var(--teal)',marginBottom:8}}>{testEmailStatus}</div>}
 
-              <div className="detail-section-title" style={{marginTop:14}}>Staff Action Log</div>
-              {notes.filter(n=>n.author==='staff').map(n=>(
-                <div key={n.id} className="note-item">
-                  <div className="note-header">
-                    <div className="note-author">{n.note_text.startsWith('Staff ')?n.note_text.split(' ').slice(0,3).join(' '):'Staff action'}</div>
-                    <div className="note-time">{fmtDate(n.created_at)} {timeAgo(n.created_at)}</div>
-                  </div>
-                  {!n.note_text.startsWith('Staff ')&&<div style={{marginTop:4}}>{n.note_text}</div>}
-                </div>
-              ))}
-              {notes.filter(n=>n.author==='staff').length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No staff actions logged</div>}
+              {/* Full unified chronological timeline */}
+              <div className="detail-section-title">Full Journey</div>
+              {(() => {
+                // Build all events into one sorted list
+                const allItems = [];
+                // Lead events
+                events.forEach(e => allItems.push({_ts: new Date(e.created_at||0), _type:'event', data:e}));
+                // Messages (both channels)
+                messages.forEach(m => allItems.push({_ts: new Date(m.received_at||0), _type:'message', data:m}));
+                // Calls
+                calls.forEach(c => allItems.push({_ts: new Date(c.logged_at||0), _type:'call', data:c}));
+                // Notes
+                notes.forEach(n => allItems.push({_ts: new Date(n.created_at||0), _type:'note', data:n}));
+                allItems.sort((a,b) => a._ts - b._ts);
+
+                if (allItems.length === 0) return <div style={{fontSize:10,color:'var(--text-muted)'}}>No activity yet</div>;
+
+                return allItems.map((item, idx) => {
+                  if (item._type === 'event') {
+                    const e = item.data;
+                    const isStop = ['sms_stop','email_unsub','lead_paused','dnd_set','manual_pause'].includes(e.event_type);
+                    const isResume = ['sms_resubscribed','lead_resumed','dnd_cleared'].includes(e.event_type);
+                    const dotColor = isStop?'var(--red)':isResume?'#22c55e':e.event_type.includes('email')?'#3b82f6':e.event_type.includes('sms')?'#22c55e':'var(--teal)';
+                    return (
+                      <div key={'ev-'+idx} className="timeline-item">
+                        <div className="timeline-dot" style={{background:dotColor}} />
+                        <div style={{flex:1}}>
+                          <div className="timeline-type">{e.event_type.replace(/_/g,' ')}</div>
+                          {e.stage_to&&<div style={{fontSize:9,color:'var(--text-muted)'}}>→ {STAGE_LABELS[e.stage_to]||e.stage_to}</div>}
+                        </div>
+                        <div className="timeline-time">{fmtDate(e.created_at)}</div>
+                      </div>
+                    );
+                  }
+                  if (item._type === 'message') {
+                    const m = item.data;
+                    const isIn = m.direction === 'inbound';
+                    const ch = m.channel || 'sms';
+                    const icon = ch === 'email' ? '📧' : '💬';
+                    const who = isIn ? 'Lead' : (m.message_type === 'auto' ? 'Auto' : 'Staff');
+                    const dotColor = isIn ? '#22c55e' : ch === 'email' ? '#3b82f6' : 'var(--teal)';
+                    return (
+                      <div key={'msg-'+idx} className="timeline-item">
+                        <div className="timeline-dot" style={{background:dotColor}} />
+                        <div style={{flex:1,minWidth:0}}>
+                          <div className="timeline-type">{icon} {who} {isIn?'replied':'sent'} {ch}</div>
+                          {m.subject && <div style={{fontSize:9,color:'var(--text-muted)',fontStyle:'italic'}}>{m.subject}</div>}
+                          <div style={{fontSize:10,color:'var(--text)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:400}}>
+                            {(m.body||'').slice(0,120)}{(m.body||'').length>120?'…':''}
+                          </div>
+                        </div>
+                        <div className="timeline-time">{fmtDate(m.received_at)}</div>
+                      </div>
+                    );
+                  }
+                  if (item._type === 'call') {
+                    const c = item.data;
+                    const ol = {spoke:'✅ Spoke',left_vm:'📞 Left VM',no_answer:'📵 No Answer',callback_scheduled:'📅 Callback'}[c.outcome]||c.outcome;
+                    return (
+                      <div key={'call-'+idx} className="timeline-item">
+                        <div className="timeline-dot" style={{background:'#f59e0b'}} />
+                        <div style={{flex:1}}>
+                          <div className="timeline-type">📞 {ol} <span style={{fontWeight:400,color:'var(--text-muted)'}}>({c.direction})</span></div>
+                          {c.notes&&<div style={{fontSize:9,color:'var(--text-muted)'}}>{c.notes}</div>}
+                        </div>
+                        <div className="timeline-time">{fmtDate(c.logged_at)}</div>
+                      </div>
+                    );
+                  }
+                  if (item._type === 'note') {
+                    const n = item.data;
+                    return (
+                      <div key={'note-'+idx} className="timeline-item">
+                        <div className="timeline-dot" style={{background:'#f59e0b'}} />
+                        <div style={{flex:1}}>
+                          <div className="timeline-type">📝 Staff note</div>
+                          <div style={{fontSize:9,color:'var(--text)'}}>{n.note_text.slice(0,100)}{n.note_text.length>100?'…':''}</div>
+                        </div>
+                        <div className="timeline-time">{fmtDate(n.created_at)}</div>
+                      </div>
+                    );
+                  }
+                  return null;
+                });
+              })()}
             </div>
           )}
         </div>
@@ -1040,6 +1399,30 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
   const [showCold, setShowCold] = useState(false);
   const [followupOnly, setFollowupOnly] = useState(false);
   const boardRef = useRef(null);
+  // Manual lead creation
+  const EMPTY_LEAD = {first_name:'',last_name:'',email:'',phone:'',source:'manual',notes:''};
+  const [showAddLead, setShowAddLead] = useState(false);
+  const [newLead, setNewLead] = useState({...EMPTY_LEAD});
+  const [addingLead, setAddingLead] = useState(false);
+  const [addLeadError, setAddLeadError] = useState('');
+
+  async function submitAddLead() {
+    if (!newLead.first_name && !newLead.email && !newLead.phone) {
+      setAddLeadError('Enter at least a name, email, or phone.');
+      return;
+    }
+    setAddingLead(true); setAddLeadError('');
+    try {
+      await api('/api/admin/leads/create', {method:'POST', body:JSON.stringify(newLead)});
+      setShowAddLead(false);
+      setNewLead({...EMPTY_LEAD});
+      onRefresh();
+    } catch(e) {
+      setAddLeadError(e?.detail || e?.message || 'Failed to create lead');
+    } finally {
+      setAddingLead(false);
+    }
+  }
 
   const filtered = useMemo(() => {
     return pipeline.filter(l => {
@@ -1123,7 +1506,70 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
           <input type="checkbox" checked={showCold} onChange={e => setShowCold(e.target.checked)} />
           Cold
         </label>
+        <button className="btn btn-teal btn-sm" onClick={() => { setNewLead({...EMPTY_LEAD}); setAddLeadError(''); setShowAddLead(true); }}
+          style={{marginLeft:'auto', fontSize:11, padding:'4px 14px', whiteSpace:'nowrap'}}>
+          + Add Lead
+        </button>
       </div>
+
+      {/* Add Lead Modal */}
+      {showAddLead && (
+        <div className="modal-overlay" onClick={() => setShowAddLead(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth:420, padding:24}}>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:16}}>
+              <h3 style={{margin:0, fontSize:15, fontWeight:700}}>Add Lead Manually</h3>
+              <button onClick={() => setShowAddLead(false)} style={{background:'none', border:'none',
+                fontSize:20, cursor:'pointer', color:'var(--text-muted)', lineHeight:1}}>×</button>
+            </div>
+            {[
+              {label:'First Name', key:'first_name', type:'text', placeholder:'Jane'},
+              {label:'Last Name',  key:'last_name',  type:'text', placeholder:'Smith'},
+              {label:'Email',      key:'email',      type:'email', placeholder:'jane@example.com'},
+              {label:'Phone',      key:'phone',      type:'tel',  placeholder:'(508) 555-0100'},
+            ].map(f => (
+              <div key={f.key} style={{marginBottom:10}}>
+                <label style={{fontSize:11, fontWeight:600, color:'var(--text-muted)', display:'block', marginBottom:3}}>{f.label}</label>
+                <input type={f.type} value={newLead[f.key]} placeholder={f.placeholder}
+                  onChange={e => setNewLead(p => ({...p, [f.key]: e.target.value}))}
+                  onKeyDown={e => e.key === 'Enter' && submitAddLead()}
+                  style={{width:'100%', fontSize:12, padding:'6px 10px', borderRadius:6,
+                    border:'1px solid var(--border)', background:'var(--surface)',
+                    color:'var(--text)', boxSizing:'border-box'}} />
+              </div>
+            ))}
+            <div style={{marginBottom:10}}>
+              <label style={{fontSize:11, fontWeight:600, color:'var(--text-muted)', display:'block', marginBottom:3}}>Source</label>
+              <select value={newLead.source} onChange={e => setNewLead(p => ({...p, source: e.target.value}))}
+                style={{width:'100%', fontSize:12, padding:'6px 10px', borderRadius:6,
+                  border:'1px solid var(--border)', background:'var(--surface)', color:'var(--text)'}}>
+                <option value="manual">Manual</option>
+                <option value="referral">Referral</option>
+                <option value="phone_call">Phone Call</option>
+                <option value="walk_in">Walk-in</option>
+                <option value="smile_tool">Smile Tool</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div style={{marginBottom:14}}>
+              <label style={{fontSize:11, fontWeight:600, color:'var(--text-muted)', display:'block', marginBottom:3}}>Notes</label>
+              <textarea value={newLead.notes} onChange={e => setNewLead(p => ({...p, notes: e.target.value}))}
+                rows={3} placeholder="Optional context about this lead…"
+                style={{width:'100%', fontSize:12, padding:'6px 10px', borderRadius:6, resize:'vertical',
+                  border:'1px solid var(--border)', background:'var(--surface)',
+                  color:'var(--text)', boxSizing:'border-box'}} />
+            </div>
+            {addLeadError && (
+              <div style={{color:'var(--red)', fontSize:11, marginBottom:10}}>{addLeadError}</div>
+            )}
+            <div style={{display:'flex', gap:8, justifyContent:'flex-end'}}>
+              <button className="btn btn-ghost btn-sm" onClick={() => setShowAddLead(false)}>Cancel</button>
+              <button className="btn btn-teal btn-sm" onClick={submitAddLead} disabled={addingLead}>
+                {addingLead ? 'Creating…' : 'Create Lead'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Kanban board */}
       <div className="kanban-board" ref={boardRef} onDragOver={handleBoardDragOver}>
@@ -1159,8 +1605,31 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
 
 // ── Dashboard Tab ───────────────────────────────────────────────────────────
 
+const OD_REL_LABELS = {
+  implant_prospect: '🦷 Implant Prospect',
+  reactivation:     '🔄 Reactivation',
+  active_patient:   '✅ Active Patient',
+  new_patient:      '🆕 New Patient',
+  cold:             '❄️ Cold',
+};
+const OD_REL_COLORS = {
+  implant_prospect: '#dc2626',
+  reactivation:     '#d97706',
+  active_patient:   '#16a34a',
+  new_patient:      '#2563eb',
+  cold:             '#9ca3af',
+};
+
 function DashboardTab({ pipeline, stats, onTabSwitch }) {
   const now = Date.now();
+  const [hotLeads, setHotLeads] = React.useState([]);
+  const [hotLoading, setHotLoading] = React.useState(true);
+
+  React.useEffect(() => {
+    api('/api/admin/hot-leads')
+      .then(d => { setHotLeads(d.leads || []); setHotLoading(false); })
+      .catch(() => setHotLoading(false));
+  }, []);
 
   // Compute KPIs from pipeline data
   const totalLeads = pipeline.length;
@@ -1245,6 +1714,13 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
             <div className="dash-kpi-label">Revenue / Lead</div>
             <div className="dash-kpi-sub">Avg across all leads</div>
           </div>
+          <div className="dash-kpi" style={{borderColor: (stats?.hot_leads_count || 0) > 0 ? 'var(--red)' : undefined}}>
+            <div className="dash-kpi-val" style={{color: (stats?.hot_leads_count || 0) > 0 ? 'var(--red)' : undefined}}>
+              {stats?.hot_leads_count ?? hotLeads.length}
+            </div>
+            <div className="dash-kpi-label">🔥 Hot Leads</div>
+            <div className="dash-kpi-sub">Implant prospects + reactivations</div>
+          </div>
         </div>
 
         {/* Funnel */}
@@ -1274,11 +1750,64 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
           })}
         </div>
 
-        {/* Coming soon placeholder */}
-        <div className="dash-section" style={{color:'var(--text-muted)'}}>
-          <div className="dash-section-title">Recent Activity</div>
-          <span className="coming-soon-badge">Coming in v2</span>
-          <p style={{fontSize:11, marginTop:8}}>Lead timeline feed — last 20 lifecycle events across all leads.</p>
+        {/* Hot Leads tile */}
+        <div className="dash-section">
+          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+            <div className="dash-section-title" style={{margin:0}}>🔥 Hot Leads</div>
+            {hotLeads.length > 0 && (
+              <span style={{background:'var(--red)',color:'#fff',borderRadius:10,
+                padding:'1px 7px',fontSize:10,fontWeight:700}}>
+                {hotLeads.length}
+              </span>
+            )}
+          </div>
+          {hotLoading ? (
+            <div style={{fontSize:11,color:'var(--text-muted)',padding:'8px 0'}}>Loading…</div>
+          ) : hotLeads.length === 0 ? (
+            <div style={{fontSize:11,color:'var(--text-muted)',padding:'12px 0',textAlign:'center'}}>
+              No hot leads — keep it up 🎉
+            </div>
+          ) : hotLeads.slice(0, 10).map(l => {
+            const name = [l.first_name, l.last_name].filter(Boolean).join(' ') || l.phone || 'Unknown';
+            const rel  = l.od_relationship || 'cold';
+            const relLabel = OD_REL_LABELS[rel] || rel;
+            const relColor = OD_REL_COLORS[rel] || '#9ca3af';
+            return (
+              <div key={l.id}
+                onClick={() => onTabSwitch('pipeline')}
+                style={{display:'flex',alignItems:'center',gap:8,padding:'7px 0',
+                  borderBottom:'1px solid var(--border)',cursor:'pointer'}}
+                onMouseOver={e => e.currentTarget.style.background='var(--teal-light)'}
+                onMouseOut={e => e.currentTarget.style.background='transparent'}>
+                <div style={{width:28,height:28,borderRadius:'50%',background:'var(--teal-light)',
+                  display:'flex',alignItems:'center',justifyContent:'center',
+                  fontSize:11,fontWeight:700,color:'var(--teal)',flexShrink:0}}>
+                  {(name[0]||'?').toUpperCase()}
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:600,fontSize:11,color:'var(--text)',
+                    whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{name}</div>
+                  <div style={{display:'flex',gap:4,marginTop:2,flexWrap:'wrap'}}>
+                    <span style={{fontSize:9,fontWeight:600,padding:'1px 5px',borderRadius:4,
+                      background:relColor+'22',color:relColor}}>{relLabel}</span>
+                    <span style={{fontSize:9,padding:'1px 5px',borderRadius:4,
+                      background:'var(--bg)',color:'var(--text-muted)',
+                      border:'1px solid var(--border)'}}>{STAGE_LABELS[l.stage] || l.stage}</span>
+                  </div>
+                </div>
+                {l.treatment_plan_value > 0 && (
+                  <div style={{fontSize:10,fontWeight:700,color:'var(--teal)',flexShrink:0}}>
+                    {fmtMoney(l.treatment_plan_value)}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {hotLeads.length > 10 && (
+            <div style={{fontSize:10,color:'var(--text-muted)',padding:'6px 0',textAlign:'center'}}>
+              +{hotLeads.length - 10} more — view in Pipeline
+            </div>
+          )}
         </div>
       </div>
 
@@ -1896,12 +2425,541 @@ function AdCreativesView({ days }) {
   );
 }
 
+// ─── AI Campaign sub-tab ──────────────────────────────────────────────────
+// Two-tier AI: Opus designs the strategy + analysis; Haiku/Sonnet implements.
+function AICampaignView() {
+  // Section 1 — Strategy (Opus)
+  const [goal, setGoal] = useState('');
+  const [targetService, setTargetService] = useState('All-on-4 Implants');
+  const [customService, setCustomService] = useState('');
+  const [budgetHint, setBudgetHint] = useState('');
+  const [stratLoading, setStratLoading] = useState(false);
+  const [stratErr, setStratErr] = useState('');
+  const [strategy, setStrategy] = useState(null);
+  const [strategyModel, setStrategyModel] = useState('');
+
+  // Section 2 — Implementation (Haiku/Sonnet)
+  const [deliverable, setDeliverable] = useState('full_package');
+  const [implModel, setImplModel] = useState('haiku');
+  const [implLoading, setImplLoading] = useState(false);
+  const [implErr, setImplErr] = useState('');
+  const [implementation, setImplementation] = useState(null);
+  const [implModelUsed, setImplModelUsed] = useState('');
+
+  // Section 3 — Performance Analysis (Opus)
+  const [analysisDays, setAnalysisDays] = useState(30);
+  const [analysisFocus, setAnalysisFocus] = useState('overall');
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisErr, setAnalysisErr] = useState('');
+  const [analysis, setAnalysis] = useState(null);
+  const [analysisModel, setAnalysisModel] = useState('');
+
+  async function generateStrategy() {
+    setStratErr(''); setStrategy(null); setImplementation(null);
+    if (!goal.trim()) { setStratErr('Please describe the campaign goal.'); return; }
+    setStratLoading(true);
+    try {
+      const service = targetService === 'Custom' ? (customService.trim() || 'Custom') : targetService;
+      const res = await api('/api/admin/ai/campaign-strategy', {
+        method: 'POST',
+        body: JSON.stringify({
+          campaign_goal: goal.trim(),
+          target_service: service,
+          budget_hint: budgetHint.trim(),
+          additional_context: '',
+        }),
+      });
+      setStrategy(res.strategy || null);
+      setStrategyModel(res.model_used || '');
+    } catch (e) {
+      setStratErr(e?.detail || e?.message || 'Strategy generation failed');
+    }
+    setStratLoading(false);
+  }
+
+  async function runImplementation() {
+    setImplErr(''); setImplementation(null);
+    if (!strategy) { setImplErr('Generate a strategy first.'); return; }
+    setImplLoading(true);
+    try {
+      const res = await api('/api/admin/ai/campaign-implement', {
+        method: 'POST',
+        body: JSON.stringify({
+          strategy,
+          deliverable,
+          model: implModel,
+        }),
+      });
+      setImplementation(res.content || null);
+      setImplModelUsed(res.model_used || '');
+    } catch (e) {
+      setImplErr(e?.detail || e?.message || 'Implementation failed');
+    }
+    setImplLoading(false);
+  }
+
+  async function runAnalysis() {
+    setAnalysisErr(''); setAnalysis(null);
+    setAnalysisLoading(true);
+    try {
+      const res = await api('/api/admin/ai/performance-analysis', {
+        method: 'POST',
+        body: JSON.stringify({
+          time_range_days: analysisDays,
+          focus: analysisFocus,
+        }),
+      });
+      setAnalysis(res.analysis || null);
+      setAnalysisModel(res.model_used || '');
+    } catch (e) {
+      setAnalysisErr(e?.detail || e?.message || 'Analysis failed');
+    }
+    setAnalysisLoading(false);
+  }
+
+  function copyText(text) {
+    try { navigator.clipboard.writeText(text); } catch(_) {}
+  }
+
+  const cardStyle = {
+    background:'#fff', border:'1px solid var(--border)', borderRadius:6,
+    padding:14, marginBottom:14,
+  };
+  const sectionTitle = {
+    fontSize:13, fontWeight:600, marginBottom:8, color:'var(--text)',
+    display:'flex', alignItems:'center', gap:6,
+  };
+  const labelStyle = { fontSize:11, color:'var(--text-muted)', display:'block', marginBottom:3 };
+  const inputStyle = {
+    width:'100%', padding:'6px 8px', fontSize:12, border:'1px solid var(--border)',
+    borderRadius:4, fontFamily:'inherit',
+  };
+  const pillGreen = {
+    background:'#d1fae5', color:'#065f46', fontSize:10, padding:'3px 8px',
+    borderRadius:3, display:'inline-block',
+  };
+  const pillAmber = {
+    background:'#fef3c7', color:'#92400e', fontSize:10, padding:'3px 8px',
+    borderRadius:3, display:'inline-block',
+  };
+  const badge = {
+    fontSize:9, padding:'1px 6px', borderRadius:3, marginLeft:6,
+    background:'#ede9fe', color:'#5b21b6', fontWeight:600,
+  };
+
+  function PriorityBadge({ p }) {
+    const pl = (p||'').toLowerCase();
+    const colors = {
+      high:   { bg:'#fee2e2', fg:'#991b1b' },
+      medium: { bg:'#fef3c7', fg:'#92400e' },
+      low:    { bg:'#dbeafe', fg:'#1e40af' },
+    };
+    const c = colors[pl] || colors.low;
+    return <span style={{...pillGreen, background:c.bg, color:c.fg}}>{(pl||'low').toUpperCase()}</span>;
+  }
+
+  function renderImplementation() {
+    if (!implementation) return null;
+    const renderAdCopy = (ad) => (
+      <div style={{marginBottom:10}}>
+        {ad.headlines && ad.headlines.length > 0 && (
+          <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Headlines ({ad.headlines.length})</div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+              {ad.headlines.map((h,i)=>(
+                <span key={i} style={{background:'#e8f4f4',color:'var(--teal-dark)',fontSize:10,padding:'2px 7px',borderRadius:3,cursor:'pointer'}}
+                  onClick={()=>copyText(h)} title="Click to copy">{h}</span>
+              ))}
+            </div>
+          </div>
+        )}
+        {ad.descriptions && ad.descriptions.length > 0 && (
+          <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Descriptions ({ad.descriptions.length})</div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+              {ad.descriptions.map((d,i)=>(
+                <span key={i} style={{background:'#fef9c3',color:'#854d0e',fontSize:10,padding:'2px 7px',borderRadius:3,cursor:'pointer'}}
+                  onClick={()=>copyText(d)} title="Click to copy">{d}</span>
+              ))}
+            </div>
+          </div>
+        )}
+        {ad.callouts && ad.callouts.length > 0 && (
+          <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Callouts ({ad.callouts.length})</div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+              {ad.callouts.map((c,i)=>(
+                <span key={i} style={{background:'#ede9fe',color:'#5b21b6',fontSize:10,padding:'2px 7px',borderRadius:3,cursor:'pointer'}}
+                  onClick={()=>copyText(c)} title="Click to copy">{c}</span>
+              ))}
+            </div>
+          </div>
+        )}
+        {ad.final_url && (
+          <div style={{fontSize:11,color:'var(--text-muted)'}}>
+            <strong>Final URL:</strong> <a href={ad.final_url} target="_blank" rel="noreferrer" style={{color:'var(--teal)'}}>{ad.final_url}</a>
+          </div>
+        )}
+      </div>
+    );
+
+    const renderSequence = (seq, channel) => (
+      <div style={{marginBottom:10}}>
+        <div style={{fontSize:11,fontWeight:600,marginBottom:6}}>
+          {channel === 'sms' ? 'SMS Sequence' : 'Email Sequence'} ({(seq.steps||[]).length} steps)
+        </div>
+        <ol style={{margin:0,paddingLeft:18}}>
+          {(seq.steps||[]).map((s,i)=>(
+            <li key={i} style={{marginBottom:8,fontSize:12}}>
+              <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:2}}>
+                Day {s.sequence_day}{s.subject ? ' — ' + s.subject : ''}
+                <button style={{marginLeft:8,padding:'1px 6px',fontSize:9,border:'1px solid var(--border)',
+                  borderRadius:3,background:'#fff',cursor:'pointer'}}
+                  onClick={()=>copyText(s.body || '')}>Copy</button>
+              </div>
+              <pre style={{background:'#f8f9fa',padding:8,borderRadius:4,fontSize:11,
+                whiteSpace:'pre-wrap',fontFamily:'inherit',margin:0,border:'1px solid var(--border)'}}>{s.body}</pre>
+            </li>
+          ))}
+        </ol>
+      </div>
+    );
+
+    if (implementation.headlines || implementation.descriptions || implementation.callouts) {
+      return renderAdCopy(implementation);
+    }
+    if (implementation.steps) {
+      return renderSequence(implementation, deliverable === 'sms_sequence' ? 'sms' : 'email');
+    }
+    if (implementation.ad_copy || implementation.sms_sequence || implementation.email_sequence) {
+      return (
+        <div>
+          {implementation.ad_copy && (
+            <div style={{marginBottom:14,paddingBottom:10,borderBottom:'1px solid var(--border)'}}>
+              <div style={{fontSize:12,fontWeight:600,marginBottom:6,color:'var(--teal-dark)'}}>Ad Copy</div>
+              {renderAdCopy(implementation.ad_copy)}
+            </div>
+          )}
+          {implementation.sms_sequence && (
+            <div style={{marginBottom:14,paddingBottom:10,borderBottom:'1px solid var(--border)'}}>
+              {renderSequence(implementation.sms_sequence, 'sms')}
+            </div>
+          )}
+          {implementation.email_sequence && (
+            <div>
+              {renderSequence(implementation.email_sequence, 'email')}
+            </div>
+          )}
+        </div>
+      );
+    }
+    // Fallback: dump JSON
+    return <pre style={{background:'#f8f9fa',padding:8,borderRadius:4,fontSize:10,
+      maxHeight:300,overflow:'auto'}}>{JSON.stringify(implementation,null,2)}</pre>;
+  }
+
+  return (
+    <div>
+      {/* ── Section 1: Strategy (Opus) ── */}
+      <div style={cardStyle}>
+        <div style={sectionTitle}>
+          <span>1. Campaign Strategy</span>
+          <span style={badge}>OPUS</span>
+        </div>
+        <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+          Opus researches your practice info, Google Ads performance, and pipeline metrics, then produces
+          a structured campaign plan with explicit instructions for the implementer.
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+          <div>
+            <label style={labelStyle}>Target service</label>
+            <select style={inputStyle} value={targetService} onChange={e=>setTargetService(e.target.value)}>
+              <option>All-on-4 Implants</option>
+              <option>Single Implants</option>
+              <option>Orthodontics</option>
+              <option>General Dentistry</option>
+              <option>Cosmetic / Smile Makeover</option>
+              <option>Custom</option>
+            </select>
+            {targetService === 'Custom' && (
+              <input style={{...inputStyle,marginTop:4}} placeholder="Specify service..."
+                value={customService} onChange={e=>setCustomService(e.target.value)} />
+            )}
+          </div>
+          <div>
+            <label style={labelStyle}>Budget hint (optional)</label>
+            <input style={inputStyle} placeholder="e.g. $5k/mo Google Ads"
+              value={budgetHint} onChange={e=>setBudgetHint(e.target.value)} />
+          </div>
+        </div>
+
+        <div style={{marginBottom:10}}>
+          <label style={labelStyle}>Campaign goal</label>
+          <textarea style={{...inputStyle,minHeight:64,resize:'vertical'}}
+            placeholder="e.g. Increase All-on-4 implant consultations from local 55+ patients in Worcester County"
+            value={goal} onChange={e=>setGoal(e.target.value)} />
+        </div>
+
+        <button className="btn btn-teal btn-sm" onClick={generateStrategy} disabled={stratLoading}>
+          {stratLoading ? '⏳ Opus is researching… (~30-60s)' : 'Generate Strategy (Opus)'}
+        </button>
+        {stratLoading && (
+          <div style={{fontSize:10,color:'var(--text-muted)',marginTop:4}}>
+            Opus is analyzing your pipeline, campaigns, and Google Ads data. This may take up to a minute.
+          </div>
+        )}
+        {stratErr && <div style={{color:'var(--red)',fontSize:11,marginTop:6}}>{stratErr}</div>}
+
+        {strategy && (
+          <div style={{marginTop:14,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+            <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>{strategy.campaign_name}</div>
+            {strategyModel && <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:8}}>Model: {strategyModel}</div>}
+
+            <div style={{marginBottom:8}}>
+              <div style={{fontSize:11,fontWeight:600,marginBottom:2}}>Objective</div>
+              <div style={{fontSize:12,color:'var(--text)'}}>{strategy.objective}</div>
+            </div>
+
+            <div style={{marginBottom:8}}>
+              <div style={{fontSize:11,fontWeight:600,marginBottom:2}}>Target Audience</div>
+              <div style={{fontSize:12,color:'var(--text)'}}>{strategy.target_audience}</div>
+            </div>
+
+            {strategy.key_messages && strategy.key_messages.length > 0 && (
+              <div style={{marginBottom:8}}>
+                <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Key Messages</div>
+                <ul style={{margin:0,paddingLeft:18,fontSize:12}}>
+                  {strategy.key_messages.map((m,i)=>(<li key={i} style={{marginBottom:2}}>{m}</li>))}
+                </ul>
+              </div>
+            )}
+
+            {strategy.ad_headlines && strategy.ad_headlines.length > 0 && (
+              <div style={{marginBottom:8}}>
+                <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Ad Headlines</div>
+                <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                  {strategy.ad_headlines.map((h,i)=>(
+                    <span key={i} style={pillGreen}>{h}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {strategy.ad_descriptions && strategy.ad_descriptions.length > 0 && (
+              <div style={{marginBottom:8}}>
+                <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Ad Descriptions</div>
+                <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                  {strategy.ad_descriptions.map((d,i)=>(
+                    <span key={i} style={pillAmber}>{d}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {strategy.sms_sequence_brief && (
+              <div style={{marginBottom:8}}>
+                <div style={{fontSize:11,fontWeight:600,marginBottom:2}}>SMS Sequence Brief</div>
+                <div style={{fontSize:12,color:'var(--text)'}}>{strategy.sms_sequence_brief}</div>
+              </div>
+            )}
+
+            {strategy.email_sequence_brief && (
+              <div style={{marginBottom:8}}>
+                <div style={{fontSize:11,fontWeight:600,marginBottom:2}}>Email Sequence Brief</div>
+                <div style={{fontSize:12,color:'var(--text)'}}>{strategy.email_sequence_brief}</div>
+              </div>
+            )}
+
+            {strategy.implementation_instructions && (
+              <details style={{marginTop:6}}>
+                <summary style={{fontSize:11,fontWeight:600,cursor:'pointer'}}>Implementation instructions for Haiku/Sonnet</summary>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,whiteSpace:'pre-wrap'}}>
+                  {strategy.implementation_instructions}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Section 2: Implementation (Haiku/Sonnet) ── */}
+      {strategy && (
+        <div style={cardStyle}>
+          <div style={sectionTitle}>
+            <span>2. Implement Deliverables</span>
+            <span style={{...badge,background:'#dbeafe',color:'#1e40af'}}>HAIKU / SONNET</span>
+          </div>
+          <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+            The implementer follows Opus's specific instructions to produce final ad copy, SMS, or email content.
+          </div>
+
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+            <div>
+              <label style={labelStyle}>Deliverable</label>
+              <select style={inputStyle} value={deliverable} onChange={e=>setDeliverable(e.target.value)}>
+                <option value="full_package">Full Package (ad + SMS + email)</option>
+                <option value="ad_copy">Ad Copy only</option>
+                <option value="sms_sequence">SMS Sequence only</option>
+                <option value="email_sequence">Email Sequence only</option>
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Model</label>
+              <select style={inputStyle} value={implModel} onChange={e=>setImplModel(e.target.value)}>
+                <option value="haiku">Haiku (fast)</option>
+                <option value="sonnet">Sonnet (thorough)</option>
+              </select>
+            </div>
+          </div>
+
+          <button className="btn btn-teal btn-sm" onClick={runImplementation} disabled={implLoading}>
+            {implLoading ? `⏳ ${implModel === 'sonnet' ? 'Sonnet' : 'Haiku'} is implementing…` : 'Implement'}
+          </button>
+          {implLoading && deliverable === 'full_package' && (
+            <div style={{fontSize:10,color:'var(--text-muted)',marginTop:4}}>
+              Full package includes ad copy, SMS sequence, and email sequence. Sonnet may take 20-40s.
+            </div>
+          )}
+          {implErr && <div style={{color:'var(--red)',fontSize:11,marginTop:6}}>{implErr}</div>}
+
+          {implementation && (
+            <div style={{marginTop:14,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+              {implModelUsed && <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:8}}>Model: {implModelUsed}</div>}
+              {renderImplementation()}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Section 3: Performance Analysis (Opus) ── */}
+      <div style={cardStyle}>
+        <div style={sectionTitle}>
+          <span>3. Performance Analysis</span>
+          <span style={badge}>OPUS</span>
+        </div>
+        <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+          Opus reviews your pipeline + Google Ads performance and returns prioritized action items.
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+          <div>
+            <label style={labelStyle}>Time range</label>
+            <select style={inputStyle} value={analysisDays} onChange={e=>setAnalysisDays(parseInt(e.target.value,10))}>
+              <option value={7}>Last 7 days</option>
+              <option value={14}>Last 14 days</option>
+              <option value={30}>Last 30 days</option>
+              <option value={60}>Last 60 days</option>
+            </select>
+          </div>
+          <div>
+            <label style={labelStyle}>Focus</label>
+            <select style={inputStyle} value={analysisFocus} onChange={e=>setAnalysisFocus(e.target.value)}>
+              <option value="overall">Overall</option>
+              <option value="google_ads">Google Ads</option>
+              <option value="leads">Leads</option>
+              <option value="conversions">Conversions</option>
+            </select>
+          </div>
+        </div>
+
+        <button className="btn btn-teal btn-sm" onClick={runAnalysis} disabled={analysisLoading}>
+          {analysisLoading ? '⏳ Opus is analyzing… (~30-60s)' : 'Analyze Performance (Opus)'}
+        </button>
+        {analysisLoading && (
+          <div style={{fontSize:10,color:'var(--text-muted)',marginTop:4}}>
+            Opus is reviewing your pipeline and Google Ads data. This may take up to a minute.
+          </div>
+        )}
+        {analysisErr && <div style={{color:'var(--red)',fontSize:11,marginTop:6}}>{analysisErr}</div>}
+
+        {analysis && (
+          <div style={{marginTop:14,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+            {analysisModel && <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:8}}>Model: {analysisModel}</div>}
+
+            <div style={{marginBottom:10,padding:10,background:'#f0f9ff',borderRadius:4,
+              borderLeft:'3px solid #0284c7'}}>
+              <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Summary</div>
+              <div style={{fontSize:12,color:'var(--text)'}}>{analysis.summary}</div>
+            </div>
+
+            {analysis.wins && analysis.wins.length > 0 && (
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:11,fontWeight:600,marginBottom:4,color:'#065f46'}}>Wins</div>
+                <ul style={{margin:0,paddingLeft:18,fontSize:12}}>
+                  {analysis.wins.map((w,i)=>(<li key={i} style={{marginBottom:3,color:'#065f46'}}>{w}</li>))}
+                </ul>
+              </div>
+            )}
+
+            {analysis.concerns && analysis.concerns.length > 0 && (
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:11,fontWeight:600,marginBottom:4,color:'#92400e'}}>Concerns</div>
+                <ul style={{margin:0,paddingLeft:18,fontSize:12}}>
+                  {analysis.concerns.map((c,i)=>(<li key={i} style={{marginBottom:3,color:'#92400e'}}>{c}</li>))}
+                </ul>
+              </div>
+            )}
+
+            {analysis.action_items && analysis.action_items.length > 0 && (() => {
+              const order = { high: 0, medium: 1, low: 2 };
+              const sorted = [...analysis.action_items].sort((a,b)=>
+                (order[(a.priority||'low').toLowerCase()] ?? 9) -
+                (order[(b.priority||'low').toLowerCase()] ?? 9)
+              );
+              return (
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Action Items</div>
+                  {sorted.map((it,i)=>(
+                    <div key={i} style={{padding:8,marginBottom:6,background:'#f8f9fa',borderRadius:4,
+                      border:'1px solid var(--border)'}}>
+                      <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:3}}>
+                        <PriorityBadge p={it.priority} />
+                        <span style={{fontSize:12,fontWeight:600}}>{it.action}</span>
+                      </div>
+                      {it.rationale && (
+                        <div style={{fontSize:11,color:'var(--text-muted)',marginLeft:2}}>{it.rationale}</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+
+            {analysis.implementation_prompt && (
+              <details style={{marginTop:6}}>
+                <summary style={{fontSize:11,fontWeight:600,cursor:'pointer'}}>Implementation prompt for Haiku</summary>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,whiteSpace:'pre-wrap'}}>
+                  {analysis.implementation_prompt}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
-  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives'
+  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'ai'
   const [dateRange, setDateRange] = useState(() => defaultDateRange(30));
   const [adCreativesDays, setAdCreativesDays] = useState(30);
   const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
   const [ga4Refreshing, setGa4Refreshing] = useState(false);
+  // New campaign modal
+  const [showNewCamp, setShowNewCamp] = useState(false);
+  const [savingCamp, setSavingCamp] = useState(false);
+  const [campSaveMsg, setCampSaveMsg] = useState('');
+  const EMPTY_CAMP = {
+    campaign_name:'', campaign_type:'MANUAL', campaign_id:'',
+    service_focus:'', promo_offer:'', target_audience:'',
+    objective:'', monthly_budget:'', expected_cpl:'',
+    start_date:'', end_date:'', landing_page:'', notes:'',
+  };
+  const [newCamp, setNewCamp] = useState(EMPTY_CAMP);
+  const setNC = (k, v) => setNewCamp(p => ({...p, [k]: v}));
 
   // Lazy-loaded ad-group and search-term data (fetched on first ReportsTab mount)
   const [adGroupStats, setAdGroupStats] = useState([]);
@@ -1947,10 +3005,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['ai','AI Campaign']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
+
+      {/* ── AI Campaign view ── */}
+      {view==='ai' && <AICampaignView />}
 
       {/* ── Ad Groups view ── */}
       {view==='adgroups' && <AdGroupsView adGroupStats={adGroupStats} dailyStats={dailyStats} />}
@@ -1981,7 +3042,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       {view==='campaigns' && <div>
       <div className="report-section">
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:12}}>
-          <div className="report-title" style={{marginBottom:0}}>Campaign Performance</div>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <div className="report-title" style={{marginBottom:0}}>Campaign Performance</div>
+            <button className="btn btn-teal btn-sm" style={{fontSize:11}} onClick={()=>{setShowNewCamp(true);setCampSaveMsg('');}}>
+              + New Campaign
+            </button>
+          </div>
           <div style={{display:'flex',gap:4,alignItems:'center',flexWrap:'wrap'}}>
             {presets.map(p=>(
               <button key={p.label}
@@ -2081,6 +3147,190 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
           </tbody>
         </table>
       </div>
+
+      {/* ── New Campaign Modal ── */}
+      {showNewCamp && (
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.45)',
+          zIndex:200,display:'flex',alignItems:'center',justifyContent:'center'}}
+          onClick={()=>setShowNewCamp(false)}>
+          <div style={{background:'#fff',borderRadius:10,padding:24,width:680,maxWidth:'96vw',
+            maxHeight:'90vh',overflowY:'auto',
+            boxShadow:'0 8px 40px rgba(0,0,0,.18)'}} onClick={e=>e.stopPropagation()}>
+
+            <div style={{fontWeight:700,fontSize:15,marginBottom:2}}>Launch New Campaign</div>
+            <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>
+              Create a campaign record to track leads, budget, and ROI. Set up the actual campaign in Google Ads / Meta separately.
+            </div>
+
+            {/* Row 1: Name + Type */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Campaign Name *</label>
+                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder="e.g. All-on-X Implants Q3 2026"
+                  value={newCamp.campaign_name} onChange={e=>setNC('campaign_name',e.target.value)} autoFocus />
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Campaign Type *</label>
+                <select style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  value={newCamp.campaign_type} onChange={e=>{setNC('campaign_type',e.target.value); if(e.target.value!=='GOOGLE_ADS') setNC('campaign_id','');}}>
+                  <option value="MANUAL">Manual / Other</option>
+                  <option value="GOOGLE_ADS">Google Ads</option>
+                  <option value="META">Meta (Facebook/Instagram)</option>
+                  <option value="EMAIL">Email</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Row 2: Service Focus + Promo Offer */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Service / Procedure Focus</label>
+                <select style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  value={newCamp.service_focus} onChange={e=>setNC('service_focus',e.target.value)}>
+                  <option value="">— Select —</option>
+                  <option value="Implants">Dental Implants</option>
+                  <option value="All-on-X">All-on-X / Full Arch</option>
+                  <option value="Invisalign">Invisalign / Clear Aligners</option>
+                  <option value="Whitening">Teeth Whitening</option>
+                  <option value="Emergency">Emergency Dentistry</option>
+                  <option value="New Patient">New Patient</option>
+                  <option value="Hygiene">Hygiene / Preventive</option>
+                  <option value="Cosmetic">Cosmetic Dentistry</option>
+                  <option value="Other">Other</option>
+                </select>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Promo / Offer</label>
+                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder='e.g. "$99 exam + X-ray", "Free implant consult"'
+                  value={newCamp.promo_offer} onChange={e=>setNC('promo_offer',e.target.value)} />
+              </div>
+            </div>
+
+            {/* Row 3: Monthly Budget + Expected CPL */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Monthly Budget ($)</label>
+                <input type="number" min="0" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder="e.g. 3000"
+                  value={newCamp.monthly_budget} onChange={e=>setNC('monthly_budget',e.target.value)} />
+                {newCamp.monthly_budget > 0 && (
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                    ~${Math.round(newCamp.monthly_budget/30)}/day
+                  </div>
+                )}
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Target CPL ($)</label>
+                <input type="number" min="0" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder="e.g. 150"
+                  value={newCamp.expected_cpl} onChange={e=>setNC('expected_cpl',e.target.value)} />
+                {newCamp.monthly_budget > 0 && newCamp.expected_cpl > 0 && (
+                  <div style={{fontSize:10,color:'var(--teal)',marginTop:2}}>
+                    ~{Math.round(newCamp.monthly_budget / newCamp.expected_cpl)} leads/mo
+                  </div>
+                )}
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Objective / Goal</label>
+                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder="e.g. 20 implant consults"
+                  value={newCamp.objective} onChange={e=>setNC('objective',e.target.value)} />
+              </div>
+            </div>
+
+            {/* Row 4: Start + End Date */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Start Date</label>
+                <input type="date" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  value={newCamp.start_date} onChange={e=>setNC('start_date',e.target.value)} />
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>End Date <span style={{fontWeight:400,color:'var(--text-muted)'}}>(optional)</span></label>
+                <input type="date" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  value={newCamp.end_date} onChange={e=>setNC('end_date',e.target.value)} />
+              </div>
+            </div>
+
+            {/* Row 5: Target Audience + Landing Page */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Target Audience</label>
+                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder="e.g. Adults 35-65, Grafton/Worcester MA"
+                  value={newCamp.target_audience} onChange={e=>setNC('target_audience',e.target.value)} />
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Landing Page URL</label>
+                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder="https://graftondentalcare.com/implants"
+                  value={newCamp.landing_page} onChange={e=>setNC('landing_page',e.target.value)} />
+              </div>
+            </div>
+
+            {/* Conditional: Google Ads Campaign ID */}
+            {newCamp.campaign_type === 'GOOGLE_ADS' && (
+              <div style={{marginBottom:10}}>
+                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>
+                  Google Ads Campaign ID <span style={{fontWeight:400,color:'var(--text-muted)'}}>(links cost + ROI data)</span>
+                </label>
+                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                  placeholder="e.g. 1234567890"
+                  value={newCamp.campaign_id} onChange={e=>setNC('campaign_id',e.target.value)} />
+              </div>
+            )}
+
+            {/* Notes */}
+            <div style={{marginBottom:14}}>
+              <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Internal Notes</label>
+              <textarea rows={2} style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box',resize:'vertical'}}
+                placeholder="Any additional context for the team…"
+                value={newCamp.notes} onChange={e=>setNC('notes',e.target.value)} />
+            </div>
+
+            {campSaveMsg && (
+              <div style={{fontSize:11,padding:'6px 10px',borderRadius:4,marginBottom:10,
+                background:campSaveMsg.startsWith('✅')?'#dcfce7':'#fee2e2',
+                color:campSaveMsg.startsWith('✅')?'#166534':'var(--red)'}}>
+                {campSaveMsg}
+              </div>
+            )}
+
+            <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+              <button className="btn btn-ghost btn-sm" onClick={()=>{setShowNewCamp(false);setNewCamp(EMPTY_CAMP);setCampSaveMsg('');}}>Cancel</button>
+              <button className="btn btn-teal btn-sm" disabled={savingCamp||!newCamp.campaign_name.trim()} onClick={async()=>{
+                setSavingCamp(true); setCampSaveMsg('');
+                // Validate end >= start
+                if(newCamp.end_date && newCamp.start_date && newCamp.end_date < newCamp.start_date) {
+                  setCampSaveMsg('❌ End date must be on or after start date');
+                  setSavingCamp(false); return;
+                }
+                if(newCamp.landing_page && !newCamp.landing_page.startsWith('http')) {
+                  setCampSaveMsg('❌ Landing page URL must start with http:// or https://');
+                  setSavingCamp(false); return;
+                }
+                try {
+                  const payload = {...newCamp,
+                    monthly_budget: parseFloat(newCamp.monthly_budget)||0,
+                    expected_cpl: parseFloat(newCamp.expected_cpl)||0,
+                  };
+                  await api('/api/admin/campaigns/create', { method:'POST', body: JSON.stringify(payload) });
+                  setCampSaveMsg('✅ Campaign created! It will appear once leads are attributed to it.');
+                  setNewCamp(EMPTY_CAMP);
+                  setTimeout(()=>{ setShowNewCamp(false); setCampSaveMsg(''); }, 2500);
+                } catch(e) {
+                  setCampSaveMsg('❌ ' + (e?.detail || e?.message || 'Save failed'));
+                }
+                setSavingCamp(false);
+              }}>
+                {savingCamp ? 'Saving…' : 'Launch Campaign'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       </div>}
     </div>
   );
@@ -2500,14 +3750,351 @@ function KeywordResearchSection() {
 }
 
 
+// ─── AITemplatesTab ───────────────────────────────────────────────────────────
+
+function AITemplatesTab() {
+  const [channel, setChannel]     = React.useState('email');
+  const [apptType, setApptType]   = React.useState('general');
+  const [prompt, setPrompt]       = React.useState('');
+  const [generating, setGenerating] = React.useState(false);
+  const [result, setResult]       = React.useState(null); // {channel, subject, body}
+  const [editSubject, setEditSubject] = React.useState('');
+  const [editBody, setEditBody]   = React.useState('');
+  const [error, setError]         = React.useState('');
+  const [success, setSuccess]     = React.useState('');
+
+  // For "Add to existing workflow"
+  const [workflows, setWorkflows] = React.useState([]);
+  const [addWfId, setAddWfId]     = React.useState('');
+  const [addDay, setAddDay]       = React.useState(1);
+  const [addTplName, setAddTplName] = React.useState('');
+  const [savingAdd, setSavingAdd] = React.useState(false);
+
+  // For "Create new workflow"
+  const [newWfName, setNewWfName] = React.useState('');
+  const [savingNew, setSavingNew] = React.useState(false);
+
+  // Track which body textarea ref for token insertion
+  const bodyRef = React.useRef(null);
+  const subjectRef = React.useRef(null);
+
+  React.useEffect(() => {
+    api('/api/admin/workflows').then(d => {
+      const wfs = d.workflows || [];
+      setWorkflows(wfs);
+      if (wfs.length > 0) setAddWfId(String(wfs[0].id));
+    }).catch(() => {});
+  }, []);
+
+  // Update default day when workflow selection changes
+  React.useEffect(() => {
+    if (!addWfId) return;
+    const wf = workflows.find(w => String(w.id) === addWfId);
+    if (!wf) return;
+    const steps = wf.steps || [];
+    const maxDay = steps.length > 0 ? Math.max(...steps.map(s => s.sequence_day)) : 0;
+    setAddDay(maxDay > 0 ? maxDay + 3 : 1);
+  }, [addWfId, workflows]);
+
+  // Auto-generate template name slug when result arrives
+  React.useEffect(() => {
+    if (result) {
+      const ts = Date.now().toString().slice(-6);
+      setAddTplName(`ai_${result.channel}_${apptType}_${ts}`);
+    }
+  }, [result]);
+
+  function insertToken(token) {
+    // Try to insert at cursor in whichever textarea is focused
+    const ta = document.activeElement;
+    if (ta && (ta === bodyRef.current || ta === subjectRef.current)) {
+      const start = ta.selectionStart;
+      const end   = ta.selectionEnd;
+      const val   = ta.value;
+      const newVal = val.slice(0, start) + token + val.slice(end);
+      if (ta === bodyRef.current) {
+        setEditBody(newVal);
+      } else {
+        setEditSubject(newVal);
+      }
+      // Restore cursor after token
+      requestAnimationFrame(() => {
+        ta.focus();
+        ta.setSelectionRange(start + token.length, start + token.length);
+      });
+    } else {
+      // Append to body if nothing focused
+      setEditBody(b => b + token);
+    }
+  }
+
+  async function generate() {
+    if (!prompt.trim()) return;
+    setGenerating(true); setError(''); setResult(null);
+    try {
+      const r = await api('/api/admin/workflow/ai-generate-message', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ channel, appointment_type: apptType, prompt }),
+      });
+      setResult(r);
+      setEditSubject(r.subject || '');
+      setEditBody(r.body || '');
+      setSuccess('');
+    } catch(e) { setError(e.message); }
+    setGenerating(false);
+  }
+
+  async function addToWorkflow() {
+    if (!addWfId || !editBody.trim() || !addTplName.trim()) return;
+    setSavingAdd(true); setError(''); setSuccess('');
+    try {
+      await api('/api/admin/workflow-steps', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          workflow_id: parseInt(addWfId),
+          sequence_day: parseInt(addDay) || 1,
+          channel: result.channel,
+          template_name: addTplName.trim(),
+          subject: editSubject.trim(),
+          body: editBody.trim(),
+          terminal: false,
+        }),
+      });
+      // Refresh workflow steps count
+      const fresh = await api('/api/admin/workflows');
+      setWorkflows(fresh.workflows || []);
+      setSuccess(`✅ Step added to workflow on day ${addDay}`);
+    } catch(e) { setError(e.message); }
+    setSavingAdd(false);
+  }
+
+  async function createAndAddWorkflow() {
+    if (!newWfName.trim() || !editBody.trim()) return;
+    setSavingNew(true); setError(''); setSuccess('');
+    try {
+      const wf = await api('/api/admin/workflows', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ name: newWfName.trim(), campaign_tag: '', description: '' }),
+      });
+      await api('/api/admin/workflow-steps', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          workflow_id: wf.id,
+          sequence_day: 1,
+          channel: result.channel,
+          template_name: addTplName.trim(),
+          subject: editSubject.trim(),
+          body: editBody.trim(),
+          terminal: false,
+        }),
+      });
+      const fresh = await api('/api/admin/workflows');
+      setWorkflows(fresh.workflows || []);
+      setAddWfId(String(wf.id));
+      setSuccess(`✅ New workflow "${newWfName.trim()}" created with this message as Day 1`);
+      setNewWfName('');
+    } catch(e) { setError(e.message); }
+    setSavingNew(false);
+  }
+
+  function reset() {
+    setResult(null); setEditSubject(''); setEditBody('');
+    setPrompt(''); setError(''); setSuccess('');
+  }
+
+  const APPT_TYPES = [
+    ['general','General'], ['consult','Consultation'], ['exam','New Patient Exam'],
+    ['implant','Implant'], ['ortho','Ortho / Invisalign'],
+  ];
+
+  const TOKENS = [
+    ['{first_name}', 'First Name'],
+    ['{unsub_url}',  'Unsub URL'],
+  ];
+
+  const inputSt = {width:'100%',padding:'4px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4,fontFamily:'inherit'};
+
+  return (
+    <div style={{display:'flex',gap:16,height:'calc(100vh - 140px)',overflow:'hidden'}}>
+      {/* Left: generator controls */}
+      <div style={{width:280,display:'flex',flexDirection:'column',gap:10,overflowY:'auto'}}>
+        <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:14}}>
+          <div style={{fontWeight:700,fontSize:12,color:'var(--teal-dark)',marginBottom:10}}>✨ Generate Message</div>
+
+          <div style={{marginBottom:8}}>
+            <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:3}}>Channel</label>
+            <div style={{display:'flex',gap:4}}>
+              {['email','sms'].map(c => (
+                <button key={c} onClick={() => setChannel(c)}
+                  className={'btn btn-sm ' + (channel === c ? 'btn-teal' : 'btn-ghost')}
+                  style={{flex:1,textTransform:'capitalize'}}>
+                  {c === 'email' ? '✉ Email' : '💬 SMS'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{marginBottom:8}}>
+            <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:3}}>Appointment Type</label>
+            <select value={apptType} onChange={e => setApptType(e.target.value)} style={{...inputSt}}>
+              {APPT_TYPES.map(([v,l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </div>
+
+          <div style={{marginBottom:10}}>
+            <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:3}}>Goal / Description</label>
+            <textarea value={prompt} rows={5} onChange={e => setPrompt(e.target.value)}
+              placeholder={'Example: Re-engage patient who saw our smile preview but hasn\'t booked. Emphasize that their smile transformation is waiting.'}
+              style={{...inputSt,resize:'vertical'}} />
+          </div>
+
+          <button className="btn btn-teal btn-sm" style={{width:'100%'}}
+            onClick={generate} disabled={generating || !prompt.trim()}>
+            {generating ? 'Generating…' : '✨ Generate with AI'}
+          </button>
+
+          {result && (
+            <button className="btn btn-ghost btn-sm" style={{width:'100%',marginTop:6}} onClick={reset}>
+              ↩ Start Over
+            </button>
+          )}
+        </div>
+
+        {result && (
+          <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:14}}>
+            <div style={{fontWeight:700,fontSize:12,color:'var(--teal-dark)',marginBottom:8}}>📌 Insert Token</div>
+            <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
+              Click to insert at cursor position in subject or body
+            </div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+              {TOKENS.map(([tok, label]) => (
+                <button key={tok} onClick={() => insertToken(tok)}
+                  style={{padding:'2px 7px',fontSize:10,borderRadius:4,border:'1px solid var(--teal)',
+                    background:'var(--teal-light)',color:'var(--teal-dark)',cursor:'pointer',fontFamily:'monospace'}}>
+                  {tok}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Right: editable output + save actions */}
+      <div style={{flex:1,display:'flex',flexDirection:'column',gap:10,overflowY:'auto'}}>
+        {error && <div style={{background:'#fee2e2',border:'1px solid #fca5a5',borderRadius:6,padding:'6px 10px',fontSize:11,color:'#dc2626'}}>{error}</div>}
+        {success && <div style={{background:'#dcfce7',border:'1px solid #86efac',borderRadius:6,padding:'6px 10px',fontSize:11,color:'#15803d'}}>{success}</div>}
+
+        {!result ? (
+          <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:32,textAlign:'center',color:'var(--text-muted)',fontSize:12,flex:1}}>
+            Configure your message on the left and click Generate.
+            <br/><br/>
+            <span style={{fontSize:11}}>💡 Practice info from Admin → Practice Information will be baked into the message automatically.</span>
+          </div>
+        ) : (
+          <>
+            {/* Editable message */}
+            <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:14}}>
+              <div style={{fontWeight:700,fontSize:12,color:'var(--teal-dark)',marginBottom:10}}>
+                ✏️ Edit Generated Message
+                <span style={{fontWeight:400,fontSize:10,color:'var(--text-muted)',marginLeft:8}}>
+                  {result.channel === 'email' ? '✉ Email' : '💬 SMS'}
+                </span>
+              </div>
+              {result.channel === 'email' && (
+                <div style={{marginBottom:8}}>
+                  <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:2}}>Subject</label>
+                  <input ref={subjectRef} value={editSubject} onChange={e => setEditSubject(e.target.value)}
+                    style={inputSt} placeholder="Email subject line" />
+                </div>
+              )}
+              <div>
+                <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:2}}>
+                  Body {result.channel === 'sms' && <span style={{fontWeight:400,color:'var(--text-muted)'}}>· {editBody.length} chars</span>}
+                </label>
+                <textarea ref={bodyRef} value={editBody} onChange={e => setEditBody(e.target.value)}
+                  rows={result.channel === 'email' ? 10 : 5}
+                  style={{...inputSt,resize:'vertical'}} />
+              </div>
+            </div>
+
+            {/* Template name */}
+            <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:14}}>
+              <div style={{fontWeight:700,fontSize:12,color:'var(--teal-dark)',marginBottom:6}}>🏷 Template Name</div>
+              <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:6}}>Unique slug identifier for this step.</div>
+              <input value={addTplName} onChange={e => setAddTplName(e.target.value)}
+                style={inputSt} placeholder="e.g. ai_email_consult_001" />
+            </div>
+
+            {/* Add to existing workflow */}
+            <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:14}}>
+              <div style={{fontWeight:700,fontSize:12,color:'var(--teal-dark)',marginBottom:8}}>➕ Add to Existing Workflow</div>
+              {workflows.length === 0 ? (
+                <div style={{fontSize:11,color:'var(--text-muted)'}}>No workflows yet — create one below.</div>
+              ) : (
+                <div style={{display:'flex',gap:8,alignItems:'flex-end',flexWrap:'wrap'}}>
+                  <div style={{flex:2,minWidth:140}}>
+                    <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:2}}>Workflow</label>
+                    <select value={addWfId} onChange={e => setAddWfId(e.target.value)} style={inputSt}>
+                      {workflows.map(wf => <option key={wf.id} value={String(wf.id)}>{wf.name}</option>)}
+                    </select>
+                  </div>
+                  <div style={{width:70}}>
+                    <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:2}}>Day</label>
+                    <input type="number" min="0" max="365" value={addDay}
+                      onChange={e => setAddDay(parseInt(e.target.value)||1)} style={inputSt} />
+                  </div>
+                  <button className="btn btn-teal btn-sm" onClick={addToWorkflow}
+                    disabled={savingAdd || !editBody.trim() || !addTplName.trim()}>
+                    {savingAdd ? 'Saving…' : 'Add Step'}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Create new workflow */}
+            <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:14}}>
+              <div style={{fontWeight:700,fontSize:12,color:'var(--teal-dark)',marginBottom:8}}>🆕 Create New Workflow</div>
+              <div style={{display:'flex',gap:8,alignItems:'flex-end'}}>
+                <div style={{flex:1}}>
+                  <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:2}}>Workflow Name</label>
+                  <input value={newWfName} onChange={e => setNewWfName(e.target.value)}
+                    placeholder="e.g. Implant Consult Follow-up" style={inputSt} />
+                </div>
+                <button className="btn btn-teal btn-sm" onClick={createAndAddWorkflow}
+                  disabled={savingNew || !newWfName.trim() || !editBody.trim() || !addTplName.trim()}>
+                  {savingNew ? 'Creating…' : 'Create & Add Step'}
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 // ─── WorkflowsSection ────────────────────────────────────────────────────────
 
+// Slugify helper: lowercase, replace non-alphanum runs with _, trim _
+function slugify(str) {
+  return (str || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
 function WorkflowsSection() {
+  const [subTab, setSubTab] = React.useState('editor'); // 'editor' | 'templates'
+
   const [workflows, setWorkflows] = React.useState([]);
   const [selectedWfId, setSelectedWfId] = React.useState(null);
   const [steps, setSteps] = React.useState([]);
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
+  const [copying, setCopying] = React.useState(false);
+  const [seeding, setSeeding] = React.useState(false);
   const [error, setError] = React.useState('');
   const [success, setSuccess] = React.useState('');
 
@@ -2515,17 +4102,35 @@ function WorkflowsSection() {
   const [showNewWf, setShowNewWf] = React.useState(false);
   const [newWfName, setNewWfName] = React.useState('');
   const [newWfTag, setNewWfTag] = React.useState('');
+  const [newWfTagManual, setNewWfTagManual] = React.useState(false);
   const [newWfDesc, setNewWfDesc] = React.useState('');
 
-  // Edit step state
-  const [editingStep, setEditingStep] = React.useState(null); // step object or null
-  const [stepDraft, setStepDraft] = React.useState({});
+  // Edit workflow (rename/tag/desc)
+  const [editingWf, setEditingWf] = React.useState(null);
+  const [editWfDraft, setEditWfDraft] = React.useState({});
 
-  // AI Generate
-  const [aiPrompt, setAiPrompt] = React.useState('');
-  const [aiGenerating, setAiGenerating] = React.useState('');
-  const [aiPreview, setAiPreview] = React.useState(null);
-  const [applyingAi, setApplyingAi] = React.useState(false);
+  // Edit step state
+  const [editingStep, setEditingStep] = React.useState(null);
+  const [stepDraft, setStepDraft] = React.useState({});
+  const [stepTnameManual, setStepTnameManual] = React.useState(false);
+
+  // Per-step AI writer
+  const [stepAiPrompt, setStepAiPrompt] = React.useState('');
+  const [stepAiApptType, setStepAiApptType] = React.useState('consult');
+  const [stepAiGenerating, setStepAiGenerating] = React.useState(false);
+  const [showStepAi, setShowStepAi] = React.useState(false);
+
+  // Email preview modal
+  const [previewStep, setPreviewStep] = React.useState(null);
+
+  // Reset per-step AI state when editing step changes
+  const stepEditKey = editingStep ? (editingStep.id ?? `new-${editingStep._key}`) : null;
+  React.useEffect(() => {
+    setStepAiPrompt('');
+    setStepAiGenerating(false);
+    setShowStepAi(false);
+    setStepTnameManual(false);
+  }, [stepEditKey]);
 
   React.useEffect(() => { loadWorkflows(); }, []);
 
@@ -2533,9 +4138,11 @@ function WorkflowsSection() {
     setLoading(true);
     try {
       const data = await api('/api/admin/workflows');
-      setWorkflows(data.workflows || []);
-      if (!selectedWfId && data.workflows && data.workflows.length > 0) {
-        selectWorkflow(data.workflows[0]);
+      const wfs = data.workflows || [];
+      setWorkflows(wfs);
+      if (!selectedWfId && wfs.length > 0) {
+        setSelectedWfId(wfs[0].id);
+        setSteps(wfs[0].steps || []);
       }
     } catch (e) {
       setError(e.message);
@@ -2548,8 +4155,18 @@ function WorkflowsSection() {
     setSelectedWfId(wf.id);
     setSteps(wf.steps || []);
     setEditingStep(null);
-    setAiPreview(null);
+    setEditingWf(null);
     setError(''); setSuccess('');
+  }
+
+  // Auto-slugify new workflow name → tag (stops once user manually edits tag)
+  function handleNewWfName(val) {
+    setNewWfName(val);
+    if (!newWfTagManual) setNewWfTag(slugify(val));
+  }
+  function handleNewWfTag(val) {
+    setNewWfTag(val);
+    setNewWfTagManual(true);
   }
 
   async function createWorkflow() {
@@ -2560,58 +4177,133 @@ function WorkflowsSection() {
         method: 'POST',
         body: JSON.stringify({ name: newWfName.trim(), campaign_tag: newWfTag.trim(), description: newWfDesc.trim() }),
       });
-      setShowNewWf(false); setNewWfName(''); setNewWfTag(''); setNewWfDesc('');
-      await loadWorkflows();
+      setShowNewWf(false); setNewWfName(''); setNewWfTag(''); setNewWfDesc(''); setNewWfTagManual(false);
+      const data = await api('/api/admin/workflows');
+      const wfs = data.workflows || [];
+      setWorkflows(wfs);
       setSelectedWfId(wf.id);
       setSteps([]);
+      setEditingStep(null);
       setSuccess('Workflow created');
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
   }
 
+  async function saveEditWf() {
+    if (!editingWf) return;
+    if (!(editWfDraft.name || '').trim()) { setError('Workflow name is required'); return; }
+    setSaving(true); setError('');
+    try {
+      await api(`/api/admin/workflows/${editingWf.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name: editWfDraft.name, campaign_tag: editWfDraft.campaign_tag, description: editWfDraft.description }),
+      });
+      const data = await api('/api/admin/workflows');
+      const wfs = data.workflows || [];
+      setWorkflows(wfs);
+      const updated = wfs.find(w => w.id === editingWf.id);
+      if (updated) setSteps(updated.steps || []);
+      setEditingWf(null);
+      setSuccess('Workflow updated');
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  async function copyWorkflow(wfId) {
+    setCopying(true); setError('');
+    try {
+      const newWf = await api(`/api/admin/workflows/${wfId}/copy`, { method: 'POST' });
+      const data = await api('/api/admin/workflows');
+      const wfs = data.workflows || [];
+      setWorkflows(wfs);
+      setSelectedWfId(newWf.id);
+      setSteps(newWf.steps || []);
+      setEditingStep(null);
+      setSuccess(`Copied to "${newWf.name}"`);
+    } catch (e) { setError(e.message); }
+    finally { setCopying(false); }
+  }
+
   async function deleteWorkflow() {
     if (!selectedWfId) return;
-    if (!window.confirm('Delete this workflow and all its steps?')) return;
+    const wf = workflows.find(w => w.id === selectedWfId);
+    if (!window.confirm(`Delete "${wf?.name}" and all its steps?`)) return;
     setSaving(true); setError('');
     try {
       await api(`/api/admin/workflows/${selectedWfId}`, { method: 'DELETE' });
-      setSelectedWfId(null); setSteps([]);
-      await loadWorkflows();
+      const data = await api('/api/admin/workflows');
+      const wfs = data.workflows || [];
+      setWorkflows(wfs);
+      if (wfs.length > 0) {
+        setSelectedWfId(wfs[0].id);
+        setSteps(wfs[0].steps || []);
+      } else {
+        setSelectedWfId(null); setSteps([]);
+      }
+      setEditingStep(null);
       setSuccess('Workflow deleted');
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
   }
 
-  function startEditStep(step) {
-    setEditingStep(step);
-    setStepDraft({ ...step });
-    setAiPreview(null);
+  async function seedNxtSmile() {
+    if (!selectedWfId) return;
+    setSeeding(true); setError('');
+    try {
+      const result = await api(`/api/admin/workflows/${selectedWfId}/seed-nxtsmile`, { method: 'POST' });
+      setSteps(result.steps || []);
+      const data = await api('/api/admin/workflows');
+      setWorkflows(data.workflows || []);
+      setSuccess('Loaded 4 nXtSmile email templates');
+    } catch (e) { setError(e.message); }
+    finally { setSeeding(false); }
   }
 
-  function startNewStep() {
+  // Auto-update template_name from day+channel unless manually edited
+  function openEditStep(step) {
+    setEditingStep({ ...step, _key: Date.now() });
+    setStepDraft({ ...step });
+    setStepTnameManual(!!step.id); // for existing steps, keep their existing name
+  }
+
+  function openNewStep() {
+    const day = steps.length > 0 ? Math.max(...steps.map(s => s.sequence_day)) + 7 : 1;
     const blank = {
       id: null, workflow_id: selectedWfId,
-      sequence_day: 1, channel: 'email',
-      template_name: '', subject: '', body: '', terminal: false,
+      sequence_day: day, channel: 'email',
+      template_name: `wf${selectedWfId}_d${day}_email`,
+      subject: '', body: '', terminal: false, _key: Date.now(),
     };
     setEditingStep(blank);
     setStepDraft({ ...blank });
-    setAiPreview(null);
+    setStepTnameManual(false);
+  }
+
+  function updateStepDraft(patch) {
+    setStepDraft(prev => {
+      const next = { ...prev, ...patch };
+      // Auto-update template_name if not manually edited and step is new
+      if (!stepTnameManual && !prev.id) {
+        const day = patch.sequence_day !== undefined ? patch.sequence_day : prev.sequence_day;
+        const ch  = patch.channel    !== undefined ? patch.channel    : prev.channel;
+        next.template_name = `wf${selectedWfId}_d${day}_${ch}`;
+      }
+      return next;
+    });
   }
 
   async function saveStep() {
     if (!stepDraft.template_name || !stepDraft.body) {
-      setError('Template name and body are required');
-      return;
+      setError('Template name and body are required'); return;
     }
     setSaving(true); setError('');
     try {
       const isNew = !stepDraft.id;
       const url = isNew ? '/api/admin/workflow-steps' : `/api/admin/workflow-steps/${stepDraft.id}`;
-      const saved = await api(url, {
+      await api(url, {
         method: isNew ? 'POST' : 'PUT',
         body: JSON.stringify({
-          workflow_id: stepDraft.workflow_id,
+          workflow_id: stepDraft.workflow_id || selectedWfId,
           sequence_day: parseInt(stepDraft.sequence_day) || 1,
           channel: stepDraft.channel,
           template_name: stepDraft.template_name,
@@ -2621,9 +4313,10 @@ function WorkflowsSection() {
         }),
       });
       setEditingStep(null);
-      // Refresh steps
       const wfData = await api(`/api/admin/workflows/${selectedWfId}`);
       setSteps(wfData.steps || []);
+      const listData = await api('/api/admin/workflows');
+      setWorkflows(listData.workflows || []);
       setSuccess('Step saved');
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
@@ -2634,260 +4327,602 @@ function WorkflowsSection() {
     setSaving(true); setError('');
     try {
       await api(`/api/admin/workflow-steps/${stepId}`, { method: 'DELETE' });
-      setSteps(s => s.filter(s => s.id !== stepId));
+      setSteps(s => s.filter(x => x.id !== stepId));
       if (editingStep && editingStep.id === stepId) setEditingStep(null);
+      const listData = await api('/api/admin/workflows');
+      setWorkflows(listData.workflows || []);
       setSuccess('Step deleted');
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
   }
 
-  async function generateAI() {
-    if (!aiPrompt.trim()) return;
-    if (!selectedWfId) { setError('Select a workflow first'); return; }
-    setAiGenerating('Generating with AI…');
-    setAiPreview(null); setError('');
+  async function generateStepAi() {
+    if (!stepAiPrompt.trim()) return;
+    // Confirm BEFORE the API call to avoid wasting credits
+    if (stepDraft.body && stepDraft.body.trim()) {
+      if (!window.confirm('Replace the current body with AI-generated content?')) return;
+    }
+    setStepAiGenerating(true); setError('');
     try {
-      const result = await api('/api/admin/workflow/ai-generate', {
+      const result = await api('/api/admin/workflow/ai-generate-message', {
         method: 'POST',
-        body: JSON.stringify({ prompt: aiPrompt, num_steps: 6 }),
+        body: JSON.stringify({ channel: stepDraft.channel || 'email', appointment_type: stepAiApptType, prompt: stepAiPrompt }),
       });
-      setAiPreview(result.steps || []);
+      setStepDraft(d => ({
+        ...d,
+        subject: result.subject || d.subject,
+        body: result.body || d.body,
+      }));
+      setShowStepAi(false);
+      setStepAiPrompt('');
     } catch (e) { setError(e.message); }
-    finally { setAiGenerating(''); }
-  }
-
-  async function applyAiSteps() {
-    if (!aiPreview || !selectedWfId) return;
-    setApplyingAi(true); setError('');
-    try {
-      for (const step of aiPreview) {
-        await api('/api/admin/workflow-steps', {
-          method: 'POST',
-          body: JSON.stringify({
-            workflow_id: selectedWfId,
-            sequence_day: step.sequence_day,
-            channel: step.channel,
-            template_name: step.template_name,
-            subject: step.subject || '',
-            body: step.body,
-            terminal: false,
-          }),
-        });
-      }
-      setAiPreview(null); setAiPrompt('');
-      const wfData = await api(`/api/admin/workflows/${selectedWfId}`);
-      setSteps(wfData.steps || []);
-      setSuccess(`Added ${aiPreview.length} AI-generated steps`);
-    } catch (e) { setError(e.message); }
-    finally { setApplyingAi(false); }
+    finally { setStepAiGenerating(false); }
   }
 
   const selectedWf = workflows.find(w => w.id === selectedWfId);
+  const sortedSteps = [...steps].sort((a,b) => a.sequence_day - b.sequence_day);
 
-  return (
-    <div style={{ display: 'flex', gap: 16, height: 'calc(100vh - 100px)', overflow: 'hidden' }}>
-      {/* Left: workflow list */}
-      <div style={{ width: 220, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 12, display: 'flex', flexDirection: 'column', gap: 6, overflow: 'hidden' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-          <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Workflows</span>
-          <button className="btn btn-teal btn-sm" onClick={() => setShowNewWf(v => !v)}>+ New</button>
-        </div>
-        {showNewWf && (
-          <div style={{ background: 'var(--gray-light)', borderRadius: 6, padding: 8, marginBottom: 4 }}>
-            <input placeholder="Name" value={newWfName} onChange={e => setNewWfName(e.target.value)}
-              style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 4 }} />
-            <input placeholder="Campaign tag (blank = default)" value={newWfTag} onChange={e => setNewWfTag(e.target.value)}
-              style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 4 }} />
-            <input placeholder="Description" value={newWfDesc} onChange={e => setNewWfDesc(e.target.value)}
-              style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 6 }} />
-            <div style={{ display: 'flex', gap: 4 }}>
-              <button className="btn btn-teal btn-sm" onClick={createWorkflow} disabled={saving}>Create</button>
-              <button className="btn btn-ghost btn-sm" onClick={() => setShowNewWf(false)}>Cancel</button>
-            </div>
-          </div>
-        )}
-        <div style={{ overflowY: 'auto', flex: 1 }}>
-          {loading && <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: 8 }}>Loading…</div>}
-          {workflows.map(wf => (
-            <div key={wf.id}
-              onClick={() => selectWorkflow(wf)}
-              style={{
-                padding: '6px 8px', borderRadius: 5, cursor: 'pointer', marginBottom: 2,
-                background: wf.id === selectedWfId ? 'var(--teal-light)' : 'transparent',
-                border: '1px solid ' + (wf.id === selectedWfId ? 'var(--teal)' : 'transparent'),
-              }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: wf.id === selectedWfId ? 'var(--teal-dark)' : 'var(--text)' }}>{wf.name}</div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                {wf.campaign_tag ? wf.campaign_tag : <em>default</em>} · {(wf.steps || []).length} steps
+  // ── Email Preview Modal ───────────────────────────────────────────────────
+  function EmailPreviewModal({ step, onClose }) {
+    const previewName = 'Jane';
+    const body = (step.body || '').replace(/\{first_name\}/g, previewName).replace(/\{unsub_url\}/g, '#unsubscribe');
+    const htmlBody = body.replace(/\n/g, '<br/>');
+    return (
+      <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+        onClick={onClose}>
+        <div style={{ background: '#fff', borderRadius: 10, width: 620, maxHeight: '85vh', overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,.3)' }}
+          onClick={e => e.stopPropagation()}>
+          {/* Header */}
+          <div style={{ background: 'var(--teal-dark)', color: '#fff', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, opacity: .7, marginBottom: 2 }}>Email Preview — {step.template_name}</div>
+              <div style={{ fontSize: 14, fontWeight: 700 }}>
+                {(step.subject || '(no subject)').replace(/\{first_name\}/g, previewName)}
               </div>
             </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Right: step editor */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
-        {error && <div style={{ background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#dc2626' }}>{error}</div>}
-        {success && <div style={{ background: '#dcfce7', border: '1px solid #86efac', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#15803d' }}>{success}</div>}
-
-        {selectedWf ? (
-          <>
-            {/* Workflow header */}
-            <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 700 }}>{selectedWf.name}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  Tag: <strong>{selectedWf.campaign_tag || '(default)'}</strong>
-                  {selectedWf.description ? ' · ' + selectedWf.description : ''}
+            <button onClick={onClose} style={{ background: 'rgba(255,255,255,.2)', border: 'none', color: '#fff', borderRadius: 5, padding: '4px 10px', cursor: 'pointer', fontSize: 13 }}>✕</button>
+          </div>
+          {/* Meta bar */}
+          <div style={{ background: '#f8fafa', borderBottom: '1px solid var(--border)', padding: '8px 16px', fontSize: 11, color: 'var(--text-muted)', display: 'flex', gap: 16, flexShrink: 0 }}>
+            <span>📅 Day {step.sequence_day}</span>
+            <span>✉ {step.channel}</span>
+            {step.terminal && <span style={{ color: 'var(--red)' }}>🔚 Terminal</span>}
+            <span style={{ marginLeft: 'auto', color: '#999' }}>Placeholders filled with sample data</span>
+          </div>
+          {/* Body */}
+          <div style={{ overflowY: 'auto', flex: 1, padding: '20px 24px' }}>
+            {step.channel === 'email' ? (
+              <div style={{ fontFamily: 'Arial, sans-serif', fontSize: 14, lineHeight: 1.7, color: '#333' }}>
+                <div style={{ background: 'var(--teal-dark)', color: '#fff', padding: '20px 24px', borderRadius: '8px 8px 0 0', marginBottom: 0 }}>
+                  <div style={{ fontSize: 18, fontWeight: 700 }}>
+                    {(step.subject || '').replace(/\{first_name\}/g, previewName)}
+                  </div>
+                </div>
+                <div style={{ border: '1px solid #e5e7eb', borderTop: 'none', borderRadius: '0 0 8px 8px', padding: '20px 24px' }}
+                  dangerouslySetInnerHTML={{ __html: htmlBody }} />
+                <div style={{ marginTop: 12, fontSize: 11, color: '#999', borderTop: '1px solid #eee', paddingTop: 10 }}>
+                  From: info@nxtsmile.com · To: jane@example.com
                 </div>
               </div>
-              <button className="btn btn-sm" style={{ background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
-                onClick={deleteWorkflow} disabled={saving}>Delete Workflow</button>
-              <button className="btn btn-teal btn-sm" onClick={startNewStep} disabled={saving}>+ Add Step</button>
+            ) : (
+              <div style={{ maxWidth: 320, margin: '0 auto' }}>
+                <div style={{ background: '#e9ecef', borderRadius: 12, padding: '10px 14px', fontSize: 13, lineHeight: 1.5, color: '#333', whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>
+                  {body}
+                </div>
+                <div style={{ fontSize: 11, color: '#999', marginTop: 8, textAlign: 'center' }}>SMS preview · {body.length} chars</div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 100px)', overflow: 'hidden', gap: 0 }}>
+      {previewStep && <EmailPreviewModal step={previewStep} onClose={() => setPreviewStep(null)} />}
+
+      {/* Sub-tab bar */}
+      <div style={{ display: 'flex', borderBottom: '2px solid var(--border)', background: '#fff', marginBottom: 12, flexShrink: 0 }}>
+        {[['editor','📋 Workflow Editor'],['templates','✨ AI Templates']].map(([key, label]) => (
+          <button key={key} onClick={() => setSubTab(key)}
+            style={{
+              padding: '7px 18px', fontSize: 12, fontWeight: subTab === key ? 700 : 500,
+              background: 'none', border: 'none', cursor: 'pointer',
+              borderBottom: subTab === key ? '2px solid var(--teal)' : '2px solid transparent',
+              color: subTab === key ? 'var(--teal)' : 'var(--text-muted)',
+              marginBottom: -2,
+            }}>{label}</button>
+        ))}
+      </div>
+
+      {subTab === 'templates' && <AITemplatesTab />}
+
+      {subTab === 'editor' && (
+        <div style={{ display: 'flex', gap: 16, flex: 1, overflow: 'hidden' }}>
+
+          {/* ── Left: workflow list ─────────────────────────────────────────── */}
+          <div style={{ width: 230, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 12, display: 'flex', flexDirection: 'column', gap: 6, overflow: 'hidden' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Workflows</span>
+              <button className="btn btn-teal btn-sm" onClick={() => { setShowNewWf(v => !v); setError(''); }}>+ New</button>
             </div>
 
-            <div style={{ display: 'flex', gap: 10, flex: 1, overflow: 'hidden' }}>
-              {/* Timeline */}
-              <div style={{ width: 220, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, overflowY: 'auto', padding: 10 }}>
-                <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 8 }}>Sequence ({steps.length} steps)</div>
-                {steps.length === 0 && (
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '12px 0' }}>No steps yet</div>
-                )}
-                {steps.sort((a,b) => a.sequence_day - b.sequence_day).map(step => (
-                  <div key={step.id}
-                    onClick={() => startEditStep(step)}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px', borderRadius: 5,
-                      cursor: 'pointer', marginBottom: 4, fontSize: 11,
-                      background: editingStep && editingStep.id === step.id ? 'var(--teal-light)' : 'var(--gray-light)',
-                      border: '1px solid ' + (editingStep && editingStep.id === step.id ? 'var(--teal)' : 'transparent'),
-                    }}>
-                    <div style={{
-                      width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
-                      background: step.channel === 'email' ? '#dbeafe' : '#fef9c3',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 10, fontWeight: 700, color: step.channel === 'email' ? '#1d4ed8' : '#92400e',
-                    }}>D{step.sequence_day}</div>
-                    <div style={{ flex: 1, overflow: 'hidden' }}>
-                      <div style={{ fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {step.channel === 'email' ? '✉ ' : '💬 '}{step.subject || step.template_name}
-                      </div>
-                      <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{step.channel}{step.terminal ? ' · 🔚' : ''}</div>
-                    </div>
-                  </div>
-                ))}
+            {/* New workflow form */}
+            {showNewWf && (
+              <div style={{ background: 'var(--gray-light)', borderRadius: 6, padding: 8, marginBottom: 4 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 2 }}>Name</div>
+                <input placeholder="e.g. nXtSmile Follow-up" value={newWfName} onChange={e => handleNewWfName(e.target.value)}
+                  style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 4 }} />
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 2 }}>Campaign Tag <span style={{ fontWeight: 400, color: '#aaa' }}>(auto-filled)</span></div>
+                <input placeholder="e.g. nxtsmile_followup" value={newWfTag} onChange={e => handleNewWfTag(e.target.value)}
+                  style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 4, fontFamily: 'monospace' }} />
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 2 }}>Description</div>
+                <input placeholder="Optional" value={newWfDesc} onChange={e => setNewWfDesc(e.target.value)}
+                  style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 6 }} />
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button className="btn btn-teal btn-sm" onClick={createWorkflow} disabled={saving || !newWfName.trim()}>Create</button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => { setShowNewWf(false); setNewWfName(''); setNewWfTag(''); setNewWfDesc(''); setNewWfTagManual(false); }}>Cancel</button>
+                </div>
               </div>
+            )}
 
-              {/* Step editor or AI generator */}
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
-                {editingStep ? (
-                  <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 14, overflowY: 'auto', flex: 1 }}>
-                    <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 10, color: 'var(--teal-dark)' }}>
-                      {editingStep.id ? 'Edit Step' : 'New Step'}
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
-                      <div>
-                        <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Day</label>
-                        <input type="number" value={stepDraft.sequence_day || 1} min="0" max="365"
-                          onChange={e => setStepDraft(d => ({...d, sequence_day: parseInt(e.target.value)||1}))}
-                          style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }} />
-                      </div>
-                      <div>
-                        <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Channel</label>
-                        <select value={stepDraft.channel || 'email'}
-                          onChange={e => setStepDraft(d => ({...d, channel: e.target.value}))}
-                          style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }}>
-                          <option value="email">Email</option>
-                          <option value="sms">SMS</option>
-                        </select>
+            {/* Workflow list */}
+            <div style={{ overflowY: 'auto', flex: 1 }}>
+              {loading && <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: 8 }}>Loading…</div>}
+              {workflows.map(wf => (
+                <div key={wf.id}>
+                  {/* Edit workflow form inline */}
+                  {editingWf && editingWf.id === wf.id ? (
+                    <div style={{ background: 'var(--teal-light)', border: '1px solid var(--teal)', borderRadius: 6, padding: 8, marginBottom: 4 }}>
+                      <input value={editWfDraft.name || ''} onChange={e => setEditWfDraft(d => ({...d, name: e.target.value}))}
+                        placeholder="Name"
+                        style={{ width: '100%', padding: '3px 5px', border: '1px solid var(--border)', borderRadius: 3, fontSize: 11, marginBottom: 3 }} />
+                      <input value={editWfDraft.campaign_tag || ''} onChange={e => setEditWfDraft(d => ({...d, campaign_tag: e.target.value}))}
+                        placeholder="Campaign tag"
+                        style={{ width: '100%', padding: '3px 5px', border: '1px solid var(--border)', borderRadius: 3, fontSize: 11, marginBottom: 3, fontFamily: 'monospace' }} />
+                      <input value={editWfDraft.description || ''} onChange={e => setEditWfDraft(d => ({...d, description: e.target.value}))}
+                        placeholder="Description"
+                        style={{ width: '100%', padding: '3px 5px', border: '1px solid var(--border)', borderRadius: 3, fontSize: 11, marginBottom: 5 }} />
+                      <div style={{ display: 'flex', gap: 3 }}>
+                        <button className="btn btn-teal btn-sm" onClick={saveEditWf} disabled={saving}>Save</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setEditingWf(null)}>Cancel</button>
                       </div>
                     </div>
-                    <div style={{ marginBottom: 8 }}>
-                      <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Template Name (unique slug)</label>
-                      <input value={stepDraft.template_name || ''} placeholder="e.g. aox_day1_email"
-                        onChange={e => setStepDraft(d => ({...d, template_name: e.target.value}))}
-                        style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }} />
-                    </div>
-                    {stepDraft.channel === 'email' && (
-                      <div style={{ marginBottom: 8 }}>
-                        <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Subject</label>
-                        <input value={stepDraft.subject || ''} placeholder="Email subject line"
-                          onChange={e => setStepDraft(d => ({...d, subject: e.target.value}))}
-                          style={{ display: 'block', width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2 }} />
+                  ) : (
+                    <div
+                      onClick={() => selectWorkflow(wf)}
+                      style={{
+                        padding: '6px 8px', borderRadius: 5, cursor: 'pointer', marginBottom: 2,
+                        background: wf.id === selectedWfId ? 'var(--teal-light)' : 'transparent',
+                        border: '1px solid ' + (wf.id === selectedWfId ? 'var(--teal)' : 'transparent'),
+                        position: 'relative',
+                      }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: wf.id === selectedWfId ? 'var(--teal-dark)' : 'var(--text)', paddingRight: 40 }}>{wf.name}</div>
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                        {wf.campaign_tag ? <code style={{ fontSize: 9 }}>{wf.campaign_tag}</code> : <em>default</em>} · {(wf.steps || []).length} steps
                       </div>
-                    )}
-                    <div style={{ marginBottom: 8 }}>
-                      <label style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Body — use {'{first_name}'}, {'{unsub_url}'}</label>
-                      <textarea value={stepDraft.body || ''} rows={8} placeholder="Message body..."
-                        onChange={e => setStepDraft(d => ({...d, body: e.target.value}))}
-                        style={{ display: 'block', width: '100%', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, marginTop: 2, resize: 'vertical', fontFamily: 'inherit' }} />
-                    </div>
-                    <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <input type="checkbox" id="terminal-chk" checked={!!stepDraft.terminal}
-                        onChange={e => setStepDraft(d => ({...d, terminal: e.target.checked}))} />
-                      <label htmlFor="terminal-chk" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                        Terminal step (marks lead cold + deletes smile image)
-                      </label>
-                    </div>
-                    <div style={{ display: 'flex', gap: 6 }}>
-                      <button className="btn btn-teal btn-sm" onClick={saveStep} disabled={saving}>{saving ? 'Saving…' : 'Save Step'}</button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => setEditingStep(null)}>Cancel</button>
-                      {editingStep.id && (
-                        <button className="btn btn-sm" style={{ marginLeft: 'auto', background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
-                          onClick={() => deleteStep(editingStep.id)} disabled={saving}>Delete</button>
+                      {/* Action buttons — show on selected */}
+                      {wf.id === selectedWfId && (
+                        <div style={{ position: 'absolute', top: 4, right: 4, display: 'flex', gap: 2 }}>
+                          <button title="Edit workflow" onClick={e => { e.stopPropagation(); setEditingWf(wf); setEditWfDraft({ name: wf.name, campaign_tag: wf.campaign_tag, description: wf.description }); }}
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 12, padding: 2 }}>✏️</button>
+                          <button title="Copy workflow" onClick={e => { e.stopPropagation(); copyWorkflow(wf.id); }} disabled={copying}
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 12, padding: 2 }}>📋</button>
+                        </div>
                       )}
                     </div>
-                  </div>
-                ) : (
-                  <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 14, flex: 1, overflowY: 'auto' }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal-dark)', marginBottom: 6 }}>✨ AI Generate Steps</div>
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
-                      Describe your campaign goals and target patient. Claude will generate a complete follow-up sequence.
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* ── Right: step editor ──────────────────────────────────────────── */}
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
+            {error && <div style={{ background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#dc2626', flexShrink: 0 }}>{error}<button onClick={() => setError('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: '#dc2626' }}>✕</button></div>}
+            {success && <div style={{ background: '#dcfce7', border: '1px solid #86efac', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#15803d', flexShrink: 0 }}>{success}<button onClick={() => setSuccess('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: '#15803d' }}>✕</button></div>}
+
+            {selectedWf ? (
+              <>
+                {/* Workflow header */}
+                <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{selectedWf.name}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                      Tag: <strong>{selectedWf.campaign_tag || '(default)'}</strong>
+                      {selectedWf.description ? ' · ' + selectedWf.description : ''}
                     </div>
-                    <textarea value={aiPrompt} rows={4}
-                      placeholder="Example: All-on-X dental implants campaign targeting adults 45+ who saw our smile preview. Goal: book a free consultation. Emphasize life-changing results, financing options, and Dr. Gupta's expertise."
-                      onChange={e => setAiPrompt(e.target.value)}
-                      style={{ width: '100%', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 12, resize: 'vertical', fontFamily: 'inherit', marginBottom: 8 }} />
-                    <button className="btn btn-teal btn-sm" onClick={generateAI} disabled={!!aiGenerating || !aiPrompt.trim()}>
-                      {aiGenerating || '✨ Generate with AI'}
+                  </div>
+                  {steps.length === 0 && (
+                    <button className="btn btn-sm" style={{ background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', whiteSpace: 'nowrap' }}
+                      onClick={seedNxtSmile} disabled={seeding}>
+                      {seeding ? 'Loading…' : '📧 Load nXtSmile Emails'}
                     </button>
-                    {aiPreview && (
-                      <div style={{ marginTop: 12 }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: 'var(--text)' }}>
-                          Preview — {aiPreview.length} steps generated
-                        </div>
-                        {aiPreview.map((s, i) => (
-                          <div key={i} style={{ background: 'var(--gray-light)', borderRadius: 5, padding: '6px 8px', marginBottom: 4, fontSize: 11 }}>
-                            <div style={{ fontWeight: 600 }}>Day {s.sequence_day} · {s.channel} {s.subject ? `· "${s.subject}"` : ''}</div>
-                            <div style={{ color: 'var(--text-muted)', marginTop: 2 }}>{s.template_name}</div>
-                            <div style={{ marginTop: 4, whiteSpace: 'pre-wrap', color: 'var(--text)', maxHeight: 60, overflow: 'hidden' }}>{s.body}</div>
+                  )}
+                  <button className="btn btn-teal btn-sm" onClick={openNewStep} disabled={saving}>+ Add Step</button>
+                  <button className="btn btn-sm" style={{ background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                    onClick={deleteWorkflow} disabled={saving}>🗑 Delete</button>
+                </div>
+
+                <div style={{ display: 'flex', gap: 10, flex: 1, overflow: 'hidden' }}>
+                  {/* Timeline */}
+                  <div style={{ width: 220, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, overflowY: 'auto', padding: 10, flexShrink: 0 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 8 }}>Sequence ({steps.length} steps)</div>
+                    {steps.length === 0 && (
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '20px 8px' }}>
+                        No steps yet.<br/>
+                        <span style={{ color: 'var(--teal)', cursor: 'pointer' }} onClick={openNewStep}>+ Add a step</span>
+                        <span> or </span>
+                        <span style={{ color: '#92400e', cursor: 'pointer' }} onClick={seedNxtSmile}>load nXtSmile emails</span>
+                      </div>
+                    )}
+                    {sortedSteps.map(step => (
+                      <div key={step.id}
+                        onClick={() => openEditStep(step)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px', borderRadius: 5,
+                          cursor: 'pointer', marginBottom: 4, fontSize: 11,
+                          background: editingStep && editingStep.id === step.id ? 'var(--teal-light)' : 'var(--gray-light)',
+                          border: '1px solid ' + (editingStep && editingStep.id === step.id ? 'var(--teal)' : 'transparent'),
+                        }}>
+                        <div style={{
+                          width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
+                          background: step.channel === 'email' ? '#dbeafe' : '#fef9c3',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 10, fontWeight: 700, color: step.channel === 'email' ? '#1d4ed8' : '#92400e',
+                        }}>D{step.sequence_day}</div>
+                        <div style={{ flex: 1, overflow: 'hidden' }}>
+                          <div style={{ fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {step.channel === 'email' ? '✉ ' : '💬 '}{step.subject || step.template_name}
                           </div>
-                        ))}
-                        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-                          <button className="btn btn-teal btn-sm" onClick={applyAiSteps} disabled={applyingAi}>
-                            {applyingAi ? 'Applying…' : `✅ Add ${aiPreview.length} Steps to Workflow`}
-                          </button>
-                          <button className="btn btn-ghost btn-sm" onClick={() => setAiPreview(null)}>Discard</button>
+                          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                            {step.channel}{step.terminal ? ' · 🔚 terminal' : ''}
+                          </div>
                         </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Step editor panel */}
+                  <div style={{ flex: 1, display: 'flex', gap: 10, overflow: 'hidden' }}>
+                    {editingStep ? (
+                      <>
+                        {/* Main step form */}
+                        <div style={{ flex: 1, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 14, overflowY: 'auto' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
+                            <div style={{ fontWeight: 700, fontSize: 12, color: 'var(--teal-dark)' }}>
+                              {editingStep.id ? 'Edit Step' : 'New Step'}
+                            </div>
+                            {/* Preview button */}
+                            {stepDraft.body && (
+                              <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto' }}
+                                onClick={() => setPreviewStep(stepDraft)}>
+                                👁 Preview
+                              </button>
+                            )}
+                          </div>
+
+                          {/* Day + Channel row */}
+                          <div style={{ display: 'flex', gap: 8, marginBottom: 10, alignItems: 'flex-end' }}>
+                            <div style={{ flex: 1 }}>
+                              <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>Day</label>
+                              <input type="number" value={stepDraft.sequence_day ?? 1} min="0" max="365"
+                                onChange={e => updateStepDraft({ sequence_day: parseInt(e.target.value) || 1 })}
+                                style={{ width: '100%', padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 13, fontWeight: 600 }} />
+                            </div>
+                            <div style={{ flex: 2 }}>
+                              <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>Channel</label>
+                              <div style={{ display: 'flex', gap: 0 }}>
+                                {['email','sms'].map(ch => (
+                                  <button key={ch} onClick={() => updateStepDraft({ channel: ch })}
+                                    style={{
+                                      flex: 1, padding: '5px 0', fontSize: 12, fontWeight: 600, border: '1px solid var(--border)',
+                                      borderRadius: ch === 'email' ? '5px 0 0 5px' : '0 5px 5px 0',
+                                      background: stepDraft.channel === ch ? 'var(--teal)' : '#fff',
+                                      color: stepDraft.channel === ch ? '#fff' : 'var(--text-muted)',
+                                      cursor: 'pointer',
+                                    }}>
+                                    {ch === 'email' ? '✉ Email' : '💬 SMS'}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Subject (email only) */}
+                          {stepDraft.channel === 'email' && (
+                            <div style={{ marginBottom: 8 }}>
+                              <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>Subject</label>
+                              <input value={stepDraft.subject || ''} placeholder="Email subject line — can use {first_name}"
+                                onChange={e => setStepDraft(d => ({...d, subject: e.target.value}))}
+                                style={{ width: '100%', padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 12 }} />
+                            </div>
+                          )}
+
+                          {/* Body */}
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 2 }}>
+                              <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)' }}>Body</label>
+                              <button onClick={() => setShowStepAi(v => !v)}
+                                style={{ marginLeft: 'auto', background: showStepAi ? 'var(--teal)' : 'var(--teal-light)', border: 'none', color: showStepAi ? '#fff' : 'var(--teal-dark)', padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 600, cursor: 'pointer' }}>
+                                ✨ Write with AI
+                              </button>
+                            </div>
+
+                            {/* Per-step AI writer */}
+                            {showStepAi && (
+                              <div style={{ background: 'var(--teal-light)', border: '1px solid #b2d8da', borderRadius: 6, padding: 10, marginBottom: 8 }}>
+                                <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+                                  <div style={{ flex: 1 }}>
+                                    <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--teal-dark)', display: 'block', marginBottom: 2 }}>Appointment Type</label>
+                                    <select value={stepAiApptType} onChange={e => setStepAiApptType(e.target.value)}
+                                      style={{ width: '100%', padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11 }}>
+                                      <option value="consult">Consultation</option>
+                                      <option value="exam">New Patient Exam</option>
+                                      <option value="implant">Implant</option>
+                                      <option value="ortho">Ortho / Invisalign</option>
+                                      <option value="general">General</option>
+                                    </select>
+                                  </div>
+                                </div>
+                                <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--teal-dark)', display: 'block', marginBottom: 2 }}>Describe what you want this message to do</label>
+                                <textarea value={stepAiPrompt} rows={3}
+                                  placeholder="e.g. Day 7 follow-up — address cost objections, mention CareCredit financing, encourage booking free consult"
+                                  onChange={e => setStepAiPrompt(e.target.value)}
+                                  style={{ width: '100%', padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, resize: 'vertical', fontFamily: 'inherit', marginBottom: 6 }} />
+                                <button className="btn btn-teal btn-sm" onClick={generateStepAi} disabled={stepAiGenerating || !stepAiPrompt.trim()}>
+                                  {stepAiGenerating ? '✨ Generating…' : '✨ Generate'}
+                                </button>
+                                <button className="btn btn-ghost btn-sm" style={{ marginLeft: 6 }} onClick={() => setShowStepAi(false)}>Cancel</button>
+                              </div>
+                            )}
+
+                            <textarea value={stepDraft.body || ''} rows={10}
+                              placeholder={'Message body…\n\nAvailable placeholders:\n{first_name} — patient name\n{unsub_url} — unsubscribe link (email only)'}
+                              onChange={e => setStepDraft(d => ({...d, body: e.target.value}))}
+                              style={{ display: 'block', width: '100%', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 12, resize: 'vertical', fontFamily: 'inherit' }} />
+                            {stepDraft.channel === 'sms' && (
+                              <div style={{ fontSize: 10, color: (stepDraft.body||'').length > 160 ? '#92400e' : 'var(--text-muted)', marginTop: 2, textAlign: 'right' }}>
+                                {(stepDraft.body||'').length} chars {(stepDraft.body||'').length > 160 ? '· multiple SMS segments' : '· 1 SMS segment'}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Template name */}
+                          <div style={{ marginBottom: 8 }}>
+                            <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>
+                              Template Name <span style={{ fontWeight: 400, color: '#aaa' }}>(unique slug — auto-generated)</span>
+                            </label>
+                            <input value={stepDraft.template_name || ''}
+                              onChange={e => { setStepTnameManual(true); setStepDraft(d => ({...d, template_name: e.target.value})); }}
+                              style={{ width: '100%', padding: '4px 8px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, fontFamily: 'monospace', color: 'var(--text-muted)' }} />
+                          </div>
+
+                          {/* Terminal */}
+                          <div style={{ marginBottom: 14, display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <input type="checkbox" id="terminal-chk" checked={!!stepDraft.terminal}
+                              onChange={e => setStepDraft(d => ({...d, terminal: e.target.checked}))} />
+                            <label htmlFor="terminal-chk" style={{ fontSize: 11, color: 'var(--text-muted)', cursor: 'pointer' }}>
+                              Terminal step — marks lead cold + deletes smile image
+                            </label>
+                          </div>
+
+                          {/* Save / Cancel / Delete */}
+                          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <button className="btn btn-teal btn-sm" onClick={saveStep} disabled={saving}>{saving ? 'Saving…' : 'Save Step'}</button>
+                            <button className="btn btn-ghost btn-sm" onClick={() => setEditingStep(null)}>Cancel</button>
+                            {editingStep.id && (
+                              <button className="btn btn-sm" style={{ marginLeft: 'auto', background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                                onClick={() => deleteStep(editingStep.id)} disabled={saving}>Delete Step</button>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Placeholder reference panel */}
+                        <div style={{ width: 180, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 12, flexShrink: 0, overflowY: 'auto' }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 8 }}>Placeholders</div>
+                          {[
+                            ['{first_name}', 'Patient first name — always safe'],
+                            ['{unsub_url}', 'Unsubscribe link — email only'],
+                          ].map(([ph, desc]) => (
+                            <div key={ph} style={{ marginBottom: 8 }}>
+                              <code style={{ fontSize: 10, background: 'var(--teal-light)', color: 'var(--teal-dark)', padding: '2px 5px', borderRadius: 3, display: 'block', marginBottom: 2 }}>{ph}</code>
+                              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{desc}</div>
+                            </div>
+                          ))}
+                          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8, marginTop: 4 }}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 6 }}>Baked in by AI</div>
+                            {['Practice name','Doctor name','Phone number','Booking link','Address'].map(item => (
+                              <div key={item} style={{ fontSize: 10, color: '#aaa', marginBottom: 3 }}>✓ {item}</div>
+                            ))}
+                          </div>
+                          {stepDraft.channel === 'sms' && (
+                            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8, marginTop: 4 }}>
+                              <div style={{ fontSize: 10, color: '#f59e0b', fontWeight: 600 }}>SMS tip</div>
+                              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }}>End with "Reply STOP to opt out." and keep under 160 chars for 1 segment.</div>
+                            </div>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      /* Empty state when no step selected */
+                      <div style={{ flex: 1, background: '#fff', border: '1px solid var(--border)', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
+                        <div style={{ fontSize: 32 }}>📋</div>
+                        <div style={{ fontWeight: 600 }}>Select a step to edit, or add a new one</div>
+                        <button className="btn btn-teal btn-sm" onClick={openNewStep}>+ Add Step</button>
                       </div>
                     )}
                   </div>
+                </div>
+              </>
+            ) : (
+              <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 32, textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, flex: 1 }}>
+                {loading ? 'Loading workflows…' : (
+                  <>
+                    <div style={{ fontSize: 28, marginBottom: 8 }}>📋</div>
+                    <div>Select or create a workflow on the left</div>
+                  </>
                 )}
               </div>
-            </div>
-          </>
-        ) : (
-          <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 32, textAlign: 'center', color: 'var(--text-muted)', fontSize: 12 }}>
-            {loading ? 'Loading workflows…' : 'Select or create a workflow on the left'}
+            )}
           </div>
-        )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Practice Information Card ─────────────────────────────────────────────────
+function PracticeSettingsCard() {
+  const emptyForm = {
+    name:'', phone:'', email:'', doctor_name:'', address:'', hours:'', review_link:'',
+    booking_link_consult:'', booking_link_exam:'', booking_link_implant:'',
+    booking_link_ortho:'', booking_link_general:'',
+  };
+  const [form, setForm] = React.useState(emptyForm);
+  const [loaded, setLoaded] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [msg, setMsg] = React.useState('');
+
+  React.useEffect(() => {
+    api('/api/admin/practice-settings').then(data => {
+      setForm(f => ({...f, ...data}));
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  async function handleSave(e) {
+    e.preventDefault();
+    setSaving(true); setMsg('');
+    try {
+      await api('/api/admin/practice-settings', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(form),
+      });
+      setMsg('Saved ✓');
+      setTimeout(() => setMsg(''), 3000);
+    } catch(err) { setMsg('Error: ' + err.message); }
+    setSaving(false);
+  }
+
+  function field(key, label, placeholder, token) {
+    return (
+      <div style={{marginBottom:8}}>
+        <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:2}}>
+          {label} {token && <span style={{fontFamily:'monospace',fontSize:9,color:'var(--teal)',background:'var(--teal-light)',padding:'1px 4px',borderRadius:3}}>{token}</span>}
+        </label>
+        <input
+          value={form[key] || ''}
+          onChange={e => setForm(f => ({...f, [key]: e.target.value}))}
+          placeholder={placeholder}
+          style={{width:'100%',padding:'4px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}
+        />
       </div>
+    );
+  }
+
+  if (!loaded) return null;
+
+  return (
+    <div className="report-section" style={{marginBottom:12}}>
+      <div className="report-title" style={{marginBottom:12}}>🏥 Practice Information</div>
+      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+        Used by AI to generate messages. Values are baked into generated text — keep them current.
+      </div>
+      <form onSubmit={handleSave}>
+        <div style={{fontSize:10,fontWeight:700,textTransform:'uppercase',color:'var(--text-muted)',marginBottom:6,letterSpacing:.5}}>Contact Info</div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0 12px'}}>
+          {field('name','Practice Name','Grafton Dental Care','{practice_name}')}
+          {field('doctor_name','Doctor Name','Dr. Anurag Gupta','{doctor_name}')}
+          {field('phone','Phone','508-318-4477','{practice_phone}')}
+          {field('email','Email','info@graftondentalcare.com',null)}
+          {field('hours','Office Hours','Mon–Fri 8am–5pm',null)}
+          {field('review_link','Google Review Link','https://g.page/r/...',null)}
+        </div>
+        {field('address','Address (city/state)','Grafton, MA',null)}
+
+        <div style={{fontSize:10,fontWeight:700,textTransform:'uppercase',color:'var(--text-muted)',marginBottom:6,marginTop:12,letterSpacing:.5}}>Booking Links</div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0 12px'}}>
+          {field('booking_link_consult','Consultation',  'https://visitgdc.com/...', null)}
+          {field('booking_link_exam',   'New Patient Exam','https://visitgdc.com/...', null)}
+          {field('booking_link_implant','Implant Consult','https://visitgdc.com/...', null)}
+          {field('booking_link_ortho',  'Ortho / Invisalign','https://visitgdc.com/...', null)}
+          {field('booking_link_general','General / Default','https://visitgdc.com', null)}
+        </div>
+
+        <div style={{display:'flex',gap:8,alignItems:'center',marginTop:10}}>
+          <button type="submit" className="btn btn-teal btn-sm" disabled={saving}>
+            {saving ? 'Saving…' : 'Save Practice Info'}
+          </button>
+          {msg && <span style={{fontSize:11,color:msg.startsWith('Error')?'var(--red)':'var(--green)'}}>{msg}</span>}
+        </div>
+      </form>
     </div>
   );
 }
 
 
 // ── OD Connection Card ────────────────────────────────────────────────────────
+function AISettingsCard() {
+  const [key, setKey] = React.useState('');
+  const [loaded, setLoaded] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [saveMsg, setSaveMsg] = React.useState('');
+
+  React.useEffect(() => {
+    api('/api/admin/ai-settings').then(r => {
+      setKey(r.anthropic_api_key || '');
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  async function handleSave(e) {
+    e.preventDefault();
+    setSaving(true); setSaveMsg('');
+    try {
+      await api('/api/admin/ai-settings', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ anthropic_api_key: key }),
+      });
+      setSaveMsg('Saved ✓');
+      setTimeout(() => setSaveMsg(''), 3000);
+    } catch(err) {
+      setSaveMsg('Error: ' + err.message);
+    }
+    setSaving(false);
+  }
+
+  if (!loaded) return null;
+
+  return (
+    <div className="report-section" style={{marginBottom:12}}>
+      <div className="report-title" style={{marginBottom:12}}>🤖 AI Settings</div>
+      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+        Used for AI-generated workflow sequences. Get your key at{' '}
+        <strong>console.anthropic.com → API Keys</strong>.
+      </div>
+      <form onSubmit={handleSave} style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+        <label style={{fontSize:11,fontWeight:600,minWidth:120}}>Anthropic API Key</label>
+        <input
+          type="password"
+          value={key}
+          onChange={e => setKey(e.target.value)}
+          placeholder="sk-ant-..."
+          style={{flex:1,minWidth:200,padding:'4px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}
+        />
+        <button type="submit" className="btn btn-teal btn-sm" disabled={saving}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        {saveMsg && <span style={{fontSize:11,color:saveMsg.startsWith('Error')?'var(--red)':'var(--green)'}}>{saveMsg}</span>}
+      </form>
+    </div>
+  );
+}
+
 function ODConnectionCard() {
   const [form, setForm] = React.useState({
     od_db_host: '', od_db_port: 3306, od_db_user: '', od_db_password: '',
@@ -3277,9 +5312,10 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
           <button className="btn btn-teal" onClick={()=>handleAction('gads', onGAds)} disabled={loading.gads}>
             {loading.gads?'Syncing...':'Google Ads Sync'}
           </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('conv', onConversions)} disabled={loading.conv}>
+          {/* Upload Conversions — hidden until conversion actions are created in Google Ads */}
+          {/* <button className="btn btn-teal" onClick={()=>handleAction('conv', onConversions)} disabled={loading.conv}>
             {loading.conv?'Uploading...':'Upload Conversions'}
-          </button>
+          </button> */}
           <button className="btn btn-teal" onClick={()=>handleAction('ga4', onGA4Refresh)} disabled={loading.ga4}>
             {loading.ga4?'Pulling...':'Refresh GA4 Data'}
           </button>
@@ -3288,6 +5324,10 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
           </button>
         </div>
       </div>
+
+      <PracticeSettingsCard />
+
+      <AISettingsCard />
 
       <ODConnectionCard />
 
@@ -3443,6 +5483,83 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
   );
 }
 
+function InboxTab({ onOpenLead }) {
+  const [data, setData] = useState({ count: 0, leads: [] });
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    loadInbox();
+    const t = setInterval(loadInbox, 15000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function loadInbox() {
+    try {
+      const d = await api('/api/admin/inbox/unread');
+      setData(d);
+    } catch(e) { console.error('inbox load error', e); }
+    finally { setLoading(false); }
+  }
+
+  async function markRead(leadId) {
+    await api('/api/admin/lead/' + leadId + '/mark-read', { method: 'POST' });
+    loadInbox();
+    // Notify the App bell so the badge count refreshes immediately
+    try { window.dispatchEvent(new CustomEvent('inbox-unread-changed')); } catch(_) {}
+  }
+
+  if (loading) return <div style={{padding:20,color:'var(--text-muted)',fontSize:12}}>Loading…</div>;
+
+  return (
+    <div style={{maxWidth:700}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
+        <div style={{fontSize:14,fontWeight:700}}>Unread Messages</div>
+        {data.count > 0 && (
+          <span style={{background:'var(--red)',color:'#fff',borderRadius:10,padding:'1px 7px',fontSize:11,fontWeight:700}}>
+            {data.count}
+          </span>
+        )}
+      </div>
+      {data.leads.length === 0 ? (
+        <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'24px',textAlign:'center',color:'var(--text-muted)',fontSize:12}}>
+          ✓ All caught up — no unread messages
+        </div>
+      ) : (
+        data.leads.map(l => {
+          const name = [l.first_name, l.last_name].filter(Boolean).join(' ') || l.phone || 'Unknown';
+          const ago = timeAgo(l.last_received_at);
+          return (
+            <div key={l.lead_id} style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,
+              padding:'10px 14px',marginBottom:6,display:'flex',gap:10,alignItems:'flex-start'}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:3}}>
+                  <span style={{fontWeight:700,fontSize:12}}>{name}</span>
+                  <span style={{background:'var(--red)',color:'#fff',borderRadius:8,padding:'0 5px',fontSize:9,fontWeight:700}}>
+                    {l.unread_count} new
+                  </span>
+                  <span style={{fontSize:9,color:'var(--text-muted)'}}>{ago}</span>
+                </div>
+                <div style={{fontSize:11,color:'var(--text)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:420}}>
+                  {l.last_body}
+                </div>
+                {l.phone && <div style={{fontSize:9,color:'var(--text-muted)',marginTop:1}}>{l.phone}</div>}
+              </div>
+              <div style={{display:'flex',gap:4,flexShrink:0}}>
+                <button className="btn btn-teal btn-sm" onClick={() => { onOpenLead && onOpenLead(l.lead_id); }}>
+                  Open
+                </button>
+                <button className="btn btn-ghost btn-sm" onClick={() => markRead(l.lead_id)}>
+                  ✓ Read
+                </button>
+              </div>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [tab, setTab] = useState('dashboard');  // Dashboard is now the landing tab
   const [pipeline, setPipeline] = useState([]);
@@ -3452,12 +5569,35 @@ function App() {
   const [ga4Data, setGa4Data] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [showNotifPanel, setShowNotifPanel] = useState(false);
+  const [notifLeads, setNotifLeads] = useState([]);
+  const [desktopPermission, setDesktopPermission] = useState(
+    typeof Notification !== 'undefined' ? Notification.permission : 'denied'
+  );
+  const prevUnreadRef = React.useRef(null);
+  const prevLeadIdsRef = React.useRef(null); // track which lead_ids had unread last poll
 
   useEffect(() => {
     loadData();
     const interval = setInterval(loadData, 30000);
-    return () => clearInterval(interval);
+    // Re-fetch inbox count immediately when a lead is marked read (from DetailPanel or InboxTab)
+    window.addEventListener('inbox-unread-changed', loadData);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('inbox-unread-changed', loadData);
+    };
   }, []);
+
+  // Update browser tab title
+  useEffect(() => {
+    document.title = unreadCount > 0 ? `(${unreadCount}) nXtSmile Pipeline` : 'nXtSmile Pipeline';
+  }, [unreadCount]);
+
+  function requestDesktopNotifications() {
+    if (typeof Notification === 'undefined') return;
+    Notification.requestPermission().then(p => setDesktopPermission(p));
+  }
 
   async function loadData() {
     try {
@@ -3472,6 +5612,30 @@ function App() {
       setCampaignStats(c.campaigns || []);
       setKeywordStats(c.keywords || []);
       if (g) setGa4Data(g);
+      api('/api/admin/inbox/unread').then(d => {
+        const newCount = d.count || 0;
+        const leads = d.leads || [];
+        setNotifLeads(leads);
+        // Fire desktop notification for each newly-appeared unread lead
+        // Read permission live (avoids stale closure after user grants mid-session)
+        const livePermission = typeof Notification !== 'undefined' ? Notification.permission : 'denied';
+        if (livePermission === 'granted' && prevLeadIdsRef.current !== null) {
+          const prevIds = prevLeadIdsRef.current;
+          const newLeads = leads.filter(l => !prevIds.has(l.lead_id));
+          newLeads.forEach(l => {
+            const name = [l.first_name, l.last_name].filter(Boolean).join(' ') || l.phone || 'Unknown';
+            const n = new Notification('nXtSmile — New SMS', {
+              body: `${name}: ${(l.last_body || '').slice(0, 80)}`,
+              icon: '/favicon.ico',
+              tag: `sms-${l.lead_id}`,
+            });
+            n.onclick = () => { window.focus(); n.close(); };
+          });
+        }
+        prevLeadIdsRef.current = new Set(leads.map(l => l.lead_id));
+        prevUnreadRef.current = newCount;
+        setUnreadCount(newCount);
+      }).catch(() => {});
     } catch (e) {
       console.error('Load error:', e);
     } finally {
@@ -3489,10 +5653,108 @@ function App() {
         <div className="header-logo">nXt<span>smile</span> Pipeline</div>
         <div className="header-right">
           <div className="header-dot" />
-          Live
+          <span style={{fontSize:10,opacity:.7}}>Live</span>
+
+          {/* Desktop notification permission prompt */}
+          {desktopPermission === 'default' && (
+            <button onClick={requestDesktopNotifications}
+              style={{fontSize:10,padding:'2px 8px',borderRadius:4,border:'1px solid rgba(255,255,255,.4)',
+                background:'rgba(255,255,255,.1)',color:'#fff',cursor:'pointer',display:'flex',alignItems:'center',gap:4}}>
+              🔔 Enable alerts
+            </button>
+          )}
+
+          {/* Bell icon with dropdown */}
+          <div style={{position:'relative'}}>
+            <button onClick={() => setShowNotifPanel(v => !v)}
+              style={{background:'none',border:'none',cursor:'pointer',color:'#fff',padding:'2px 4px',
+                display:'flex',alignItems:'center',gap:4,position:'relative'}}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+              </svg>
+              {unreadCount > 0 && (
+                <span style={{position:'absolute',top:-4,right:-4,background:'var(--red)',color:'#fff',
+                  borderRadius:'50%',minWidth:16,height:16,fontSize:9,fontWeight:700,
+                  display:'flex',alignItems:'center',justifyContent:'center',padding:'0 3px',lineHeight:1}}>
+                  {unreadCount > 9 ? '9+' : unreadCount}
+                </span>
+              )}
+            </button>
+
+            {/* Click-outside overlay */}
+            {showNotifPanel && (
+              <div onClick={() => setShowNotifPanel(false)}
+                style={{position:'fixed',inset:0,zIndex:9998}} />
+            )}
+
+            {/* Notification dropdown panel */}
+            {showNotifPanel && (
+              <div style={{position:'absolute',top:'calc(100% + 8px)',right:0,width:320,
+                background:'#fff',borderRadius:8,boxShadow:'0 8px 32px rgba(0,0,0,.18)',
+                border:'1px solid var(--border)',zIndex:9999,overflow:'hidden'}}>
+                <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',
+                  padding:'10px 14px',borderBottom:'1px solid var(--border)'}}>
+                  <span style={{fontSize:12,fontWeight:700,color:'var(--text)'}}>
+                    Unread Messages {unreadCount > 0 && (
+                      <span style={{background:'var(--red)',color:'#fff',borderRadius:8,
+                        padding:'0 5px',fontSize:9,fontWeight:700,marginLeft:4}}>{unreadCount}</span>
+                    )}
+                  </span>
+                  <button onClick={() => { setShowNotifPanel(false); setTab('inbox'); }}
+                    style={{fontSize:10,color:'var(--teal)',background:'none',border:'none',cursor:'pointer',fontWeight:600}}>
+                    View all →
+                  </button>
+                </div>
+                <div style={{maxHeight:320,overflowY:'auto'}}>
+                  {notifLeads.length === 0 ? (
+                    <div style={{padding:'20px',textAlign:'center',color:'var(--text-muted)',fontSize:11}}>
+                      ✓ All caught up
+                    </div>
+                  ) : notifLeads.slice(0, 8).map(l => {
+                    const name = [l.first_name, l.last_name].filter(Boolean).join(' ') || l.phone || 'Unknown';
+                    return (
+                      <div key={l.lead_id}
+                        onClick={() => { setShowNotifPanel(false); setSelectedId(l.lead_id); setTab('pipeline'); }}
+                        style={{display:'flex',gap:10,padding:'10px 14px',cursor:'pointer',
+                          borderBottom:'1px solid var(--border)',background:'#fff'}}
+                        onMouseOver={e => e.currentTarget.style.background='var(--teal-light)'}
+                        onMouseOut={e => e.currentTarget.style.background='#fff'}>
+                        <div style={{width:32,height:32,borderRadius:'50%',background:'var(--teal-light)',
+                          display:'flex',alignItems:'center',justifyContent:'center',
+                          fontSize:12,fontWeight:700,color:'var(--teal)',flexShrink:0}}>
+                          {(name[0]||'?').toUpperCase()}
+                        </div>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:2}}>
+                            <span style={{fontWeight:700,fontSize:11,color:'var(--text)'}}>{name}</span>
+                            <span style={{background:'var(--red)',color:'#fff',borderRadius:8,
+                              padding:'0 4px',fontSize:8,fontWeight:700}}>{l.unread_count} new</span>
+                          </div>
+                          <div style={{fontSize:10,color:'var(--text-muted)',overflow:'hidden',
+                            textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{l.last_body}</div>
+                          <div style={{fontSize:9,color:'var(--text-muted)',marginTop:1}}>{timeAgo(l.last_received_at)}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
       <div className="tab-bar">
+        <button className={'tab' + (tab === 'inbox' ? ' active' : '')} onClick={() => { setTab('inbox'); setShowNotifPanel(false); }} style={{position:'relative'}}>
+          Inbox
+          {unreadCount > 0 && (
+            <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',
+              background:'var(--red)',color:'#fff',borderRadius:8,fontSize:8,fontWeight:700,
+              padding:'0 5px',minWidth:14,height:14,marginLeft:4,lineHeight:1}}>
+              {unreadCount > 9 ? '9+' : unreadCount}
+            </span>
+          )}
+        </button>
         <button className={'tab' + (tab === 'dashboard' ? ' active' : '')} onClick={() => setTab('dashboard')}>Dashboard</button>
         <button className={'tab' + (tab === 'pipeline' ? ' active' : '')} onClick={() => setTab('pipeline')}>Pipeline</button>
         <button className={'tab' + (tab === 'reports' ? ' active' : '')} onClick={() => setTab('reports')}>Reports & Campaigns</button>
@@ -3504,6 +5766,9 @@ function App() {
           <div style={{ textAlign: 'center', padding: 20, color: 'var(--text-muted)' }}>Loading...</div>
         ) : (
           <React.Fragment>
+            {tab === 'inbox' && (
+              <InboxTab onOpenLead={(id) => { setSelectedId(id); setTab('pipeline'); }} />
+            )}
             {tab === 'dashboard' && (
               <DashboardTab pipeline={pipeline} stats={stats} onTabSwitch={setTab} />
             )}

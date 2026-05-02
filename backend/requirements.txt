@@ -8,5 +8,7 @@ twilio==9.3.4
 pymysql==1.1.1
 python-multipart==0.0.12
 httpx==0.27.2
-google-analytics-data==0.18.7
+google-analytics-data>=0.21.0
 google-cloud-storage==2.18.2
+google-ads==25.1.0
+anthropic>=0.25.0

@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS leads (
     tx_accepted_at  TEXT DEFAULT '',
     tx_completed_at TEXT DEFAULT '',
     cold_at         TEXT DEFAULT '',
+    tags        TEXT DEFAULT '[]',
     updated_at  TEXT NOT NULL
 );
 
@@ -457,6 +458,51 @@ CREATE TABLE IF NOT EXISTS sms_messages (
 CREATE INDEX IF NOT EXISTS idx_sms_messages_lead ON sms_messages(lead_id);
 CREATE INDEX IF NOT EXISTS idx_sms_messages_from ON sms_messages(from_number);
 CREATE INDEX IF NOT EXISTS idx_sms_messages_received ON sms_messages(received_at DESC);
+
+CREATE TABLE IF NOT EXISTS lead_calls (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id     TEXT NOT NULL,
+    direction   TEXT NOT NULL DEFAULT 'outbound',  -- 'outbound' | 'inbound'
+    outcome     TEXT NOT NULL DEFAULT 'no_answer', -- 'spoke' | 'left_vm' | 'no_answer' | 'callback_scheduled'
+    duration_sec INTEGER DEFAULT 0,
+    notes       TEXT DEFAULT '',
+    logged_by   TEXT DEFAULT 'admin',
+    logged_at   TEXT NOT NULL,
+    FOREIGN KEY (lead_id) REFERENCES leads(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lead_calls_lead ON lead_calls(lead_id);
+CREATE INDEX IF NOT EXISTS idx_lead_calls_logged ON lead_calls(logged_at DESC);
+
+-- ── Managed Campaigns ─────────────────────────────────────────────────────────
+-- Tracks manually created and linked campaigns for attribution + planning.
+-- campaign_id is a logical key (GAds numeric ID or auto-generated slug); NOT always a GAds ID.
+-- Lead attribution still matches on lead.campaign_name — rename a campaign carefully.
+CREATE TABLE IF NOT EXISTS campaigns (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     TEXT NOT NULL UNIQUE,   -- GAds ID or auto-slug; logical key
+    campaign_name   TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'DRAFT',   -- DRAFT, ACTIVE, PAUSED, COMPLETED, ARCHIVED
+    campaign_type   TEXT NOT NULL DEFAULT 'MANUAL',  -- MANUAL, GOOGLE_ADS, META, EMAIL
+    -- Dental-specific fields
+    service_focus   TEXT DEFAULT '',        -- Implants, Invisalign, Whitening, Emergency, New Patient, Hygiene, Cosmetic
+    promo_offer     TEXT DEFAULT '',        -- e.g. "$99 exam + X-ray", "Free implant consult"
+    target_audience TEXT DEFAULT '',        -- free-text description
+    -- Planning
+    objective       TEXT DEFAULT '',        -- e.g. "20 implant consults in 30 days"
+    monthly_budget  REAL DEFAULT 0.0,
+    expected_cpl    REAL DEFAULT 0.0,       -- target cost per lead $
+    start_date      TEXT DEFAULT '',        -- YYYY-MM-DD
+    end_date        TEXT DEFAULT '',        -- YYYY-MM-DD (optional)
+    landing_page    TEXT DEFAULT '',        -- URL
+    notes           TEXT DEFAULT '',
+    -- Meta
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
+CREATE INDEX IF NOT EXISTS idx_campaigns_type   ON campaigns(campaign_type);
 """
 
 LIFECYCLE_STAGES = [
@@ -537,6 +583,13 @@ def _migrate(conn):
         ("cold_at",             "TEXT DEFAULT ''"),
         # GCS blob name for re-signing fresh signed URLs at email-send time
         ("smile_blob_name",     "TEXT DEFAULT ''"),
+        # Next-action tracking
+        ("next_action_at",      "TEXT DEFAULT ''"),
+        ("next_action_note",    "TEXT DEFAULT ''"),
+        # OD relationship classification
+        ("od_relationship",     "TEXT DEFAULT 'cold'"),
+        # Lead tags (JSON array of strings)
+        ("tags",                "TEXT DEFAULT '[]'"),
     ]
 
     for col_name, col_type in new_columns:
@@ -562,6 +615,53 @@ def _migrate(conn):
             FOREIGN KEY (lead_id) REFERENCES leads(id)
         )
     """)
+
+    # Add read_at column to sms_messages if missing
+    sms_cols = {row[1] for row in conn.execute("PRAGMA table_info(sms_messages)").fetchall()}
+    if "read_at" not in sms_cols:
+        conn.execute("ALTER TABLE sms_messages ADD COLUMN read_at TEXT DEFAULT NULL")
+
+    # Create lead_calls table if not exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lead_calls (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id      TEXT NOT NULL,
+            direction    TEXT NOT NULL DEFAULT 'outbound',
+            outcome      TEXT NOT NULL DEFAULT 'no_answer',
+            duration_sec INTEGER DEFAULT 0,
+            notes        TEXT DEFAULT '',
+            logged_by    TEXT DEFAULT 'admin',
+            logged_at    TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lead_calls_lead ON lead_calls(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lead_calls_logged ON lead_calls(logged_at DESC)")
+
+    # Managed campaigns table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id     TEXT NOT NULL UNIQUE,
+            campaign_name   TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'DRAFT',
+            campaign_type   TEXT NOT NULL DEFAULT 'MANUAL',
+            service_focus   TEXT DEFAULT '',
+            promo_offer     TEXT DEFAULT '',
+            target_audience TEXT DEFAULT '',
+            objective       TEXT DEFAULT '',
+            monthly_budget  REAL DEFAULT 0.0,
+            expected_cpl    REAL DEFAULT 0.0,
+            start_date      TEXT DEFAULT '',
+            end_date        TEXT DEFAULT '',
+            landing_page    TEXT DEFAULT '',
+            notes           TEXT DEFAULT '',
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_type   ON campaigns(campaign_type)")
 
     # Create indexes if missing
     conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_gclid ON leads(gclid)")
@@ -1116,7 +1216,7 @@ def upsert_lead(data: dict) -> dict:
                         "appointment_date","appointment_status","no_show_count",
                         "keyword_text","search_term","ad_group_name","ad_group_id",
                         "ad_id","ad_name","campaign_name","campaign_id",
-                        "click_cost","gads_synced_at"]:
+                        "click_cost","gads_synced_at","tags"]:
                 if data.get(col) not in (None, ""):
                     fields.append(f"{col}=?")
                     values.append(data[col])
@@ -1136,23 +1236,43 @@ def upsert_lead(data: dict) -> dict:
                     first_name, last_name, email, phone, phone_hash, email_hash,
                     goals, gclid, fbclid, msclkid, utm_source, utm_medium,
                     utm_campaign, utm_term, utm_content, landing_url,
-                    smile_image_url, smile_blob_name, notes)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    smile_image_url, smile_blob_name, notes, tags)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
-                data.get("source", "unknown"), data.get("stage", "new"),
+                data.get("source") or "unknown", data.get("stage", "new"),
                 data.get("first_name", ""), data.get("last_name", ""),
                 email_raw, phone_raw,
                 _hash_phone(phone_raw) if phone_raw else "",
                 _hash(email_raw) if email_raw else "",
                 json.dumps(data.get("goals", [])) if isinstance(data.get("goals"), list) else data.get("goals", ""),
                 data.get("gclid", ""), data.get("fbclid", ""), data.get("msclkid", ""),
-                data.get("utm_source", ""), data.get("utm_medium", ""),
+                data.get("utm_source") or "", data.get("utm_medium") or "",
                 data.get("utm_campaign", ""), data.get("utm_term", ""),
-                data.get("utm_content", ""), data.get("landing_url", ""),
+                data.get("utm_content", ""), data.get("landing_url") or "",
                 data.get("smile_image_url", ""), data.get("smile_blob_name", ""),
                 data.get("notes", ""),
+                data.get("tags", "[]"),
             ))
+            # Auto-note: inline into same connection so no nested-transaction risk
+            try:
+                src = data.get("source") or "unknown"
+                utm_s = data.get("utm_source") or ""
+                utm_m = data.get("utm_medium") or ""
+                utm = f"{utm_s}/{utm_m}" if (utm_s or utm_m) else ""
+                url = (data.get("landing_url") or "")[:200]
+                parts = [f"Lead created via {src}"]
+                if utm and utm != "/":
+                    parts.append(utm)
+                if url:
+                    parts.append(url)
+                note_text = " — ".join(parts)
+                conn.execute(
+                    "INSERT INTO lead_notes (lead_id, note_text, author, created_at) VALUES (?,?,?,?)",
+                    (lead_id, note_text, "system", now),
+                )
+            except Exception:
+                pass  # Auto-note failure must never block lead creation
         return dict(conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
 
 
@@ -1495,6 +1615,19 @@ def get_pipeline_stats() -> dict:
         """).fetchone()[0]
         no_show_count = counts.get("no_show", 0)
         scheduled_count = counts.get("scheduled", 0)
+        # Hot leads: implant prospects / reactivations not yet completed,
+        # no-shows, or leads with an active treatment plan value.
+        # NOTE: The OR-chain is intentional — no_show is excluded from clause 1
+        # by 'stage NOT IN' but re-included by clause 2. Keep the comment.
+        hot_leads_count = conn.execute("""
+            SELECT COUNT(*) FROM leads WHERE (
+                (od_relationship IN ('implant_prospect','reactivation')
+                 AND stage NOT IN ('treatment_completed','cold'))
+                OR (stage = 'no_show' AND no_show_count >= 1)
+                OR (treatment_plan_value > 0
+                    AND stage NOT IN ('treatment_completed','cold'))
+            )
+        """).fetchone()[0]
 
         return {
             "total_leads": total,
@@ -1506,7 +1639,36 @@ def get_pipeline_stats() -> dict:
             "sent_today": sent_today,
             "no_show_count": no_show_count,
             "scheduled_count": scheduled_count,
+            "hot_leads_count": hot_leads_count,
         }
+
+
+def get_hot_leads() -> list:
+    """
+    Return up to 20 leads that are 'hot' — implant prospects, reactivations,
+    no-shows, or leads with an active treatment plan value — ordered by
+    relationship priority then treatment plan value descending.
+    """
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM leads
+            WHERE (
+                (od_relationship IN ('implant_prospect','reactivation')
+                 AND stage NOT IN ('treatment_completed','cold'))
+                OR (stage = 'no_show' AND no_show_count >= 1)
+                OR (treatment_plan_value > 0
+                    AND stage NOT IN ('treatment_completed','cold'))
+            )
+            ORDER BY
+                CASE od_relationship
+                    WHEN 'implant_prospect' THEN 1
+                    WHEN 'reactivation' THEN 2
+                    ELSE 3
+                END,
+                treatment_plan_value DESC
+            LIMIT 20
+        """).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ─── Lead Notes ─────────────────────────────────────────────────────────────
@@ -1546,6 +1708,32 @@ def delete_note(note_id: int) -> bool:
     with _conn() as conn:
         conn.execute("DELETE FROM lead_notes WHERE id=?", (note_id,))
         return True
+
+
+# ─── Lead Tags ───────────────────────────────────────────────────────────────
+
+def get_lead_tags(lead_id: str) -> list:
+    lead = get_lead(lead_id)
+    if not lead:
+        return []
+    raw = lead.get("tags") or "[]"
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def set_lead_tags(lead_id: str, tags: list) -> list:
+    """Replace the tag list for a lead. Normalizes: lowercase, strip, non-empty, dedupe."""
+    normalized = list(dict.fromkeys(
+        t.lower().strip() for t in tags
+        if isinstance(t, str) and t.strip()
+    ))
+    serialized = json.dumps(normalized)
+    now = _now()
+    with _conn() as conn:
+        conn.execute("UPDATE leads SET tags=?, updated_at=? WHERE id=?", (serialized, now, lead_id))
+    return normalized
 
 
 # ─── Force stage (admin override — allows backward movement) ───────────────
@@ -1651,6 +1839,74 @@ def get_google_ads_campaigns() -> list:
             ORDER BY campaign_name
         """).fetchall()
         return [r["campaign_name"] for r in rows]
+
+
+def get_all_campaigns() -> list:
+    """Return all managed campaigns ordered by created_at desc."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM campaigns ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_campaign(data: dict) -> dict:
+    """Insert a new campaign row. Returns the created row as a dict."""
+    now = _now()
+    # Auto-generate a slug if no campaign_id provided
+    campaign_id = (data.get("campaign_id") or "").strip()
+    if not campaign_id:
+        slug = data["campaign_name"].lower().replace(" ", "_")
+        # keep only alphanumeric + underscore, max 50 chars
+        import re as _re
+        slug = _re.sub(r"[^a-z0-9_]", "", slug)[:50]
+        campaign_id = f"manual_{slug}_{now[:10].replace('-','')}"
+
+    # DRAFT if no start_date, else ACTIVE
+    status = data.get("status") or ("ACTIVE" if data.get("start_date") else "DRAFT")
+
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO campaigns
+                (campaign_id, campaign_name, status, campaign_type,
+                 service_focus, promo_offer, target_audience, objective,
+                 monthly_budget, expected_cpl, start_date, end_date,
+                 landing_page, notes, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            campaign_id,
+            data["campaign_name"],
+            status,
+            data.get("campaign_type", "MANUAL"),
+            data.get("service_focus", ""),
+            data.get("promo_offer", ""),
+            data.get("target_audience", ""),
+            data.get("objective", ""),
+            float(data.get("monthly_budget") or 0),
+            float(data.get("expected_cpl") or 0),
+            data.get("start_date", ""),
+            data.get("end_date", ""),
+            data.get("landing_page", ""),
+            data.get("notes", ""),
+            now, now,
+        ))
+        row = conn.execute(
+            "SELECT * FROM campaigns WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()
+        return dict(row)
+
+
+def update_campaign_status(campaign_id: str, status: str) -> bool:
+    """Patch a campaign's status (ACTIVE, PAUSED, COMPLETED, ARCHIVED)."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE campaigns SET status=?, updated_at=? WHERE campaign_id=?",
+            (status, now, campaign_id)
+        )
+        return conn.execute(
+            "SELECT COUNT(*) FROM campaigns WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()[0] > 0
 
 
 def get_distinct_sources() -> list:
@@ -3099,3 +3355,104 @@ def insert_sms_message(
 def add_lead_event(lead_id: str, event_type: str, detail: str = "", source: str = "system") -> dict:
     """Thin wrapper around add_event for use by stop_engine and webhooks."""
     return add_event(lead_id, event_type, detail=detail, source=source)
+
+
+# ─── Unread SMS / Inbox ───────────────────────────────────────────────────────
+
+def get_unread_sms_count() -> int:
+    """Count inbound SMS messages not yet read by staff."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM sms_messages WHERE direction='inbound' AND read_at IS NULL"
+        ).fetchone()
+        return row[0] if row else 0
+
+
+def get_unread_sms_leads() -> list:
+    """
+    Return leads that have at least one unread inbound SMS, with the most recent
+    unread message body + timestamp. Ordered by most recent message first.
+    """
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                sm.lead_id,
+                l.first_name,
+                l.last_name,
+                l.phone,
+                l.stage,
+                COUNT(sm.id)              AS unread_count,
+                MAX(sm.received_at)       AS last_received_at,
+                (SELECT body FROM sms_messages
+                 WHERE lead_id = sm.lead_id AND direction = 'inbound' AND read_at IS NULL
+                 ORDER BY received_at DESC LIMIT 1) AS last_body
+            FROM sms_messages sm
+            LEFT JOIN leads l ON l.id = sm.lead_id
+            WHERE sm.direction = 'inbound' AND sm.read_at IS NULL
+            GROUP BY sm.lead_id
+            ORDER BY last_received_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_sms_read(lead_id: str) -> int:
+    """Mark all unread inbound SMS for a lead as read. Returns rows updated."""
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE sms_messages SET read_at=? "
+            "WHERE lead_id=? AND direction='inbound' AND read_at IS NULL",
+            (now, lead_id)
+        )
+        return cur.rowcount
+
+
+# ─── Call Log ─────────────────────────────────────────────────────────────────
+
+def log_call(lead_id: str, direction: str, outcome: str,
+             duration_sec: int = 0, notes: str = "", logged_by: str = "admin") -> int:
+    """Log a phone call attempt or received call. Returns new row id."""
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO lead_calls (lead_id, direction, outcome, duration_sec, notes, logged_by, logged_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (lead_id, direction, outcome, duration_sec, notes, logged_by, now)
+        )
+        # Update last_staff_contact_at: any outbound attempt, or any direction if outcome='spoke'
+        if direction == "outbound" or outcome == "spoke":
+            conn.execute(
+                "UPDATE leads SET last_staff_contact_at=? WHERE id=?", (now, lead_id)
+            )
+        return cur.lastrowid
+
+
+def get_calls(lead_id: str) -> list:
+    """Return call log for a lead, newest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, direction, outcome, duration_sec, notes, logged_by, logged_at "
+            "FROM lead_calls WHERE lead_id=? ORDER BY logged_at DESC",
+            (lead_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ─── Next Action ──────────────────────────────────────────────────────────────
+
+def set_next_action(lead_id: str, next_action_at: str, next_action_note: str = "") -> None:
+    """Set the next follow-up date and optional note on a lead."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE leads SET next_action_at=?, next_action_note=? WHERE id=?",
+            (next_action_at, next_action_note, lead_id)
+        )
+
+
+def clear_next_action(lead_id: str) -> None:
+    """Clear next action after it's been actioned."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE leads SET next_action_at='', next_action_note='' WHERE id=?",
+            (lead_id,)
+        )

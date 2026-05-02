@@ -13,12 +13,19 @@ Three functions:
 import hashlib
 import logging
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 from database import get_all_leads, get_lead, add_event, update_stage, enqueue_follow_ups, get_od_settings
 from config import get_settings
 from ga4_events import (
     track_treatment_presented, track_treatment_accepted, track_treatment_completed,
 )
+
+_REACTIVATION_DAYS = 548  # 18 months
+_EASTERN = ZoneInfo("America/New_York")
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +73,45 @@ def _get_sqlite():
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# ── od_relationship classifier ───────────────────────────────────────────────
+
+def _compute_od_relationship(tp_status: dict, apt_info: dict) -> str:
+    """
+    Return one of: 'implant_prospect', 'reactivation', 'active_patient',
+                   'new_patient', 'cold'
+    Priority order matters — check implant first, then reactivation, then active.
+    """
+    # 1. Implant prospect — treatment plan with implant CDT codes exists
+    if tp_status.get("has_treatment_plan"):
+        return "implant_prospect"
+
+    # 2. Reactivation — previously active but no visit in 18+ months.
+    #    MySQL returns naive datetimes in office-local time (America/New_York).
+    #    Compare against an Eastern-aware cutoff — never stamp as UTC.
+    last_complete = apt_info.get("last_complete_date")
+    if apt_info.get("has_showed") and last_complete:
+        cutoff = datetime.now(_EASTERN) - timedelta(days=_REACTIVATION_DAYS)
+        if isinstance(last_complete, str):
+            try:
+                last_complete = datetime.fromisoformat(last_complete)
+            except ValueError:
+                last_complete = None
+        if last_complete:
+            # Treat naive datetimes as Eastern (office-local)
+            if last_complete.tzinfo is None:
+                last_complete = last_complete.replace(tzinfo=_EASTERN)
+            if last_complete < cutoff:
+                return "reactivation"
+
+    # 3. Active patient — has at least one completed appointment, no implant plan
+    if apt_info.get("has_showed"):
+        return "active_patient"
+
+    # 4. New patient — matched to OD but no completed appointments yet
+    #    (may or may not have a future appointment scheduled)
+    return "new_patient"
 
 
 # ── Part 1: Match unmatched leads to OD patients ────────────────────────────
@@ -129,16 +175,21 @@ def match_leads_to_od() -> dict:
                 if not pat_num:
                     continue
 
-                # Get production for this patient (implant codes only)
+                # Get production, treatment plan, and appointment info
                 production = _get_patient_production(conn, pat_num)
+                tp_status  = _get_treatment_plan_status(conn, pat_num)
+                apt_info   = _get_appointment_info(conn, pat_num)
+                od_rel     = _compute_od_relationship(tp_status, apt_info)
 
                 # Update lead in SQLite
                 lconn = _get_sqlite()
                 now = datetime.now(timezone.utc).isoformat()
                 lconn.execute("""
-                    UPDATE leads SET od_patient_num=?, od_matched_at=?, attributed_production=?, updated_at=?
+                    UPDATE leads
+                    SET od_patient_num=?, od_matched_at=?, attributed_production=?,
+                        od_relationship=?, updated_at=?
                     WHERE id=?
-                """, (pat_num, now, production["total"], now, lead["id"]))
+                """, (pat_num, now, production["total"], od_rel, now, lead["id"]))
                 lconn.commit()
                 lconn.close()
 
@@ -148,9 +199,11 @@ def match_leads_to_od() -> dict:
                               "match_method": match_method,
                               "production": production["total"],
                               "codes": production["codes"],
+                              "od_relationship": od_rel,
                           }))
 
-                logger.info(f"Lead {lead['id']} matched to OD PatNum {pat_num} via {match_method}, production=${production['total']:.2f}")
+                logger.info(f"Lead {lead['id']} matched to OD PatNum {pat_num} via {match_method}, "
+                            f"production=${production['total']:.2f}, relationship={od_rel}")
                 matched += 1
 
             except Exception as e:
@@ -216,7 +269,10 @@ def sync_treatment_stages() -> dict:
                 elif apt_info["has_scheduled"]:
                     new_stage = "scheduled"
 
-                # Update production, income, appointment info, and treatment_plan_value
+                # Re-evaluate od_relationship on every sync pass (relationship evolves)
+                od_rel = _compute_od_relationship(tp_status, apt_info)
+
+                # Update production, income, appointment info, treatment_plan_value, and od_relationship
                 lconn = _get_sqlite()
                 now = datetime.now(timezone.utc).isoformat()
                 lconn.execute("""
@@ -227,6 +283,7 @@ def sync_treatment_stages() -> dict:
                         appointment_date=?,
                         appointment_status=?,
                         no_show_count=?,
+                        od_relationship=?,
                         updated_at=?
                     WHERE id=?
                 """, (
@@ -236,6 +293,7 @@ def sync_treatment_stages() -> dict:
                     apt_info.get("next_apt_date", ""),
                     apt_info.get("status", ""),
                     apt_info.get("broken_count", 0),
+                    od_rel,
                     now,
                     lead["id"],
                 ))
@@ -426,35 +484,42 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
     """
     Get appointment status for a patient.
     AptStatus: 1=Scheduled, 2=Complete, 3=UnschedList, 4=ASAP, 5=Broken
+    last_complete_date: datetime of most recent completed appointment (for reactivation check).
     """
     result = {
         "has_scheduled": False,
-        "has_showed": False,      # Complete appointment exists
+        "has_showed": False,       # Complete appointment exists
         "has_broken": False,
         "broken_count": 0,
         "next_apt_date": "",
         "status": "",
+        "last_complete_date": None,  # datetime | None — used by _compute_od_relationship
     }
     try:
         with conn.cursor() as cur:
-            # Get all appointments for this patient
+            # Rows ordered DESC by AptDateTime — first complete row is the most recent.
+            # LIMIT 50: covers all clinically relevant appointments without full scan.
             cur.execute("""
                 SELECT AptStatus, AptDateTime
                 FROM appointment
                 WHERE PatNum = %s
                 ORDER BY AptDateTime DESC
+                LIMIT 50
             """, [int(pat_num)])
             rows = cur.fetchall()
 
             for row in rows:
                 status = int(row[0])
-                apt_date = row[1]
+                apt_date = row[1]  # datetime object from pymysql
 
                 if status == 5:  # Broken
                     result["has_broken"] = True
                     result["broken_count"] += 1
                 elif status == 2:  # Complete
                     result["has_showed"] = True
+                    # Capture only the MOST RECENT completed apt (rows are DESC so first wins)
+                    if result["last_complete_date"] is None and apt_date:
+                        result["last_complete_date"] = apt_date  # keep as datetime
                 elif status == 1:  # Scheduled
                     result["has_scheduled"] = True
                     if apt_date:
