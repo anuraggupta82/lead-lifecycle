@@ -1739,9 +1739,167 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, co
   );
 }
 
+function AdCreativesView({ days }) {
+  const [ads, setAds] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState(null); // ad_id
+
+  useEffect(() => {
+    setLoading(true);
+    api(`/api/admin/gads/ads?days=${days}`)
+      .then(r => setAds(r.ads || []))
+      .catch(() => setAds([]))
+      .finally(() => setLoading(false));
+  }, [days]);
+
+  if (loading) return <div style={{padding:24,textAlign:'center',color:'var(--text-muted)',fontSize:12}}>Loading ad creatives…</div>;
+  if (!ads.length) return <div style={{padding:24,textAlign:'center',color:'var(--text-muted)',fontSize:12}}>No ad creatives found. Run Google Ads Sync to populate data.</div>;
+
+  function statusColor(s) {
+    if (!s) return '#6b7280';
+    const u = s.toUpperCase();
+    if (u === 'ENABLED') return '#16a34a';
+    if (u === 'PAUSED')  return '#f59e0b';
+    if (u === 'REMOVED') return '#dc2626';
+    return '#6b7280';
+  }
+
+  function fmtPct(n) { return n == null ? '—' : n.toFixed(1) + '%'; }
+  function fmtMoney(n) { return n == null ? '—' : '$' + n.toFixed(2); }
+  function fmtNum(n)  { return n == null || n === 0 ? '—' : n.toLocaleString(); }
+
+  return (
+    <div className="report-section">
+      <div className="report-title">Ad Creatives</div>
+      <table className="report-table">
+        <thead>
+          <tr>
+            <th>Ad</th>
+            <th>Campaign</th>
+            <th>Ad Group</th>
+            <th>Status</th>
+            <th className="num">Impr</th>
+            <th className="num">Clicks</th>
+            <th className="num">CTR</th>
+            <th className="num">Cost</th>
+            <th className="num">Leads</th>
+            <th className="num">CPL</th>
+            <th style={{width:60}}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {ads.map(ad => {
+            const isOpen = expanded === ad.ad_id;
+            const assets = ad.assets_json || {};
+            const headlines = assets.headlines || [];
+            const descriptions = assets.descriptions || [];
+            // ETA fallback fields
+            const h1 = ad.headline_1 || '';
+            const h2 = ad.headline_2 || '';
+            const h3 = ad.headline_3 || '';
+            const d1 = ad.description_1 || '';
+            const d2 = ad.description_2 || '';
+
+            return (
+              <React.Fragment key={ad.ad_id}>
+                <tr>
+                  <td style={{fontWeight:600,maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={ad.ad_name||ad.ad_id}>
+                    {ad.ad_name || ad.ad_id}
+                  </td>
+                  <td style={{maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={ad.campaign_name}>
+                    {(ad.campaign_name||'').replace(/^grafton_nxtsmile_/,'')||'—'}
+                  </td>
+                  <td style={{maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={ad.ad_group_name}>
+                    {ad.ad_group_name||'—'}
+                  </td>
+                  <td>
+                    <span style={{fontSize:10,fontWeight:600,color:statusColor(ad.status),
+                                  background:statusColor(ad.status)+'22',padding:'1px 5px',borderRadius:3}}>
+                      {ad.status||'—'}
+                    </span>
+                  </td>
+                  <td className="num">{fmtNum(ad.impressions)}</td>
+                  <td className="num">{fmtNum(ad.clicks)}</td>
+                  <td className="num">{fmtPct(ad.ctr)}</td>
+                  <td className="num">{fmtMoney(ad.cost)}</td>
+                  <td className="num">{fmtNum(ad.leads)}</td>
+                  <td className="num">{fmtMoney(ad.cpl)}</td>
+                  <td style={{textAlign:'center'}}>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setExpanded(isOpen ? null : ad.ad_id)}>
+                      {isOpen ? '▲' : '▼'}
+                    </button>
+                  </td>
+                </tr>
+                {isOpen && (
+                  <tr>
+                    <td colSpan={11} style={{background:'#f8f9fa',padding:'10px 16px'}}>
+                      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:6}}>
+                        <strong>Type:</strong> {ad.ad_type||'—'} &nbsp;|&nbsp;
+                        <strong>ID:</strong> {ad.ad_id} &nbsp;|&nbsp;
+                        <strong>Final URL:</strong> {ad.final_url ? <a href={ad.final_url} target="_blank" rel="noreferrer" style={{color:'var(--teal)'}}>{ad.final_url}</a> : '—'}
+                      </div>
+                      {/* RSA assets */}
+                      {headlines.length > 0 && (
+                        <div style={{marginBottom:8}}>
+                          <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Headlines ({headlines.length})</div>
+                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                            {headlines.map((h,i) => (
+                              <span key={i} style={{background:'#e8f4f4',color:'var(--teal-dark)',fontSize:10,padding:'2px 7px',borderRadius:3}}>
+                                {h.text}{h.pinned && h.pinned !== 'UNSPECIFIED' ? <em style={{color:'var(--text-muted)'}}> (pin {h.pinned})</em> : ''}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {descriptions.length > 0 && (
+                        <div style={{marginBottom:4}}>
+                          <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Descriptions ({descriptions.length})</div>
+                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                            {descriptions.map((d,i) => (
+                              <span key={i} style={{background:'#fef9c3',color:'#854d0e',fontSize:10,padding:'2px 7px',borderRadius:3}}>
+                                {d.text}{d.pinned && d.pinned !== 'UNSPECIFIED' ? <em style={{color:'var(--text-muted)'}}> (pin {d.pinned})</em> : ''}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {/* ETA fallback */}
+                      {headlines.length === 0 && (h1||h2||h3) && (
+                        <div style={{marginBottom:8}}>
+                          <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Headlines</div>
+                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                            {[h1,h2,h3].filter(Boolean).map((h,i)=>(
+                              <span key={i} style={{background:'#e8f4f4',color:'var(--teal-dark)',fontSize:10,padding:'2px 7px',borderRadius:3}}>{h}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {headlines.length === 0 && (d1||d2) && (
+                        <div>
+                          <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Descriptions</div>
+                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                            {[d1,d2].filter(Boolean).map((d,i)=>(
+                              <span key={i} style={{background:'#fef9c3',color:'#854d0e',fontSize:10,padding:'2px 7px',borderRadius:3}}>{d}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
-  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms'
+  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives'
   const [dateRange, setDateRange] = useState(() => defaultDateRange(30));
+  const [adCreativesDays, setAdCreativesDays] = useState(30);
   const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
   const [ga4Refreshing, setGa4Refreshing] = useState(false);
 
@@ -1789,7 +1947,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -1799,6 +1957,25 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
       {/* ── Search Terms view ── */}
       {view==='searchterms' && <SearchTermsView searchTermStats={searchTermStats} />}
+
+      {/* ── Ad Creatives view ── */}
+      {view==='adcreatives' && (
+        <div>
+          <div style={{display:'flex',gap:6,alignItems:'center',marginBottom:10}}>
+            <span style={{fontSize:11,color:'var(--text-muted)'}}>Window:</span>
+            {[7,30,90].map(d=>(
+              <button key={d}
+                style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                  background:adCreativesDays===d?'var(--teal)':'#fff',
+                  color:adCreativesDays===d?'#fff':'var(--text-muted)'}}
+                onClick={()=>setAdCreativesDays(d)}>
+                {d}d
+              </button>
+            ))}
+          </div>
+          <AdCreativesView days={adCreativesDays} />
+        </div>
+      )}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>

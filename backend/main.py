@@ -1404,6 +1404,46 @@ def admin_gads_search_terms(days: int = 30, campaign: str = ""):
     return {"search_terms": get_search_term_stats(campaign_name=campaign, days=days)}
 
 
+@app.get("/api/admin/gads/ads", dependencies=[Depends(_require_admin)])
+def admin_gads_ads(days: int = 30):
+    """
+    List all ad creatives with aggregated metrics and lead counts for the last N days.
+    Includes CTR and CPL computed server-side for convenience.
+    """
+    from database import get_ads_with_metrics
+    ads = get_ads_with_metrics(days=days)
+    for ad in ads:
+        impressions = ad.get("impressions") or 0
+        clicks      = ad.get("clicks") or 0
+        cost_micros = ad.get("cost_micros") or 0
+        leads       = ad.get("leads") or 0
+        cost        = cost_micros / 1_000_000.0
+        ad["cost"]  = round(cost, 2)
+        ad["ctr"]   = round(clicks / impressions * 100, 2) if impressions > 0 else 0.0
+        ad["cpc"]   = round(cost / clicks, 2) if clicks > 0 else 0.0
+        ad["cpl"]   = round(cost / leads, 2)  if leads  > 0 else 0.0
+        # Parse assets_json if stored as string
+        if isinstance(ad.get("assets_json"), str):
+            try:
+                ad["assets_json"] = json.loads(ad["assets_json"])
+            except Exception:
+                ad["assets_json"] = {"headlines": [], "descriptions": []}
+        # Ensure it's always a dict shape the frontend expects
+        if not isinstance(ad.get("assets_json"), dict):
+            ad["assets_json"] = {"headlines": [], "descriptions": []}
+    return {"ads": ads, "days": days}
+
+
+@app.get("/api/admin/gads/ads/{ad_id}/metrics", dependencies=[Depends(_require_admin)])
+def admin_gads_ad_metrics(ad_id: str, days: int = 30):
+    """Daily metrics time-series for a single ad creative."""
+    from database import get_ad_metrics_series
+    rows = get_ad_metrics_series(ad_id=ad_id, days=days)
+    for row in rows:
+        row["cost"] = round((row.get("cost_micros") or 0) / 1_000_000.0, 2)
+    return {"ad_id": ad_id, "days": days, "metrics": rows}
+
+
 # ─── Pipeline with enrichment ────────────────────────────────────────────────
 
 @app.get("/api/pipeline/enriched")

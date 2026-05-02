@@ -5,7 +5,7 @@ import sqlite3
 import os
 import json
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from config import get_settings
 
@@ -398,6 +398,47 @@ CREATE TABLE IF NOT EXISTS gads_spend_guardrails (
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
+
+-- ── Phase 3: Ad Creative Tables ───────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS gads_ads (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ad_id           TEXT NOT NULL UNIQUE,
+    customer_id     TEXT NOT NULL DEFAULT '',   -- Google Ads customer ID (for multi-account safety)
+    ad_name         TEXT DEFAULT '',
+    ad_group_id     TEXT DEFAULT '',
+    ad_group_name   TEXT DEFAULT '',
+    campaign_id     TEXT DEFAULT '',
+    campaign_name   TEXT DEFAULT '',
+    status          TEXT DEFAULT '',            -- ENABLED, PAUSED, REMOVED
+    ad_type         TEXT DEFAULT '',            -- RESPONSIVE_SEARCH_AD, EXPANDED_TEXT_AD, etc.
+    headline_1      TEXT DEFAULT '',
+    headline_2      TEXT DEFAULT '',
+    headline_3      TEXT DEFAULT '',
+    description_1   TEXT DEFAULT '',
+    description_2   TEXT DEFAULT '',
+    final_url       TEXT DEFAULT '',
+    assets_json     TEXT DEFAULT '[]',          -- full RSA headline/description assets as JSON
+    synced_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gads_ads_campaign  ON gads_ads(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_gads_ads_ad_group  ON gads_ads(ad_group_id);
+CREATE INDEX IF NOT EXISTS idx_gads_ads_status    ON gads_ads(status);
+
+CREATE TABLE IF NOT EXISTS gads_ad_metrics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ad_id       TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    impressions INTEGER DEFAULT 0,
+    clicks      INTEGER DEFAULT 0,
+    cost_micros INTEGER DEFAULT 0,
+    conversions REAL    DEFAULT 0.0,
+    UNIQUE(ad_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gads_ad_metrics_date ON gads_ad_metrics(date);
+CREATE INDEX IF NOT EXISTS idx_gads_ad_metrics_ad   ON gads_ad_metrics(ad_id, date);
 
 -- ── Step 10: TCPA Stop Conditions ─────────────────────────────────────────────
 
@@ -847,6 +888,48 @@ def _migrate(conn):
             updated_at       TEXT NOT NULL
         )
     """)
+
+    # ── Phase 3: Ad Creative Tables ───────────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_ads (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ad_id           TEXT NOT NULL UNIQUE,
+            customer_id     TEXT NOT NULL DEFAULT '',
+            ad_name         TEXT DEFAULT '',
+            ad_group_id     TEXT DEFAULT '',
+            ad_group_name   TEXT DEFAULT '',
+            campaign_id     TEXT DEFAULT '',
+            campaign_name   TEXT DEFAULT '',
+            status          TEXT DEFAULT '',
+            ad_type         TEXT DEFAULT '',
+            headline_1      TEXT DEFAULT '',
+            headline_2      TEXT DEFAULT '',
+            headline_3      TEXT DEFAULT '',
+            description_1   TEXT DEFAULT '',
+            description_2   TEXT DEFAULT '',
+            final_url       TEXT DEFAULT '',
+            assets_json     TEXT DEFAULT '[]',
+            synced_at       TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ads_campaign ON gads_ads(campaign_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ads_ad_group ON gads_ads(ad_group_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ads_status   ON gads_ads(status)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_ad_metrics (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ad_id       TEXT NOT NULL,
+            date        TEXT NOT NULL,
+            impressions INTEGER DEFAULT 0,
+            clicks      INTEGER DEFAULT 0,
+            cost_micros INTEGER DEFAULT 0,
+            conversions REAL    DEFAULT 0.0,
+            UNIQUE(ad_id, date)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ad_metrics_date ON gads_ad_metrics(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ad_metrics_ad   ON gads_ad_metrics(ad_id, date)")
 
     # ── Step 10b: Phone hash normalization backfill ────────────────────────────
     # Re-hash all leads using _hash_phone() (last-10-digits) so Twilio E.164
@@ -2757,6 +2840,134 @@ def upsert_spend_guardrail(campaign_id: str, campaign_name: str, daily_cap_usd: 
             "SELECT * FROM gads_spend_guardrails WHERE campaign_id=?", (campaign_id,)
         ).fetchone()
         return dict(row)
+
+
+# ─── Phase 3: Ad Creative Tables ─────────────────────────────────────────────
+
+def save_gads_ads(ads: list, customer_id: str = "") -> int:
+    """Upsert ad creative metadata rows. Returns count upserted."""
+    if not ads:
+        return 0
+    now = _now()
+    with _conn() as conn:
+        for ad in ads:
+            conn.execute("""
+                INSERT INTO gads_ads
+                    (ad_id, customer_id, ad_name, ad_group_id, ad_group_name,
+                     campaign_id, campaign_name, status, ad_type,
+                     headline_1, headline_2, headline_3,
+                     description_1, description_2, final_url,
+                     assets_json, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(ad_id) DO UPDATE SET
+                    customer_id   = excluded.customer_id,
+                    ad_name       = excluded.ad_name,
+                    ad_group_id   = excluded.ad_group_id,
+                    ad_group_name = excluded.ad_group_name,
+                    campaign_id   = excluded.campaign_id,
+                    campaign_name = excluded.campaign_name,
+                    status        = excluded.status,
+                    ad_type       = excluded.ad_type,
+                    headline_1    = excluded.headline_1,
+                    headline_2    = excluded.headline_2,
+                    headline_3    = excluded.headline_3,
+                    description_1 = excluded.description_1,
+                    description_2 = excluded.description_2,
+                    final_url     = excluded.final_url,
+                    assets_json   = excluded.assets_json,
+                    synced_at     = excluded.synced_at
+            """, (
+                ad["ad_id"],
+                ad.get("customer_id", customer_id),
+                ad.get("ad_name", ""),
+                ad.get("ad_group_id", ""),
+                ad.get("ad_group_name", ""),
+                ad.get("campaign_id", ""),
+                ad.get("campaign_name", ""),
+                ad.get("status", ""),
+                ad.get("ad_type", ""),
+                ad.get("headline_1", ""),
+                ad.get("headline_2", ""),
+                ad.get("headline_3", ""),
+                ad.get("description_1", ""),
+                ad.get("description_2", ""),
+                ad.get("final_url", ""),
+                json.dumps(ad.get("assets_json", [])),
+                now,
+            ))
+    return len(ads)
+
+
+def save_gads_ad_metrics(rows: list) -> int:
+    """Upsert daily ad metrics. Returns count upserted."""
+    if not rows:
+        return 0
+    with _conn() as conn:
+        for row in rows:
+            conn.execute("""
+                INSERT INTO gads_ad_metrics
+                    (ad_id, date, impressions, clicks, cost_micros, conversions)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(ad_id, date) DO UPDATE SET
+                    impressions = excluded.impressions,
+                    clicks      = excluded.clicks,
+                    cost_micros = excluded.cost_micros,
+                    conversions = excluded.conversions
+            """, (
+                row["ad_id"],
+                row["date"],
+                int(row.get("impressions", 0)),
+                int(row.get("clicks", 0)),
+                int(row.get("cost_micros", 0)),
+                float(row.get("conversions", 0.0)),
+            ))
+    return len(rows)
+
+
+def get_ads_with_metrics(days: int = 30) -> list:
+    """
+    Return all ad creatives joined with aggregated metrics for last N days,
+    plus lead count from leads table joined on ad_id.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                a.ad_id, a.ad_name, a.ad_group_id, a.ad_group_name,
+                a.campaign_id, a.campaign_name, a.status, a.ad_type,
+                a.headline_1, a.headline_2, a.headline_3,
+                a.description_1, a.description_2, a.final_url, a.assets_json,
+                COALESCE(SUM(m.impressions), 0) AS impressions,
+                COALESCE(SUM(m.clicks), 0)      AS clicks,
+                COALESCE(SUM(m.cost_micros), 0) AS cost_micros,
+                COALESCE(SUM(m.conversions), 0) AS conversions,
+                COALESCE(lc.lead_count, 0)       AS leads
+            FROM gads_ads a
+            LEFT JOIN gads_ad_metrics m
+                ON m.ad_id = a.ad_id AND m.date >= ?
+            LEFT JOIN (
+                SELECT ad_id, COUNT(*) AS lead_count
+                FROM leads
+                WHERE ad_id != '' AND created_at >= ?
+                GROUP BY ad_id
+            ) lc ON lc.ad_id = a.ad_id
+            GROUP BY a.ad_id
+            ORDER BY cost_micros DESC
+        """, (cutoff, cutoff)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_ad_metrics_series(ad_id: str, days: int = 30) -> list:
+    """Return daily metrics time-series for one ad."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT date, impressions, clicks, cost_micros, conversions
+            FROM gads_ad_metrics
+            WHERE ad_id = ? AND date >= ?
+            ORDER BY date ASC
+        """, (ad_id, cutoff)).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ─── Step 10: TCPA Stop Conditions ───────────────────────────────────────────

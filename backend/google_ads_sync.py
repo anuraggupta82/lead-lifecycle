@@ -19,7 +19,7 @@ from config import get_settings
 from database import (
     get_all_leads, upsert_lead, save_gads_keywords_cache,
     save_gads_geo_cache, save_gads_schedule_cache,
-    save_gads_daily_stats,
+    save_gads_daily_stats, save_gads_ads, save_gads_ad_metrics,
 )
 
 logger = logging.getLogger(__name__)
@@ -294,6 +294,164 @@ def _fetch_campaign_daily_stats(client, customer_id: str, days: int = 30) -> int
     return 0
 
 
+def _fetch_ad_creatives(client, customer_id: str) -> list:
+    """
+    Fetch ad creative metadata from ad_group_ad resource.
+    Includes all statuses (ENABLED, PAUSED, REMOVED) so historical leads
+    joining on ad_id don't orphan when an ad is removed.
+    Returns list of dicts ready for save_gads_ads().
+    """
+    import json as _json
+    service = client.get_service("GoogleAdsService")
+
+    query = """
+        SELECT
+            ad_group_ad.ad.id,
+            ad_group_ad.ad.name,
+            ad_group_ad.ad.type,
+            ad_group_ad.status,
+            ad_group_ad.ad.expanded_text_ad.headline_part1,
+            ad_group_ad.ad.expanded_text_ad.headline_part2,
+            ad_group_ad.ad.expanded_text_ad.headline_part3,
+            ad_group_ad.ad.expanded_text_ad.description,
+            ad_group_ad.ad.expanded_text_ad.description2,
+            ad_group_ad.ad.responsive_search_ad.headlines,
+            ad_group_ad.ad.responsive_search_ad.descriptions,
+            ad_group_ad.ad.final_urls,
+            ad_group.id,
+            ad_group.name,
+            campaign.id,
+            campaign.name
+        FROM ad_group_ad
+        WHERE campaign.advertising_channel_type = 'SEARCH'
+    """
+
+    ads = []
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            ad = row.ad_group_ad.ad
+            ad_id = str(ad.id) if ad.id else ""
+            if not ad_id:
+                continue
+
+            # Determine ad type string safely (use .name for proto enums, fallback to split)
+            try:
+                ad_type = ad.type_.name if hasattr(ad.type_, "name") else str(ad.type_).split(".")[-1]
+            except Exception:
+                ad_type = ""
+
+            # ETA fields
+            eta = ad.expanded_text_ad
+            # RSA assets — store all as JSON, use first 3/2 for display columns
+            rsa = ad.responsive_search_ad
+            rsa_headlines = [a.text for a in rsa.headlines if a.text]
+            rsa_descs     = [a.text for a in rsa.descriptions if a.text]
+
+            if ad_type == "RESPONSIVE_SEARCH_AD":
+                h1 = rsa_headlines[0] if len(rsa_headlines) > 0 else ""
+                h2 = rsa_headlines[1] if len(rsa_headlines) > 1 else ""
+                h3 = rsa_headlines[2] if len(rsa_headlines) > 2 else ""
+                d1 = rsa_descs[0] if len(rsa_descs) > 0 else ""
+                d2 = rsa_descs[1] if len(rsa_descs) > 1 else ""
+                assets = {
+                    "headlines":     [{"text": a.text, "pinned": str(a.pinned_field)} for a in rsa.headlines if a.text],
+                    "descriptions":  [{"text": a.text, "pinned": str(a.pinned_field)} for a in rsa.descriptions if a.text],
+                }
+            else:
+                # ETA — store same dict shape as RSA for consistent frontend handling
+                h1 = eta.headline_part1 or ""
+                h2 = eta.headline_part2 or ""
+                h3 = eta.headline_part3 or ""
+                d1 = eta.description  or ""
+                d2 = eta.description2 or ""
+                assets = {
+                    "headlines":    [{"text": t, "pinned": ""} for t in [h1, h2, h3] if t],
+                    "descriptions": [{"text": t, "pinned": ""} for t in [d1, d2] if t],
+                }
+
+            # Safe access to repeated final_urls field
+            final_url = next(iter(ad.final_urls), "") if ad.final_urls else ""
+
+            # Status string (use .name for proto enums, fallback to split)
+            try:
+                st = row.ad_group_ad.status
+                status = st.name if hasattr(st, "name") else str(st).split(".")[-1]
+            except Exception:
+                status = ""
+
+            ads.append({
+                "ad_id":         ad_id,
+                "customer_id":   customer_id,
+                "ad_name":       ad.name or "",
+                "ad_group_id":   str(row.ad_group.id) if row.ad_group.id else "",
+                "ad_group_name": row.ad_group.name or "",
+                "campaign_id":   str(row.campaign.id) if row.campaign.id else "",
+                "campaign_name": row.campaign.name or "",
+                "status":        status,
+                "ad_type":       ad_type,
+                "headline_1":    h1,
+                "headline_2":    h2,
+                "headline_3":    h3,
+                "description_1": d1,
+                "description_2": d2,
+                "final_url":     final_url,
+                "assets_json":   assets,
+            })
+
+        logger.info(f"Ad creatives: {len(ads)} ads fetched")
+    except Exception as e:
+        logger.error(f"_fetch_ad_creatives failed: {e}")
+        raise
+
+    return ads
+
+
+def _fetch_ad_daily_metrics(client, customer_id: str, days: int = 30) -> list:
+    """
+    Fetch daily metrics per ad creative.
+    No campaign/ad_group status filter — matches Pass 6 convention so paused-mid-
+    window ads don't silently vanish from historical data.
+    Uses search_stream for large result sets.
+    Returns list of dicts ready for save_gads_ad_metrics().
+    """
+    service = client.get_service("GoogleAdsService")
+    end_date   = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    query = f"""
+        SELECT
+            ad_group_ad.ad.id,
+            segments.date,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions
+        FROM ad_group_ad
+        WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+            AND campaign.advertising_channel_type = 'SEARCH'
+    """
+
+    rows = []
+    stream = service.search_stream(customer_id=customer_id, query=query)
+    for batch in stream:
+        for row in batch.results:
+            ad_id = str(row.ad_group_ad.ad.id) if row.ad_group_ad.ad.id else ""
+            if not ad_id:
+                continue
+            rows.append({
+                "ad_id":       ad_id,
+                "date":        row.segments.date,
+                "impressions": int(row.metrics.impressions or 0),
+                "clicks":      int(row.metrics.clicks or 0),
+                "cost_micros": int(row.metrics.cost_micros or 0),
+                "conversions": float(row.metrics.conversions or 0.0),
+            })
+
+    logger.info(f"Ad daily metrics: {len(rows)} rows fetched")
+    return rows
+
+
 def sync_gclids_to_keywords(days_back: int = 7) -> dict:
     """
     Main sync function. Resolves gclids on leads to keyword/ad data.
@@ -419,6 +577,22 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         logger.warning(f"Daily ad-group stats fetch failed (non-fatal): {e}")
         daily_rows = 0
 
+    # Pass 7: Ad creative metadata + daily metrics
+    logger.info("Fetching ad creative metadata and daily metrics...")
+    ad_rows = 0
+    ad_metric_rows = 0
+    try:
+        ad_list = _fetch_ad_creatives(client, customer_id)
+        if ad_list:
+            ad_rows = save_gads_ads(ad_list, customer_id=customer_id)
+            logger.info(f"Ad creatives: {ad_rows} upserted")
+        metric_list = _fetch_ad_daily_metrics(client, customer_id, days=30)
+        if metric_list:
+            ad_metric_rows = save_gads_ad_metrics(metric_list)
+            logger.info(f"Ad daily metrics: {ad_metric_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Ad creative sync failed (non-fatal): {e}")
+
     result = {
         "synced": synced,
         "skipped": skipped,
@@ -430,6 +604,8 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         "geo_locations_cached": len(geo_data),
         "schedule_hours_cached": len(schedule_data.get("by_hour", [])),
         "daily_stats_rows": daily_rows,
+        "ad_creatives_synced": ad_rows,
+        "ad_metric_rows": ad_metric_rows,
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result
