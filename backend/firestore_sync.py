@@ -6,7 +6,7 @@ import hashlib
 import logging
 import urllib.request
 import json
-from database import upsert_lead, get_lead, enqueue_follow_ups, add_event
+from database import upsert_lead, get_lead, enqueue_follow_ups, add_event, is_deleted_lead
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -130,6 +130,15 @@ def sync_from_firestore() -> dict:
         try:
             normalized = _normalize_firestore_lead(doc)
             if not normalized or not normalized.get("id"):
+                skipped += 1
+                continue
+
+            # Tombstone check — never re-import a lead that admin deleted
+            if is_deleted_lead(normalized["id"], normalized.get("email") or ""):
+                logger.info(
+                    f"Skipping deleted lead {normalized['id']} "
+                    f"({normalized.get('email','')}) — tombstoned"
+                )
                 skipped += 1
                 continue
 

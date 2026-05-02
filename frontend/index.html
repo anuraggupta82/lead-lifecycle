@@ -167,6 +167,24 @@
     .report-table .num { text-align: right; font-variant-numeric: tabular-nums; }
     .report-table .money { color: #059669; font-weight: 600; }
 
+    /* Reports sub-view toggle */
+    .reports-view-toggle { display: flex; gap: 4px; margin-bottom: 14px; }
+    .reports-view-btn { padding: 5px 14px; font-size: 11px; font-weight: 500; border: 1px solid var(--border);
+                        border-radius: 20px; background: #fff; cursor: pointer; color: var(--text-muted); }
+    .reports-view-btn.active { background: var(--teal); color: #fff; border-color: var(--teal); }
+
+    /* Status pill for search terms */
+    .st-status { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 9px; font-weight: 600; }
+    .st-status.added { background: #d1fae5; color: #065f46; }
+    .st-status.excluded { background: #fee2e2; color: #991b1b; }
+    .st-status.none { background: #f1f5f9; color: #64748b; }
+
+    /* Trend chart container */
+    .trend-chart-wrap { padding: 12px; }
+    .trend-empty { color: var(--text-muted); font-size: 11px; font-style: italic; padding: 16px 0; text-align: center; }
+    .trend-svg { display: block; width: 100%; max-width: 480px; border: 1px solid var(--border);
+                 border-radius: 4px; background: #fafafa; }
+
     .admin-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
     .time-range { display: flex; gap: 4px; }
     .time-range button { padding: 4px 8px; font-size: 10px; border: 1px solid var(--border); border-radius: 4px; background: #fff; cursor: pointer; }
@@ -212,6 +230,88 @@
     .coming-soon-badge { display: inline-block; background: #fef9c3; color: #854d0e; padding: 2px 6px; border-radius: 3px; font-size: 9px; font-weight: 600; margin-top: 4px; }
 
     .empty-row { font-size: 10px; color: var(--text-muted); font-style: italic; }
+
+    /* ── Kanban Board ─────────────────────────────────────────────────────── */
+    .kanban-board { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; align-items: flex-start; }
+    .kanban-board::-webkit-scrollbar { height: 6px; }
+    .kanban-board::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    .kanban-col { flex: 0 0 210px; background: #fff; border: 1px solid var(--border);
+                  border-radius: 8px; display: flex; flex-direction: column;
+                  max-height: calc(100vh - 170px); min-height: 100px; }
+    .kanban-col.drag-over { background: rgba(13,122,127,.05); border-color: var(--teal); }
+    .kanban-col-header { padding: 8px 10px; border-bottom: 1px solid var(--border);
+                         display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+                         border-radius: 7px 7px 0 0; border-top: 3px solid transparent; }
+    .kanban-col-header .stage-label { font-size: 11px; font-weight: 600; }
+    .kanban-col-header .stage-count { font-size: 10px; font-weight: 600; background: var(--gray-light);
+                                       padding: 0 6px; border-radius: 8px; color: var(--text-muted); }
+    .kanban-col-body { flex: 1; overflow-y: auto; padding: 6px; display: flex;
+                       flex-direction: column; gap: 5px; }
+    .kanban-col-body::-webkit-scrollbar { width: 4px; }
+    .kanban-col-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .kanban-card { background: #fff; border: 1px solid var(--border); border-radius: 6px;
+                   padding: 8px 10px; cursor: pointer; transition: all .12s; font-size: 11px;
+                   display: flex; flex-direction: column; gap: 3px; user-select: none; }
+    .kanban-card:hover { border-color: var(--teal); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    .kanban-card.selected { border-color: var(--teal); box-shadow: 0 0 0 2px rgba(13,122,127,.15); }
+    .kanban-card.needs-followup { border-left: 3px solid #f59e0b; }
+    .kanban-card.dragging { opacity: .5; }
+    .kc-name { font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kc-row { display: flex; justify-content: space-between; align-items: center; gap: 4px; }
+    .kc-meta { font-size: 10px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kc-revenue { font-size: 10px; color: #059669; font-weight: 700; }
+    .kc-time { font-size: 9px; color: var(--text-muted); white-space: nowrap; }
+    .kc-badge { font-size: 8px; padding: 1px 4px; border-radius: 3px; font-weight: 600; }
+    .kc-notes { background: #fef3c7; color: #92400e; }
+    .kc-appt { background: #d1fae5; color: #065f46; }
+    .kc-kw { background: #ede9fe; color: #7c3aed; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+    .kc-followup-pill { display: inline-flex; align-items: center; gap: 4px; background: #fef3c7;
+                        color: #92400e; padding: 1px 6px; border-radius: 4px; font-size: 9px; font-weight: 600; }
+    .kanban-empty { font-size: 10px; color: var(--text-muted); font-style: italic;
+                    text-align: center; padding: 16px 0; }
+    /* Stage dropdown on card */
+    .kc-stage-select { font-size: 9px; border: 1px solid var(--border); border-radius: 3px;
+                       background: #fff; color: var(--text-muted); padding: 1px 3px; cursor: pointer; }
+    .kc-stage-select:focus { outline: none; border-color: var(--teal); }
+
+    /* Follow-up filter pill in filter bar */
+    .followup-pill-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px;
+                         border-radius: 5px; border: 1px solid #f59e0b; background: #fffbeb;
+                         color: #92400e; font-size: 11px; font-weight: 500; cursor: pointer; }
+    .followup-pill-btn.active { background: #f59e0b; color: #fff; }
+    .followup-pill-btn .pill-count { font-weight: 700; }
+
+    /* ── Dashboard Tab ────────────────────────────────────────────────────── */
+    .dash-layout { display: grid; grid-template-columns: 1fr 260px; gap: 12px; align-items: start; }
+    .dash-left { display: flex; flex-direction: column; gap: 12px; }
+    .dash-right { display: flex; flex-direction: column; gap: 12px; }
+    .dash-kpi-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; }
+    .dash-kpi { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+    .dash-kpi-val { font-size: 26px; font-weight: 700; color: var(--teal); line-height: 1.1; }
+    .dash-kpi-label { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
+    .dash-kpi-sub { font-size: 10px; color: var(--text-muted); margin-top: 4px; }
+    .dash-section { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+    .dash-section-title { font-size: 12px; font-weight: 600; margin-bottom: 12px; color: var(--text); }
+    /* Funnel */
+    .funnel-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+    .funnel-label { width: 130px; font-size: 10px; color: var(--text); text-align: right; flex-shrink: 0; }
+    .funnel-bar-wrap { flex: 1; height: 22px; background: var(--gray-light); border-radius: 4px; overflow: hidden; position: relative; }
+    .funnel-bar { height: 100%; border-radius: 4px; transition: width .4s ease; min-width: 2px; }
+    .funnel-count { width: 32px; font-size: 11px; font-weight: 600; color: var(--text); text-align: right; flex-shrink: 0; }
+    .funnel-pct { width: 38px; font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
+    /* Alerts */
+    .alert-item { display: flex; justify-content: space-between; align-items: center;
+                  padding: 9px 0; border-bottom: 1px solid var(--border); cursor: pointer;
+                  transition: background .1s; border-radius: 4px; }
+    .alert-item:last-child { border-bottom: none; }
+    .alert-item:hover { background: var(--teal-light); margin: 0 -14px; padding: 9px 14px; }
+    .alert-label { font-size: 11px; color: var(--text); }
+    .alert-sub { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+    .alert-count { font-size: 20px; font-weight: 700; }
+    .alert-count.warn { color: #f59e0b; }
+    .alert-count.danger { color: #ef4444; }
+    .alert-count.ok { color: #059669; }
+    .alert-count.info { color: var(--teal); }
   </style>
 </head>
 <body>
@@ -582,87 +682,416 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   );
 }
 
-function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh }) {
+// ── Kanban Components ──────────────────────────────────────────────────────
+
+function KanbanCard({ lead, isSelected, onClick, onStageChange }) {
+  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ') || lead.email || 'Unknown';
+  const needsFollowup = isStaffFollowUp(lead);
+  const kw = (lead.keyword_text || '').replace(/^\[.*?\]\s*/, ''); // strip match type prefix
+  const [dragging, setDragging] = useState(false);
+
+  function handleStageSelect(e) {
+    e.stopPropagation();
+    const newStage = e.target.value;
+    if (newStage && newStage !== lead.stage) onStageChange(lead.id, newStage);
+  }
+
+  return (
+    <div
+      className={'kanban-card' + (isSelected ? ' selected' : '') + (needsFollowup ? ' needs-followup' : '') + (dragging ? ' dragging' : '')}
+      onClick={() => onClick(lead.id)}
+      draggable
+      onDragStart={e => {
+        e.dataTransfer.setData('text/plain', lead.id);
+        e.dataTransfer.effectAllowed = 'move';
+        setDragging(true);
+      }}
+      onDragEnd={() => setDragging(false)}
+    >
+      <div className="kc-row">
+        <span className="kc-name">{name}</span>
+        <span className={'chip-source ' + srcClass(lead.source)} style={{fontSize:'8px'}}>{lead.source || '?'}</span>
+      </div>
+      {lead.phone && <div className="kc-meta">📞 {lead.phone}</div>}
+      {lead.appointment_date && (
+        <div className="kc-row">
+          <span className="kc-badge kc-appt">📅 {fmtDate(lead.appointment_date)}</span>
+        </div>
+      )}
+      {kw && <div className="kc-row"><span className="kc-badge kc-kw" title={kw}>🔑 {kw}</span></div>}
+      <div className="kc-row">
+        {lead.attributed_production > 0 && <span className="kc-revenue">{fmtMoney(lead.attributed_production)}</span>}
+        {(lead.notes_count || 0) > 0 && <span className="kc-badge kc-notes">💬{lead.notes_count}</span>}
+        <span className="kc-time" style={{marginLeft:'auto'}}>{timeAgo(lead.created_at)}</span>
+      </div>
+      {needsFollowup && (
+        <div><span className="kc-followup-pill">⚠ Follow up</span></div>
+      )}
+      {/* Non-drag fallback: stage dropdown */}
+      <div onClick={e => e.stopPropagation()} style={{marginTop:3}}>
+        <select className="kc-stage-select" value={lead.stage} onChange={handleStageSelect}>
+          {STAGES.filter(s => s !== 'cold').map(s => (
+            <option key={s} value={s}>{STAGE_LABELS[s]}</option>
+          ))}
+          <option value="cold">{STAGE_LABELS.cold}</option>
+        </select>
+      </div>
+    </div>
+  );
+}
+
+function KanbanColumn({ stage, label, leads, color, selectedId, onCardClick, onDrop, onStageChange }) {
+  const [dragOver, setDragOver] = useState(false);
+
+  return (
+    <div
+      className={'kanban-col' + (dragOver ? ' drag-over' : '')}
+    >
+      <div className="kanban-col-header" style={{borderTopColor: color}}>
+        <span className="stage-dot" style={{background: color}} />
+        <span className="stage-label">{label}</span>
+        <span className="stage-count">{leads.length}</span>
+      </div>
+      <div
+        className="kanban-col-body"
+        onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOver(true); }}
+        onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
+        onDrop={e => {
+          e.preventDefault();
+          setDragOver(false);
+          const id = e.dataTransfer.getData('text/plain');
+          if (id) onDrop(id, stage);
+        }}
+      >
+        {leads.length === 0 && <div className="kanban-empty">No leads</div>}
+        {leads.map(l => (
+          <KanbanCard
+            key={l.id}
+            lead={l}
+            isSelected={selectedId === l.id}
+            onClick={onCardClick}
+            onStageChange={onStageChange}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [sourceFilter, setSourceFilter] = useState('all');
   const [showCold, setShowCold] = useState(false);
+  const [followupOnly, setFollowupOnly] = useState(false);
+  const boardRef = useRef(null);
 
   const filtered = useMemo(() => {
-    let items = pipeline.filter(l => {
+    return pipeline.filter(l => {
       if (!showCold && l.stage === 'cold') return false;
       if (sourceFilter !== 'all' && l.source !== sourceFilter) return false;
+      if (followupOnly && !isStaffFollowUp(l)) return false;
       if (searchTerm) {
         const term = searchTerm.toLowerCase();
-        const name = (l.first_name + ' ' + l.last_name).toLowerCase();
-        const email = (l.email||'').toLowerCase();
-        const phone = (l.phone||'').toLowerCase();
+        const name = ((l.first_name || '') + ' ' + (l.last_name || '')).trim().toLowerCase();
+        const email = (l.email || '').toLowerCase();
+        const phone = (l.phone || '').toLowerCase();
         if (!name.includes(term) && !email.includes(term) && !phone.includes(term)) return false;
       }
       return true;
     });
-    return items;
-  }, [pipeline, searchTerm, sourceFilter, showCold]);
+  }, [pipeline, searchTerm, sourceFilter, showCold, followupOnly]);
 
   const byStage = useMemo(() => {
     const map = {};
-    STAGES.forEach(s => map[s] = []);
-    map['cold'] = [];
+    STAGES.forEach(s => { map[s] = []; });
     filtered.forEach(l => {
       if (map[l.stage] !== undefined) map[l.stage].push(l);
     });
     return map;
   }, [filtered]);
 
-  const staffFollowUps = filtered.filter(isStaffFollowUp);
+  const followupCount = useMemo(() => pipeline.filter(isStaffFollowUp).length, [pipeline]);
 
   const sources = useMemo(() => {
-    const set = new Set(pipeline.filter(l=>l.source).map(l=>l.source));
+    const set = new Set(pipeline.filter(l => l.source).map(l => l.source));
     return ['all', ...Array.from(set).sort()];
   }, [pipeline]);
 
   async function handleDrop(leadId, newStage) {
-    await api('/api/admin/lead/' + leadId + '/force-stage',{method:'PUT',body:JSON.stringify({stage:newStage,reason:'drag-drop'})});
-    onStageChange(leadId, newStage);
+    try {
+      await api('/api/admin/lead/' + leadId + '/force-stage', { method: 'PUT', body: JSON.stringify({ stage: newStage, reason: 'drag-drop' }) });
+      onStageChange(leadId, newStage);
+    } catch (err) {
+      console.error('Stage change failed', err);
+      if (onRefresh) onRefresh();
+    }
   }
+
+  // Edge-scroll while dragging: scroll the kanban board when near edges
+  function handleBoardDragOver(e) {
+    const board = boardRef.current;
+    if (!board) return;
+    const rect = board.getBoundingClientRect();
+    const edgeSize = 60;
+    if (e.clientX < rect.left + edgeSize) board.scrollBy(-12, 0);
+    else if (e.clientX > rect.right - edgeSize) board.scrollBy(12, 0);
+  }
+
+  const visibleStages = STAGES.filter(s => s !== 'cold');
 
   return (
     <div>
+      {/* KPI strip */}
       <div className="kpi-strip">
-        <div className="kpi"><div className="kpi-val">{stats?.total_leads||0}</div><div className="kpi-label">Total</div></div>
-        <div className="kpi"><div className="kpi-val">{filtered.length}</div><div className="kpi-label">Active</div></div>
-        <div className="kpi"><div className="kpi-val">{byStage.scheduled.length}</div><div className="kpi-label">Scheduled</div></div>
-        <div className="kpi"><div className="kpi-val">{byStage.no_show.length}</div><div className="kpi-label">No-Shows</div></div>
-        <div className="kpi"><div className="kpi-val">{byStage.treatment_completed.length}</div><div className="kpi-label">Treated</div></div>
-        <div className="kpi"><div className="kpi-val">{fmtMoney(stats?.attributed_revenue||0)}</div><div className="kpi-label">Revenue</div></div>
+        <div className="kpi"><div className="kpi-val">{stats?.total_leads || 0}</div><div className="kpi-label">Total</div></div>
+        <div className="kpi"><div className="kpi-val">{filtered.length}</div><div className="kpi-label">Showing</div></div>
+        <div className="kpi"><div className="kpi-val">{byStage.scheduled ? byStage.scheduled.length : 0}</div><div className="kpi-label">Scheduled</div></div>
+        <div className="kpi"><div className="kpi-val">{byStage.no_show ? byStage.no_show.length : 0}</div><div className="kpi-label">No-Shows</div></div>
+        <div className="kpi"><div className="kpi-val">{byStage.treatment_completed ? byStage.treatment_completed.length : 0}</div><div className="kpi-label">Treated</div></div>
+        <div className="kpi"><div className="kpi-val">{fmtMoney(stats?.attributed_revenue || 0)}</div><div className="kpi-label">Revenue</div></div>
       </div>
 
+      {/* Filter bar */}
       <div className="filter-bar">
-        <select className="filter-select" value={sourceFilter} onChange={e=>setSourceFilter(e.target.value)}>
-          {sources.map(s => (
-            <option key={s} value={s}>{s === 'all' ? 'All Sources' : s}</option>
-          ))}
+        <select className="filter-select" value={sourceFilter} onChange={e => setSourceFilter(e.target.value)}>
+          {sources.map(s => <option key={s} value={s}>{s === 'all' ? 'All Sources' : s}</option>)}
         </select>
-        <input type="text" className="search-box" placeholder="Search name, email, phone..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} />
-        <label style={{fontSize:11,display:'flex',gap:6,alignItems:'center',cursor:'pointer'}}>
-          <input type="checkbox" checked={showCold} onChange={e=>setShowCold(e.target.checked)} />
-          Show Cold
+        <input type="text" className="search-box" placeholder="Search name, email, phone..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
+        <button
+          className={'followup-pill-btn' + (followupOnly ? ' active' : '')}
+          onClick={() => setFollowupOnly(f => !f)}
+        >
+          ⚠ <span className="pill-count">{followupCount}</span> Follow-up
+        </button>
+        <label style={{fontSize:11, display:'flex', gap:6, alignItems:'center', cursor:'pointer'}}>
+          <input type="checkbox" checked={showCold} onChange={e => setShowCold(e.target.checked)} />
+          Cold
         </label>
       </div>
 
-      {staffFollowUps.length > 0 && (
-        <StageRow stage="followup" label="Staff Follow-Up" leads={staffFollowUps} selectedId={selectedId}
-          onCardClick={onCardClick} onDrop={handleDrop} color="#f59e0b" className="special followup-row" />
-      )}
-
-      {STAGES.map(s => (
-        <StageRow key={s} stage={s} label={STAGE_LABELS[s]} leads={byStage[s]} selectedId={selectedId}
-          onCardClick={onCardClick} onDrop={handleDrop} color={STAGE_COLORS[s]} />
-      ))}
-      {showCold && byStage.cold.length > 0 && (
-        <StageRow stage="cold" label="Cold" leads={byStage.cold} selectedId={selectedId}
-          onCardClick={onCardClick} onDrop={handleDrop} color="#9ca3af" />
-      )}
+      {/* Kanban board */}
+      <div className="kanban-board" ref={boardRef} onDragOver={handleBoardDragOver}>
+        {visibleStages.map(s => (
+          <KanbanColumn
+            key={s}
+            stage={s}
+            label={STAGE_LABELS[s]}
+            leads={byStage[s] || []}
+            color={STAGE_COLORS[s] || '#6b7280'}
+            selectedId={selectedId}
+            onCardClick={onCardClick}
+            onDrop={handleDrop}
+            onStageChange={(id, newStage) => handleDrop(id, newStage)}
+          />
+        ))}
+        {showCold && (
+          <KanbanColumn
+            stage="cold"
+            label="Cold"
+            leads={byStage.cold || []}
+            color="#9ca3af"
+            selectedId={selectedId}
+            onCardClick={onCardClick}
+            onDrop={handleDrop}
+            onStageChange={(id, newStage) => handleDrop(id, newStage)}
+          />
+        )}
+      </div>
     </div>
+  );
+}
+
+// ── Dashboard Tab ───────────────────────────────────────────────────────────
+
+function DashboardTab({ pipeline, stats, onTabSwitch }) {
+  const now = Date.now();
+
+  // Compute KPIs from pipeline data
+  const totalLeads = pipeline.length;
+  const scheduled = pipeline.filter(l => l.stage === 'scheduled').length;
+  const totalRevenue = pipeline.reduce((s, l) => s + (l.attributed_production || 0), 0);
+  const treated = pipeline.filter(l => l.stage === 'treatment_completed').length;
+  const convRate = totalLeads > 0 ? Math.round(scheduled / totalLeads * 100) : 0;
+  const revPerLead = totalLeads > 0 ? Math.round(totalRevenue / totalLeads) : 0;
+
+  // Avg days to appointment (leads with appointment_date set)
+  const withAppt = pipeline.filter(l => l.appointment_date && l.created_at);
+  const avgDaysToAppt = withAppt.length > 0
+    ? Math.round(withAppt.reduce((s, l) => {
+        return s + (new Date(l.appointment_date) - new Date(l.created_at)) / (1000 * 60 * 60 * 24);
+      }, 0) / withAppt.length)
+    : null;
+
+  // Alerts
+  const followupNeeded = pipeline.filter(isStaffFollowUp).length;
+  const noShowsThisWeek = pipeline.filter(l => {
+    if (l.stage !== 'no_show') return false;
+    const d = (now - new Date(l.updated_at).getTime()) / (1000 * 60 * 60 * 24);
+    return d <= 7;
+  }).length;
+  const stuckInNew = pipeline.filter(l => {
+    if (l.stage !== 'new') return false;
+    const d = (now - new Date(l.created_at).getTime()) / (1000 * 60 * 60 * 24);
+    return d > 7;
+  }).length;
+  const scheduledThisWeek = pipeline.filter(l => {
+    if (!l.appointment_date) return false;
+    const appt = new Date(l.appointment_date).getTime();
+    return appt >= now && appt <= now + 7 * 24 * 60 * 60 * 1000;
+  }).length;
+
+  // Funnel data
+  const FUNNEL_STAGES = [
+    { key: 'new', label: 'New Lead' },
+    { key: 'auto_nurture', label: 'Auto-Nurture' },
+    { key: 'scheduled', label: 'Scheduled' },
+    { key: 'showed', label: 'Showed' },
+    { key: 'treatment_presented', label: 'Tx Presented' },
+    { key: 'treatment_accepted', label: 'Tx Accepted' },
+    { key: 'treatment_completed', label: 'Tx Completed' },
+  ];
+  const stageCounts = {};
+  pipeline.forEach(l => { stageCounts[l.stage] = (stageCounts[l.stage] || 0) + 1; });
+  const maxCount = Math.max(...FUNNEL_STAGES.map(s => stageCounts[s.key] || 0), 1);
+
+  return (
+    <div className="dash-layout">
+      <div className="dash-left">
+        {/* KPI Cards */}
+        <div className="dash-kpi-grid">
+          <div className="dash-kpi">
+            <div className="dash-kpi-val">{totalLeads}</div>
+            <div className="dash-kpi-label">Total Leads</div>
+            <div className="dash-kpi-sub">All time</div>
+          </div>
+          <div className="dash-kpi">
+            <div className="dash-kpi-val">{convRate}%</div>
+            <div className="dash-kpi-label">Booking Rate</div>
+            <div className="dash-kpi-sub">{scheduled} scheduled / {totalLeads} leads</div>
+          </div>
+          <div className="dash-kpi">
+            <div className="dash-kpi-val">{scheduled}</div>
+            <div className="dash-kpi-label">Scheduled</div>
+            <div className="dash-kpi-sub">Active appointments</div>
+          </div>
+          <div className="dash-kpi">
+            <div className="dash-kpi-val">{fmtMoney(totalRevenue)}</div>
+            <div className="dash-kpi-label">Attributed Revenue</div>
+            <div className="dash-kpi-sub">{treated} treatment{treated !== 1 ? 's' : ''} completed</div>
+          </div>
+          <div className="dash-kpi">
+            <div className="dash-kpi-val">{avgDaysToAppt !== null ? avgDaysToAppt + 'd' : '—'}</div>
+            <div className="dash-kpi-label">Avg Days to Appt</div>
+            <div className="dash-kpi-sub">{withAppt.length} leads with appt data</div>
+          </div>
+          <div className="dash-kpi">
+            <div className="dash-kpi-val">{fmtMoney(revPerLead)}</div>
+            <div className="dash-kpi-label">Revenue / Lead</div>
+            <div className="dash-kpi-sub">Avg across all leads</div>
+          </div>
+        </div>
+
+        {/* Funnel */}
+        <div className="dash-section">
+          <div className="dash-section-title">Funnel</div>
+          {FUNNEL_STAGES.map((s, i) => {
+            const count = stageCounts[s.key] || 0;
+            const widthPct = Math.round(count / maxCount * 100);
+            const prevCount = i > 0 ? (stageCounts[FUNNEL_STAGES[i-1].key] || 0) : null;
+            const dropPct = prevCount !== null && prevCount > 0
+              ? Math.round(count / prevCount * 100) + '%'
+              : '';
+            return (
+              <div key={s.key} className="funnel-row">
+                <span className="funnel-label">{s.label}</span>
+                <div className="funnel-bar-wrap">
+                  <div className="funnel-bar" style={{
+                    width: widthPct + '%',
+                    background: STAGE_COLORS[s.key] || '#6b7280',
+                    opacity: 0.75
+                  }} />
+                </div>
+                <span className="funnel-count">{count}</span>
+                <span className="funnel-pct">{dropPct}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Coming soon placeholder */}
+        <div className="dash-section" style={{color:'var(--text-muted)'}}>
+          <div className="dash-section-title">Recent Activity</div>
+          <span className="coming-soon-badge">Coming in v2</span>
+          <p style={{fontSize:11, marginTop:8}}>Lead timeline feed — last 20 lifecycle events across all leads.</p>
+        </div>
+      </div>
+
+      <div className="dash-right">
+        {/* Alerts */}
+        <div className="dash-section">
+          <div className="dash-section-title">Action Items</div>
+          <div className="alert-item" onClick={() => onTabSwitch('pipeline')}>
+            <div>
+              <div className="alert-label">Staff Follow-Up</div>
+              <div className="alert-sub">Leads needing a call or email</div>
+            </div>
+            <div className={'alert-count ' + (followupNeeded > 0 ? 'warn' : 'ok')}>{followupNeeded}</div>
+          </div>
+          <div className="alert-item" onClick={() => onTabSwitch('pipeline')}>
+            <div>
+              <div className="alert-label">No-Shows This Week</div>
+              <div className="alert-sub">Broken appointments (7d)</div>
+            </div>
+            <div className={'alert-count ' + (noShowsThisWeek > 0 ? 'danger' : 'ok')}>{noShowsThisWeek}</div>
+          </div>
+          <div className="alert-item" onClick={() => onTabSwitch('pipeline')}>
+            <div>
+              <div className="alert-label">Stuck in New {'>'} 7d</div>
+              <div className="alert-sub">Not moving through funnel</div>
+            </div>
+            <div className={'alert-count ' + (stuckInNew > 0 ? 'warn' : 'ok')}>{stuckInNew}</div>
+          </div>
+          <div className="alert-item" onClick={() => onTabSwitch('pipeline')}>
+            <div>
+              <div className="alert-label">Scheduled This Week</div>
+              <div className="alert-sub">Upcoming appointments (7d)</div>
+            </div>
+            <div className={'alert-count info'}>{scheduledThisWeek}</div>
+          </div>
+        </div>
+
+        {/* Stage breakdown */}
+        <div className="dash-section">
+          <div className="dash-section-title">Leads by Stage</div>
+          {STAGES.filter(s => (stageCounts[s] || 0) > 0).map(s => (
+            <div key={s} style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+                                 padding:'5px 0',borderBottom:'1px solid var(--border)',fontSize:11}}>
+              <div style={{display:'flex',alignItems:'center',gap:6}}>
+                <span style={{width:8,height:8,borderRadius:'50%',background:STAGE_COLORS[s]||'#9ca3af',display:'inline-block'}} />
+                {STAGE_LABELS[s]}
+              </div>
+              <span style={{fontWeight:600,color:'var(--text)'}}>{stageCounts[s] || 0}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── PipelineTab — thin wrapper around KanbanBoard ──────────────────────────
+
+// PipelineTab is a thin wrapper — all logic lives in KanbanBoard above
+function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh }) {
+  return (
+    <KanbanBoard
+      pipeline={pipeline}
+      stats={stats}
+      selectedId={selectedId}
+      onCardClick={onCardClick}
+      onStageChange={onStageChange}
+      onRefresh={onRefresh}
+    />
   );
 }
 
@@ -675,7 +1104,213 @@ function defaultDateRange(days) {
   return { start: fmt(start), end: fmt(end) };
 }
 
-function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
+// ─── CampaignTrendChart ────────────────────────────────────────────────────
+// NOTE: filter by campaign_name (not campaign_id) because get_campaign_stats()
+// returns the name field as `campaign`, not a numeric ID.
+function CampaignTrendChart({ campaignName, dailyStats }) {
+  // Filter daily stats to this campaign (case-insensitive) and sort by date ascending
+  const nameLower = (campaignName || '').toLowerCase();
+  const rows = (dailyStats || [])
+    .filter(r => (r.campaign_name || '').toLowerCase() === nameLower)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  if (!rows.length) {
+    return (
+      <div className="trend-empty">
+        No trend data yet — will populate after the next 6 AM Google Ads sync.
+      </div>
+    );
+  }
+
+  const W = 480, H = 80, PAD_L = 28, PAD_R = 8, PAD_T = 8, PAD_B = 20;
+  const chartW = W - PAD_L - PAD_R;
+  const chartH = H - PAD_T - PAD_B;
+  const maxClicks = Math.max(...rows.map(r => r.clicks || 0), 1);
+  const count = rows.length;
+
+  // Build polyline points
+  const pts = rows.map((r, i) => {
+    const x = PAD_L + (count === 1 ? chartW / 2 : (i / (count - 1)) * chartW);
+    const y = PAD_T + chartH - ((r.clicks || 0) / maxClicks) * chartH;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  const firstDate = rows[0].date.slice(5);  // MM-DD
+  const lastDate = rows[rows.length - 1].date.slice(5);
+
+  return (
+    <div className="trend-chart-wrap">
+      <div style={{fontSize:10, color:'var(--text-muted)', marginBottom:4}}>Clicks (last {count} days)</div>
+      <svg className="trend-svg" viewBox={`0 0 ${W} ${H}`} xmlns="http://www.w3.org/2000/svg">
+        {/* Axis lines */}
+        <line x1={PAD_L} y1={PAD_T} x2={PAD_L} y2={PAD_T + chartH} stroke="var(--border)" strokeWidth="1"/>
+        <line x1={PAD_L} y1={PAD_T + chartH} x2={W - PAD_R} y2={PAD_T + chartH} stroke="var(--border)" strokeWidth="1"/>
+        {/* Y-axis labels */}
+        <text x={PAD_L - 3} y={PAD_T + 4} fontSize="7" textAnchor="end" fill="var(--text-muted)">{maxClicks}</text>
+        <text x={PAD_L - 3} y={PAD_T + chartH} fontSize="7" textAnchor="end" fill="var(--text-muted)">0</text>
+        {/* X-axis date labels */}
+        <text x={PAD_L} y={H - 4} fontSize="7" textAnchor="start" fill="var(--text-muted)">{firstDate}</text>
+        <text x={W - PAD_R} y={H - 4} fontSize="7" textAnchor="end" fill="var(--text-muted)">{lastDate}</text>
+        {/* Filled area under line */}
+        <polygon
+          points={`${PAD_L},${PAD_T + chartH} ${pts} ${PAD_L + (count === 1 ? chartW / 2 : chartW)},${PAD_T + chartH}`}
+          fill="var(--teal)" fillOpacity="0.12"
+        />
+        {/* Trend line */}
+        <polyline points={pts} fill="none" stroke="var(--teal)" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round"/>
+      </svg>
+    </div>
+  );
+}
+
+// ─── AdGroupsView ──────────────────────────────────────────────────────────
+function AdGroupsView({ adGroupStats, dailyStats }) {
+  const [campFilter, setCampFilter] = useState('all');
+
+  const campaigns = useMemo(() => {
+    const set = new Set((adGroupStats || []).map(r => r.campaign_name).filter(Boolean));
+    return ['all', ...Array.from(set).sort()];
+  }, [adGroupStats]);
+
+  const filtered = useMemo(() => {
+    if (campFilter === 'all') return adGroupStats || [];
+    return (adGroupStats || []).filter(r => r.campaign_name === campFilter);
+  }, [adGroupStats, campFilter]);
+
+  if (!filtered.length) {
+    return (
+      <div className="report-section">
+        <div className="report-title">Ad Groups</div>
+        <div style={{color:'var(--text-muted)',fontStyle:'italic',fontSize:11,padding:'16px 0'}}>
+          No ad-group data yet — will populate after the next 6 AM Google Ads sync.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+        <div className="report-title" style={{marginBottom:0}}>Ad Groups</div>
+        <select className="filter-select" value={campFilter} onChange={e => setCampFilter(e.target.value)}>
+          {campaigns.map(c => (
+            <option key={c} value={c}>{c === 'all' ? 'All Campaigns' : c.replace(/^grafton_nxtsmile_/,'')}</option>
+          ))}
+        </select>
+      </div>
+      <table className="report-table">
+        <thead>
+          <tr>
+            <th>Ad Group</th>
+            <th>Campaign</th>
+            <th className="num">Impr</th>
+            <th className="num">Clicks</th>
+            <th className="num">Cost</th>
+            <th className="num">CPC</th>
+            <th className="num">Leads</th>
+            <th className="num">CPL</th>
+            <th className="num">Conv%</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map((r, i) => (
+            <tr key={i}>
+              <td style={{fontWeight:500}}>{r.ad_group_name || '(unknown)'}</td>
+              <td style={{color:'var(--text-muted)',fontSize:10}}>{(r.campaign_name||'').replace(/^grafton_nxtsmile_/,'')}</td>
+              <td className="num">{(r.impressions||0).toLocaleString()}</td>
+              <td className="num">{(r.clicks||0).toLocaleString()}</td>
+              <td className="num">{fmtMoney(r.cost||0)}</td>
+              <td className="num">{r.avg_cpc > 0 ? '$'+Number(r.avg_cpc).toFixed(2) : '—'}</td>
+              <td className="num">{r.lead_count||0}</td>
+              <td className="num">{r.cpl > 0 ? '$'+Number(r.cpl).toFixed(0) : '—'}</td>
+              <td className="num">{r.conversion_rate > 0 ? r.conversion_rate+'%' : '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── SearchTermsView ───────────────────────────────────────────────────────
+function SearchTermsView({ searchTermStats }) {
+  const [campFilter, setCampFilter] = useState('all');
+
+  const campaigns = useMemo(() => {
+    const set = new Set((searchTermStats || []).map(r => r.campaign_name).filter(Boolean));
+    return ['all', ...Array.from(set).sort()];
+  }, [searchTermStats]);
+
+  const filtered = useMemo(() => {
+    if (campFilter === 'all') return searchTermStats || [];
+    return (searchTermStats || []).filter(r => r.campaign_name === campFilter);
+  }, [searchTermStats, campFilter]);
+
+  function statusClass(s) {
+    if (!s) return 'none';
+    const l = s.toLowerCase();
+    if (l === 'added') return 'added';
+    if (l === 'excluded') return 'excluded';
+    return 'none';
+  }
+
+  if (!filtered.length) {
+    return (
+      <div className="report-section">
+        <div className="report-title">Search Terms</div>
+        <div style={{color:'var(--text-muted)',fontStyle:'italic',fontSize:11,padding:'16px 0'}}>
+          No search term data yet — will populate after the next 6 AM Google Ads sync.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+        <div className="report-title" style={{marginBottom:0}}>Search Terms</div>
+        <select className="filter-select" value={campFilter} onChange={e => setCampFilter(e.target.value)}>
+          {campaigns.map(c => (
+            <option key={c} value={c}>{c === 'all' ? 'All Campaigns' : c.replace(/^grafton_nxtsmile_/,'')}</option>
+          ))}
+        </select>
+        <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>{filtered.length} terms</span>
+      </div>
+      <table className="report-table">
+        <thead>
+          <tr>
+            <th>Search Term</th>
+            <th>Status</th>
+            <th>Campaign</th>
+            <th>Ad Group</th>
+            <th className="num">Impr</th>
+            <th className="num">Clicks</th>
+            <th className="num">Cost</th>
+            <th className="num">CPC</th>
+            <th className="num">Leads</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map((r, i) => (
+            <tr key={i}>
+              <td style={{fontStyle:'italic'}}>{r.search_term}</td>
+              <td><span className={'st-status ' + statusClass(r.status)}>{(r.status||'NONE').toUpperCase()}</span></td>
+              <td style={{fontSize:10,color:'var(--text-muted)'}}>{(r.campaign_name||'').replace(/^grafton_nxtsmile_/,'')}</td>
+              <td style={{fontSize:10,color:'var(--text-muted)'}}>{r.ad_group_name||''}</td>
+              <td className="num">{(r.impressions||0).toLocaleString()}</td>
+              <td className="num">{(r.clicks||0).toLocaleString()}</td>
+              <td className="num">{fmtMoney(r.cost||0)}</td>
+              <td className="num">{r.cpc > 0 ? '$'+Number(r.cpc).toFixed(2) : '—'}</td>
+              <td className="num">{r.lead_count||0}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, colSpan }) {
   const [panelTab, setPanelTab] = useState('analytics');
   const campName = (campaign.campaign||'').toLowerCase();
 
@@ -704,7 +1339,7 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
         <div className="camp-analytics-inner">
           {/* Sub-tab bar */}
           <div style={{display:'flex',gap:0,borderBottom:'1px solid var(--border)',marginBottom:12}}>
-            {[['analytics','Analytics'],['keywords','Keywords']].map(([k,l])=>(
+            {[['analytics','Analytics'],['keywords','Keywords'],['trend','Trend']].map(([k,l])=>(
               <button key={k} onClick={()=>setPanelTab(k)}
                 style={{padding:'5px 16px',fontSize:11,fontWeight:500,cursor:'pointer',
                   background:'none',border:'none',
@@ -837,6 +1472,11 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
               )}
             </div>
           )}
+
+          {/* ── Trend tab ── */}
+          {panelTab==='trend' && (
+            <CampaignTrendChart campaignName={campaign.campaign||''} dailyStats={dailyStats||[]} />
+          )}
         </div>
       </td>
     </tr>
@@ -844,9 +1484,27 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, colSpan }) {
 }
 
 function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
+  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms'
   const [dateRange, setDateRange] = useState(() => defaultDateRange(30));
-  const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords'
+  const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
   const [ga4Refreshing, setGa4Refreshing] = useState(false);
+
+  // Lazy-loaded ad-group and search-term data (fetched on first ReportsTab mount)
+  const [adGroupStats, setAdGroupStats] = useState([]);
+  const [searchTermStats, setSearchTermStats] = useState([]);
+  const [dailyStats, setDailyStats] = useState([]);
+
+  useEffect(() => {
+    Promise.all([
+      api('/api/admin/gads/ad-groups').catch(() => ({ ad_groups: [] })),
+      api('/api/admin/gads/search-terms').catch(() => ({ search_terms: [] })),
+      api('/api/admin/gads/daily-stats?days=30').catch(() => ({ rows: [] })),
+    ]).then(([ag, st, ds]) => {
+      setAdGroupStats(ag.ad_groups || []);
+      setSearchTermStats(st.search_terms || []);
+      setDailyStats(ds.rows || []);
+    });
+  }, []);
 
   const presets = [
     { label: '7d', days: 7 },
@@ -873,6 +1531,21 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
   return (
     <div>
+      {/* View toggle */}
+      <div className="reports-view-toggle">
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms']].map(([k,l])=>(
+          <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
+        ))}
+      </div>
+
+      {/* ── Ad Groups view ── */}
+      {view==='adgroups' && <AdGroupsView adGroupStats={adGroupStats} dailyStats={dailyStats} />}
+
+      {/* ── Search Terms view ── */}
+      {view==='searchterms' && <SearchTermsView searchTermStats={searchTermStats} />}
+
+      {/* ── Campaigns view ── */}
+      {view==='campaigns' && <div>
       <div className="report-section">
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:12}}>
           <div className="report-title" style={{marginBottom:0}}>Campaign Performance</div>
@@ -944,8 +1617,14 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       </button>
                       <button
                         className={'btn-expand'+(openTab==='keywords'?' active':'')}
+                        style={{marginRight:4}}
                         onClick={()=>togglePanel(campKey,'keywords')}>
                         Keywords {openTab==='keywords'?'▲':'▼'}
+                      </button>
+                      <button
+                        className={'btn-expand'+(openTab==='trend'?' active':'')}
+                        onClick={()=>togglePanel(campKey,'trend')}>
+                        Trend {openTab==='trend'?'▲':'▼'}
                       </button>
                     </td>
                   </tr>
@@ -954,6 +1633,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       campaign={c}
                       keywordStats={keywordStats}
                       ga4Data={ga4Data}
+                      dailyStats={dailyStats}
                       colSpan={COLS}
                     />
                   )}
@@ -968,6 +1648,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
           </tbody>
         </table>
       </div>
+      </div>}
     </div>
   );
 }
@@ -1575,7 +2256,7 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
 }
 
 function App() {
-  const [tab, setTab] = useState('pipeline');
+  const [tab, setTab] = useState('dashboard');  // Dashboard is now the landing tab
   const [pipeline, setPipeline] = useState([]);
   const [stats, setStats] = useState(null);
   const [campaignStats, setCampaignStats] = useState([]);
@@ -1596,12 +2277,12 @@ function App() {
         api('/api/pipeline/enriched'),
         api('/api/admin/stats'),
         api('/api/admin/campaigns'),
-        api('/api/admin/ga4').catch(()=>null),
+        api('/api/admin/ga4').catch(() => null),
       ]);
-      setPipeline(p.leads||[]);
+      setPipeline(p.leads || []);
       setStats(s);
-      setCampaignStats(c.campaigns||[]);
-      setKeywordStats(c.keywords||[]);
+      setCampaignStats(c.campaigns || []);
+      setKeywordStats(c.keywords || []);
       if (g) setGa4Data(g);
     } catch (e) {
       console.error('Load error:', e);
@@ -1611,7 +2292,7 @@ function App() {
   }
 
   function handleStageChange(leadId, newStage) {
-    setPipeline(pipeline.map(l => l.id === leadId ? {...l, stage:newStage} : l));
+    setPipeline(pipeline.map(l => l.id === leadId ? { ...l, stage: newStage } : l));
   }
 
   return (
@@ -1624,37 +2305,41 @@ function App() {
         </div>
       </div>
       <div className="tab-bar">
-        <button className={'tab' + (tab==='pipeline'?' active':'')} onClick={()=>setTab('pipeline')}>Pipeline</button>
-        <button className={'tab' + (tab==='reports'?' active':'')} onClick={()=>setTab('reports')}>Reports & Campaigns</button>
-        <button className={'tab' + (tab==='admin'?' active':'')} onClick={()=>setTab('admin')}>Admin</button>
+        <button className={'tab' + (tab === 'dashboard' ? ' active' : '')} onClick={() => setTab('dashboard')}>Dashboard</button>
+        <button className={'tab' + (tab === 'pipeline' ? ' active' : '')} onClick={() => setTab('pipeline')}>Pipeline</button>
+        <button className={'tab' + (tab === 'reports' ? ' active' : '')} onClick={() => setTab('reports')}>Reports & Campaigns</button>
+        <button className={'tab' + (tab === 'admin' ? ' active' : '')} onClick={() => setTab('admin')}>Admin</button>
       </div>
       <div className="main">
         {loading ? (
-          <div style={{textAlign:'center',padding:20,color:'var(--text-muted)'}}>Loading...</div>
+          <div style={{ textAlign: 'center', padding: 20, color: 'var(--text-muted)' }}>Loading...</div>
         ) : (
-          <>
-            {tab==='pipeline' && (
-              <>
+          <React.Fragment>
+            {tab === 'dashboard' && (
+              <DashboardTab pipeline={pipeline} stats={stats} onTabSwitch={setTab} />
+            )}
+            {tab === 'pipeline' && (
+              <React.Fragment>
                 <PipelineTab pipeline={pipeline} stats={stats} selectedId={selectedId}
                   onCardClick={setSelectedId} onStageChange={handleStageChange} onRefresh={loadData} />
                 {selectedId && (
-                  <DetailPanel lead={pipeline.find(l=>l.id===selectedId)} onClose={()=>setSelectedId(null)}
+                  <DetailPanel lead={pipeline.find(l => l.id === selectedId)} onClose={() => setSelectedId(null)}
                     onStageChange={handleStageChange} onRefresh={loadData}
-                    onDelete={(id)=>{setPipeline(p=>p.filter(l=>l.id!==id));setSelectedId(null);}} />
+                    onDelete={(id) => { setPipeline(p => p.filter(l => l.id !== id)); setSelectedId(null); }} />
                 )}
-              </>
+              </React.Fragment>
             )}
-            {tab==='reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} />}
-            {tab==='admin' && (
+            {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} />}
+            {tab === 'admin' && (
               <AdminTab
-                onSync={()=>api('/api/admin/sync', {method:'POST'})}
-                onMatch={()=>api('/api/admin/match', {method:'POST'})}
-                onGAds={()=>api('/api/admin/gads-sync', {method:'POST'})}
-                onConversions={()=>api('/api/admin/upload-conversions', {method:'POST'})}
-                onGA4Refresh={()=>api('/api/admin/ga4/refresh', {method:'POST'})}
-                onOptimize={()=>api('/api/admin/optimize?dry_run=true', {method:'POST'})} />
+                onSync={() => api('/api/admin/sync', { method: 'POST' })}
+                onMatch={() => api('/api/admin/match', { method: 'POST' })}
+                onGAds={() => api('/api/admin/gads-sync', { method: 'POST' })}
+                onConversions={() => api('/api/admin/upload-conversions', { method: 'POST' })}
+                onGA4Refresh={() => api('/api/admin/ga4/refresh', { method: 'POST' })}
+                onOptimize={() => api('/api/admin/optimize?dry_run=true', { method: 'POST' })} />
             )}
-          </>
+          </React.Fragment>
         )}
       </div>
     </div>

@@ -19,6 +19,7 @@ from config import get_settings
 from database import (
     get_all_leads, upsert_lead, save_gads_keywords_cache,
     save_gads_geo_cache, save_gads_schedule_cache,
+    save_gads_daily_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,8 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
                 click_view.keyword_info.match_type,
                 ad_group.name,
                 ad_group.id,
+                ad_group_ad.ad.id,
+                ad_group_ad.ad.name,
                 campaign.name,
                 campaign.id,
                 segments.date
@@ -90,6 +93,8 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
                     "match_type": str(row.click_view.keyword_info.match_type) if row.click_view.keyword_info.match_type else "",
                     "ad_group_name": row.ad_group.name or "",
                     "ad_group_id": str(row.ad_group.id) if row.ad_group.id else "",
+                    "ad_id": str(row.ad_group_ad.ad.id) if row.ad_group_ad.ad.id else "",
+                    "ad_name": row.ad_group_ad.ad.name or "",
                     "campaign_name": row.campaign.name or "",
                     "campaign_id": str(row.campaign.id) if row.campaign.id else "",
                     "click_date": row.segments.date or date_str,
@@ -223,6 +228,72 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
     return results
 
 
+def _fetch_campaign_daily_stats(client, customer_id: str, days: int = 30) -> int:
+    """
+    Query ad_group resource segmented by date for impressions/clicks/cost/conversions.
+    Uses search_stream (handles >10k rows) with a BETWEEN date range.
+
+    Incremental strategy: always re-fetch the last 3 days (for late-arriving data),
+    skip dates already synced that are older than 3 days.
+
+    Upserts into gads_daily_stats via save_gads_daily_stats().
+    Returns count of rows upserted.
+
+    Note: no campaign/ad_group status filter — we want historical data even if
+    something was paused mid-window (silently dropping paused items would cause
+    metrics to vanish retroactively).
+    """
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    query = f"""
+        SELECT
+            campaign.id,
+            campaign.name,
+            ad_group.id,
+            ad_group.name,
+            segments.date,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions
+        FROM ad_group
+        WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+    """
+
+    logger.info(f"Querying daily ad-group stats ({start_date} to {end_date})...")
+
+    rows = []
+    # No inner try/except — let outer caller (Pass 6 in sync_gclids_to_keywords)
+    # handle errors so auth/quota failures are not silently swallowed as "0 rows".
+    stream = service.search_stream(customer_id=customer_id, query=query)
+    for batch in stream:
+        for row in batch.results:
+            campaign_id = str(row.campaign.id) if row.campaign.id else ""
+            ad_group_id = str(row.ad_group.id) if row.ad_group.id else ""
+            if not campaign_id or not ad_group_id:
+                continue
+            rows.append({
+                "date": row.segments.date,
+                "campaign_id": campaign_id,
+                "campaign_name": row.campaign.name or "",
+                "ad_group_id": ad_group_id,
+                "ad_group_name": row.ad_group.name or "",
+                "impressions": int(row.metrics.impressions or 0),
+                "clicks": int(row.metrics.clicks or 0),
+                "cost_micros": int(row.metrics.cost_micros or 0),
+                "conversions": float(row.metrics.conversions or 0.0),
+            })
+
+    logger.info(f"Daily ad-group stats: {len(rows)} rows fetched from API")
+    if rows:
+        count = save_gads_daily_stats(rows)
+        logger.info(f"Upserted {count} rows into gads_daily_stats")
+        return count
+    return 0
+
+
 def sync_gclids_to_keywords(days_back: int = 7) -> dict:
     """
     Main sync function. Resolves gclids on leads to keyword/ad data.
@@ -281,7 +352,9 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
                 "keyword_text": keyword,
                 "search_term": keyword,  # click_view doesn't have search_term; keyword is closest
                 "ad_group_name": click_data["ad_group_name"],
-                "ad_id": click_data.get("ad_group_id", ""),
+                "ad_group_id": click_data.get("ad_group_id", ""),
+                "ad_id": click_data.get("ad_id", ""),           # actual ad creative ID
+                "ad_name": click_data.get("ad_name", ""),       # ad creative name
                 "campaign_name": click_data.get("campaign_name", ""),
                 "campaign_id": click_data.get("campaign_id", ""),
                 "click_cost": click_cost,
@@ -293,9 +366,9 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
 
             logger.info(
                 f"Lead {lead['id']}: gclid → keyword='{keyword}', "
-                f"ad_group='{click_data['ad_group_name']}', "
-                f"campaign='{click_data['campaign_name']}', "
-                f"CPC=${click_cost:.2f}"
+                f"ad_group='{click_data['ad_group_name']}' (id={click_data.get('ad_group_id', '')}), "
+                f"ad_id={click_data.get('ad_id', '')}, ad_name='{click_data.get('ad_name', '')}', "
+                f"campaign='{click_data['campaign_name']}', CPC=${click_cost:.2f}"
             )
 
         except Exception as e:
@@ -337,6 +410,15 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         logger.warning(f"Schedule performance fetch failed (non-fatal): {e}")
         schedule_data = {}
 
+    # Pass 6: Daily campaign+ad_group stats for trend charts
+    logger.info("Fetching daily ad-group stats for trend charts...")
+    try:
+        daily_rows = _fetch_campaign_daily_stats(client, customer_id, days=30)
+        logger.info(f"Daily ad-group stats: {daily_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Daily ad-group stats fetch failed (non-fatal): {e}")
+        daily_rows = 0
+
     result = {
         "synced": synced,
         "skipped": skipped,
@@ -347,6 +429,7 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         "search_terms_cached": len(search_terms),
         "geo_locations_cached": len(geo_data),
         "schedule_hours_cached": len(schedule_data.get("by_hour", [])),
+        "daily_stats_rows": daily_rows,
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result

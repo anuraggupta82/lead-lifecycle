@@ -206,6 +206,14 @@ Identify when underperformance is NOT an ad problem:
 - lead-lifecycle: Mac Mini (localhost:7070) — the deployment computer
 - Appointment scheduler: GCP Cloud Run (lab-case-manager)
 
+## GCP Monitoring
+
+The `cowork-monitor` service account covers the graftondentalcare.com org, including `marketing-landing-page-491721`.
+- **Credential file:** `/Users/anurag/Documents/Projects/_CREDENTIALS_VAULT/gcp-cowork-monitor.json`
+- **Service account:** `cowork-monitor@lab-case-manager.iam.gserviceaccount.com`
+- Can pull Cloud Run logs, build status, and health for the nxtsmile backend without opening the console.
+- GitHub-triggered Cloud Builds for this project are in the `us-east4` region: `GET /v1/projects/marketing-landing-page-491721/locations/us-east4/builds`
+
 ---
 
 ## Google Ads Account Info

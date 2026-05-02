@@ -39,6 +39,9 @@ from database import (
     add_note, get_notes, delete_note, force_stage,
     get_campaign_stats, get_google_ads_campaigns, get_distinct_sources, get_keyword_stats,
     get_search_term_stats, get_geo_stats, get_schedule_stats,
+    add_deleted_lead_tombstone, backfill_communication_log,
+    get_or_create_conversation, get_conversation, get_messages, get_all_conversations,
+    get_daily_stats, get_ad_group_stats,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -67,6 +70,15 @@ async def lifespan(app: FastAPI):
     # Startup
     init_db()
     logger.info("Database initialized")
+
+    # One-time-safe backfill: ensure communication_log has a row for every
+    # follow_up_queue entry already marked 'sent', so a restart will never
+    # replay an already-delivered template. Idempotent on subsequent boots.
+    try:
+        n = backfill_communication_log()
+        logger.info(f"communication_log backfill: inserted {n} row(s)")
+    except Exception as e:
+        logger.warning(f"communication_log backfill failed (non-fatal): {e}")
 
     # Auto-sync Firestore leads on startup (non-blocking — ignore errors)
     try:
@@ -131,6 +143,17 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Scheduled OD sync failed: {e}")
 
+    # Every 5 min — Poll IMAP inbox for inbound emails
+    def _imap_poll_job():
+        _stamp("imap_poll")
+        try:
+            from imap_service import poll_once
+            result = poll_once()
+            if result.get("fetched", 0) > 0 or result.get("errors", 0) > 0:
+                logger.info(f"IMAP poll: {result}")
+        except Exception as e:
+            logger.error(f"IMAP poll failed: {e}")
+
     # 11 PM — Upload offline conversions
     def _conversion_upload_job():
         _stamp("conversion_upload")
@@ -141,6 +164,10 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Scheduled conversion upload failed: {e}")
 
+    from apscheduler.triggers.interval import IntervalTrigger
+    ads_scheduler.add_job(_imap_poll_job, IntervalTrigger(minutes=5),
+                          id="imap_poll", name="IMAP Inbox Poll",
+                          max_instances=1, coalesce=True, replace_existing=True)
     ads_scheduler.add_job(_ga4_pull_job, CronTrigger(hour=5, minute=30),
                           id="ga4_pull", name="GA4 Analytics Data Pull", replace_existing=True)
     ads_scheduler.add_job(_gads_sync_job, CronTrigger(hour=6, minute=0),
@@ -635,6 +662,19 @@ def admin_delete_lead(lead_id: str):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
+    # Tombstone first — even if Firestore delete or GCS delete fails below,
+    # the next Firestore sync will refuse to re-import this lead.
+    try:
+        add_deleted_lead_tombstone(
+            lead_id,
+            email=lead.get("email", ""),
+            deleted_by="admin",
+            reason="admin_delete_lead",
+        )
+        logger.info(f"Tombstone written for lead {lead_id} ({lead.get('email','')})")
+    except Exception as e:
+        logger.warning(f"Could not write tombstone for lead {lead_id}: {e}")
+
     # Delete smile image from GCS using blob name (preferred) or parse from URL (legacy)
     gcs_blob_name = lead.get("smile_blob_name", "")
     image_url = lead.get("smile_image_url", "")
@@ -864,6 +904,27 @@ def admin_campaigns():
     }
 
 
+# ─── Google Ads extended reporting ───────────────────────────────────────────
+
+@app.get("/api/admin/gads/ad-groups", dependencies=[Depends(_require_admin)])
+def admin_gads_ad_groups():
+    """Ad-group level aggregated stats from gads_daily_stats + leads."""
+    return {"ad_groups": get_ad_group_stats(days=30)}
+
+
+@app.get("/api/admin/gads/daily-stats", dependencies=[Depends(_require_admin)])
+def admin_gads_daily_stats(days: int = 30, campaign_id: Optional[str] = None):
+    """Daily time-series stats per campaign (summed across ad groups). Max 90 days."""
+    days = min(max(int(days), 1), 90)
+    return {"rows": get_daily_stats(days=days, campaign_id=campaign_id or None), "days": days}
+
+
+@app.get("/api/admin/gads/search-terms", dependencies=[Depends(_require_admin)])
+def admin_gads_search_terms(days: int = 30, campaign: str = ""):
+    """Search terms from gads_search_terms_cache, optionally filtered by campaign name."""
+    return {"search_terms": get_search_term_stats(campaign_name=campaign, days=days)}
+
+
 # ─── Pipeline with enrichment ────────────────────────────────────────────────
 
 @app.get("/api/pipeline/enriched")
@@ -1040,6 +1101,73 @@ def keyword_research(body: KeywordResearchRequest):
         }
     except Exception as e:
         logger.error(f"Keyword research failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Email Inbox (Step 5 — bi-directional inbox) ─────────────────────────────
+
+@app.post("/api/admin/email-inbox/poll", dependencies=[Depends(_require_admin)])
+def admin_email_inbox_poll():
+    """
+    Manually trigger an IMAP poll of info@nxtsmile.com.
+    Fetches UNSEEN messages, matches to leads, stores in conversations/messages.
+    """
+    try:
+        from imap_service import poll_once
+        result = poll_once()
+        logger.info(f"Manual IMAP poll: {result}")
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.error(f"Manual IMAP poll error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/conversations", dependencies=[Depends(_require_admin)])
+def admin_get_conversations(limit: int = 100, unmatched_only: bool = False):
+    """
+    Return all email conversations, newest first.
+    Each row includes lead name, contact email, last message preview, and message count.
+    """
+    convs = get_all_conversations(limit=limit, unmatched_only=unmatched_only)
+    return {"conversations": convs, "total": len(convs)}
+
+
+@app.get("/api/admin/conversations/{lead_id}", dependencies=[Depends(_require_admin)])
+def admin_get_lead_conversation(lead_id: str):
+    """Return full conversation thread for a specific lead."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    conv = get_conversation(lead_id)
+    if not conv:
+        return {"conversation": None, "messages": [], "lead": lead}
+    messages = get_messages(conv["id"])
+    return {"conversation": conv, "messages": messages, "lead": lead}
+
+
+class ReplyRequest(BaseModel):
+    body: str
+    subject: Optional[str] = None
+
+
+@app.post("/api/admin/conversations/{lead_id}/reply", dependencies=[Depends(_require_admin)])
+def admin_reply_to_lead(lead_id: str, body: ReplyRequest):
+    """
+    Send a staff reply email to a lead and store it in their conversation thread.
+    In dev mode the email is redirected to test_redirect_email.
+    """
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    try:
+        from imap_service import send_reply
+        result = send_reply(lead_id=lead_id, body=body.body, subject=body.subject)
+        logger.info(f"Staff reply sent: lead={lead_id}, to={result['to']}")
+        return {"status": "sent", **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Reply failed for lead {lead_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

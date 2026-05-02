@@ -9,7 +9,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from database import (
     get_due_follow_ups, mark_follow_up_sent, update_stage,
-    add_event, get_lead, unsubscribe
+    add_event, get_lead, unsubscribe,
+    already_sent, record_send,
 )
 from email_service import (
     send_day1_email, send_day7_email, send_day14_email,
@@ -64,6 +65,13 @@ def _process_queue():
             mark_follow_up_sent(queue_id, "skipped", "no_phone")
             continue
 
+        # Dedupe — restart-safe guard. If this template was already delivered
+        # to this lead, mark the queue row sent and skip (do NOT re-send).
+        if already_sent(lead_id, template):
+            mark_follow_up_sent(queue_id, "sent", "already_sent_dedupe")
+            logger.info(f"Skipped {template} for lead {lead_id} (already in communication_log)")
+            continue
+
         try:
             success = False
             unsub_url = _unsubscribe_url(lead_id, channel)
@@ -95,6 +103,8 @@ def _process_queue():
             mark_follow_up_sent(queue_id, status)
 
             if success:
+                # Persist the send so a future restart won't replay this template
+                record_send(lead_id, template, channel, queue_id=queue_id)
                 add_event(
                     lead_id,
                     f"{channel}_sent",
@@ -142,7 +152,9 @@ def start_scheduler():
         name="Follow-up Queue Processor",
         replace_existing=True,
         max_instances=1,
-        misfire_grace_time=60,
+        coalesce=True,
+        misfire_grace_time=300,
+        next_run_time=None,
     )
     _scheduler.start()
     logger.info("Follow-up engine started (runs every 15 min)")

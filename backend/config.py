@@ -19,11 +19,20 @@ class Settings(BaseSettings):
     # Kill switch — set EMAILS_DISABLED=true in .env to block all outbound email
     emails_disabled: bool = True
 
+    # Kill switch — set SMS_DISABLED=true in .env to block all outbound SMS
+    sms_disabled: bool = True
+
+    # Environment + test redirect (dev mode reroutes mail/SMS to these)
+    env: str = "dev"                              # "dev" or "prod"
+    test_redirect_email: str = "anurag82@gmail.com"
+    test_redirect_phone: str = "+13122134799"
+
     # Email (Zoho SMTP — marketing emails from nXtsmile)
     smtp_host: str = "smtp.zoho.com"
     smtp_port: int = 587
     smtp_user: str = "info@nxtsmile.com"
     smtp_password: str = ""
+    imap_password: str = ""  # Zoho IMAP password for info@nxtsmile.com (may differ from SMTP)
     email_from: str = "nXtsmile <info@nxtsmile.com>"
     notify_email: str = "info@graftondentalcare.com"
 

@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS leads (
     keyword_text    TEXT DEFAULT '',       -- matched keyword from Google Ads
     search_term     TEXT DEFAULT '',       -- actual search query the user typed
     ad_group_name   TEXT DEFAULT '',       -- ad group name
+    ad_group_id     TEXT DEFAULT '',       -- ad group numeric ID
     ad_id           TEXT DEFAULT '',       -- ad creative ID
+    ad_name         TEXT DEFAULT '',       -- ad creative name
     campaign_name   TEXT DEFAULT '',       -- Google Ads campaign name
     campaign_id     TEXT DEFAULT '',       -- Google Ads campaign ID
     click_cost      REAL DEFAULT 0.0,     -- cost per click in dollars
@@ -263,6 +265,82 @@ CREATE TABLE IF NOT EXISTS gads_schedule_cache (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_schedule_cache_key ON gads_schedule_cache(segment_type, segment_value, days);
+
+CREATE TABLE IF NOT EXISTS communication_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id     TEXT NOT NULL,
+    template    TEXT NOT NULL,        -- e.g. 'day1_email','day3_sms'
+    channel     TEXT NOT NULL,        -- 'email' or 'sms'
+    sent_at     TEXT NOT NULL,
+    queue_id    INTEGER DEFAULT NULL, -- follow_up_queue.id, if applicable
+    UNIQUE(lead_id, template)
+);
+
+CREATE INDEX IF NOT EXISTS idx_comm_log_lead ON communication_log(lead_id);
+CREATE INDEX IF NOT EXISTS idx_comm_log_template ON communication_log(template);
+
+CREATE TABLE IF NOT EXISTS deleted_leads (
+    lead_id        TEXT PRIMARY KEY,
+    email          TEXT DEFAULT '',
+    deleted_at     TEXT NOT NULL,
+    deleted_by     TEXT DEFAULT 'admin',
+    reason         TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_deleted_leads_email ON deleted_leads(email);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id         TEXT,                          -- NULL = unmatched (no lead found)
+    channel         TEXT NOT NULL DEFAULT 'email', -- 'email' (sms in future)
+    contact_email   TEXT NOT NULL DEFAULT '',      -- the lead/contact's email address
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY (lead_id) REFERENCES leads(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_lead ON conversations(lead_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_email ON conversations(contact_email);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL,
+    direction       TEXT NOT NULL,       -- 'inbound' | 'outbound'
+    from_addr       TEXT NOT NULL DEFAULT '',
+    subject         TEXT NOT NULL DEFAULT '',
+    body            TEXT NOT NULL DEFAULT '',
+    message_id      TEXT NOT NULL DEFAULT '',  -- RFC 5322 Message-ID (or synthetic UUID)
+    in_reply_to     TEXT NOT NULL DEFAULT '',
+    msg_references  TEXT NOT NULL DEFAULT '',  -- renamed from 'references' (SQL reserved)
+    received_at     TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+);
+
+-- Partial unique index: enforce dedup only when message_id is non-empty
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_msgid_unique
+    ON messages(message_id)
+    WHERE message_id != '';
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at);
+
+CREATE TABLE IF NOT EXISTS gads_daily_stats (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    date          TEXT NOT NULL,
+    campaign_id   TEXT NOT NULL DEFAULT '',
+    campaign_name TEXT DEFAULT '',
+    ad_group_id   TEXT NOT NULL DEFAULT '',
+    ad_group_name TEXT DEFAULT '',
+    impressions   INTEGER DEFAULT 0,
+    clicks        INTEGER DEFAULT 0,
+    cost_micros   INTEGER DEFAULT 0,
+    conversions   REAL DEFAULT 0.0,
+    synced_at     TEXT NOT NULL,
+    UNIQUE (date, campaign_id, ad_group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gads_daily_date ON gads_daily_stats(date);
+CREATE INDEX IF NOT EXISTS idx_gads_daily_campaign ON gads_daily_stats(campaign_id, date);
 """
 
 LIFECYCLE_STAGES = [
@@ -314,7 +392,9 @@ def _migrate(conn):
         ("keyword_text",        "TEXT DEFAULT ''"),
         ("search_term",         "TEXT DEFAULT ''"),
         ("ad_group_name",       "TEXT DEFAULT ''"),
+        ("ad_group_id",         "TEXT DEFAULT ''"),
         ("ad_id",               "TEXT DEFAULT ''"),
+        ("ad_name",             "TEXT DEFAULT ''"),
         ("campaign_name",       "TEXT DEFAULT ''"),
         ("campaign_id",         "TEXT DEFAULT ''"),
         ("click_cost",          "REAL DEFAULT 0.0"),
@@ -518,6 +598,65 @@ def _migrate(conn):
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_schedule_cache_key ON gads_schedule_cache(segment_type, segment_value, days)")
 
+    # ── Conversations + Messages tables (Step 5 — bi-directional email inbox) ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id         TEXT,
+            channel         TEXT NOT NULL DEFAULT 'email',
+            contact_email   TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_lead ON conversations(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_email ON conversations(contact_email)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL,
+            direction       TEXT NOT NULL,
+            from_addr       TEXT NOT NULL DEFAULT '',
+            subject         TEXT NOT NULL DEFAULT '',
+            body            TEXT NOT NULL DEFAULT '',
+            message_id      TEXT NOT NULL DEFAULT '',
+            in_reply_to     TEXT NOT NULL DEFAULT '',
+            msg_references  TEXT NOT NULL DEFAULT '',
+            received_at     TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+        )
+    """)
+    # Partial unique index for dedup — only enforce when message_id is non-empty
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_msgid_unique
+        ON messages(message_id)
+        WHERE message_id != ''
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at)")
+
+    # Google Ads daily stats — ad-group-level metrics for trend charts
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_daily_stats (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            date          TEXT NOT NULL,
+            campaign_id   TEXT NOT NULL DEFAULT '',
+            campaign_name TEXT DEFAULT '',
+            ad_group_id   TEXT NOT NULL DEFAULT '',
+            ad_group_name TEXT DEFAULT '',
+            impressions   INTEGER DEFAULT 0,
+            clicks        INTEGER DEFAULT 0,
+            cost_micros   INTEGER DEFAULT 0,
+            conversions   REAL DEFAULT 0.0,
+            synced_at     TEXT NOT NULL,
+            UNIQUE (date, campaign_id, ad_group_id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_daily_date ON gads_daily_stats(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_daily_campaign ON gads_daily_stats(campaign_id, date)")
+
     # Seed default memories if table is empty
     existing = conn.execute("SELECT COUNT(*) FROM optimizer_memory").fetchone()[0]
     if existing == 0:
@@ -579,8 +718,8 @@ def upsert_lead(data: dict) -> dict:
                         "booking_id","od_patient_num","attributed_production",
                         "treatment_plan_value","attributed_income",
                         "appointment_date","appointment_status","no_show_count",
-                        "keyword_text","search_term","ad_group_name","ad_id",
-                        "campaign_name","campaign_id",
+                        "keyword_text","search_term","ad_group_name","ad_group_id",
+                        "ad_id","ad_name","campaign_name","campaign_id",
                         "click_cost","gads_synced_at"]:
                 if data.get(col) not in (None, ""):
                     fields.append(f"{col}=?")
@@ -1464,3 +1603,373 @@ def update_optimizer_memory(memory_id: int, value: str, reason: str) -> Optional
         )
         row = conn.execute("SELECT * FROM optimizer_memory WHERE id=?", (memory_id,)).fetchone()
         return dict(row) if row else None
+
+
+# ─── Communication Log (send-once dedupe) ────────────────────────────────────
+
+def already_sent(lead_id: str, template: str) -> bool:
+    """Return True if this lead has already received this template."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM communication_log WHERE lead_id=? AND template=? LIMIT 1",
+            (lead_id, template),
+        ).fetchone()
+        return row is not None
+
+
+def record_send(lead_id: str, template: str, channel: str, queue_id: Optional[int] = None) -> None:
+    """Record that a template was successfully sent. Idempotent on (lead_id, template)."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO communication_log (lead_id, template, channel, sent_at, queue_id) "
+            "VALUES (?,?,?,?,?)",
+            (lead_id, template, channel, now, queue_id),
+        )
+
+
+def backfill_communication_log() -> int:
+    """
+    One-time-ish backfill: copy every follow_up_queue row with status='sent'
+    into communication_log so we don't re-send to leads who already got the
+    email/SMS before this dedupe table existed.
+    Safe to run on every startup — INSERT OR IGNORE means existing rows are
+    untouched. Returns number of rows inserted.
+    """
+    with _conn() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM communication_log").fetchone()[0]
+        conn.execute("""
+            INSERT OR IGNORE INTO communication_log (lead_id, template, channel, sent_at, queue_id)
+            SELECT lead_id, template, channel,
+                   COALESCE(NULLIF(sent_at, ''), scheduled_at),
+                   id
+            FROM follow_up_queue
+            WHERE status = 'sent'
+        """)
+        after = conn.execute("SELECT COUNT(*) FROM communication_log").fetchone()[0]
+        return after - before
+
+
+# ─── Deleted-lead tombstones ──────────────────────────────────────────────────
+
+def is_deleted_lead(lead_id: str, email: str = "") -> bool:
+    """Return True if this lead_id (or email) has been admin-deleted."""
+    with _conn() as conn:
+        if lead_id:
+            row = conn.execute(
+                "SELECT 1 FROM deleted_leads WHERE lead_id=? LIMIT 1", (lead_id,)
+            ).fetchone()
+            if row:
+                return True
+        if email:
+            row = conn.execute(
+                "SELECT 1 FROM deleted_leads WHERE email=? COLLATE NOCASE LIMIT 1",
+                (email.strip().lower(),),
+            ).fetchone()
+            if row:
+                return True
+        return False
+
+
+def add_deleted_lead_tombstone(lead_id: str, email: str = "", deleted_by: str = "admin",
+                                reason: str = "") -> None:
+    """Record that a lead was permanently deleted. Idempotent on lead_id."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_leads (lead_id, email, deleted_at, deleted_by, reason) "
+            "VALUES (?,?,?,?,?)",
+            (lead_id, (email or "").strip().lower(), now, deleted_by, reason),
+        )
+
+
+# ─── Conversations + Messages (Step 5 — bi-directional email inbox) ──────────
+
+def get_or_create_conversation(lead_id: Optional[str], channel: str, contact_email: str) -> dict:
+    """
+    Return the existing conversation for this lead (or contact_email if lead_id is None),
+    or create a new one.
+
+    One conversation per lead in v1. If lead_id is None (unmatched), we key on contact_email.
+    """
+    now = _now()
+    with _conn() as conn:
+        if lead_id:
+            row = conn.execute(
+                "SELECT * FROM conversations WHERE lead_id=? AND channel=? LIMIT 1",
+                (lead_id, channel),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM conversations WHERE lead_id IS NULL AND contact_email=? AND channel=? LIMIT 1",
+                (contact_email.lower().strip(), channel),
+            ).fetchone()
+
+        if row:
+            return dict(row)
+
+        # Create new conversation
+        cursor = conn.execute(
+            "INSERT INTO conversations (lead_id, channel, contact_email, created_at, updated_at) "
+            "VALUES (?,?,?,?,?)",
+            (lead_id, channel, contact_email.lower().strip(), now, now),
+        )
+        new_row = conn.execute(
+            "SELECT * FROM conversations WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+        return dict(new_row)
+
+
+def append_message(
+    conversation_id: int,
+    direction: str,
+    from_addr: str,
+    subject: str,
+    body: str,
+    message_id: str,
+    in_reply_to: str,
+    msg_references: str,
+    received_at: str,
+) -> bool:
+    """
+    Insert a message into the messages table.
+    Uses INSERT OR IGNORE for dedup on message_id (partial unique index handles empty IDs).
+    Returns True if the row was inserted, False if it was a duplicate.
+    """
+    with _conn() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO messages
+                (conversation_id, direction, from_addr, subject, body,
+                 message_id, in_reply_to, msg_references, received_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (conversation_id, direction, from_addr.lower().strip(), subject, body,
+             message_id, in_reply_to, msg_references, received_at),
+        )
+        inserted = cursor.rowcount > 0
+
+        if inserted:
+            # Update conversation.updated_at
+            conn.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=?",
+                (received_at, conversation_id),
+            )
+
+        return inserted
+
+
+def get_conversation(lead_id: str) -> Optional[dict]:
+    """Return the conversation for a lead, or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE lead_id=? AND channel='email' LIMIT 1",
+            (lead_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_messages(conversation_id: int, limit: int = 50) -> list:
+    """Return messages for a conversation, oldest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE conversation_id=? ORDER BY received_at ASC LIMIT ?",
+            (conversation_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_conversations(limit: int = 100, unmatched_only: bool = False) -> list:
+    """
+    Return recent conversations with latest message preview.
+    Joins with leads to include name/email where available.
+    """
+    with _conn() as conn:
+        filter_clause = "WHERE c.lead_id IS NULL" if unmatched_only else ""
+        rows = conn.execute(f"""
+            SELECT
+                c.id, c.lead_id, c.channel, c.contact_email, c.created_at, c.updated_at,
+                l.first_name, l.last_name,
+                (SELECT subject FROM messages WHERE conversation_id=c.id ORDER BY received_at DESC LIMIT 1) AS last_subject,
+                (SELECT body FROM messages WHERE conversation_id=c.id ORDER BY received_at DESC LIMIT 1) AS last_body_snippet,
+                (SELECT direction FROM messages WHERE conversation_id=c.id ORDER BY received_at DESC LIMIT 1) AS last_direction,
+                (SELECT COUNT(*) FROM messages WHERE conversation_id=c.id) AS message_count
+            FROM conversations c
+            LEFT JOIN leads l ON c.lead_id = l.id
+            {filter_clause}
+            ORDER BY c.updated_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            # Truncate snippet
+            snippet = (d.get("last_body_snippet") or "")[:120]
+            d["last_body_snippet"] = snippet
+            results.append(d)
+        return results
+
+
+# ─── Google Ads Daily Stats ───────────────────────────────────────────────────
+
+def save_gads_daily_stats(rows: list) -> int:
+    """
+    Upsert a list of daily ad-group stats rows.
+    Each row must have: date, campaign_id, campaign_name, ad_group_id, ad_group_name,
+    impressions, clicks, cost_micros, conversions.
+    Returns number of rows processed.
+    """
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        for row in rows:
+            conn.execute("""
+                INSERT INTO gads_daily_stats
+                    (date, campaign_id, campaign_name, ad_group_id, ad_group_name,
+                     impressions, clicks, cost_micros, conversions, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date, campaign_id, ad_group_id) DO UPDATE SET
+                    campaign_name=excluded.campaign_name,
+                    ad_group_name=excluded.ad_group_name,
+                    impressions=excluded.impressions,
+                    clicks=excluded.clicks,
+                    cost_micros=excluded.cost_micros,
+                    conversions=excluded.conversions,
+                    synced_at=excluded.synced_at
+            """, (
+                row["date"],
+                row["campaign_id"],
+                row["campaign_name"],
+                row["ad_group_id"],
+                row["ad_group_name"],
+                int(row.get("impressions", 0)),
+                int(row.get("clicks", 0)),
+                int(row.get("cost_micros", 0)),
+                float(row.get("conversions", 0.0)),
+                now,
+            ))
+    return len(rows)
+
+
+def get_daily_stats(days: int = 30, campaign_id: Optional[str] = None) -> list:
+    """
+    Return daily aggregate stats (summed across ad groups) for the last N days.
+    Optionally filter by campaign_id (pass None for all campaigns).
+    Returns list of dicts ordered by date ASC.
+
+    Groups by (date, campaign_id) only — uses MAX(campaign_name) so a renamed
+    campaign doesn't produce duplicate rows per day.
+    Date filter uses 'localtime' to match local timezone (consistent with OD/leads).
+    """
+    days = max(min(int(days), 90), 1)
+    modifier = f"-{days} days"
+    with _conn() as conn:
+        if campaign_id:
+            rows = conn.execute("""
+                SELECT
+                    date,
+                    campaign_id,
+                    MAX(campaign_name) AS campaign_name,
+                    SUM(impressions)   AS impressions,
+                    SUM(clicks)        AS clicks,
+                    SUM(cost_micros)   AS cost_micros,
+                    ROUND(SUM(cost_micros) / 1000000.0, 2) AS cost,
+                    SUM(conversions)   AS conversions
+                FROM gads_daily_stats
+                WHERE date >= date('now', 'localtime', ?)
+                  AND campaign_id = ?
+                GROUP BY date, campaign_id
+                ORDER BY date ASC
+            """, (modifier, campaign_id)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT
+                    date,
+                    campaign_id,
+                    MAX(campaign_name) AS campaign_name,
+                    SUM(impressions)   AS impressions,
+                    SUM(clicks)        AS clicks,
+                    SUM(cost_micros)   AS cost_micros,
+                    ROUND(SUM(cost_micros) / 1000000.0, 2) AS cost,
+                    SUM(conversions)   AS conversions
+                FROM gads_daily_stats
+                WHERE date >= date('now', 'localtime', ?)
+                GROUP BY date, campaign_id
+                ORDER BY date ASC
+            """, (modifier,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_ad_group_stats(days: int = 30) -> list:
+    """
+    Return ad-group-level aggregated stats.
+
+    Metrics (impressions/clicks/cost) come from gads_daily_stats grouped by
+    ad_group_id — accurate because this table is ad-group-grained.
+
+    Lead attribution (lead_count, revenue, etc.) is joined from leads by
+    ad_group_name + campaign_name string match — display-only accuracy is
+    acceptable since each lead has exactly one ad_group_name.
+
+    conversion_rate = treatment-accepted leads / total leads × 100.
+    Date filter uses 'localtime' to match local timezone.
+    """
+    days = max(min(int(days), 90), 1)
+    modifier = f"-{days} days"
+    with _conn() as conn:
+        rows = conn.execute("""
+            WITH ag_metrics AS (
+                -- Accurate ad-group metrics from daily stats table
+                -- Use MAX(name) so renamed ad groups don't split into multiple rows
+                SELECT
+                    ad_group_id,
+                    MAX(ad_group_name) AS ad_group_name,
+                    campaign_id,
+                    MAX(campaign_name) AS campaign_name,
+                    SUM(impressions)   AS impressions,
+                    SUM(clicks)        AS clicks,
+                    ROUND(SUM(cost_micros) / 1000000.0, 2) AS cost,
+                    CASE WHEN SUM(clicks) > 0
+                        THEN ROUND(SUM(cost_micros) / 1000000.0 / SUM(clicks), 4)
+                        ELSE 0.0 END AS avg_cpc,
+                    SUM(conversions)   AS conversions
+                FROM gads_daily_stats
+                WHERE date >= date('now', 'localtime', ?)
+                GROUP BY ad_group_id, campaign_id
+            )
+            SELECT
+                ag.ad_group_id,
+                ag.ad_group_name,
+                ag.campaign_id,
+                ag.campaign_name,
+                ag.impressions,
+                ag.clicks,
+                ag.cost,
+                ag.avg_cpc,
+                ag.conversions,
+                COUNT(DISTINCT l.id) AS lead_count,
+                SUM(CASE WHEN l.stage IN (
+                    'scheduled','showed','no_show',
+                    'treatment_presented','treatment_accepted','treatment_completed'
+                ) THEN 1 ELSE 0 END) AS scheduled_count,
+                COALESCE(SUM(l.attributed_production), 0) AS revenue,
+                CASE WHEN COUNT(DISTINCT l.id) > 0
+                    THEN ROUND(ag.cost / COUNT(DISTINCT l.id), 2)
+                    ELSE 0 END AS cpl,
+                -- conversion_rate: treatment-accepted leads / total leads
+                CASE WHEN COUNT(DISTINCT l.id) > 0
+                    THEN ROUND(
+                        CAST(SUM(CASE WHEN l.stage IN (
+                            'treatment_accepted','treatment_completed'
+                        ) THEN 1 ELSE 0 END) AS REAL)
+                        / COUNT(DISTINCT l.id) * 100, 1)
+                    ELSE 0 END AS conversion_rate
+            FROM ag_metrics ag
+            LEFT JOIN leads l
+                ON LOWER(l.ad_group_name) = LOWER(ag.ad_group_name)
+               AND LOWER(l.campaign_name) = LOWER(ag.campaign_name)
+            GROUP BY ag.ad_group_id, ag.campaign_id
+            ORDER BY ag.cost DESC
+        """, (modifier,)).fetchall()
+        return [dict(r) for r in rows]

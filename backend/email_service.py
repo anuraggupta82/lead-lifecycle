@@ -13,6 +13,20 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _resolve_recipient(original_email: str) -> tuple[str, str]:
+    """
+    In dev mode, redirect every outbound email to the test inbox.
+    Returns (effective_to_address, subject_prefix).
+    In prod, returns (original_email, "").
+    """
+    settings = get_settings()
+    if getattr(settings, "env", "dev").lower() == "dev":
+        redirect = getattr(settings, "test_redirect_email", "") or original_email
+        prefix = f"[DEV → {original_email}] " if original_email else "[DEV] "
+        return redirect, prefix
+    return original_email, ""
+
+
 def _send(to_email: str, subject: str, html: str, plain: str = "") -> bool:
     settings = get_settings()
     if getattr(settings, "emails_disabled", False):
@@ -21,11 +35,16 @@ def _send(to_email: str, subject: str, html: str, plain: str = "") -> bool:
     if not settings.smtp_password:
         logger.warning("SMTP password not set — email not sent")
         return False
+
+    # Dev-mode redirect (after kill-switch, before SMTP)
+    effective_to, subj_prefix = _resolve_recipient(to_email)
+    effective_subject = f"{subj_prefix}{subject}"
+
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
+        msg["Subject"] = effective_subject
         msg["From"] = settings.email_from
-        msg["To"] = to_email
+        msg["To"] = effective_to
         msg.attach(MIMEText(plain or "Please view this in an HTML email client.", "plain"))
         msg.attach(MIMEText(html, "html"))
 
@@ -33,11 +52,11 @@ def _send(to_email: str, subject: str, html: str, plain: str = "") -> bool:
             server.ehlo()
             server.starttls()
             server.login(settings.smtp_user, settings.smtp_password)
-            server.sendmail(settings.smtp_user, [to_email], msg.as_string())
-        logger.info(f"Email sent to {to_email}: {subject}")
+            server.sendmail(settings.smtp_user, [effective_to], msg.as_string())
+        logger.info(f"Email sent to {effective_to} (orig={to_email}): {effective_subject}")
         return True
     except Exception as e:
-        logger.error(f"Email failed to {to_email}: {e}")
+        logger.error(f"Email failed to {effective_to} (orig={to_email}): {e}")
         return False
 
 
@@ -50,18 +69,31 @@ def _send_msg(msg: MIMEMultipart) -> bool:
     if not settings.smtp_password:
         logger.warning("SMTP password not set — email not sent")
         return False
-    to_addr = msg.get("To", "?")
-    subject = msg.get("Subject", "?")
+    original_to = msg.get("To", "")
+    original_subject = msg.get("Subject", "")
+
+    # Dev-mode redirect — rewrite To header AND envelope recipient
+    effective_to, subj_prefix = _resolve_recipient(original_to)
+    if effective_to != original_to:
+        # Replace the To header (must del before set, else duplicates)
+        del msg["To"]
+        msg["To"] = effective_to
+    if subj_prefix:
+        del msg["Subject"]
+        msg["Subject"] = f"{subj_prefix}{original_subject}"
+
     try:
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
             server.ehlo()
             server.starttls()
             server.login(settings.smtp_user, settings.smtp_password)
-            server.send_message(msg)
-        logger.info(f"Email sent to {to_addr}: {subject}")
+            # Use explicit sendmail so the envelope recipient is the redirect target,
+            # not whatever was in the (now-rewritten) To header.
+            server.sendmail(settings.smtp_user, [effective_to], msg.as_string())
+        logger.info(f"Email sent to {effective_to} (orig={original_to}): {msg.get('Subject','?')}")
         return True
     except Exception as e:
-        logger.error(f"Email failed to {to_addr}: {e}")
+        logger.error(f"Email failed to {effective_to} (orig={original_to}): {e}")
         return False
 
 

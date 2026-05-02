@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 
 def _send_sms(to_number: str, body: str) -> bool:
     settings = get_settings()
+
+    # Kill switch — independent of env
+    if getattr(settings, "sms_disabled", False):
+        logger.info(f"SMS DISABLED — skipped sending to {to_number}")
+        return False
+
     if not all([settings.twilio_account_sid, settings.twilio_auth_token, settings.twilio_from_number]):
         logger.warning("Twilio not configured — SMS not sent")
         return False
@@ -23,6 +29,14 @@ def _send_sms(to_number: str, body: str) -> bool:
         return False
     e164 = f"+{digits}"
 
+    # Dev-mode redirect — reroute to test phone, prefix body with original target
+    original_e164 = e164
+    if getattr(settings, "env", "dev").lower() == "dev":
+        redirect = getattr(settings, "test_redirect_phone", "") or e164
+        if redirect and redirect != e164:
+            body = f"[DEV → {original_e164}] {body}"
+            e164 = redirect
+
     try:
         from twilio.rest import Client
         client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
@@ -31,10 +45,10 @@ def _send_sms(to_number: str, body: str) -> bool:
             from_=settings.twilio_from_number,
             to=e164,
         )
-        logger.info(f"SMS sent to {e164}: SID {message.sid}")
+        logger.info(f"SMS sent to {e164} (orig={original_e164}): SID {message.sid}")
         return True
     except Exception as e:
-        logger.error(f"SMS failed to {e164}: {e}")
+        logger.error(f"SMS failed to {e164} (orig={original_e164}): {e}")
         return False
 
 
