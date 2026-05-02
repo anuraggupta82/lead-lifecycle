@@ -542,6 +542,12 @@ def _migrate(conn):
             except Exception:
                 pass
 
+    # Add sent_by and message_type columns to messages table (Step 8 migration)
+    msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    for col_name, col_def in [("sent_by", "TEXT DEFAULT NULL"), ("message_type", "TEXT DEFAULT 'auto'")]:
+        if col_name not in msg_cols:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {col_name} {col_def}")
+
     # Search terms cache table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS gads_search_terms_cache (
@@ -1972,4 +1978,72 @@ def get_ad_group_stats(days: int = 30) -> list:
             GROUP BY ag.ad_group_id, ag.campaign_id
             ORDER BY ag.cost DESC
         """, (modifier,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ─── Manual Messaging (Step 8) ────────────────────────────────────────────────
+
+def save_outbound_message(lead_id: str, channel: str, subject: str, body: str,
+                          sent_by: str = "admin") -> int:
+    """
+    Store a manually sent outbound message in the conversations/messages tables.
+    Gets or creates a single conversation per (lead_id, channel).
+    Returns the new message id.
+    """
+    now = _now()
+    with _conn() as conn:
+        # Get or create conversation for this lead + channel
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE lead_id=? AND channel=? LIMIT 1",
+            (lead_id, channel)
+        ).fetchone()
+        if row:
+            conv_id = row[0]
+            conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
+        else:
+            # Fetch contact info from leads table for contact_email
+            lead_row = conn.execute(
+                "SELECT email FROM leads WHERE id=?", (lead_id,)
+            ).fetchone()
+            contact_email = lead_row[0] if lead_row else ""
+            cur = conn.execute(
+                "INSERT INTO conversations (lead_id, channel, contact_email, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (lead_id, channel, contact_email, now, now)
+            )
+            conv_id = cur.lastrowid
+
+        # Insert outbound message
+        cur = conn.execute(
+            "INSERT INTO messages "
+            "(conversation_id, direction, from_addr, subject, body, message_id, "
+            " in_reply_to, msg_references, received_at, sent_by, message_type) "
+            "VALUES (?, 'outbound', 'practice', ?, ?, '', '', ?, ?, ?)",
+            (conv_id, subject, body, now, now, sent_by, "manual")
+        )
+        return cur.lastrowid
+
+
+def get_lead_messages(lead_id: str) -> list:
+    """
+    Return all messages for a lead across all channels, ordered by received_at.
+    Joins conversation channel so the frontend knows which channel each message used.
+    """
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                m.id,
+                m.direction,
+                m.from_addr,
+                m.subject,
+                m.body,
+                m.received_at,
+                m.sent_by,
+                m.message_type,
+                c.channel
+            FROM messages m
+            JOIN conversations c ON c.id = m.conversation_id
+            WHERE c.lead_id = ?
+            ORDER BY m.received_at ASC, m.id ASC
+        """, (lead_id,)).fetchall()
         return [dict(r) for r in rows]

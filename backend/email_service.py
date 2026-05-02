@@ -283,6 +283,14 @@ def _get_smile_bytes(lead: dict) -> bytes:
     return b""
 
 
+def send_manual_email(to_email: str, subject: str, body: str) -> bool:
+    """Send a freeform manual email (no template). Respects kill switch + dev redirect."""
+    import html as _html
+    escaped = _html.escape(body).replace('\n', '<br>')
+    html_body = f"<html><body style='font-family:Arial,sans-serif;color:#333;max-width:560px;margin:0 auto'>{escaped}</body></html>"
+    return _send(to_email, subject, html_body, plain=body)
+
+
 def send_day1_email(lead: dict, unsubscribe_url: str) -> bool:
     settings = get_settings()
     name = (lead.get("first_name") or "there").title()

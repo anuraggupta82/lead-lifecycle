@@ -154,6 +154,35 @@
     .fq-skipped { background: #e5e7eb; color: #6b7280; }
     .fq-failed { background: #fef2f2; color: #dc2626; }
 
+    /* Manual messaging thread */
+    .msg-thread { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+    .msg-bubble { max-width: 85%; padding: 6px 10px; border-radius: 10px; font-size: 11px; line-height: 1.4; position: relative; }
+    .msg-bubble.outbound { align-self: flex-end; background: var(--teal); color: #fff; border-bottom-right-radius: 3px; }
+    .msg-bubble.auto-item { align-self: flex-start; background: #f3f4f6; color: var(--text); border-bottom-left-radius: 3px; border: 1px solid var(--border); }
+    .msg-meta { font-size: 9px; margin-top: 2px; opacity: 0.7; }
+    .msg-bubble.outbound .msg-meta { text-align: right; }
+    .msg-tag { display: inline-block; font-size: 8px; font-weight: 600; text-transform: uppercase;
+               padding: 1px 4px; border-radius: 3px; margin-bottom: 2px; letter-spacing: .4px; }
+    .msg-tag.auto { background: #e0e7ff; color: #3730a3; }
+    .msg-tag.manual { background: #d1fae5; color: #065f46; }
+    .compose-bar { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 4px; }
+    .compose-channel { display: flex; gap: 4px; margin-bottom: 7px; }
+    .compose-channel button { padding: 3px 10px; border-radius: 12px; border: 1px solid var(--border);
+                              font-size: 10px; font-weight: 600; cursor: pointer; background: #fff; color: var(--text-muted); }
+    .compose-channel button.active { background: var(--teal); color: #fff; border-color: var(--teal); }
+    .compose-textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--border);
+                        border-radius: 6px; padding: 6px 8px; font-size: 11px; resize: vertical;
+                        font-family: inherit; min-height: 52px; }
+    .compose-textarea:focus { outline: none; border-color: var(--teal); }
+    .compose-subject { width: 100%; box-sizing: border-box; border: 1px solid var(--border);
+                       border-radius: 6px; padding: 5px 8px; font-size: 11px; margin-bottom: 4px;
+                       font-family: inherit; }
+    .compose-subject:focus { outline: none; border-color: var(--teal); }
+    .compose-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 5px; }
+    .char-count { font-size: 9px; color: var(--text-muted); }
+    .char-count.warn { color: #f59e0b; }
+    .char-count.over { color: var(--red); }
+
     /* Reports & Admin */
     .report-section { background: #fff; border: 1px solid var(--border); border-radius: 8px;
                       padding: 14px; margin-bottom: 12px; }
@@ -339,7 +368,13 @@ async function api(path, opts = {}) {
     ...opts,
     headers: { 'Content-Type':'application/json', 'X-Admin-Password':ADMIN_PW, ...(opts.headers||{}) },
   });
-  if (!res.ok) throw new Error('API ' + res.status);
+  if (!res.ok) {
+    let detail = 'API ' + res.status;
+    try { const j = await res.json(); detail = j.detail || detail; } catch(_) {}
+    const err = new Error(detail);
+    err.detail = detail;
+    throw err;
+  }
   return res.json();
 }
 
@@ -437,12 +472,48 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [testEmailStatus, setTestEmailStatus] = useState('');
+  // Manual messaging state
+  const [messages, setMessages] = useState([]);
+  const [composeChannel, setComposeChannel] = useState('sms');
+  const [composeSubject, setComposeSubject] = useState('');
+  const [composeBody, setComposeBody] = useState('');
+  const [sendingMsg, setSendingMsg] = useState(false);
+  const [sendError, setSendError] = useState('');
 
   useEffect(() => {
     if (!lead) return;
     api('/api/lead/' + lead.id).then(setDetail);
     api('/api/admin/lead/' + lead.id + '/notes').then(d=>setNotes(d.notes||[]));
+    api('/api/admin/lead/' + lead.id + '/messages').then(d=>setMessages(d.messages||[]));
   }, [lead?.id]);
+
+  function refreshMessages() {
+    api('/api/admin/lead/' + lead.id + '/messages').then(d=>setMessages(d.messages||[]));
+  }
+
+  async function sendMessage() {
+    const body = composeBody.trim();
+    if (!body) return;
+    setSendingMsg(true); setSendError('');
+    try {
+      if (composeChannel === 'sms') {
+        await api('/api/admin/lead/' + lead.id + '/send-sms', {
+          method: 'POST', body: JSON.stringify({message: body})
+        });
+      } else {
+        const subj = composeSubject.trim();
+        if (!subj) { setSendError('Subject is required'); setSendingMsg(false); return; }
+        await api('/api/admin/lead/' + lead.id + '/send-email', {
+          method: 'POST', body: JSON.stringify({subject: subj, body})
+        });
+      }
+      setComposeBody(''); setComposeSubject('');
+      refreshMessages();
+    } catch(e) {
+      setSendError(e?.detail || e?.message || 'Send failed');
+    }
+    setSendingMsg(false);
+  }
 
   if (!lead) return null;
   const name = [lead.first_name,lead.last_name].filter(Boolean).join(' ')||lead.email||'Unknown';
@@ -591,7 +662,8 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
           )}
           {tab==='communication' && (
             <div>
-              <div className="detail-section-title">Automated Communications</div>
+              {/* Automated sequence schedule */}
+              <div className="detail-section-title">Sequence Schedule</div>
               {queue.map((q,i)=>(
                 <div key={i} className="fq-item">
                   <span className={'fq-status fq-'+q.status}>{q.status}</span>
@@ -603,7 +675,56 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
                   </div>
                 </div>
               ))}
-              {queue.length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No communications yet</div>}
+              {queue.length===0&&<div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>No sequence scheduled</div>}
+
+              {/* Manual message thread */}
+              <div className="detail-section-title" style={{marginTop:12}}>Messages</div>
+              <div className="msg-thread">
+                {messages.map((m,i)=>(
+                  <div key={i} className={'msg-bubble ' + (m.direction==='outbound' ? 'outbound' : 'auto-item')}>
+                    <div>
+                      <span className={'msg-tag ' + (m.message_type==='manual' ? 'manual' : 'auto')}>
+                        {m.message_type==='manual' ? (m.direction==='outbound'?'Manual':'Reply') : 'Auto'}
+                        {' · '}{(m.channel||'').toUpperCase()}
+                      </span>
+                      {m.subject && <div style={{fontWeight:600,fontSize:10,marginBottom:2}}>{m.subject}</div>}
+                    </div>
+                    <div style={{whiteSpace:'pre-wrap'}}>{m.body}</div>
+                    <div className="msg-meta">
+                      {m.direction==='outbound' && m.sent_by ? (m.sent_by + ' · ') : ''}
+                      {fmtDate(m.received_at)}
+                    </div>
+                  </div>
+                ))}
+                {messages.length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No messages yet</div>}
+              </div>
+
+              {/* Compose bar */}
+              <div className="compose-bar">
+                <div className="compose-channel">
+                  <button className={composeChannel==='sms'?'active':''} onClick={()=>setComposeChannel('sms')}>SMS</button>
+                  <button className={composeChannel==='email'?'active':''} onClick={()=>setComposeChannel('email')}>Email</button>
+                </div>
+                {composeChannel==='email' && (
+                  <input className="compose-subject" placeholder="Subject..."
+                    value={composeSubject} onChange={e=>setComposeSubject(e.target.value)} />
+                )}
+                <textarea className="compose-textarea"
+                  placeholder={composeChannel==='sms'?'Type an SMS message... (Reply STOP to opt out)':'Type your email message...'}
+                  value={composeBody} onChange={e=>setComposeBody(e.target.value)}
+                  rows={composeChannel==='email'?4:2} />
+                <div className="compose-footer">
+                  <span className={'char-count'+(composeChannel==='sms'&&composeBody.length>140?' warn':'')+(composeChannel==='sms'&&composeBody.length>160?' over':'')}>
+                    {composeChannel==='sms' ? composeBody.length+'/160' : ''}
+                    {sendError && <span style={{color:'var(--red)',marginLeft:6}}>{sendError}</span>}
+                  </span>
+                  <button className="btn btn-teal btn-sm" onClick={sendMessage} disabled={sendingMsg||!composeBody.trim()}>
+                    {sendingMsg?'Sending…':'Send'}
+                  </button>
+                </div>
+              </div>
+
+              {/* Event log */}
               <div className="detail-section-title" style={{marginTop:14}}>Event Log</div>
               {events.filter(e=>['email_sent','sms_sent','stage_changed','lead_created','smile_completed','booking_confirmed','od_matched','image_deleted'].includes(e.event_type)).map((e,i)=>(
                 <div key={i} className="timeline-item">

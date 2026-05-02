@@ -52,6 +52,11 @@ def _send_sms(to_number: str, body: str) -> bool:
         return False
 
 
+def send_manual_sms(to_phone: str, body: str) -> bool:
+    """Send a freeform manual SMS (no template). Respects kill switch + dev redirect."""
+    return _send_sms(to_phone, body)
+
+
 def send_day3_sms(lead: dict) -> bool:
     """Day 3 — friendly nudge referencing smile preview."""
     settings = get_settings()

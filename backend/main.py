@@ -42,6 +42,7 @@ from database import (
     add_deleted_lead_tombstone, backfill_communication_log,
     get_or_create_conversation, get_conversation, get_messages, get_all_conversations,
     get_daily_stats, get_ad_group_stats,
+    save_outbound_message, get_lead_messages,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -1169,6 +1170,75 @@ def admin_reply_to_lead(lead_id: str, body: ReplyRequest):
     except Exception as e:
         logger.error(f"Reply failed for lead {lead_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Manual Messaging (Step 8) ────────────────────────────────────────────────
+
+class ManualSmsRequest(BaseModel):
+    message: str
+
+
+class ManualEmailRequest(BaseModel):
+    subject: str
+    body: str
+
+
+@app.get("/api/admin/lead/{lead_id}/messages", dependencies=[Depends(_require_admin)])
+def admin_get_lead_messages(lead_id: str):
+    """Return all messages (auto + manual) for a lead, ordered by timestamp."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"messages": get_lead_messages(lead_id)}
+
+
+@app.post("/api/admin/lead/{lead_id}/send-sms", dependencies=[Depends(_require_admin)])
+def admin_send_manual_sms(lead_id: str, body: ManualSmsRequest):
+    """Send a manual SMS to a lead. Respects kill switch and dev redirect."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    phone = (lead.get("phone") or "").strip()
+    if not phone:
+        raise HTTPException(status_code=422, detail="Lead has no phone number")
+    msg = body.message.strip()
+    if not msg:
+        raise HTTPException(status_code=422, detail="Message cannot be empty")
+    if len(msg) > 1600:
+        raise HTTPException(status_code=422, detail="Message too long (max 1600 chars)")
+
+    from sms_service import send_manual_sms
+    ok = send_manual_sms(phone, msg)
+    if not ok:
+        raise HTTPException(status_code=502, detail="SMS send failed — check logs")
+    msg_id = save_outbound_message(lead_id, "sms", "", msg, sent_by="admin")
+    return {"ok": True, "message_id": msg_id}
+
+
+@app.post("/api/admin/lead/{lead_id}/send-email", dependencies=[Depends(_require_admin)])
+def admin_send_manual_email(lead_id: str, body: ManualEmailRequest):
+    """Send a manual email to a lead. Respects kill switch and dev redirect."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    to_email = (lead.get("email") or "").strip()
+    if not to_email:
+        raise HTTPException(status_code=422, detail="Lead has no email address")
+    subject = body.subject.strip()
+    email_body = body.body.strip()
+    if not subject:
+        raise HTTPException(status_code=422, detail="Subject cannot be empty")
+    if not email_body:
+        raise HTTPException(status_code=422, detail="Email body cannot be empty")
+    if len(email_body) > 100_000:
+        raise HTTPException(status_code=422, detail="Email body too long (max 100KB)")
+
+    from email_service import send_manual_email
+    ok = send_manual_email(to_email, subject, email_body)
+    if not ok:
+        raise HTTPException(status_code=502, detail="Email send failed — check logs")
+    msg_id = save_outbound_message(lead_id, "email", subject, email_body, sent_by="admin")
+    return {"ok": True, "message_id": msg_id}
 
 
 if __name__ == "__main__":
