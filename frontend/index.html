@@ -479,6 +479,10 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const [composeBody, setComposeBody] = useState('');
   const [sendingMsg, setSendingMsg] = useState(false);
   const [sendError, setSendError] = useState('');
+  // Step 10: pause / DND controls
+  const [pauseWorking, setPauseWorking] = useState(false);
+  const [dndWorking, setDndWorking] = useState(false);
+  const [stopMsg, setStopMsg] = useState('');
 
   useEffect(() => {
     if (!lead) return;
@@ -544,6 +548,51 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
     onClose();
   }
 
+  // ── Step 10 helpers ──────────────────────────────────────────────────────
+  async function pauseLead() {
+    setPauseWorking(true); setStopMsg('');
+    try {
+      await api('/api/admin/lead/'+lead.id+'/pause', {method:'POST', body:JSON.stringify({reason:'admin'})});
+      setStopMsg('Lead paused — sequence cancelled.');
+      onRefresh();
+      api('/api/lead/'+lead.id).then(setDetail);
+    } catch(e) { setStopMsg('Error: '+(e?.detail||e?.message||'unknown')); }
+    setPauseWorking(false);
+  }
+
+  async function resumeLead() {
+    setPauseWorking(true); setStopMsg('');
+    try {
+      await api('/api/admin/lead/'+lead.id+'/resume', {method:'POST', body:JSON.stringify({})});
+      setStopMsg('Lead resumed.');
+      onRefresh();
+      api('/api/lead/'+lead.id).then(setDetail);
+    } catch(e) { setStopMsg('Error: '+(e?.detail||e?.message||'unknown')); }
+    setPauseWorking(false);
+  }
+
+  async function setDnd(channel) {
+    setDndWorking(true); setStopMsg('');
+    try {
+      await api('/api/admin/lead/'+lead.id+'/dnd', {method:'POST', body:JSON.stringify({channel, reason:'admin'})});
+      setStopMsg('DND set for '+channel+'. Queue cancelled.');
+      onRefresh();
+      api('/api/lead/'+lead.id).then(setDetail);
+    } catch(e) { setStopMsg('Error: '+(e?.detail||e?.message||'unknown')); }
+    setDndWorking(false);
+  }
+
+  async function clearDnd(channel) {
+    setDndWorking(true); setStopMsg('');
+    try {
+      await api('/api/admin/lead/'+lead.id+'/clear-dnd', {method:'POST', body:JSON.stringify({channel})});
+      setStopMsg('DND cleared for '+channel+'.');
+      onRefresh();
+      api('/api/lead/'+lead.id).then(setDetail);
+    } catch(e) { setStopMsg('Error: '+(e?.detail||e?.message||'unknown')); }
+    setDndWorking(false);
+  }
+
   const events = detail?.events||[];
   const queue = detail?.follow_up_queue||[];
 
@@ -597,6 +646,27 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
               onClick={()=>setTab(t.k)}>{t.l}</button>
           ))}
         </div>
+        {/* ── Step 10: DND / Paused status banner ── */}
+        {(lead.unsubscribed_sms || lead.unsubscribed_email || lead.paused_at) && (
+          <div style={{display:'flex',gap:4,flexWrap:'wrap',padding:'4px 10px',background:'var(--surface-alt,#fef3c7)',borderBottom:'1px solid var(--border)'}}>
+            {lead.unsubscribed_sms && (
+              <span style={{fontSize:10,fontWeight:600,color:'#b45309',background:'#fde68a',borderRadius:4,padding:'2px 7px'}}>
+                📵 SMS DND{lead.dnd_reason?' ('+lead.dnd_reason+')':''}
+              </span>
+            )}
+            {lead.unsubscribed_email && (
+              <span style={{fontSize:10,fontWeight:600,color:'#b45309',background:'#fde68a',borderRadius:4,padding:'2px 7px'}}>
+                📧 Email Unsubscribed
+              </span>
+            )}
+            {lead.paused_at && (
+              <span style={{fontSize:10,fontWeight:600,color:'#7c3aed',background:'#ede9fe',borderRadius:4,padding:'2px 7px'}}>
+                ⏸ Sequence Paused{lead.paused_reason?' ('+lead.paused_reason+')':''}
+                {lead.paused_until?' until '+fmtDate(lead.paused_until):''}
+              </span>
+            )}
+          </div>
+        )}
         <div className="detail-body">
           {tab==='info' && (
             <div>
@@ -664,13 +734,16 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
               {/* Automated sequence schedule */}
               <div className="detail-section-title">Sequence Schedule</div>
               {queue.map((q,i)=>(
-                <div key={i} className="fq-item">
+                <div key={i} className="fq-item" style={{opacity:q.status==='cancelled'?0.55:1}}>
                   <span className={'fq-status fq-'+q.status}>{q.status}</span>
                   <div style={{flex:1,marginLeft:4,fontSize:10}}>
                     <strong>{q.channel==='sms'?'SMS':'Email'}</strong> — {q.template||q.description||('Day '+q.sequence_day)}
+                    {q.status==='cancelled'&&q.cancellation_reason&&(
+                      <span style={{color:'var(--red)',marginLeft:4,fontSize:9}}>({q.cancellation_reason})</span>
+                    )}
                   </div>
                   <div style={{fontSize:9,color:'var(--text-muted)',marginLeft:'auto',whiteSpace:'nowrap'}}>
-                    {q.sent_at ? fmtDate(q.sent_at) : fmtDate(q.scheduled_at)}
+                    {q.sent_at ? fmtDate(q.sent_at) : q.cancelled_at ? fmtDate(q.cancelled_at) : fmtDate(q.scheduled_at)}
                   </div>
                 </div>
               ))}
@@ -725,21 +798,84 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
 
               {/* Event log */}
               <div className="detail-section-title" style={{marginTop:14}}>Event Log</div>
-              {events.filter(e=>['email_sent','sms_sent','stage_changed','lead_created','smile_completed','booking_confirmed','od_matched','image_deleted'].includes(e.event_type)).map((e,i)=>(
-                <div key={i} className="timeline-item">
-                  <div className="timeline-dot" style={{background:e.event_type.includes('email')?'#3b82f6':e.event_type.includes('sms')?'#22c55e':'var(--teal)'}} />
-                  <div style={{flex:1}}>
-                    <div className="timeline-type">{e.event_type.replace(/_/g,' ')}</div>
-                    {e.stage_to&&<div style={{fontSize:9,color:'var(--text-muted)'}}>→ {STAGE_LABELS[e.stage_to]||e.stage_to}</div>}
+              {events.filter(e=>[
+                'email_sent','sms_sent','stage_changed','lead_created','smile_completed',
+                'booking_confirmed','od_matched','image_deleted',
+                // Step 10 events
+                'sms_stop','email_unsub','sms_resubscribed','lead_paused','lead_resumed',
+                'dnd_set','dnd_cleared','manual_pause','replied'
+              ].includes(e.event_type)).map((e,i)=>{
+                const isStop = ['sms_stop','email_unsub','lead_paused','dnd_set','manual_pause'].includes(e.event_type);
+                const isResume = ['sms_resubscribed','lead_resumed','dnd_cleared'].includes(e.event_type);
+                const dotColor = isStop ? 'var(--red)' : isResume ? '#22c55e' :
+                  e.event_type.includes('email') ? '#3b82f6' :
+                  e.event_type.includes('sms') ? '#22c55e' : 'var(--teal)';
+                return (
+                  <div key={i} className="timeline-item">
+                    <div className="timeline-dot" style={{background:dotColor}} />
+                    <div style={{flex:1}}>
+                      <div className="timeline-type">{e.event_type.replace(/_/g,' ')}</div>
+                      {e.stage_to&&<div style={{fontSize:9,color:'var(--text-muted)'}}>→ {STAGE_LABELS[e.stage_to]||e.stage_to}</div>}
+                    </div>
+                    <div className="timeline-time">{fmtDate(e.created_at)}</div>
                   </div>
-                  <div className="timeline-time">{fmtDate(e.created_at)}</div>
-                </div>
-              ))}
+                );
+              })}
               {events.length===0&&<div style={{fontSize:10,color:'var(--text-muted)'}}>No events</div>}
             </div>
           )}
           {tab==='staff' && (
             <div>
+              {/* ── Step 10: Pause / DND controls ── */}
+              <div className="detail-section-title">Sequence Controls</div>
+              <div style={{display:'flex',gap:4,flexWrap:'wrap',marginBottom:6}}>
+                {lead.paused_at ? (
+                  <button className="btn btn-ghost btn-sm" disabled={pauseWorking}
+                    onClick={resumeLead}
+                    style={{background:'#ede9fe',color:'#7c3aed',border:'1px solid #c4b5fd'}}>
+                    {pauseWorking?'Working…':'▶ Resume Sequence'}
+                  </button>
+                ) : (
+                  <button className="btn btn-ghost btn-sm" disabled={pauseWorking}
+                    onClick={pauseLead}
+                    style={{background:'#fef3c7',color:'#b45309',border:'1px solid #fcd34d'}}>
+                    {pauseWorking?'Working…':'⏸ Pause Sequence'}
+                  </button>
+                )}
+                {lead.unsubscribed_sms ? (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
+                    onClick={()=>clearDnd('sms')}
+                    style={{background:'#dcfce7',color:'#166534',border:'1px solid #86efac'}}>
+                    {dndWorking?'Working…':'📵 Clear SMS DND'}
+                  </button>
+                ) : (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
+                    onClick={()=>setDnd('sms')}
+                    style={{background:'#fee2e2',color:'#991b1b',border:'1px solid #fca5a5'}}>
+                    {dndWorking?'Working…':'📵 Set SMS DND'}
+                  </button>
+                )}
+                {lead.unsubscribed_email ? (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
+                    onClick={()=>clearDnd('email')}
+                    style={{background:'#dcfce7',color:'#166534',border:'1px solid #86efac'}}>
+                    {dndWorking?'Working…':'📧 Clear Email DND'}
+                  </button>
+                ) : (
+                  <button className="btn btn-ghost btn-sm" disabled={dndWorking}
+                    onClick={()=>setDnd('email')}
+                    style={{background:'#fee2e2',color:'#991b1b',border:'1px solid #fca5a5'}}>
+                    {dndWorking?'Working…':'📧 Set Email DND'}
+                  </button>
+                )}
+              </div>
+              {stopMsg && (
+                <div style={{fontSize:10,padding:'4px 8px',borderRadius:4,marginBottom:8,
+                  background:stopMsg.startsWith('Error')?'#fee2e2':'#dcfce7',
+                  color:stopMsg.startsWith('Error')?'var(--red)':'#166534'}}>
+                  {stopMsg}
+                </div>
+              )}
               <div className="detail-section-title">Log Staff Action</div>
               <div style={{display:'flex',gap:4,marginBottom:8}}>
                 <button className="btn btn-ghost btn-sm" onClick={()=>{
@@ -2710,6 +2846,234 @@ function ODConnectionCard() {
 }
 
 
+// ── Pending Approvals Panel ────────────────────────────────────────────────────
+function PendingApprovalsPanel() {
+  const [rows, setRows]           = useState(null);   // null = loading
+  const [writesStatus, setWrites] = useState(null);   // {enabled, env_enabled, runtime_enabled}
+  const [acting, setActing]       = useState({});     // {action_id: 'apply'|'reject'}
+  const [togglingWrites, setTW]   = useState(false);
+  const [error, setError]         = useState(null);
+
+  async function load() {
+    try {
+      const [pr, wr] = await Promise.all([
+        api('/api/admin/gads/pending-approvals'),
+        api('/api/admin/gads/writes-status'),
+      ]);
+      setRows(pr.pending || []);
+      setWrites(wr);
+      setError(null);
+    } catch(e) {
+      setError(e.message);
+      setRows([]);
+    }
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function handleApply(action_id) {
+    if (writesStatus && !writesStatus.enabled) {
+      alert('Google Ads writes are disabled. Enable writes first.');
+      return;
+    }
+    if (!confirm('Apply this recommendation to Google Ads now?')) return;
+    setActing(prev => ({...prev, [action_id]: 'apply'}));
+    try {
+      await api(`/api/admin/gads/approve/${action_id}`, { method: 'POST' });
+      setRows(prev => prev.map(r => r.action_id === action_id
+        ? {...r, _result: 'applied'} : r));
+    } catch(e) {
+      alert('Apply failed: ' + e.message);
+    }
+    setActing(prev => ({...prev, [action_id]: null}));
+  }
+
+  async function handleReject(action_id) {
+    if (!confirm('Reject and dismiss this recommendation?')) return;
+    setActing(prev => ({...prev, [action_id]: 'reject'}));
+    try {
+      await api(`/api/admin/gads/reject/${action_id}`, { method: 'POST' });
+      setRows(prev => prev.map(r => r.action_id === action_id
+        ? {...r, _result: 'rejected'} : r));
+    } catch(e) {
+      alert('Reject failed: ' + e.message);
+    }
+    setActing(prev => ({...prev, [action_id]: null}));
+  }
+
+  async function toggleWrites() {
+    if (!writesStatus) return;
+    const newVal = !writesStatus.runtime_enabled;
+    if (newVal && !confirm('Enable live Google Ads writes? This allows keyword pauses, bid changes, and keyword additions to execute immediately.')) return;
+    setTW(true);
+    try {
+      await api('/api/admin/gads/writes-enabled', { method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ enabled: newVal }) });
+      setWrites(prev => ({...prev, runtime_enabled: newVal, enabled: prev.env_enabled && newVal}));
+    } catch(e) {
+      alert('Toggle failed: ' + e.message);
+    }
+    setTW(false);
+  }
+
+  const OP_ICONS = {
+    pause_keyword:       '⛔',
+    increase_bid:        '⬆️',
+    decrease_bid:        '⬇️',
+    add_exact_keyword:   '✨',
+    add_negative_keyword:'🚫',
+  };
+  const OP_COLORS = {
+    pause_keyword:       { bg:'#fef2f2', label:'#dc2626' },
+    increase_bid:        { bg:'#f0fdf4', label:'#16a34a' },
+    decrease_bid:        { bg:'#fffbeb', label:'#f59e0b' },
+    add_exact_keyword:   { bg:'#f0f9ff', label:'#0891b2' },
+    add_negative_keyword:{ bg:'var(--gray-light)', label:'#6b7280' },
+  };
+
+  function fmtState(json_str, op) {
+    if (!json_str) return '—';
+    try {
+      const obj = JSON.parse(json_str);
+      if (op === 'pause_keyword')        return `enabled → paused`;
+      if (op === 'increase_bid' || op === 'decrease_bid') {
+        const before = obj.current_bid_micros ? `$${(obj.current_bid_micros/1e6).toFixed(2)}` : '—';
+        const after  = obj.new_bid_micros     ? `$${(obj.new_bid_micros/1e6).toFixed(2)}`     : '—';
+        return op === 'increase_bid' ? `${before} → ${after} ⬆️` : `${before} → ${after} ⬇️`;
+      }
+      if (op === 'add_exact_keyword')    return `[exact] "${obj.keyword_text}"`;
+      if (op === 'add_negative_keyword') return `[neg/${obj.match_type||'broad'}] "${obj.keyword_text}"`;
+      return JSON.stringify(obj).slice(0,80);
+    } catch { return json_str.slice(0,80); }
+  }
+
+  const writesEnabled = writesStatus?.enabled ?? false;
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
+        <div className="report-title" style={{marginBottom:0}}>Pending Recommendations</div>
+        <button className="btn" style={{fontSize:10,padding:'3px 8px'}} onClick={load}>↻ Refresh</button>
+      </div>
+
+      {/* Write Controls Banner */}
+      {writesStatus && (
+        <div style={{
+          display:'flex', alignItems:'center', gap:10, marginBottom:12,
+          padding:'8px 12px', borderRadius:6,
+          background: writesEnabled ? '#f0fdf4' : '#fef9c3',
+          border: `1px solid ${writesEnabled ? '#86efac' : '#fde68a'}`,
+          fontSize:11
+        }}>
+          <span style={{fontWeight:600, color: writesEnabled ? '#15803d' : '#854d0e'}}>
+            Google Ads Writes: {writesEnabled ? '✅ ENABLED' : '⚠️ DISABLED'}
+          </span>
+          {!writesStatus.env_enabled && (
+            <span style={{color:'#92400e',fontSize:10}}>
+              (CAMPAIGN_WRITE_OPS_ENABLED env var is off — set to true to allow writes)
+            </span>
+          )}
+          {writesStatus.env_enabled && (
+            <button
+              className="btn"
+              style={{fontSize:10, padding:'2px 10px',
+                background: writesEnabled ? '#fef2f2' : '#f0fdf4',
+                color: writesEnabled ? '#dc2626' : '#16a34a'}}
+              onClick={toggleWrites}
+              disabled={togglingWrites}
+            >
+              {togglingWrites ? '…' : writesEnabled ? 'Disable Writes' : 'Enable Writes'}
+            </button>
+          )}
+          <span style={{color:'var(--text-muted)',fontSize:9,marginLeft:'auto'}}>
+            Both env var and runtime switch must be on for any action to execute
+          </span>
+        </div>
+      )}
+
+      {error && (
+        <div style={{padding:10,background:'#fef2f2',borderRadius:6,color:'#dc2626',fontSize:11,marginBottom:8}}>
+          Error loading recommendations: {error}
+        </div>
+      )}
+
+      {rows === null && !error && (
+        <div style={{fontSize:11,color:'var(--text-muted)',textAlign:'center',padding:16}}>Loading…</div>
+      )}
+
+      {rows !== null && rows.length === 0 && (
+        <div style={{fontSize:11,color:'var(--text-muted)',textAlign:'center',padding:16}}>
+          No pending recommendations. Run the optimizer to generate new ones.
+        </div>
+      )}
+
+      {rows !== null && rows.length > 0 && rows.map(row => {
+        const done   = row._result === 'applied' || row._result === 'rejected';
+        const colors = OP_COLORS[row.operation] || {bg:'var(--gray-light)',label:'#374151'};
+        const icon   = OP_ICONS[row.operation] || '❓';
+        const busy   = acting[row.action_id];
+        return (
+          <div key={row.action_id} style={{
+            background: done ? '#f8fafc' : colors.bg,
+            border:'1px solid var(--border)',
+            borderRadius:6, padding:'10px 12px', marginBottom:8,
+            opacity: done ? 0.65 : 1
+          }}>
+            <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:4}}>
+              <span style={{fontSize:13}}>{icon}</span>
+              <span style={{fontSize:11,fontWeight:700,color:colors.label,textTransform:'uppercase',letterSpacing:'0.5px'}}>
+                {row.operation.replace(/_/g,' ')}
+              </span>
+              <span style={{fontSize:12,fontWeight:600,color:'var(--text)',marginLeft:4}}>
+                "{row.entity_name}"
+              </span>
+              {row._result && (
+                <span style={{marginLeft:'auto',fontSize:10,fontWeight:700,
+                  color: row._result==='applied' ? '#16a34a' : '#dc2626'}}>
+                  {row._result === 'applied' ? '✅ Applied' : '❌ Rejected'}
+                </span>
+              )}
+            </div>
+
+            <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:3}}>
+              <strong>Reason:</strong> {row.reason}
+            </div>
+
+            <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
+              <strong>Change:</strong> {fmtState(row.after_state_json || row.before_state_json, row.operation)}
+              &nbsp;&nbsp;
+              <strong>Requested:</strong> {new Date(row.created_at).toLocaleString()}
+            </div>
+
+            {!done && (
+              <div style={{display:'flex',gap:6}}>
+                <button
+                  className="btn btn-teal"
+                  style={{fontSize:10,padding:'3px 12px',opacity: writesEnabled?1:0.5}}
+                  onClick={()=>handleApply(row.action_id)}
+                  disabled={!!busy}
+                  title={writesEnabled?'Apply this recommendation':'Enable Google Ads writes first'}
+                >
+                  {busy==='apply' ? '…' : '✅ Apply'}
+                </button>
+                <button
+                  className="btn"
+                  style={{fontSize:10,padding:'3px 12px',background:'#fef2f2',color:'#dc2626'}}
+                  onClick={()=>handleReject(row.action_id)}
+                  disabled={!!busy}
+                >
+                  {busy==='reject' ? '…' : '❌ Reject'}
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
@@ -2749,6 +3113,8 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
       </div>
 
       <ODConnectionCard />
+
+      <PendingApprovalsPanel />
 
       {optimizerResult && (
         <div className="report-section">

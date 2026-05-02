@@ -848,6 +848,20 @@ def _migrate(conn):
         )
     """)
 
+    # ── Step 10b: Phone hash normalization backfill ────────────────────────────
+    # Re-hash all leads using _hash_phone() (last-10-digits) so Twilio E.164
+    # lookups resolve correctly. Safe: 10-digit stored phones produce the same
+    # hash as before; 11-digit stored phones get corrected.
+    try:
+        rows = conn.execute("SELECT id, phone FROM leads WHERE phone != ''").fetchall()
+        for row in rows:
+            corrected = _hash_phone(row["phone"])
+            conn.execute("UPDATE leads SET phone_hash=? WHERE id=?", (corrected, row["id"]))
+        if rows:
+            print(f"[db] Phone hash backfill: normalized {len(rows)} leads to last-10-digits")
+    except Exception as _e:
+        print(f"[db] Phone hash backfill failed (non-fatal): {_e}")
+
     # ── Step 10: TCPA Stop Conditions ─────────────────────────────────────────
     # New columns on leads table
     leads_cols = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
@@ -981,6 +995,16 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()
 
 
+def _hash_phone(phone: str) -> str:
+    """Hash the last 10 digits of a phone number.
+    Normalizes E.164 (+15083184477) and local (5083184477) to same hash.
+    Uses _hash() internally for consistency with the rest of the codebase.
+    """
+    digits = "".join(c for c in phone if c.isdigit())
+    normalized = digits[-10:] if len(digits) >= 10 else digits
+    return _hash(normalized)
+
+
 # ─── Leads ───────────────────────────────────────────────────────────────────
 
 def upsert_lead(data: dict) -> dict:
@@ -1015,7 +1039,7 @@ def upsert_lead(data: dict) -> dict:
                     values.append(data[col])
             if phone_raw:
                 fields += ["phone_hash=?"]
-                values += [_hash(phone_digits) if phone_digits else ""]
+                values += [_hash_phone(phone_raw) if phone_raw else ""]
             if email_raw:
                 fields += ["email_hash=?"]
                 values += [_hash(email_raw)]
@@ -1036,7 +1060,7 @@ def upsert_lead(data: dict) -> dict:
                 data.get("source", "unknown"), data.get("stage", "new"),
                 data.get("first_name", ""), data.get("last_name", ""),
                 email_raw, phone_raw,
-                _hash(phone_digits) if phone_digits else "",
+                _hash_phone(phone_raw) if phone_raw else "",
                 _hash(email_raw) if email_raw else "",
                 json.dumps(data.get("goals", [])) if isinstance(data.get("goals"), list) else data.get("goals", ""),
                 data.get("gclid", ""), data.get("fbclid", ""), data.get("msclkid", ""),
@@ -2738,24 +2762,27 @@ def upsert_spend_guardrail(campaign_id: str, campaign_name: str, daily_cap_usd: 
 # ─── Step 10: TCPA Stop Conditions ───────────────────────────────────────────
 
 def get_lead_by_phone(phone: str) -> Optional[dict]:
-    """Look up a lead by normalized phone number (digits only, last 10)."""
+    """Look up a lead by normalized phone number.
+    Uses _hash_phone() (last-10-digit normalization) so E.164 (+15083184477)
+    and local (5083184477) resolve to the same hash.
+    """
     if not phone:
         return None
     digits = "".join(c for c in phone if c.isdigit())
     if not digits:
         return None
-    # Match last 10 digits for E.164 vs local number flexibility
+    # Normalize to last 10 for LIKE fallback
     suffix = digits[-10:] if len(digits) >= 10 else digits
     with _conn() as conn:
-        # Try exact phone_hash match first (most reliable)
-        phone_hash = _hash(digits)
+        # Hash match — normalized to last-10 on both sides
+        phone_hash = _hash_phone(phone)
         row = conn.execute(
             "SELECT * FROM leads WHERE phone_hash=? ORDER BY created_at DESC LIMIT 1",
             (phone_hash,)
         ).fetchone()
         if row:
             return dict(row)
-        # Fallback: LIKE match on stored phone
+        # Fallback: LIKE match on stored phone (covers legacy rows before backfill)
         row = conn.execute(
             "SELECT * FROM leads WHERE phone LIKE ? ORDER BY created_at DESC LIMIT 1",
             (f"%{suffix}",)
@@ -2767,11 +2794,11 @@ def set_lead_dnd(lead_id: str, channel: str, reason: str = "STOP keyword") -> No
     """
     Mark a lead as DND for a channel. Reuses unsubscribed_sms / unsubscribed_email columns.
     Also stamps dnd_reason / dnd_set_at for audit purposes.
-    Inserts a lifecycle_event of type 'sms_stop' or 'email_unsub'.
+    Does NOT log a lifecycle_event — callers (stop_engine.handle_event) are
+    responsible for event logging to avoid duplicate sms_stop/email_unsub entries.
     """
     now = _now()
     field = "unsubscribed_sms" if channel == "sms" else "unsubscribed_email"
-    event_type = "sms_stop" if channel == "sms" else "email_unsub"
     with _conn() as conn:
         conn.execute(
             f"UPDATE leads SET {field}=1, dnd_reason=?, dnd_set_at=?, updated_at=? WHERE id=?",
@@ -2781,8 +2808,6 @@ def set_lead_dnd(lead_id: str, channel: str, reason: str = "STOP keyword") -> No
             "INSERT INTO unsubscribes (lead_id, channel, reason, created_at) VALUES (?,?,?,?)",
             (lead_id, channel, reason, now)
         )
-    add_event(lead_id, event_type, detail=json.dumps({"channel": channel, "reason": reason}),
-              source="twilio_webhook")
 
 
 def pause_lead(lead_id: str, reason: str = "admin", until: str = "") -> None:

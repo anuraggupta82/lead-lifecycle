@@ -60,11 +60,20 @@ from firestore_sync import sync_from_firestore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import logging.handlers as _lh
+_LOG_FILE = os.path.join(os.path.dirname(__file__), "logs", "app.log")
+os.makedirs(os.path.dirname(_LOG_FILE), exist_ok=True)
+_file_handler = _lh.RotatingFileHandler(
+    _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(), _file_handler],
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Log file: {_LOG_FILE}")
 
 # Module-level scheduler reference so endpoints can inspect job state
 ads_scheduler = None
@@ -625,7 +634,9 @@ async def gads_approve_action(action_id: str, request: Request):
     """
     from database import get_audit_row, update_gads_action_result, set_audit_approval
     from campaign_safety import check_writes_enabled, WriteBlockedError
-    from ai_optimizer import _build_client, _execute_single_pause
+    from ai_optimizer import (_build_client, _execute_single_pause,
+                               _execute_bid_change, _execute_add_keyword,
+                               _execute_add_negative)
 
     row = get_audit_row(action_id)
     if not row:
@@ -657,19 +668,99 @@ async def gads_approve_action(action_id: str, request: Request):
             logger.info(f"Approved + executed pause_keyword: {row['entity_name']} ({action_id[:8]})")
 
         elif operation in ("increase_bid", "decrease_bid"):
-            # Phase 1: not yet wired — log as pending for future Phase 2
-            raise HTTPException(
-                status_code=501,
-                detail=f"'{operation}' execution not yet implemented in Phase 1. "
-                       f"Please apply this bid change manually in Google Ads."
-            )
+            after = json.loads(row["after_state_json"] or "{}")
+            raw_bid = after.get("new_bid_micros")
+            if not raw_bid:
+                raise HTTPException(
+                    status_code=422,
+                    detail="after_state_json missing new_bid_micros — cannot execute bid change"
+                )
+            try:
+                new_bid_micros = int(raw_bid)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="new_bid_micros must be an integer")
+            client = _build_client()
+            try:
+                _execute_bid_change(
+                    client, customer_id,
+                    resource_name=row["entity_id"],
+                    new_bid_micros=new_bid_micros
+                )
+            except ValueError as e:
+                # Bid guardrail violation — user error, not server error
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"rejected: {str(e)[:200]}")
+                raise HTTPException(status_code=422, detail=str(e))
+            except Exception as e:
+                update_gads_action_result(action_id, executed=True,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed {operation}: {row['entity_name']} "
+                        f"new_bid={new_bid_micros} ({action_id[:8]})")
 
-        elif operation in ("add_exact_keyword", "add_negative_keyword"):
-            raise HTTPException(
-                status_code=501,
-                detail=f"'{operation}' execution not yet implemented in Phase 1. "
-                       f"Please add this keyword manually in Google Ads."
-            )
+        elif operation == "add_exact_keyword":
+            after = json.loads(row["after_state_json"] or "{}")
+            keyword_text = after.get("keyword_text")
+            match_type = after.get("match_type", "EXACT")
+            ad_group_resource = after.get("ad_group_resource") or row["entity_id"]
+            if not keyword_text:
+                raise HTTPException(
+                    status_code=422,
+                    detail="after_state_json missing keyword_text"
+                )
+            client = _build_client()
+            try:
+                _execute_add_keyword(
+                    client, customer_id,
+                    ad_group_resource=ad_group_resource,
+                    keyword_text=keyword_text,
+                    match_type=match_type
+                )
+            except ValueError as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"rejected: {str(e)[:200]}")
+                raise HTTPException(status_code=422, detail=str(e))
+            except Exception as e:
+                update_gads_action_result(action_id, executed=True,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed add_exact_keyword: '{keyword_text}' "
+                        f"({action_id[:8]})")
+
+        elif operation == "add_negative_keyword":
+            after = json.loads(row["after_state_json"] or "{}")
+            keyword_text = after.get("keyword_text")
+            match_type = after.get("match_type", "BROAD")
+            campaign_resource = after.get("campaign_resource") or row["entity_id"]
+            if not keyword_text:
+                raise HTTPException(
+                    status_code=422,
+                    detail="after_state_json missing keyword_text"
+                )
+            client = _build_client()
+            try:
+                _execute_add_negative(
+                    client, customer_id,
+                    campaign_resource=campaign_resource,
+                    keyword_text=keyword_text,
+                    match_type=match_type
+                )
+            except ValueError as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"rejected: {str(e)[:200]}")
+                raise HTTPException(status_code=422, detail=str(e))
+            except Exception as e:
+                update_gads_action_result(action_id, executed=True,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed add_negative_keyword: '{keyword_text}' "
+                        f"({action_id[:8]})")
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
@@ -812,6 +903,9 @@ async def twilio_inbound_webhook(request: Request):
     body_clean  = body_raw.strip()
 
     # ── Twilio signature verification ────────────────────────────────────────
+    # sig_valid tracks whether the signature check passed.
+    # In log_only mode, bad-sig requests are logged but state mutations are blocked.
+    sig_valid = True
     sig_mode = _get_setting("twilio_sig_mode", "log_only")
     if sig_mode != "skip" and settings.twilio_auth_token:
         x_sig = request.headers.get("X-Twilio-Signature", "")
@@ -825,13 +919,14 @@ async def twilio_inbound_webhook(request: Request):
             if sig_mode == "enforce":
                 return _Resp(content=TWIML_EMPTY, media_type="application/xml",
                              status_code=403)
-            # log_only: fall through
+            # log_only: proceed for logging + SMS storage, but block state mutations
+            sig_valid = False
 
     # ── Match lead by phone number ────────────────────────────────────────────
     lead = get_lead_by_phone(from_number)
     lead_id = lead["id"] if lead else None
 
-    # ── Store inbound message ─────────────────────────────────────────────────
+    # ── Store inbound message (always — even on bad sig, for audit trail) ─────
     insert_sms_message(
         lead_id=lead_id,
         direction="inbound",
@@ -846,10 +941,17 @@ async def twilio_inbound_webhook(request: Request):
     first_word = words[0].lower().strip(".,!?") if words else ""
 
     if first_word in _SMS_STOP_WORDS:
+        if not sig_valid:
+            # Bad sig in log_only mode — message is logged but don't mutate lead state
+            logger.warning(
+                f"STOP keyword received but signature invalid (log_only) — "
+                f"skipping DND/cancellation for {from_number}"
+            )
+            return _Resp(content=TWIML_EMPTY, media_type="application/xml")
         if lead_id:
-            # Set DND flag (reuses unsubscribed_sms) and log event
+            # Set DND flag (reuses unsubscribed_sms column)
             set_lead_dnd(lead_id, "sms", reason="STOP keyword")
-            # Cancel queued SMS rows via stop engine
+            # Cancel queued SMS rows + log sms_stop event via stop engine
             _stop_handle(lead_id, "sms_stop", reason="STOP keyword")
         else:
             # Unknown number — log but don't send confirmation (Twilio CTIA guidance)
@@ -858,11 +960,15 @@ async def twilio_inbound_webhook(request: Request):
         return _Resp(content=TWIML_STOP_REPLY, media_type="application/xml")
 
     elif first_word in _SMS_START_WORDS:
+        if not sig_valid:
+            logger.warning(
+                f"START keyword received but signature invalid (log_only) — "
+                f"skipping re-subscribe for {from_number}"
+            )
+            return _Resp(content=TWIML_EMPTY, media_type="application/xml")
         if lead_id:
-            from database import resume_lead
             # Clear unsubscribed_sms flag
             from database import _conn as _dbc
-            import sqlite3 as _sq
             _now_ts = datetime.now(timezone.utc).isoformat()
             with _dbc() as _c:
                 _c.execute(
@@ -873,11 +979,12 @@ async def twilio_inbound_webhook(request: Request):
         return _Resp(content=TWIML_START_REPLY, media_type="application/xml")
 
     elif first_word in _SMS_HELP_WORDS:
+        # HELP is informational — no state mutation, safe to reply even on bad sig
         return _Resp(content=TWIML_HELP_REPLY, media_type="application/xml")
 
     else:
-        # Regular reply — log the event (stop_engine handles replied as log-only)
-        if lead_id:
+        # Regular reply — log the event only if sig is valid (stop_engine: log-only)
+        if lead_id and sig_valid:
             _stop_handle(lead_id, "replied", reason=f"inbound_sms: {body_clean[:80]}")
         return _Resp(content=TWIML_EMPTY, media_type="application/xml")
 

@@ -63,8 +63,12 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
             ad_group_criterion.keyword.match_type,
             ad_group_criterion.status,
             ad_group_criterion.resource_name,
+            ad_group_criterion.effective_cpc_bid_micros,
+            ad_group_criterion.cpc_bid_micros,
             ad_group.name,
+            ad_group.resource_name,
             campaign.name,
+            campaign.resource_name,
             metrics.impressions,
             metrics.clicks,
             metrics.cost_micros,
@@ -83,13 +87,19 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
         for row in response:
             cost = (row.metrics.cost_micros or 0) / 1_000_000.0
             clicks = row.metrics.clicks or 0
+            # Use cpc_bid_micros (manual CPC) if set; fall back to effective_cpc
+            current_bid = (row.ad_group_criterion.cpc_bid_micros or
+                           row.ad_group_criterion.effective_cpc_bid_micros or 0)
             results.append({
                 "keyword": row.ad_group_criterion.keyword.text,
                 "match_type": str(row.ad_group_criterion.keyword.match_type),
                 "status": str(row.ad_group_criterion.status),
                 "resource_name": row.ad_group_criterion.resource_name,
+                "current_bid_micros": current_bid,
                 "ad_group": row.ad_group.name,
+                "ad_group_resource": row.ad_group.resource_name,
                 "campaign": row.campaign.name,
+                "campaign_resource": row.campaign.resource_name,
                 "impressions": row.metrics.impressions or 0,
                 "clicks": clicks,
                 "cost": cost,
@@ -113,6 +123,10 @@ def _get_search_terms(client, customer_id: str, days: int = 30) -> list:
         SELECT
             search_term_view.search_term,
             search_term_view.status,
+            ad_group.resource_name,
+            ad_group.name,
+            campaign.resource_name,
+            campaign.name,
             metrics.impressions,
             metrics.clicks,
             metrics.cost_micros,
@@ -130,6 +144,10 @@ def _get_search_terms(client, customer_id: str, days: int = 30) -> list:
             results.append({
                 "search_term": row.search_term_view.search_term,
                 "status": str(row.search_term_view.status),
+                "ad_group_resource": row.ad_group.resource_name,
+                "ad_group": row.ad_group.name,
+                "campaign_resource": row.campaign.resource_name,
+                "campaign": row.campaign.name,
                 "impressions": row.metrics.impressions or 0,
                 "clicks": row.metrics.clicks or 0,
                 "cost": cost,
@@ -254,6 +272,7 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "keyword": keyword,
                 "match_type": kw["match_type"],
                 "resource_name": kw["resource_name"],
+                "current_bid_micros": kw.get("current_bid_micros", 0),
                 "reason": f"ROAS {roas:.1f}x — ${attr['production']:.0f} production from ${kw['cost']:.2f} spend",
                 "roas": roas,
             })
@@ -264,6 +283,7 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                     "keyword": keyword,
                     "match_type": kw["match_type"],
                     "resource_name": kw["resource_name"],
+                    "current_bid_micros": kw.get("current_bid_micros", 0),
                     "reason": f"${cost_per_booking:.2f}/booking — {attr['booked']} bookings",
                     "roas": 0,
                 })
@@ -278,6 +298,7 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "keyword": keyword,
                 "match_type": kw["match_type"],
                 "resource_name": kw["resource_name"],
+                "current_bid_micros": kw.get("current_bid_micros", 0),
                 "reason": f"{attr['leads']} leads but 0 bookings from ${kw['cost']:.2f} spend",
             })
 
@@ -332,6 +353,9 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "clicks": st.get("clicks", 0),
                 "impressions": st.get("impressions", 0),
                 "cost": st["cost"],
+                "campaign_resource": st.get("campaign_resource", ""),
+                "campaign": st.get("campaign", ""),
+                "ad_group_resource": st.get("ad_group_resource", ""),
                 "reason": f"Memory: classified as negative",
             })
             actions["memory_applied"].append(f"NEGATIVE '{st['search_term']}': memory classification")
@@ -350,6 +374,9 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "clicks": st.get("clicks", 0),
                 "impressions": st.get("impressions", 0),
                 "cost": st["cost"],
+                "campaign_resource": st.get("campaign_resource", ""),
+                "campaign": st.get("campaign", ""),
+                "ad_group_resource": st.get("ad_group_resource", ""),
                 "reason": neg_reason,
             })
         elif st["conversions"] > 0 and term not in existing_keywords:
@@ -366,6 +393,9 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                     "clicks": st["clicks"],
                     "conversions": st["conversions"],
                     "cost": st["cost"],
+                    "ad_group_resource": st.get("ad_group_resource", ""),
+                    "ad_group": st.get("ad_group", ""),
+                    "campaign_resource": st.get("campaign_resource", ""),
                     "reason": "Has real lead attribution + Google conversion",
                 })
             else:
@@ -375,6 +405,9 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                     "clicks": st["clicks"],
                     "conversions": st["conversions"],
                     "cost": st["cost"],
+                    "ad_group_resource": st.get("ad_group_resource", ""),
+                    "ad_group": st.get("ad_group", ""),
+                    "campaign_resource": st.get("campaign_resource", ""),
                     "reason": "Google conversion but NO lead in pipeline — verify before adding",
                 })
 
@@ -391,6 +424,9 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "search_term": st["search_term"],
                 "impressions": st["impressions"],
                 "cost": st["cost"],
+                "campaign_resource": st.get("campaign_resource", ""),
+                "campaign": st.get("campaign", ""),
+                "ad_group_resource": st.get("ad_group_resource", ""),
                 "reason": "High impressions, zero clicks — likely irrelevant",
             })
         elif st.get("clicks", 0) > 5 and st["cost"] > 15 and st["conversions"] == 0:
@@ -404,6 +440,9 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                     "search_term": st["search_term"],
                     "clicks": st.get("clicks", 0),
                     "cost": st["cost"],
+                    "campaign_resource": st.get("campaign_resource", ""),
+                    "campaign": st.get("campaign", ""),
+                    "ad_group_resource": st.get("ad_group_resource", ""),
                     "reason": f"${st['cost']:.2f} spent, {st.get('clicks',0)} clicks, 0 conversions/leads",
                 })
 
@@ -535,6 +574,120 @@ def _execute_single_pause(client, customer_id: str, resource_name: str) -> bool:
         raise
 
 
+# Bid guardrails — hard limits enforced before any bid write
+_MIN_BID_MICROS = 10_000       # $0.01 — Google rejects sub-cent bids
+_MAX_BID_MICROS = 50_000_000   # $50.00 — hard ceiling for GDC ad spend
+
+
+def _execute_bid_change(client, customer_id: str, resource_name: str,
+                         new_bid_micros: int) -> bool:
+    """
+    Update the manual CPC bid (cpc_bid_micros) on a single keyword.
+    Uses the same FieldMask pattern as _execute_single_pause.
+    Does NOT check kill switch — caller must check first.
+    Raises ValueError if bid is outside guardrail limits.
+    Returns True on success.
+    """
+    if new_bid_micros < _MIN_BID_MICROS:
+        raise ValueError(
+            f"Bid {new_bid_micros} micros (${new_bid_micros/1_000_000:.4f}) "
+            f"is below minimum ${_MIN_BID_MICROS/1_000_000:.2f}"
+        )
+    if new_bid_micros > _MAX_BID_MICROS:
+        raise ValueError(
+            f"Bid {new_bid_micros} micros (${new_bid_micros/1_000_000:.2f}) "
+            f"exceeds maximum ${_MAX_BID_MICROS/1_000_000:.2f}"
+        )
+
+    service = client.get_service("AdGroupCriterionService")
+    operation = client.get_type("AdGroupCriterionOperation")
+    criterion = operation.update
+    criterion.resource_name = resource_name
+    criterion.cpc_bid_micros = new_bid_micros
+    client.copy_from(
+        operation.update_mask,
+        client.get_type("FieldMask")(paths=["cpc_bid_micros"])
+    )
+    try:
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Bid change failed for {resource_name} → {new_bid_micros}: {e}")
+        raise
+
+
+def _execute_add_keyword(client, customer_id: str, ad_group_resource: str,
+                          keyword_text: str, match_type: str = "EXACT") -> bool:
+    """
+    Add a new keyword to an ad group.
+    Does NOT check kill switch — caller must check first.
+    Handles ALREADY_EXISTS gracefully (returns True, caller marks as duplicate).
+    Returns True on success or duplicate.
+    """
+    match_type = (match_type or "EXACT").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise ValueError(f"Invalid match_type '{match_type}' — must be EXACT, PHRASE, or BROAD")
+    service = client.get_service("AdGroupCriterionService")
+    operation = client.get_type("AdGroupCriterionOperation")
+    criterion = operation.create
+    criterion.ad_group = ad_group_resource
+    criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+    criterion.keyword.text = keyword_text
+    criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+    try:
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"Added keyword '{keyword_text}' [{match_type}] to {ad_group_resource}")
+        return True
+    except Exception as e:
+        err_str = str(e)
+        # Idempotent: keyword already exists is not a hard failure
+        if "KEYWORD_ALREADY_EXISTS" in err_str or "already exists" in err_str.lower():
+            logger.info(f"Keyword '{keyword_text}' already exists in {ad_group_resource} — treating as success")
+            return True
+        logger.error(f"Add keyword failed '{keyword_text}' → {ad_group_resource}: {e}")
+        raise
+
+
+def _execute_add_negative(client, customer_id: str, campaign_resource: str,
+                           keyword_text: str, match_type: str = "BROAD") -> bool:
+    """
+    Add a campaign-level negative keyword.
+    Does NOT check kill switch — caller must check first.
+    Handles ALREADY_EXISTS gracefully (returns True).
+    Returns True on success or duplicate.
+    """
+    match_type = (match_type or "BROAD").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise ValueError(f"Invalid match_type '{match_type}' — must be EXACT, PHRASE, or BROAD")
+    service = client.get_service("CampaignCriterionService")
+    operation = client.get_type("CampaignCriterionOperation")
+    criterion = operation.create
+    criterion.campaign = campaign_resource
+    criterion.negative = True
+    criterion.keyword.text = keyword_text
+    criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+    try:
+        service.mutate_campaign_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"Added negative '{keyword_text}' [{match_type}] to campaign {campaign_resource}")
+        return True
+    except Exception as e:
+        err_str = str(e)
+        if "KEYWORD_ALREADY_EXISTS" in err_str or "already exists" in err_str.lower():
+            logger.info(f"Negative '{keyword_text}' already in {campaign_resource} — treating as success")
+            return True
+        logger.error(f"Add negative failed '{keyword_text}' → {campaign_resource}: {e}")
+        raise
+
+
 # ── Main Entry Point ─────────────────────────────────────────────────────────
 
 def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> dict:
@@ -622,13 +775,23 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         actions_pending += 1
 
     for kw in actions["increase_bid"]:
+        current_bid = kw.get("current_bid_micros", 0)
+        # Compute new bid: +10%, clamped between MIN and MAX
+        new_bid = int(current_bid * 1.10) if current_bid > 0 else 0
         aid = log_pending(
             operation="increase_bid",
             entity_type="keyword",
             entity_id=kw.get("resource_name", ""),
             entity_name=kw["keyword"],
-            before_state={"match_type": kw.get("match_type", ""), "roas": kw.get("roas", 0)},
-            after_state={"bid_change": "+10%"},
+            before_state={
+                "match_type": kw.get("match_type", ""),
+                "current_bid_micros": current_bid,
+                "roas": kw.get("roas", 0),
+            },
+            after_state={
+                "bid_change": "+10%",
+                "new_bid_micros": new_bid,
+            },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
         )
@@ -636,13 +799,22 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         actions_pending += 1
 
     for kw in actions["decrease_bid"]:
+        current_bid = kw.get("current_bid_micros", 0)
+        # Compute new bid: -10%, clamped to minimum viable
+        new_bid = int(current_bid * 0.90) if current_bid > 0 else 0
         aid = log_pending(
             operation="decrease_bid",
             entity_type="keyword",
             entity_id=kw.get("resource_name", ""),
             entity_name=kw["keyword"],
-            before_state={"match_type": kw.get("match_type", "")},
-            after_state={"bid_change": "-10%"},
+            before_state={
+                "match_type": kw.get("match_type", ""),
+                "current_bid_micros": current_bid,
+            },
+            after_state={
+                "bid_change": "-10%",
+                "new_bid_micros": new_bid,
+            },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
         )
@@ -653,10 +825,19 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         aid = log_pending(
             operation="add_exact_keyword",
             entity_type="keyword",
-            entity_id=st["search_term"],
+            entity_id=st.get("ad_group_resource", st["search_term"]),
             entity_name=st["search_term"],
-            before_state={"type": "search_term", "clicks": st.get("clicks", 0), "conversions": st.get("conversions", 0)},
-            after_state={"match_type": "EXACT"},
+            before_state={
+                "type": "search_term",
+                "clicks": st.get("clicks", 0),
+                "conversions": st.get("conversions", 0),
+            },
+            after_state={
+                "keyword_text": st["search_term"],
+                "match_type": "EXACT",
+                "ad_group_resource": st.get("ad_group_resource", ""),
+                "ad_group": st.get("ad_group", ""),
+            },
             optimizer_run_id=run_id,
             reason=st.get("reason", ""),
         )
@@ -667,10 +848,18 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         aid = log_pending(
             operation="add_negative_keyword",
             entity_type="keyword",
-            entity_id=st["search_term"],
+            entity_id=st.get("campaign_resource", st["search_term"]),
             entity_name=st["search_term"],
-            before_state={"type": "search_term", "cost": st.get("cost", 0)},
-            after_state={"status": "NEGATIVE"},
+            before_state={
+                "type": "search_term",
+                "cost": st.get("cost", 0),
+            },
+            after_state={
+                "keyword_text": st["search_term"],
+                "match_type": "BROAD",
+                "campaign_resource": st.get("campaign_resource", ""),
+                "campaign": st.get("campaign", ""),
+            },
             optimizer_run_id=run_id,
             reason=st.get("reason", ""),
         )
