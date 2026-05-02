@@ -46,6 +46,8 @@ from database import (
     # Step 9: workflows
     get_all_workflows, get_workflow, get_workflow_steps, get_workflow_step,
     upsert_workflow, upsert_workflow_step, delete_workflow_step, delete_workflow,
+    # OD settings
+    get_setting, save_setting, get_od_settings,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -1452,6 +1454,75 @@ def admin_ai_generate_workflow(body: AIGenerateRequest):
             step["subject"] = ""
 
     return {"steps": steps}
+
+
+# ─── OD Connection Settings ──────────────────────────────────────────────────
+
+class ODSettingsRequest(BaseModel):
+    od_db_host:       str = ""
+    od_db_port:       int = 3306
+    od_db_user:       str = ""
+    od_db_password:   str = ""   # empty string = don't change existing saved password
+    od_db_name:       str = "opendental"
+    od_api_base:      str = ""
+    od_developer_key: str = ""
+    od_customer_key:  str = ""
+
+
+@app.get("/api/admin/od-settings", dependencies=[Depends(_require_admin)])
+def admin_get_od_settings():
+    s = get_od_settings()
+    return {
+        "od_db_host":       s["od_db_host"],
+        "od_db_port":       s["od_db_port"],
+        "od_db_user":       s["od_db_user"],
+        "od_db_password":   "••••••••" if s["od_db_password"] else "",
+        "od_db_name":       s["od_db_name"],
+        "od_api_base":      s["od_api_base"],
+        "od_developer_key": s["od_developer_key"],
+        "od_customer_key":  "••••••••" if s["od_customer_key"] else "",
+    }
+
+
+@app.post("/api/admin/od-settings", dependencies=[Depends(_require_admin)])
+def admin_save_od_settings(body: ODSettingsRequest):
+    save_setting("od_db_host",       body.od_db_host.strip())
+    save_setting("od_db_port",       str(body.od_db_port))
+    save_setting("od_db_user",       body.od_db_user.strip())
+    save_setting("od_db_name",       body.od_db_name.strip())
+    save_setting("od_api_base",      body.od_api_base.strip())
+    save_setting("od_developer_key", body.od_developer_key.strip())
+    # Only overwrite password/customer key if a real value was sent
+    if body.od_db_password and not body.od_db_password.startswith("•"):
+        save_setting("od_db_password", body.od_db_password)
+    if body.od_customer_key and not body.od_customer_key.startswith("•"):
+        save_setting("od_customer_key", body.od_customer_key)
+    return {"ok": True}
+
+
+@app.post("/api/admin/od-test", dependencies=[Depends(_require_admin)])
+def admin_test_od_connection():
+    s = get_od_settings()
+    if not s["od_db_host"]:
+        raise HTTPException(status_code=400, detail="No host configured")
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=s["od_db_host"],
+            port=s["od_db_port"],
+            user=s["od_db_user"],
+            password=s["od_db_password"],
+            database=s["od_db_name"],
+            connect_timeout=5,
+            charset="utf8mb4",
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT VERSION()")
+            version = cur.fetchone()[0]
+        conn.close()
+        return {"ok": True, "message": f"Connected ✓  MySQL {version}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 if __name__ == "__main__":

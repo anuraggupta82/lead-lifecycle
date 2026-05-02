@@ -1076,6 +1076,35 @@ def delete_workflow_step(step_id: int) -> bool:
         return True
 
 
+# ─── App Settings (persistent key/value store) ───────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    with _conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+
+def save_setting(key: str, value: str):
+    with _conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+
+
+def get_od_settings() -> dict:
+    """Return OD connection settings from DB, falling back to env/config defaults."""
+    from config import get_settings
+    cfg = get_settings()
+    return {
+        "od_db_host":       get_setting("od_db_host")       or cfg.od_db_host,
+        "od_db_port":       int(get_setting("od_db_port") or cfg.od_db_port),
+        "od_db_user":       get_setting("od_db_user")       or cfg.od_db_user,
+        "od_db_password":   get_setting("od_db_password")   or cfg.od_db_password,
+        "od_db_name":       get_setting("od_db_name")       or cfg.od_db_name,
+        "od_api_base":      get_setting("od_api_base")      or cfg.od_api_base,
+        "od_developer_key": get_setting("od_developer_key") or cfg.od_developer_key,
+        "od_customer_key":  get_setting("od_customer_key")  or cfg.od_customer_key,
+    }
+
+
 def delete_workflow(workflow_id: int) -> bool:
     with _conn() as conn:
         conn.execute("DELETE FROM workflow_steps WHERE workflow_id=?", (workflow_id,))

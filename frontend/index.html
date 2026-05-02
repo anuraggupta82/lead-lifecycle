@@ -2575,6 +2575,142 @@ function WorkflowsSection() {
 }
 
 
+// ── OD Connection Card ────────────────────────────────────────────────────────
+function ODConnectionCard() {
+  const [form, setForm] = React.useState({
+    od_db_host: '', od_db_port: 3306, od_db_user: '', od_db_password: '',
+    od_db_name: 'opendental', od_api_base: '', od_developer_key: '', od_customer_key: '',
+  });
+  const [loaded, setLoaded] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [testing, setTesting] = React.useState(false);
+  const [testResult, setTestResult] = React.useState(null); // {ok, message}
+  const [saveMsg, setSaveMsg] = React.useState('');
+
+  React.useEffect(() => {
+    api('/api/admin/od-settings').then(data => {
+      setForm(f => ({...f, ...data}));
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  function set(k, v) { setForm(f => ({...f, [k]: v})); setTestResult(null); setSaveMsg(''); }
+
+  async function save() {
+    setSaving(true); setSaveMsg('');
+    try {
+      await api('/api/admin/od-settings', { method: 'POST', body: JSON.stringify(form) });
+      setSaveMsg('✓ Saved');
+    } catch(e) { setSaveMsg('Error: ' + e.message); }
+    finally { setSaving(false); }
+  }
+
+  async function test() {
+    // Save first so the test uses the current form values
+    setSaving(true);
+    try { await api('/api/admin/od-settings', { method: 'POST', body: JSON.stringify(form) }); }
+    catch(e) {}
+    setSaving(false);
+    setTesting(true); setTestResult(null);
+    try {
+      const r = await api('/api/admin/od-test', { method: 'POST' });
+      setTestResult({ ok: true, message: r.message });
+    } catch(e) { setTestResult({ ok: false, message: e.message || e.detail || 'Connection failed' }); }
+    finally { setTesting(false); }
+  }
+
+  const inp = {
+    padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 4,
+    fontSize: 11, width: '100%', fontFamily: 'inherit',
+  };
+
+  return (
+    <div className="report-section">
+      <div className="report-title">🔌 OpenDental Connection</div>
+      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:12}}>
+        Settings are saved to the local database and override .env values. Only accessible on the office LAN.
+      </div>
+
+      {/* MySQL row */}
+      <div style={{marginBottom:8}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',marginBottom:6}}>MySQL Database</div>
+        <div style={{display:'grid',gridTemplateColumns:'2fr 0.6fr 1fr 1fr 1fr',gap:8}}>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>Host</label>
+            <input style={inp} value={form.od_db_host} placeholder="GraftonServer"
+              onChange={e=>set('od_db_host', e.target.value)} />
+          </div>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>Port</label>
+            <input style={inp} type="number" value={form.od_db_port}
+              onChange={e=>set('od_db_port', parseInt(e.target.value)||3306)} />
+          </div>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>Username</label>
+            <input style={inp} value={form.od_db_user} placeholder="root"
+              onChange={e=>set('od_db_user', e.target.value)} />
+          </div>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>Password</label>
+            <input style={inp} type="password" value={form.od_db_password} placeholder="(none)"
+              onChange={e=>set('od_db_password', e.target.value)} />
+          </div>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>Database</label>
+            <input style={inp} value={form.od_db_name} placeholder="opendental"
+              onChange={e=>set('od_db_name', e.target.value)} />
+          </div>
+        </div>
+      </div>
+
+      {/* API row */}
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',marginBottom:6}}>REST API (for future write access)</div>
+        <div style={{display:'grid',gridTemplateColumns:'2fr 1fr 1fr',gap:8}}>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>API Base URL</label>
+            <input style={inp} value={form.od_api_base} placeholder="http://GraftonServer:30223/api/v1"
+              onChange={e=>set('od_api_base', e.target.value)} />
+          </div>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>Developer Key</label>
+            <input style={inp} value={form.od_developer_key} placeholder="Developer key"
+              onChange={e=>set('od_developer_key', e.target.value)} />
+          </div>
+          <div>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'block',marginBottom:2}}>Customer Key</label>
+            <input style={{...inp, fontFamily:'monospace'}} type="password" value={form.od_customer_key}
+              placeholder="Customer key" onChange={e=>set('od_customer_key', e.target.value)} />
+          </div>
+        </div>
+      </div>
+
+      {/* Actions row */}
+      <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <button className="btn btn-teal btn-sm" onClick={save} disabled={saving || !loaded}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button className="btn btn-ghost btn-sm" onClick={test} disabled={testing || saving || !loaded}>
+          {testing ? 'Testing…' : '⚡ Test Connection'}
+        </button>
+        {saveMsg && <span style={{fontSize:11,color:saveMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{saveMsg}</span>}
+        {testResult && (
+          <span style={{
+            fontSize:11, fontWeight:600,
+            color: testResult.ok ? '#16a34a' : '#dc2626',
+            background: testResult.ok ? '#dcfce7' : '#fee2e2',
+            border: '1px solid ' + (testResult.ok ? '#86efac' : '#fca5a5'),
+            borderRadius:5, padding:'3px 8px',
+          }}>
+            {testResult.ok ? '✓' : '✗'} {testResult.message}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
@@ -2612,6 +2748,8 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
           </button>
         </div>
       </div>
+
+      <ODConnectionCard />
 
       {optimizerResult && (
         <div className="report-section">

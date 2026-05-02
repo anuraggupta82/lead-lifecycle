@@ -14,7 +14,7 @@ import hashlib
 import logging
 import json
 from datetime import datetime, timezone
-from database import get_all_leads, get_lead, add_event, update_stage, enqueue_follow_ups
+from database import get_all_leads, get_lead, add_event, update_stage, enqueue_follow_ups, get_od_settings
 from config import get_settings
 from ga4_events import (
     track_treatment_presented, track_treatment_accepted, track_treatment_completed,
@@ -42,13 +42,13 @@ def _hash(value: str) -> str:
 def _get_db():
     try:
         import pymysql
-        settings = get_settings()
+        s = get_od_settings()
         return pymysql.connect(
-            host=settings.od_db_host,
-            port=settings.od_db_port,
-            user=settings.od_db_user,
-            password=settings.od_db_password,
-            database=settings.od_db_name,
+            host=s["od_db_host"],
+            port=s["od_db_port"],
+            user=s["od_db_user"],
+            password=s["od_db_password"],
+            database=s["od_db_name"],
             connect_timeout=5,
             charset="utf8mb4",
         )
