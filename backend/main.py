@@ -54,6 +54,7 @@ from database import (
     add_lead_event,
     # Inbox / call log / next action helpers
     get_unread_sms_count, get_unread_sms_leads, mark_sms_read,
+    get_unread_email_count, get_unread_email_leads, mark_email_read,
     log_call, get_calls, set_next_action, clear_next_action,
     # Lead tags
     get_lead_tags, set_lead_tags,
@@ -189,8 +190,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Scheduled conversion upload failed: {e}")
 
-    from apscheduler.triggers.interval import IntervalTrigger
-    ads_scheduler.add_job(_imap_poll_job, IntervalTrigger(minutes=5),
+    ads_scheduler.add_job(_imap_poll_job, CronTrigger(minute="0,5,10,15,20,25,30,35,40,45,50,55"),
                           id="imap_poll", name="IMAP Inbox Poll",
                           max_instances=1, coalesce=True, replace_existing=True)
     ads_scheduler.add_job(_ga4_pull_job, CronTrigger(hour=5, minute=30),
@@ -1214,6 +1214,8 @@ def admin_delete_lead(lead_id: str):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
+    settings = get_settings()
+
     # Tombstone first — even if Firestore delete or GCS delete fails below,
     # the next Firestore sync will refuse to re-import this lead.
     tombstone_written = False
@@ -1823,6 +1825,9 @@ def admin_get_lead_conversation(lead_id: str):
     if not conv:
         return {"conversation": None, "messages": [], "lead": lead}
     messages = get_messages(conv["id"])
+    # Do NOT auto-mark as read here — mark-read is triggered explicitly by
+    # user action (send reply or "Mark as read" button) so the bell badge
+    # stays visible until the user intentionally dismisses it.
     return {"conversation": conv, "messages": messages, "lead": lead}
 
 
@@ -1891,7 +1896,11 @@ def admin_send_manual_sms(lead_id: str, body: ManualSmsRequest):
     ok = send_manual_sms(phone, msg)
     if not ok:
         raise HTTPException(status_code=502, detail="SMS send failed — check logs")
-    msg_id = save_outbound_message(lead_id, "sms", "", msg, sent_by="admin")
+    msg_id = None
+    try:
+        msg_id = save_outbound_message(lead_id, "sms", "", msg, sent_by="admin")
+    except Exception as e:
+        logger.error(f"save_outbound_message failed after SMS send: {e}", exc_info=True)
     return {"ok": True, "message_id": msg_id}
 
 
@@ -1917,7 +1926,11 @@ def admin_send_manual_email(lead_id: str, body: ManualEmailRequest):
     ok = send_manual_email(to_email, subject, email_body)
     if not ok:
         raise HTTPException(status_code=502, detail="Email send failed — check logs")
-    msg_id = save_outbound_message(lead_id, "email", subject, email_body, sent_by="admin")
+    msg_id = None
+    try:
+        msg_id = save_outbound_message(lead_id, "email", subject, email_body, sent_by="admin")
+    except Exception as e:
+        logger.error(f"save_outbound_message failed after email send: {e}", exc_info=True)
     return {"ok": True, "message_id": msg_id}
 
 
@@ -1925,19 +1938,50 @@ def admin_send_manual_email(lead_id: str, body: ManualEmailRequest):
 
 @app.get("/api/admin/inbox/unread", dependencies=[Depends(_require_admin)])
 def admin_inbox_unread():
-    """Return unread inbound SMS count + list of leads with unread messages."""
+    """Return unread inbound SMS + email count + combined list of leads with unread messages."""
+    sms_count = get_unread_sms_count()
+    email_count = get_unread_email_count()
+    sms_leads = get_unread_sms_leads()
+    email_leads = get_unread_email_leads()
+
+    # Merge: combine leads from both channels, dedupe by lead_id
+    # SMS leads use 'last_received_at', email leads use 'latest_at' — normalize to 'latest_at'
+    merged = {}
+    for l in sms_leads:
+        row = {**l, "channel": "sms", "has_unread_email": False,
+               "latest_at": l.get("latest_at") or l.get("last_received_at") or ""}
+        merged[l["lead_id"]] = row
+
+    for el in email_leads:
+        lid = el["lead_id"]
+        el_at = el.get("latest_at") or ""
+        if lid in merged:
+            # Lead has both unread SMS and email — keep most recent timestamp
+            merged[lid]["unread_count"] = merged[lid].get("unread_count", 0) + el.get("unread_count", 0)
+            merged[lid]["has_unread_email"] = True
+            merged[lid]["channel"] = "both"
+            if el_at > merged[lid].get("latest_at", ""):
+                merged[lid]["latest_at"] = el_at
+                merged[lid]["latest_body"] = el.get("latest_body", merged[lid].get("latest_body"))
+        else:
+            merged[lid] = {**el, "channel": "email", "has_unread_email": True, "latest_at": el_at}
+
+    leads_list = sorted(merged.values(), key=lambda x: x.get("latest_at", ""), reverse=True)
     return {
-        "count": get_unread_sms_count(),
-        "leads": get_unread_sms_leads(),
+        "count": sms_count + email_count,
+        "sms_count": sms_count,
+        "email_count": email_count,
+        "leads": leads_list,
     }
 
 @app.post("/api/admin/lead/{lead_id}/mark-read", dependencies=[Depends(_require_admin)])
 def admin_mark_sms_read(lead_id: str):
-    """Mark all inbound SMS for a lead as read."""
+    """Mark all inbound SMS and email messages for a lead as read."""
     if not get_lead(lead_id):
         raise HTTPException(status_code=404, detail="Lead not found")
-    updated = mark_sms_read(lead_id)
-    return {"ok": True, "updated": updated}
+    sms_updated = mark_sms_read(lead_id)
+    email_updated = mark_email_read(lead_id)
+    return {"ok": True, "updated": sms_updated + email_updated}
 
 
 # ─── Call Log ─────────────────────────────────────────────────────────────────

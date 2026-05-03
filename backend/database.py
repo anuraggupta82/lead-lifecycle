@@ -621,6 +621,11 @@ def _migrate(conn):
     if "read_at" not in sms_cols:
         conn.execute("ALTER TABLE sms_messages ADD COLUMN read_at TEXT DEFAULT NULL")
 
+    # Add read_at column to messages (email inbox) if missing
+    msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "read_at" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN read_at TEXT DEFAULT NULL")
+
     # Create lead_calls table if not exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS lead_calls (
@@ -2828,8 +2833,8 @@ def save_outbound_message(lead_id: str, channel: str, subject: str, body: str,
             "INSERT INTO messages "
             "(conversation_id, direction, from_addr, subject, body, message_id, "
             " in_reply_to, msg_references, received_at, sent_by, message_type) "
-            "VALUES (?, 'outbound', 'practice', ?, ?, '', '', ?, ?, ?)",
-            (conv_id, subject, body, now, now, sent_by, "manual")
+            "VALUES (?, 'outbound', 'practice', ?, ?, '', '', '', ?, ?, ?)",
+            (conv_id, subject, body, now, sent_by, "manual")
         )
         return cur.lastrowid
 
@@ -3402,6 +3407,61 @@ def mark_sms_read(lead_id: str) -> int:
         cur = conn.execute(
             "UPDATE sms_messages SET read_at=? "
             "WHERE lead_id=? AND direction='inbound' AND read_at IS NULL",
+            (now, lead_id)
+        )
+        return cur.rowcount
+
+
+# ─── Email Inbox Unread Tracking ──────────────────────────────────────────────
+
+def get_unread_email_count() -> int:
+    """Count inbound email messages not yet read by staff."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE direction='inbound' AND read_at IS NULL"
+        ).fetchone()
+        return row[0] if row else 0
+
+
+def get_unread_email_leads() -> list:
+    """
+    Return leads (and unmatched conversations) that have at least one unread inbound email.
+    Uses LEFT JOIN so emails from senders not yet matched to a lead still appear.
+    """
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                COALESCE(l.id, 'unmatched-' || CAST(c.id AS TEXT)) AS lead_id,
+                l.first_name, l.last_name,
+                COALESCE(l.email, c.contact_email)                  AS email,
+                MAX(m.received_at)                                   AS latest_at,
+                COUNT(m.id)                                          AS unread_count,
+                (SELECT m2.body FROM messages m2
+                 WHERE m2.conversation_id = c.id
+                   AND m2.direction = 'inbound'
+                   AND m2.read_at IS NULL
+                 ORDER BY m2.received_at DESC LIMIT 1)               AS latest_body,
+                CASE WHEN l.id IS NULL THEN 1 ELSE 0 END             AS is_unmatched
+            FROM messages m
+            JOIN conversations c ON c.id = m.conversation_id
+            LEFT JOIN leads l ON l.id = c.lead_id
+            WHERE m.direction = 'inbound' AND m.read_at IS NULL
+            GROUP BY c.id
+            ORDER BY latest_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_email_read(lead_id: str) -> int:
+    """Mark all unread inbound emails for a lead as read. Returns rows updated."""
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            """UPDATE messages SET read_at=?
+               WHERE direction='inbound' AND read_at IS NULL
+               AND conversation_id IN (
+                   SELECT id FROM conversations WHERE lead_id=?
+               )""",
             (now, lead_id)
         )
         return cur.rowcount

@@ -73,9 +73,11 @@ def _dispatch_dynamic(item: dict, step: dict, unsub_url: str) -> bool:
     elif channel == "email":
         escaped = _html_module.escape(rendered_body).replace("\n", "<br>")
         html_body = (
-            f"<html><body style='font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0 auto'>"
+            "<html><body style='margin:0;padding:0;background:#ffffff;'>"
+            "<div style='font-family:Arial,sans-serif;color:#333;max-width:600px;"
+            "margin:0;padding:16px;text-align:left;'>"
             f"{escaped}"
-            f"</body></html>"
+            "</div></body></html>"
         )
         return _send(item.get("email", ""), rendered_subject, html_body, plain=rendered_body)
     else:
@@ -83,8 +85,30 @@ def _dispatch_dynamic(item: dict, step: dict, unsub_url: str) -> bool:
         return False
 
 
+# Send window: 9 AM – 6 PM America/New_York
+_SEND_WINDOW_START = 9   # 9:00 AM ET
+_SEND_WINDOW_END   = 18  # 6:00 PM ET (exclusive)
+
+
+def _in_send_window() -> bool:
+    """Return True if current Eastern time is within the allowed send window."""
+    try:
+        import zoneinfo
+        et = zoneinfo.ZoneInfo("America/New_York")
+    except ImportError:
+        import pytz
+        et = pytz.timezone("America/New_York")
+    from datetime import datetime
+    now_et = datetime.now(et)
+    return _SEND_WINDOW_START <= now_et.hour < _SEND_WINDOW_END
+
+
 def _process_queue():
     """Called every 15 minutes by APScheduler."""
+    if not _in_send_window():
+        logger.debug("Follow-up engine: outside send window (9 AM–6 PM ET), skipping")
+        return
+
     due = get_due_follow_ups()
     if not due:
         return

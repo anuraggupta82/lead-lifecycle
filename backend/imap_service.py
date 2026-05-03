@@ -87,6 +87,47 @@ def _strip_html(html: str) -> str:
     return text
 
 
+def _strip_quoted_reply(text: str) -> str:
+    """
+    Remove quoted reply chains from email body — show only the new reply text.
+    Strips everything from common markers:
+      - Lines starting with ">" (quoted text)
+      - "On <date>, <name> wrote:" (Gmail/Apple Mail style)
+      - "-----Original Message-----"
+    """
+    import re
+    lines = text.splitlines()
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            break
+        if re.match(r"^On .{10,200}wrote:\s*$", stripped):
+            break
+        if stripped.startswith("-----Original Message-----"):
+            break
+        if stripped.startswith("________________________________"):
+            break
+        result.append(line)
+    cleaned = "\n".join(result).rstrip()
+    # Strip trailing email signature marker  (-- on its own line)
+    cleaned = re.sub(r"\n--\s*\n.*$", "", cleaned, flags=re.DOTALL).rstrip()
+    return cleaned
+
+
+def _decode_header_value(value: str) -> str:
+    """Decode MIME encoded-word headers (e.g. =?UTF-8?Q?...?=) to plain text."""
+    from email.header import decode_header as _dh
+    parts = _dh(value)
+    decoded = []
+    for part, charset in parts:
+        if isinstance(part, bytes):
+            decoded.append(part.decode(charset or "utf-8", errors="replace"))
+        else:
+            decoded.append(part)
+    return "".join(decoded)
+
+
 def _is_bounce_or_auto(msg: email.message.Message, our_address: str) -> bool:
     """
     Return True if this message should be silently skipped:
@@ -127,7 +168,7 @@ def poll_once() -> dict:
     errors = 0
 
     try:
-        imap = imaplib.IMAP4_SSL("imap.zoho.com", 993, timeout=30)
+        imap = imaplib.IMAP4_SSL("imappro.zoho.com", 993, timeout=30)
     except Exception as e:
         logger.error(f"IMAP connection failed: {e}")
         return {"fetched": 0, "matched": 0, "unmatched": 0, "skipped": 0, "errors": 1, "error": str(e)}
@@ -136,13 +177,17 @@ def poll_once() -> dict:
         imap.login(settings.smtp_user, settings.imap_password)
         imap.select("INBOX")
 
-        status, data = imap.search(None, "UNSEEN")
+        # Search last 7 days (ALL, not just UNSEEN) so we catch messages
+        # opened in Zoho webmail before the poller ran. Dedup by message_id in DB.
+        from datetime import datetime, timedelta
+        since_date = (datetime.utcnow() - timedelta(days=7)).strftime("%d-%b-%Y")
+        status, data = imap.search(None, f'SINCE "{since_date}"')
         if status != "OK":
-            logger.warning(f"IMAP SEARCH UNSEEN returned status: {status}")
+            logger.warning(f"IMAP SEARCH returned status: {status}")
             return {"fetched": 0, "matched": 0, "unmatched": 0, "skipped": 0, "errors": 0}
 
         msg_ids = data[0].split()
-        logger.info(f"IMAP poll: {len(msg_ids)} UNSEEN messages")
+        logger.info(f"IMAP poll: {len(msg_ids)} messages in last 7 days")
 
         for msg_id in msg_ids:
             fetched += 1
@@ -159,8 +204,6 @@ def poll_once() -> dict:
                 if _is_bounce_or_auto(msg, settings.smtp_user):
                     logger.debug(f"Skipping auto/bounce message {msg_id}")
                     skipped += 1
-                    # Still mark as read so we don't re-process
-                    imap.store(msg_id, "+FLAGS", "\\Seen")
                     continue
 
                 result = _process_message(msg)
@@ -172,9 +215,6 @@ def poll_once() -> dict:
                     skipped += 1
                 else:
                     errors += 1
-
-                # Mark as read regardless of match outcome
-                imap.store(msg_id, "+FLAGS", "\\Seen")
 
             except Exception as e:
                 logger.error(f"Error processing message {msg_id}: {e}")
@@ -222,8 +262,8 @@ def _process_message(msg: email.message.Message) -> str:
         # (two emails with empty Message-ID will each get a fresh UUID — rare edge case)
         message_id = f"<synthetic-{uuid.uuid4()}@nxtsmile.local>"
 
-    subject = msg.get("Subject", "").strip()
-    body = _extract_text_body(msg)
+    subject = _decode_header_value(msg.get("Subject", "")).strip()
+    body = _strip_quoted_reply(_extract_text_body(msg))
     received_at = datetime.now(timezone.utc).isoformat()
 
     # Parse date header if available
