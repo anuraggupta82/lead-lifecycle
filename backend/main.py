@@ -1986,6 +1986,22 @@ Return ONLY a JSON array, no explanation."""
                 {"item": "Campaign reviewed and approved",       "value": "Pending review", "done": False,         "skippable": False, "category": "required",    "note": "Final review before enabling campaign."},
             ]
 
+        # Merge with existing checklist: preserve user-typed values and done state
+        # for items whose label still exists in the new AI list
+        existing = get_campaign_build(campaign_id).get("launch_checklist") or []
+        if existing:
+            existing_by_key = {x["item"]: x for x in existing if isinstance(x, dict)}
+            for item in checklist:
+                old = existing_by_key.get(item["item"])
+                if old:
+                    # Preserve value if user typed something custom
+                    if old.get("value") and not item.get("value"):
+                        item["value"] = old["value"]
+                    # Preserve done state for user-manually-checked items
+                    # (only preserve False→True, not True→False which AI may have corrected)
+                    if old.get("done") and not item.get("done"):
+                        item["done"] = True
+
         save_campaign_build_step(campaign_id, step, checklist)
         return {"ok": True, "step": step, "data": checklist}
 

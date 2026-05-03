@@ -3977,6 +3977,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
                     async function generateBuildStep(step) {
                       setBuildLoading(step);
+                      // Clear any inline edit in progress so stale keys don't linger
+                      if (step === 'launch_checklist') setChecklistEditing(null);
                       try {
                         await api(`/api/admin/campaigns/${camp.campaign_id}/build-step`, {
                           method: 'POST',
@@ -3997,7 +3999,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       keywords:    !!build.keywords,
                       ad_copy:     !!build.ad_copy,
                       ad_groups:   !!build.ad_groups,
-                      launch:      !!(build.launch_checklist && build.launch_checklist.every(x=>x.done)),
+                      launch:      !!(build.launch_checklist && build.launch_checklist.some(x=>x.category==='required') && build.launch_checklist.filter(x=>x.category==='required').every(x=>x.done)),
                       performance: true,
                     };
                     const WIZARD_ORDER = ['strategy','keywords','ad_copy','ad_groups','launch','performance'];
@@ -4564,13 +4566,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             <div>
                               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
                                 <div style={{fontSize:13,fontWeight:700}}>🚀 Launch Checklist</div>
-                                {!build.launch_checklist && (
-                                  <button className="btn btn-teal btn-sm" style={{fontSize:11}}
-                                    disabled={!!buildLoading}
-                                    onClick={()=>generateBuildStep('launch_checklist')}>
-                                    {buildLoading==='launch_checklist'?'⏳ Loading…':'Initialize Checklist'}
-                                  </button>
-                                )}
+                                <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                  disabled={!!buildLoading}
+                                  onClick={()=>generateBuildStep('launch_checklist')}>
+                                  {buildLoading==='launch_checklist'
+                                    ? '⏳ Analyzing…'
+                                    : build.launch_checklist ? '🤖 AI Re-verify' : 'Initialize Checklist'}
+                                </button>
                               </div>
                               {!build.launch_checklist ? (
                                 <div style={{textAlign:'center',color:'var(--text-muted)',padding:30,fontStyle:'italic',fontSize:12}}>
@@ -4617,7 +4619,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                                 method:'POST', body:JSON.stringify({step:'launch_checklist', data: newList})
                                               });
                                               setChecklistEditing(p=>({...p, saving:false, saved:true}));
-                                              setTimeout(()=>setChecklistEditing(null), 1200);
+                                              setTimeout(()=>setChecklistEditing(curr=>
+                                                curr?.key===editKey && curr?.saved ? null : curr
+                                              ), 1200);
                                             } catch(e) {
                                               // Rollback on failure
                                               const origList = items.map((x,j)=>j===i?{...x,value:checklistEditing.originalValue}:x);
@@ -4667,7 +4671,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                                     style={{fontSize:10,color: isSaved?'#059669': (item.value?'#374151':'#9ca3af'),
                                                       background: isSaved?'#d1fae5': (item.value?'#f3f4f6':'#fafafa'),
                                                       border: `1px solid ${isSaved?'#6ee7b7': (item.value?'#e5e7eb':'#e5e7eb')}`,
-                                                      padding:'1px 7px',borderRadius:10,cursor:'text',
+                                                      padding:'1px 7px',borderRadius:10,cursor:'pointer',
                                                       maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',
                                                       whiteSpace:'nowrap',flexShrink:0,fontWeight:400,
                                                       outline:'none',transition:'border-color .15s'}}>
