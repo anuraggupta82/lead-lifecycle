@@ -410,12 +410,17 @@ def fetch_campaign_build_data(campaign_resource_name: str) -> dict:
 
             cpc_micros = crit.cpc_bid_micros or 0
             eff_micros  = crit.effective_cpc_bid_micros or 0
-            cpc_usd = round((cpc_micros or eff_micros) / 1_000_000.0, 2) if (cpc_micros or eff_micros) else None
+            # Only surface explicit per-keyword max-CPC overrides.
+            # effective_cpc_bid_micros falls back to $0.01 floor for paused
+            # campaigns — that value is real but meaningless to display.
+            cpc_usd = round(cpc_micros / 1_000_000.0, 2) if cpc_micros else None
+            eff_cpc_usd = round(eff_micros / 1_000_000.0, 2) if eff_micros else None
 
             entry = {
-                "keyword":    kw_text,
-                "match_type": match_type_clean,
-                "cpc_bid":    cpc_usd,
+                "keyword":       kw_text,
+                "match_type":    match_type_clean,
+                "cpc_bid":       cpc_usd,       # explicit override only (None if inherited)
+                "effective_cpc": eff_cpc_usd,   # Google's effective floor (informational)
                 "ad_group":   row.ad_group.name or "",
                 "ad_group_id": str(row.ad_group.id),
                 "resource_name": crit.resource_name,

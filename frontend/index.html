@@ -2424,9 +2424,9 @@ function AdCreativesView({ days }) {
   );
 }
 
-// ─── AI Campaign sub-tab ──────────────────────────────────────────────────
-// Two-tier AI: Opus designs the strategy + analysis; Haiku/Sonnet implements.
-function AICampaignView() {
+// ─── AI Campaign sub-tab (REMOVED — AI is now built into campaign wizard) ──
+// function AICampaignView() {  ← kept as comment to preserve line refs
+function _AICampaignView_REMOVED() {
   // Section 1 — Strategy (Opus)
   const [goal, setGoal] = useState('');
   const [targetService, setTargetService] = useState('All-on-4 Implants');
@@ -2942,7 +2942,7 @@ function AICampaignView() {
 
 
 function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
-  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'ai'
+  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives'
   const [dateRange, setDateRange] = useState(() => defaultDateRange(30));
   const [adCreativesDays, setAdCreativesDays] = useState(30);
   const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
@@ -3282,13 +3282,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['ai','AI Campaign']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
-
-      {/* ── AI Campaign view ── */}
-      {view==='ai' && <AICampaignView />}
 
       {/* ── Ad Groups view ── */}
       {view==='adgroups' && <AdGroupsView adGroupStats={adGroupStats} dailyStats={dailyStats} />}
@@ -4187,6 +4184,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                   )}
                                 </div>
                               )}
+                              {/* Refine box — only shown after strategy is generated */}
+                              {strategy && <RefineBox step="strategy"/>}
                             </div>
                           )}
 
@@ -4229,7 +4228,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           {kws.map((k,i) => (
                                             <span key={i} style={{background:bg,color,fontSize:11,padding:'3px 9px',borderRadius:4,border:`1px solid ${color}30`}}>
                                               {k.keyword}
-                                              {k.cpc_bid ? <span style={{marginLeft:4,fontWeight:700}}>${k.cpc_bid}</span> : null}
+                                              {k.cpc_bid && k.cpc_bid >= 0.05 ? <span style={{marginLeft:4,fontWeight:700}}>${k.cpc_bid}</span> : null}
                                             </span>
                                           ))}
                                         </div>
@@ -5093,7 +5092,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   <div style={{background:'#fee2e2',border:'1px solid #fca5a5',borderRadius:8,padding:'12px 14px',fontSize:12,color:'#dc2626'}}>
                     ❌ Strategy generation failed: {wizardStrategy._error}
                     <div style={{marginTop:8,fontSize:11,color:'#6b7280'}}>
-                      Your campaign was saved successfully. You can generate a strategy from the AI Campaign tab at any time.
+                      Your campaign was saved. You can retry strategy generation by re-opening the campaign.
                     </div>
                   </div>
                 )}

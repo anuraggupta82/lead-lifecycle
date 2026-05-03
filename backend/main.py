@@ -1642,7 +1642,7 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
     from database import get_campaign_by_id, get_campaign_build
     import anthropic as _anthropic, json as _json, re as _re
 
-    VALID_STEPS = {"keywords", "ad_copy", "ad_groups"}
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "strategy"}
     if body.step not in VALID_STEPS:
         raise HTTPException(status_code=400, detail=f"Refinement only supported for: {VALID_STEPS}")
 
@@ -1650,10 +1650,17 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    build = get_campaign_build(campaign_id)
-    current = build.get(body.step)
-    if not current:
-        raise HTTPException(status_code=400, detail=f"No existing {body.step} to refine. Generate it first.")
+    # Strategy is stored in strategy_json on the campaign row; others are in campaign_build_json
+    if body.step == "strategy":
+        raw_strat = camp.get("strategy_json") or {}
+        current = _json.loads(raw_strat) if isinstance(raw_strat, str) else raw_strat
+        if not current:
+            raise HTTPException(status_code=400, detail="No strategy to refine. Generate it first.")
+    else:
+        build = get_campaign_build(campaign_id)
+        current = build.get(body.step)
+        if not current:
+            raise HTTPException(status_code=400, detail=f"No existing {body.step} to refine. Generate it first.")
 
     strategy = camp.get("strategy_json") or {}
     if isinstance(strategy, str):
@@ -1662,8 +1669,14 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
         except Exception:
             strategy = {}
 
-    settings = get_settings()
-    ai_client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    _api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    ai_client = _anthropic.Anthropic(api_key=_api_key)
+
+    step_guidance = ""
+    if body.step == "strategy":
+        step_guidance = """For the strategy step, the JSON schema is:
+{objective, target_audience, key_messages (list), ad_headlines (list), ad_descriptions (list), implementation_instructions}
+Keep all fields present. Modify only what the user instruction targets."""
 
     prompt = f"""You are a Google Ads specialist helping refine a campaign build step.
 
@@ -1676,6 +1689,7 @@ Current {body.step} content:
 
 User instruction: {body.instruction}
 
+{step_guidance}
 Apply the user's instruction to modify the {body.step} content. Return the complete updated {body.step} JSON structure — same format as the input, with the requested changes applied.
 
 Rules:
@@ -1800,15 +1814,20 @@ class CampaignBuildStepSaveRequest(BaseModel):
 
 @app.post("/api/admin/campaigns/{campaign_id}/build-step-save", dependencies=[Depends(_require_admin)])
 def admin_campaign_build_step_save(campaign_id: str, body: CampaignBuildStepSaveRequest):
-    """Save accepted refined build step data into campaign_build_json."""
-    from database import get_campaign_by_id, save_campaign_build_step
+    """Save accepted refined build step data into campaign_build_json (or strategy_json for strategy step)."""
+    from database import get_campaign_by_id, save_campaign_build_step, update_campaign_strategy
+    import json as _json
     camp = get_campaign_by_id(campaign_id)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist"}
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist", "strategy"}
     if body.step not in VALID_STEPS:
         raise HTTPException(status_code=400, detail=f"Invalid step")
-    save_campaign_build_step(campaign_id, body.step, body.data)
+    if body.step == "strategy":
+        # Strategy lives in strategy_json on the campaign row
+        update_campaign_strategy(campaign_id, body.data)
+    else:
+        save_campaign_build_step(campaign_id, body.step, body.data)
     return {"ok": True, "step": body.step}
 
 
@@ -1866,8 +1885,8 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
     # Existing build data for context
     build = get_campaign_build(campaign_id)
 
-    settings = get_settings()
-    ai_client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    _api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    ai_client = _anthropic.Anthropic(api_key=_api_key)
 
     campaign_name = camp.get("campaign_name", "")
     service_focus = camp.get("service_focus", "")
