@@ -1474,6 +1474,7 @@ class CampaignCreateRequest(BaseModel):
     end_date: Optional[str] = ""
     landing_page: Optional[str] = ""
     notes: Optional[str] = ""
+    workflow_id: Optional[int] = None      # Attached follow-up workflow (NULL = use default)
 
     @validator("campaign_name")
     def name_not_empty(cls, v):
@@ -1510,12 +1511,42 @@ class CampaignCreateRequest(BaseModel):
             raise ValueError("landing_page must start with http:// or https://")
         return v
 
+    @validator("workflow_id", pre=True)
+    def coerce_workflow_id(cls, v):
+        """Coerce empty string → None so frontend select can send '' for 'no workflow'."""
+        if v in (None, "", "0", 0):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+
+class CampaignUpdateWorkflowRequest(BaseModel):
+    workflow_id: Optional[int] = None
+
+    @validator("workflow_id", pre=True)
+    def coerce_workflow_id(cls, v):
+        if v in (None, "", "0", 0):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
 
 @app.get("/api/admin/campaigns/list", dependencies=[Depends(_require_admin)])
 def admin_campaigns_list():
     """Return all managed campaign rows from the campaigns table."""
     from database import get_all_campaigns
     return {"campaigns": get_all_campaigns()}
+
+
+@app.get("/api/admin/campaigns/list-with-workflows", dependencies=[Depends(_require_admin)])
+def admin_campaigns_list_with_workflows():
+    """Return all campaigns with their attached workflow name (single LEFT JOIN)."""
+    from database import get_all_campaigns_with_workflows
+    return {"campaigns": get_all_campaigns_with_workflows()}
 
 
 @app.post("/api/admin/campaigns/create", dependencies=[Depends(_require_admin)])
@@ -1530,6 +1561,18 @@ def admin_create_campaign(body: CampaignCreateRequest):
         # Don't leak SQL internals; surface a clean message
         detail = "A campaign with that name already exists" if "UNIQUE" in str(e) else "Failed to create campaign"
         raise HTTPException(status_code=500, detail=detail)
+
+
+@app.patch("/api/admin/campaigns/{campaign_id}/workflow", dependencies=[Depends(_require_admin)])
+def admin_campaign_set_workflow(campaign_id: str, body: CampaignUpdateWorkflowRequest):
+    """Attach or detach a workflow from an existing campaign.
+    Send {"workflow_id": 3} to attach, {"workflow_id": null} to detach.
+    """
+    from database import update_campaign_workflow
+    found = update_campaign_workflow(campaign_id, body.workflow_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"ok": True}
 
 
 @app.patch("/api/admin/campaigns/{campaign_id}/status", dependencies=[Depends(_require_admin)])

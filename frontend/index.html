@@ -2947,18 +2947,81 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [adCreativesDays, setAdCreativesDays] = useState(30);
   const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
   const [ga4Refreshing, setGa4Refreshing] = useState(false);
-  // New campaign modal
-  const [showNewCamp, setShowNewCamp] = useState(false);
+  // Campaign Creation Wizard
+  const [showWizard, setShowWizard] = useState(false);
+  const [wizardStep, setWizardStep] = useState(1);
   const [savingCamp, setSavingCamp] = useState(false);
   const [campSaveMsg, setCampSaveMsg] = useState('');
+  const [wizardStepError, setWizardStepError] = useState('');
+  const [wizardWorkflows, setWizardWorkflows] = useState([]);
+  const [wizardWfId, setWizardWfId] = useState('');
   const EMPTY_CAMP = {
     campaign_name:'', campaign_type:'MANUAL', campaign_id:'',
     service_focus:'', promo_offer:'', target_audience:'',
     objective:'', monthly_budget:'', expected_cpl:'',
     start_date:'', end_date:'', landing_page:'', notes:'',
+    workflow_id: null,
   };
   const [newCamp, setNewCamp] = useState(EMPTY_CAMP);
   const setNC = (k, v) => setNewCamp(p => ({...p, [k]: v}));
+
+  async function openWizard() {
+    setShowWizard(true);
+    setWizardStep(1);
+    setNewCamp(EMPTY_CAMP);
+    setWizardWfId('');
+    setCampSaveMsg('');
+    setWizardStepError('');
+    try {
+      const d = await api('/api/admin/workflows');
+      setWizardWorkflows(d.workflows || []);
+    } catch(_) { setWizardWorkflows([]); }
+  }
+
+  function closeWizard() {
+    setShowWizard(false);
+    setWizardStep(1);
+    setNewCamp(EMPTY_CAMP);
+    setWizardWfId('');
+    setCampSaveMsg('');
+    setWizardStepError('');
+  }
+
+  function wizardNext() {
+    setWizardStepError('');
+    if (wizardStep === 1) {
+      if (!newCamp.campaign_name.trim()) { setWizardStepError('Campaign name is required'); return; }
+      setWizardStep(2);
+    } else if (wizardStep === 2) {
+      if (newCamp.end_date && newCamp.start_date && newCamp.end_date < newCamp.start_date) {
+        setWizardStepError('End date must be on or after start date'); return;
+      }
+      if (newCamp.landing_page && !newCamp.landing_page.startsWith('http')) {
+        setWizardStepError('Landing page URL must start with http:// or https://'); return;
+      }
+      setWizardStep(3);
+    }
+  }
+
+  async function wizardLaunch() {
+    setSavingCamp(true); setCampSaveMsg(''); setWizardStepError('');
+    try {
+      const wfIdVal = wizardWfId === '' ? null : parseInt(wizardWfId) || null;
+      const payload = { ...newCamp,
+        monthly_budget: parseFloat(newCamp.monthly_budget) || 0,
+        expected_cpl: parseFloat(newCamp.expected_cpl) || 0,
+        workflow_id: wfIdVal,
+      };
+      await api('/api/admin/campaigns/create', { method: 'POST', body: JSON.stringify(payload) });
+      setCampSaveMsg('✅ Campaign launched!');
+      setNewCamp(EMPTY_CAMP);
+      setWizardWfId('');
+      setTimeout(() => { closeWizard(); }, 1800);
+    } catch(e) {
+      setCampSaveMsg('❌ ' + (e?.detail || e?.message || 'Save failed'));
+    }
+    setSavingCamp(false);
+  }
 
   // Lazy-loaded ad-group and search-term data (fetched on first ReportsTab mount)
   const [adGroupStats, setAdGroupStats] = useState([]);
@@ -3043,7 +3106,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:12}}>
           <div style={{display:'flex',alignItems:'center',gap:8}}>
             <div className="report-title" style={{marginBottom:0}}>Campaign Performance</div>
-            <button className="btn btn-teal btn-sm" style={{fontSize:11}} onClick={()=>{setShowNewCamp(true);setCampSaveMsg('');}}>
+            <button className="btn btn-teal btn-sm" style={{fontSize:11}} onClick={openWizard}>
               + New Campaign
             </button>
           </div>
@@ -3147,185 +3210,250 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         </table>
       </div>
 
-      {/* ── New Campaign Modal ── */}
-      {showNewCamp && (
+      {/* ── Campaign Creation Wizard ── */}
+      {showWizard && (
         <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.45)',
           zIndex:200,display:'flex',alignItems:'center',justifyContent:'center'}}
-          onClick={()=>setShowNewCamp(false)}>
-          <div style={{background:'#fff',borderRadius:10,padding:24,width:680,maxWidth:'96vw',
-            maxHeight:'90vh',overflowY:'auto',
-            boxShadow:'0 8px 40px rgba(0,0,0,.18)'}} onClick={e=>e.stopPropagation()}>
+          onClick={closeWizard}>
+          <div style={{background:'#fff',borderRadius:12,padding:28,width:660,maxWidth:'96vw',
+            maxHeight:'92vh',overflowY:'auto',boxShadow:'0 8px 40px rgba(0,0,0,.2)'}}
+            onClick={e=>e.stopPropagation()}>
 
-            <div style={{fontWeight:700,fontSize:15,marginBottom:2}}>Launch New Campaign</div>
-            <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>
-              Create a campaign record to track leads, budget, and ROI. Set up the actual campaign in Google Ads / Meta separately.
+            {/* Progress bar */}
+            <div style={{display:'flex',gap:4,marginBottom:18}}>
+              {[1,2,3].map(s=>(
+                <div key={s} style={{flex:1,height:4,borderRadius:2,
+                  background: s <= wizardStep ? 'var(--teal)' : 'var(--border)',
+                  transition:'background .2s'}} />
+              ))}
             </div>
 
-            {/* Row 1: Name + Type */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Campaign Name *</label>
-                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder="e.g. All-on-X Implants Q3 2026"
-                  value={newCamp.campaign_name} onChange={e=>setNC('campaign_name',e.target.value)} autoFocus />
-              </div>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Campaign Type *</label>
-                <select style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  value={newCamp.campaign_type} onChange={e=>{setNC('campaign_type',e.target.value); if(e.target.value!=='GOOGLE_ADS') setNC('campaign_id','');}}>
-                  <option value="MANUAL">Manual / Other</option>
-                  <option value="GOOGLE_ADS">Google Ads</option>
-                  <option value="META">Meta (Facebook/Instagram)</option>
-                  <option value="EMAIL">Email</option>
-                </select>
-              </div>
+            {/* Step labels */}
+            <div style={{display:'flex',justifyContent:'space-between',marginBottom:16}}>
+              {[['1','Identity'],['2','Budget & Targeting'],['3','Workflow']].map(([n,lbl])=>(
+                <div key={n} style={{fontSize:10,color: parseInt(n)===wizardStep ? 'var(--teal)' : 'var(--text-muted)',fontWeight: parseInt(n)===wizardStep ? 700 : 400}}>
+                  Step {n}: {lbl}
+                </div>
+              ))}
             </div>
 
-            {/* Row 2: Service Focus + Promo Offer */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+            {/* ── Step 1: Identity ── */}
+            {wizardStep === 1 && (
               <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Service / Procedure Focus</label>
-                <select style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  value={newCamp.service_focus} onChange={e=>setNC('service_focus',e.target.value)}>
-                  <option value="">— Select —</option>
-                  <option value="Implants">Dental Implants</option>
-                  <option value="All-on-X">All-on-X / Full Arch</option>
-                  <option value="Invisalign">Invisalign / Clear Aligners</option>
-                  <option value="Whitening">Teeth Whitening</option>
-                  <option value="Emergency">Emergency Dentistry</option>
-                  <option value="New Patient">New Patient</option>
-                  <option value="Hygiene">Hygiene / Preventive</option>
-                  <option value="Cosmetic">Cosmetic Dentistry</option>
-                  <option value="Other">Other</option>
-                </select>
-              </div>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Promo / Offer</label>
-                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder='e.g. "$99 exam + X-ray", "Free implant consult"'
-                  value={newCamp.promo_offer} onChange={e=>setNC('promo_offer',e.target.value)} />
-              </div>
-            </div>
+                <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>Campaign Identity</div>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>Name this campaign and tell us what type it is.</div>
 
-            {/* Row 3: Monthly Budget + Expected CPL */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Monthly Budget ($)</label>
-                <input type="number" min="0" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder="e.g. 3000"
-                  value={newCamp.monthly_budget} onChange={e=>setNC('monthly_budget',e.target.value)} />
-                {newCamp.monthly_budget > 0 && (
-                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
-                    ~${Math.round(newCamp.monthly_budget/30)}/day
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Campaign Name *</label>
+                    <input style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="e.g. All-on-X Implants Q3 2026"
+                      value={newCamp.campaign_name} onChange={e=>setNC('campaign_name',e.target.value)} autoFocus />
                   </div>
-                )}
-              </div>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Target CPL ($)</label>
-                <input type="number" min="0" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder="e.g. 150"
-                  value={newCamp.expected_cpl} onChange={e=>setNC('expected_cpl',e.target.value)} />
-                {newCamp.monthly_budget > 0 && newCamp.expected_cpl > 0 && (
-                  <div style={{fontSize:10,color:'var(--teal)',marginTop:2}}>
-                    ~{Math.round(newCamp.monthly_budget / newCamp.expected_cpl)} leads/mo
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Campaign Type *</label>
+                    <select style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      value={newCamp.campaign_type} onChange={e=>{setNC('campaign_type',e.target.value); if(e.target.value!=='GOOGLE_ADS') setNC('campaign_id','');}}>
+                      <option value="MANUAL">Manual / Other</option>
+                      <option value="GOOGLE_ADS">Google Ads</option>
+                      <option value="META">Meta (Facebook/Instagram)</option>
+                      <option value="EMAIL">Email</option>
+                    </select>
                   </div>
-                )}
-              </div>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Objective / Goal</label>
-                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder="e.g. 20 implant consults"
-                  value={newCamp.objective} onChange={e=>setNC('objective',e.target.value)} />
-              </div>
-            </div>
+                </div>
 
-            {/* Row 4: Start + End Date */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Start Date</label>
-                <input type="date" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  value={newCamp.start_date} onChange={e=>setNC('start_date',e.target.value)} />
-              </div>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>End Date <span style={{fontWeight:400,color:'var(--text-muted)'}}>(optional)</span></label>
-                <input type="date" style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  value={newCamp.end_date} onChange={e=>setNC('end_date',e.target.value)} />
-              </div>
-            </div>
-
-            {/* Row 5: Target Audience + Landing Page */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Target Audience</label>
-                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder="e.g. Adults 35-65, Grafton/Worcester MA"
-                  value={newCamp.target_audience} onChange={e=>setNC('target_audience',e.target.value)} />
-              </div>
-              <div>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Landing Page URL</label>
-                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder="https://graftondentalcare.com/implants"
-                  value={newCamp.landing_page} onChange={e=>setNC('landing_page',e.target.value)} />
-              </div>
-            </div>
-
-            {/* Conditional: Google Ads Campaign ID */}
-            {newCamp.campaign_type === 'GOOGLE_ADS' && (
-              <div style={{marginBottom:10}}>
-                <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>
-                  Google Ads Campaign ID <span style={{fontWeight:400,color:'var(--text-muted)'}}>(links cost + ROI data)</span>
-                </label>
-                <input style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                  placeholder="e.g. 1234567890"
-                  value={newCamp.campaign_id} onChange={e=>setNC('campaign_id',e.target.value)} />
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Service / Procedure Focus</label>
+                    <select style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      value={newCamp.service_focus} onChange={e=>setNC('service_focus',e.target.value)}>
+                      <option value="">— Select —</option>
+                      <option value="Implants">Dental Implants</option>
+                      <option value="All-on-X">All-on-X / Full Arch</option>
+                      <option value="Invisalign">Invisalign / Clear Aligners</option>
+                      <option value="Whitening">Teeth Whitening</option>
+                      <option value="Emergency">Emergency Dentistry</option>
+                      <option value="New Patient">New Patient</option>
+                      <option value="Hygiene">Hygiene / Preventive</option>
+                      <option value="Cosmetic">Cosmetic Dentistry</option>
+                      <option value="Other">Other</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Promo / Offer</label>
+                    <input style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder='e.g. "Free implant consult"'
+                      value={newCamp.promo_offer} onChange={e=>setNC('promo_offer',e.target.value)} />
+                  </div>
+                </div>
               </div>
             )}
 
-            {/* Notes */}
-            <div style={{marginBottom:14}}>
-              <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Internal Notes</label>
-              <textarea rows={2} style={{width:'100%',fontSize:12,padding:'6px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box',resize:'vertical'}}
-                placeholder="Any additional context for the team…"
-                value={newCamp.notes} onChange={e=>setNC('notes',e.target.value)} />
-            </div>
+            {/* ── Step 2: Budget & Targeting ── */}
+            {wizardStep === 2 && (
+              <div>
+                <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>Budget & Targeting</div>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>Set your budget, dates, and who you're targeting.</div>
 
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Monthly Budget ($)</label>
+                    <input type="number" min="0" style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="e.g. 3000"
+                      value={newCamp.monthly_budget} onChange={e=>setNC('monthly_budget',e.target.value)} />
+                    {newCamp.monthly_budget > 0 && <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>~${Math.round(newCamp.monthly_budget/30)}/day</div>}
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Target CPL ($)</label>
+                    <input type="number" min="0" style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="e.g. 150"
+                      value={newCamp.expected_cpl} onChange={e=>setNC('expected_cpl',e.target.value)} />
+                    {newCamp.monthly_budget > 0 && newCamp.expected_cpl > 0 && (
+                      <div style={{fontSize:10,color:'var(--teal)',marginTop:2}}>~{Math.round(newCamp.monthly_budget / newCamp.expected_cpl)} leads/mo</div>
+                    )}
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Objective</label>
+                    <input style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="e.g. 20 implant consults"
+                      value={newCamp.objective} onChange={e=>setNC('objective',e.target.value)} />
+                  </div>
+                </div>
+
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Start Date</label>
+                    <input type="date" style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      value={newCamp.start_date} onChange={e=>setNC('start_date',e.target.value)} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>End Date <span style={{fontWeight:400,color:'var(--text-muted)'}}>(optional)</span></label>
+                    <input type="date" style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      value={newCamp.end_date} onChange={e=>setNC('end_date',e.target.value)} />
+                  </div>
+                </div>
+
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Target Audience</label>
+                    <input style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="e.g. Adults 35-65, Worcester MA"
+                      value={newCamp.target_audience} onChange={e=>setNC('target_audience',e.target.value)} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Landing Page URL</label>
+                    <input style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="https://nxtsmile.com"
+                      value={newCamp.landing_page} onChange={e=>setNC('landing_page',e.target.value)} />
+                  </div>
+                </div>
+
+                {newCamp.campaign_type === 'GOOGLE_ADS' && (
+                  <div style={{marginBottom:10}}>
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>
+                      Google Ads Campaign ID <span style={{fontWeight:400,color:'var(--text-muted)'}}>(links cost + ROI data)</span>
+                    </label>
+                    <input style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="e.g. 1234567890"
+                      value={newCamp.campaign_id} onChange={e=>setNC('campaign_id',e.target.value)} />
+                  </div>
+                )}
+
+                <div style={{marginBottom:4}}>
+                  <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Internal Notes</label>
+                  <textarea rows={2} style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box',resize:'vertical'}}
+                    placeholder="Any additional context for the team…"
+                    value={newCamp.notes} onChange={e=>setNC('notes',e.target.value)} />
+                </div>
+              </div>
+            )}
+
+            {/* ── Step 3: Workflow ── */}
+            {wizardStep === 3 && (
+              <div>
+                <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>Attach a Follow-up Workflow</div>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>
+                  Choose which automated email/SMS sequence fires when a lead comes from this campaign.
+                  Leave blank to use the default workflow.
+                </div>
+
+                <div style={{marginBottom:14}}>
+                  <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Workflow</label>
+                  <select style={{width:'100%',fontSize:12,padding:'8px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                    value={wizardWfId}
+                    onChange={e=>setWizardWfId(e.target.value)}>
+                    <option value="">— Use default workflow —</option>
+                    {wizardWorkflows.map(wf=>(
+                      <option key={wf.id} value={String(wf.id)}>
+                        {wf.name}{wf.campaign_tag ? ` [${wf.campaign_tag}]` : ' (default)'} · {(wf.steps||[]).length} steps
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Workflow step preview */}
+                {wizardWfId && (() => {
+                  const wf = wizardWorkflows.find(w => String(w.id) === wizardWfId);
+                  if (!wf || !(wf.steps||[]).length) return (
+                    <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',padding:'10px 0'}}>No steps in this workflow yet.</div>
+                  );
+                  return (
+                    <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px'}}>
+                      <div style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',marginBottom:8,textTransform:'uppercase',letterSpacing:'.5px'}}>Sequence Preview</div>
+                      {wf.steps.map((s,i)=>(
+                        <div key={i} style={{display:'flex',gap:8,alignItems:'flex-start',marginBottom:6}}>
+                          <div style={{minWidth:42,fontSize:10,fontWeight:700,color:'var(--teal)',paddingTop:1}}>Day {s.sequence_day}</div>
+                          <div style={{fontSize:11,color: s.channel==='email' ? '#2563eb' : '#7c3aed',minWidth:32}}>{s.channel==='email' ? '✉' : '💬'}</div>
+                          <div style={{fontSize:11,color:'var(--text)',flex:1,lineHeight:1.4}}>
+                            {s.subject || (s.body||'').slice(0,70) + ((s.body||'').length>70?'…':'')}
+                            {s.terminal && <span style={{fontSize:9,background:'#fee2e2',color:'#dc2626',borderRadius:3,padding:'1px 4px',marginLeft:4}}>final</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+
+                {!wizardWfId && (
+                  <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,padding:'10px 14px',fontSize:11,color:'#166534'}}>
+                    ✅ The default workflow will fire automatically for leads from this campaign.
+                    You can attach a specific workflow later from the Campaigns table.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Error / success messages */}
+            {wizardStepError && (
+              <div style={{fontSize:11,padding:'6px 10px',borderRadius:4,marginTop:12,background:'#fee2e2',color:'#dc2626'}}>
+                {wizardStepError}
+              </div>
+            )}
             {campSaveMsg && (
-              <div style={{fontSize:11,padding:'6px 10px',borderRadius:4,marginBottom:10,
+              <div style={{fontSize:11,padding:'6px 10px',borderRadius:4,marginTop:12,
                 background:campSaveMsg.startsWith('✅')?'#dcfce7':'#fee2e2',
-                color:campSaveMsg.startsWith('✅')?'#166534':'var(--red)'}}>
+                color:campSaveMsg.startsWith('✅')?'#166534':'#dc2626'}}>
                 {campSaveMsg}
               </div>
             )}
 
-            <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
-              <button className="btn btn-ghost btn-sm" onClick={()=>{setShowNewCamp(false);setNewCamp(EMPTY_CAMP);setCampSaveMsg('');}}>Cancel</button>
-              <button className="btn btn-teal btn-sm" disabled={savingCamp||!newCamp.campaign_name.trim()} onClick={async()=>{
-                setSavingCamp(true); setCampSaveMsg('');
-                // Validate end >= start
-                if(newCamp.end_date && newCamp.start_date && newCamp.end_date < newCamp.start_date) {
-                  setCampSaveMsg('❌ End date must be on or after start date');
-                  setSavingCamp(false); return;
-                }
-                if(newCamp.landing_page && !newCamp.landing_page.startsWith('http')) {
-                  setCampSaveMsg('❌ Landing page URL must start with http:// or https://');
-                  setSavingCamp(false); return;
-                }
-                try {
-                  const payload = {...newCamp,
-                    monthly_budget: parseFloat(newCamp.monthly_budget)||0,
-                    expected_cpl: parseFloat(newCamp.expected_cpl)||0,
-                  };
-                  await api('/api/admin/campaigns/create', { method:'POST', body: JSON.stringify(payload) });
-                  setCampSaveMsg('✅ Campaign created! It will appear once leads are attributed to it.');
-                  setNewCamp(EMPTY_CAMP);
-                  setTimeout(()=>{ setShowNewCamp(false); setCampSaveMsg(''); }, 2500);
-                } catch(e) {
-                  setCampSaveMsg('❌ ' + (e?.detail || e?.message || 'Save failed'));
-                }
-                setSavingCamp(false);
-              }}>
-                {savingCamp ? 'Saving…' : 'Launch Campaign'}
-              </button>
+            {/* Navigation buttons */}
+            <div style={{display:'flex',gap:8,justifyContent:'space-between',marginTop:20}}>
+              <button className="btn btn-ghost btn-sm" onClick={closeWizard}>Cancel</button>
+              <div style={{display:'flex',gap:8}}>
+                {wizardStep > 1 && (
+                  <button className="btn btn-ghost btn-sm" onClick={()=>{setWizardStep(s=>s-1); setWizardStepError('');}}>← Back</button>
+                )}
+                {wizardStep < 3 ? (
+                  <button className="btn btn-teal btn-sm" onClick={wizardNext}>
+                    Next →
+                  </button>
+                ) : (
+                  <button className="btn btn-teal btn-sm" disabled={savingCamp} onClick={wizardLaunch}>
+                    {savingCamp ? 'Launching…' : '🚀 Launch Campaign'}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -4092,7 +4220,7 @@ function WorkflowsSection() {
   const [steps, setSteps] = React.useState([]);
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
-  const [copying, setCopying] = React.useState(false);
+  const [copyingId, setCopyingId] = React.useState(null); // wf id being duplicated (null = none)
   const [seeding, setSeeding] = React.useState(false);
   const [error, setError] = React.useState('');
   const [success, setSuccess] = React.useState('');
@@ -4209,7 +4337,7 @@ function WorkflowsSection() {
   }
 
   async function copyWorkflow(wfId) {
-    setCopying(true); setError('');
+    setCopyingId(wfId); setError('');
     try {
       const newWf = await api(`/api/admin/workflows/${wfId}/copy`, { method: 'POST' });
       const data = await api('/api/admin/workflows');
@@ -4218,9 +4346,10 @@ function WorkflowsSection() {
       setSelectedWfId(newWf.id);
       setSteps(newWf.steps || []);
       setEditingStep(null);
-      setSuccess(`Copied to "${newWf.name}"`);
+      setEditingWf(null); // close rename pane if open
+      setSuccess(`Duplicated to "${newWf.name}" — rename and edit steps below`);
     } catch (e) { setError(e.message); }
-    finally { setCopying(false); }
+    finally { setCopyingId(null); }
   }
 
   async function deleteWorkflow() {
@@ -4501,15 +4630,22 @@ function WorkflowsSection() {
                       <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
                         {wf.campaign_tag ? <code style={{ fontSize: 9 }}>{wf.campaign_tag}</code> : <em>default</em>} · {(wf.steps || []).length} steps
                       </div>
-                      {/* Action buttons — show on selected */}
-                      {wf.id === selectedWfId && (
-                        <div style={{ position: 'absolute', top: 4, right: 4, display: 'flex', gap: 2 }}>
-                          <button title="Edit workflow" onClick={e => { e.stopPropagation(); setEditingWf(wf); setEditWfDraft({ name: wf.name, campaign_tag: wf.campaign_tag, description: wf.description }); }}
-                            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 12, padding: 2 }}>✏️</button>
-                          <button title="Copy workflow" onClick={e => { e.stopPropagation(); copyWorkflow(wf.id); }} disabled={copying}
-                            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 12, padding: 2 }}>📋</button>
-                        </div>
-                      )}
+                      {/* Action buttons — edit always visible on hover/selected; duplicate on every row */}
+                      <div style={{ position: 'absolute', top: 4, right: 4, display: 'flex', gap: 2 }}>
+                        {wf.id === selectedWfId && (
+                          <button title="Edit name/tag" onClick={e => { e.stopPropagation(); setEditingWf(wf); setEditWfDraft({ name: wf.name, campaign_tag: wf.campaign_tag, description: wf.description }); }}
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 11, padding: '1px 4px', borderRadius: 3, color: 'var(--text-muted)' }}>✏️</button>
+                        )}
+                        <button
+                          title="Duplicate workflow"
+                          onClick={e => { e.stopPropagation(); copyWorkflow(wf.id); }}
+                          disabled={copyingId !== null}
+                          style={{ background: 'none', border: '1px solid var(--border)', cursor: 'pointer', fontSize: 10,
+                            padding: '1px 5px', borderRadius: 3, color: 'var(--text-muted)',
+                            opacity: copyingId !== null ? 0.5 : 1 }}>
+                          {copyingId === wf.id ? '…' : '⧉'}
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>

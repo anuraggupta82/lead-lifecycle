@@ -863,6 +863,11 @@ def _migrate(conn):
     if "workflow_step_id" not in fq_cols:
         conn.execute("ALTER TABLE follow_up_queue ADD COLUMN workflow_step_id INTEGER DEFAULT NULL")
 
+    # Add workflow_id to campaigns (Campaign Wizard migration)
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "workflow_id" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN workflow_id INTEGER DEFAULT NULL")
+
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
     conn.execute("""
@@ -1369,13 +1374,51 @@ def _normalize_campaign_tag(tag: str) -> str:
 
 def _get_workflow_steps_for_lead(conn, lead: dict) -> list:
     """Return active workflow steps for a lead.
-    Resolves campaign tag from utm_campaign / campaign_name, then falls back to
-    the default workflow (campaign_tag='').
-    """
-    raw_tag = lead.get("utm_campaign") or lead.get("campaign_name") or ""
-    tag = _normalize_campaign_tag(raw_tag)
 
-    # Try campaign-specific workflow first (if tag is non-empty)
+    Priority 1 — explicit workflow_id on the matched campaign record
+                  (matched by campaign_id first, then normalised campaign_name fallback).
+    Priority 2 — workflow campaign_tag string match (legacy behaviour).
+    Priority 3 — default workflow (campaign_tag='').
+
+    Returns a list of step dicts ordered by sequence_day.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    lead_id = lead.get("id", "?")
+
+    # ── Priority 1: campaign row → workflow_id ────────────────────────────────
+    camp_id   = (lead.get("campaign_id") or "").strip()
+    camp_name = (lead.get("campaign_name") or lead.get("utm_campaign") or "").strip()
+
+    camp_row = None
+    if camp_id:
+        camp_row = conn.execute(
+            "SELECT workflow_id FROM campaigns WHERE campaign_id=? LIMIT 1", (camp_id,)
+        ).fetchone()
+    if not camp_row and camp_name:
+        # Normalised name fallback (case-insensitive)
+        camp_row = conn.execute(
+            "SELECT workflow_id FROM campaigns WHERE LOWER(campaign_name)=LOWER(?) LIMIT 1",
+            (camp_name,)
+        ).fetchone()
+
+    if camp_row and camp_row["workflow_id"]:
+        wf_row = conn.execute(
+            "SELECT id FROM workflows WHERE id=? AND active=1", (camp_row["workflow_id"],)
+        ).fetchone()
+        if wf_row:
+            steps = conn.execute(
+                "SELECT * FROM workflow_steps WHERE workflow_id=? AND active=1 ORDER BY sequence_day",
+                (wf_row["id"],)
+            ).fetchall()
+            if steps:
+                _log.info(f"Workflow routing [lead={lead_id}]: Priority 1 — campaign workflow_id={wf_row['id']}")
+                return [dict(s) for s in steps]
+
+    # ── Priority 2: campaign_tag string match ─────────────────────────────────
+    raw_tag = camp_name or (lead.get("utm_campaign") or "")
+    tag = _normalize_campaign_tag(raw_tag)
     if tag:
         row = conn.execute(
             "SELECT id FROM workflows WHERE campaign_tag=? AND active=1 LIMIT 1", (tag,)
@@ -1383,21 +1426,24 @@ def _get_workflow_steps_for_lead(conn, lead: dict) -> list:
         if row:
             steps = conn.execute(
                 "SELECT * FROM workflow_steps WHERE workflow_id=? AND active=1 ORDER BY sequence_day",
-                (row[0],)
+                (row["id"],)
             ).fetchall()
             if steps:
+                _log.info(f"Workflow routing [lead={lead_id}]: Priority 2 — campaign_tag='{tag}' → workflow_id={row['id']}")
                 return [dict(s) for s in steps]
 
-    # Fall back to default workflow (campaign_tag='')
+    # ── Priority 3: default workflow ─────────────────────────────────────────
     row = conn.execute(
         "SELECT id FROM workflows WHERE campaign_tag='' AND active=1 LIMIT 1"
     ).fetchone()
     if not row:
+        _log.warning(f"Workflow routing [lead={lead_id}]: No default workflow found — no steps scheduled")
         return []
     steps = conn.execute(
         "SELECT * FROM workflow_steps WHERE workflow_id=? AND active=1 ORDER BY sequence_day",
-        (row[0],)
+        (row["id"],)
     ).fetchall()
+    _log.info(f"Workflow routing [lead={lead_id}]: Priority 3 — default workflow_id={row['id']}")
     return [dict(s) for s in steps]
 
 
@@ -1516,6 +1562,8 @@ def get_od_settings() -> dict:
 
 def delete_workflow(workflow_id: int) -> bool:
     with _conn() as conn:
+        # Null out any campaigns that reference this workflow before deleting
+        conn.execute("UPDATE campaigns SET workflow_id=NULL WHERE workflow_id=?", (workflow_id,))
         conn.execute("DELETE FROM workflow_steps WHERE workflow_id=?", (workflow_id,))
         conn.execute("DELETE FROM workflows WHERE id=?", (workflow_id,))
         return True
@@ -1855,6 +1903,31 @@ def get_all_campaigns() -> list:
         return [dict(r) for r in rows]
 
 
+def get_all_campaigns_with_workflows() -> list:
+    """Return all campaigns with attached workflow name (single JOIN, no N+1)."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT c.*, w.name AS workflow_name
+            FROM campaigns c
+            LEFT JOIN workflows w ON c.workflow_id = w.id
+            ORDER BY c.created_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_campaign_workflow(campaign_id: str, workflow_id) -> bool:
+    """Set or clear the workflow attached to a campaign. workflow_id=None clears it."""
+    now = _now()
+    raw_wf = workflow_id
+    wf_val = int(raw_wf) if raw_wf not in (None, "", 0, "0") else None
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE campaigns SET workflow_id=?, updated_at=? WHERE campaign_id=?",
+            (wf_val, now, campaign_id)
+        )
+        return cur.rowcount > 0
+
+
 def create_campaign(data: dict) -> dict:
     """Insert a new campaign row. Returns the created row as a dict."""
     now = _now()
@@ -1870,14 +1943,18 @@ def create_campaign(data: dict) -> dict:
     # DRAFT if no start_date, else ACTIVE
     status = data.get("status") or ("ACTIVE" if data.get("start_date") else "DRAFT")
 
+    # Coerce workflow_id: empty string or None → None; otherwise int
+    raw_wf = data.get("workflow_id")
+    workflow_id = int(raw_wf) if raw_wf not in (None, "", 0, "0") else None
+
     with _conn() as conn:
         conn.execute("""
             INSERT INTO campaigns
                 (campaign_id, campaign_name, status, campaign_type,
                  service_focus, promo_offer, target_audience, objective,
                  monthly_budget, expected_cpl, start_date, end_date,
-                 landing_page, notes, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 landing_page, notes, workflow_id, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             campaign_id,
             data["campaign_name"],
@@ -1893,6 +1970,7 @@ def create_campaign(data: dict) -> dict:
             data.get("end_date", ""),
             data.get("landing_page", ""),
             data.get("notes", ""),
+            workflow_id,
             now, now,
         ))
         row = conn.execute(
