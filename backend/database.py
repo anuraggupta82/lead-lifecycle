@@ -895,6 +895,13 @@ def _migrate(conn):
     if "ai_max_enabled" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN ai_max_enabled INTEGER NOT NULL DEFAULT 0")
 
+    # Google Ads snapshot columns — stores raw synced state separately from user-edited build
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "gads_campaign_snapshot" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN gads_campaign_snapshot TEXT DEFAULT NULL")
+    if "gads_synced_build_at" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN gads_synced_build_at TEXT DEFAULT NULL")
+
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
     conn.execute("""
@@ -2128,6 +2135,39 @@ def set_campaign_ai_max(campaign_id: str, enabled: bool) -> bool:
             (1 if enabled else 0, now, campaign_id),
         )
         return cur.rowcount > 0
+
+
+def save_gads_campaign_snapshot(campaign_id: str, snapshot: dict) -> bool:
+    """
+    Persist the raw Google Ads campaign snapshot (keywords, ads, ad groups,
+    campaign settings) to gads_campaign_snapshot. This is SEPARATE from
+    campaign_build_json (user-edited build state) — syncing never overwrites
+    what the user has manually edited in the wizard.
+    """
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE campaigns SET gads_campaign_snapshot=?, gads_synced_build_at=?, updated_at=? WHERE campaign_id=?",
+            (json.dumps(snapshot), now, now, campaign_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_gads_campaign_snapshot(campaign_id: str) -> dict:
+    """Return the latest Google Ads snapshot for a campaign, or {} if not synced yet."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT gads_campaign_snapshot, gads_synced_build_at FROM campaigns WHERE campaign_id=?",
+            (campaign_id,)
+        ).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        snap = json.loads(row[0])
+        snap["_synced_at"] = row[1] or ""
+        return snap
+    except Exception:
+        return {}
 
 
 def get_search_term_type_breakdown(campaign_id: str, days: int = 30) -> dict:

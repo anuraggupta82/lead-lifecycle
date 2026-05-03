@@ -2954,6 +2954,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [unifiedDays, setUnifiedDays] = useState(30);
   const [aiReviewSaving, setAiReviewSaving] = useState({});
   const [aiMaxSaving, setAiMaxSaving] = useState({});
+  const [syncingFromGads, setSyncingFromGads] = useState({});  // {campaign_id: bool}
   const [expandedStrategy, setExpandedStrategy] = useState(null);
   const [campActionLoading, setCampActionLoading] = useState({});
   const [detailTab, setDetailTab] = useState('strategy');
@@ -3881,6 +3882,28 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           {loading==='stop'?'…':'⏹ Stop'}
                         </button>
                       )}
+                      {/* Sync from Google Ads — only for GAds-linked campaigns */}
+                      {camp.gads_campaign_resource && (
+                        <button className="btn btn-sm" disabled={!!syncingFromGads[camp.campaign_id]}
+                          style={{fontSize:10,background:'rgba(255,255,255,.15)',color:'#fff',
+                            border:'1px solid rgba(255,255,255,.35)',display:'flex',alignItems:'center',gap:4}}
+                          onClick={async()=>{
+                            setSyncingFromGads(s=>({...s,[camp.campaign_id]:true}));
+                            try {
+                              await api(`/api/admin/campaigns/${camp.campaign_id}/sync-from-gads`,{method:'POST'});
+                              await openCampaignDetail(camp.campaign_id, campDetailDays);
+                            } catch(e){
+                              alert('Sync failed: '+(e?.detail||e?.message));
+                            } finally {
+                              setSyncingFromGads(s=>({...s,[camp.campaign_id]:false}));
+                            }
+                          }}>
+                          {syncingFromGads[camp.campaign_id]
+                            ? <><span className="spinner" style={{width:10,height:10,borderWidth:1.5,display:'inline-block'}}/> Syncing…</>
+                            : '↻ Sync from Google Ads'
+                          }
+                        </button>
+                      )}
                       {/* Days filter */}
                       <div style={{marginLeft:'auto',display:'flex',gap:4}}>
                         {[7,30,90].map(d=>(
@@ -3898,6 +3921,58 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   {/* ── Body ── */}
                   {(() => {
                     const build = cd.build || {};
+                    const gadsSnap = cd.gads_snapshot || {};
+                    const snapSyncedAt = gadsSnap.synced_from_gads_at
+                      ? new Date(gadsSnap.synced_from_gads_at).toLocaleString()
+                      : null;
+
+                    // Helper: seed a wizard step from the Google Ads snapshot
+                    async function seedFromSnapshot(step) {
+                      const stepData = gadsSnap[step];
+                      if (!stepData) return;
+                      setBuildLoading('seed_'+step);
+                      try {
+                        await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`, {
+                          method: 'POST',
+                          body: JSON.stringify({ step, data: stepData }),
+                        });
+                        await openCampaignDetail(camp.campaign_id, campDetailDays);
+                      } catch(e) { alert('Could not seed from snapshot: '+e.message); }
+                      finally { setBuildLoading(''); }
+                    }
+
+                    // Snapshot banner component — shown on wizard tabs when snapshot data exists
+                    // but the wizard step is empty, offering one-click seeding.
+                    function SnapshotBanner({ step, label }) {
+                      const hasSnap = !!(gadsSnap[step] && (
+                        (gadsSnap[step].keywords && gadsSnap[step].keywords.length > 0) ||
+                        (gadsSnap[step].ads && gadsSnap[step].ads.length > 0) ||
+                        (gadsSnap[step].ad_groups && gadsSnap[step].ad_groups.length > 0)
+                      ));
+                      if (!hasSnap) return null;
+                      const seeding = buildLoading === 'seed_'+step;
+                      return (
+                        <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:8,
+                          padding:'12px 16px',marginBottom:16,display:'flex',alignItems:'center',
+                          justifyContent:'space-between',gap:12}}>
+                          <div>
+                            <div style={{fontSize:12,fontWeight:700,color:'#1e40af',marginBottom:2}}>
+                              📥 Google Ads data available
+                            </div>
+                            <div style={{fontSize:11,color:'#3b82f6'}}>
+                              {label} were imported from your live Google Ads campaign
+                              {snapSyncedAt ? ` (synced ${snapSyncedAt})` : ''}.
+                              Seed the wizard from this data to start with real settings.
+                            </div>
+                          </div>
+                          <button className="btn btn-sm" disabled={seeding}
+                            style={{fontSize:11,background:'#2563eb',color:'#fff',border:'none',whiteSpace:'nowrap',flexShrink:0}}
+                            onClick={()=>seedFromSnapshot(step)}>
+                            {seeding ? '⏳ Seeding…' : '📥 Seed from Google Ads'}
+                          </button>
+                        </div>
+                      );
+                    }
 
                     async function generateBuildStep(step) {
                       setBuildLoading(step);
@@ -4119,16 +4194,19 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           {detailTab==='keywords' && (
                             <div>
                               {!build.keywords ? (
-                                <div style={{textAlign:'center',padding:40}}>
-                                  <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>🔍 Keyword Research</div>
-                                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
-                                    Sonnet will generate target keywords by match type plus negatives, based on your Opus Strategy.
+                                <div>
+                                  <SnapshotBanner step="keywords" label="Keywords and negative keywords"/>
+                                  <div style={{textAlign:'center',padding:40}}>
+                                    <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>🔍 Keyword Research</div>
+                                    <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
+                                      Sonnet will generate target keywords by match type plus negatives, based on your Opus Strategy.
+                                    </div>
+                                    <button className="btn btn-teal" disabled={!!buildLoading}
+                                      style={{fontSize:12}}
+                                      onClick={()=>generateBuildStep('keywords')}>
+                                      {buildLoading==='keywords' ? '⏳ Generating…' : '✨ Generate Keywords'}
+                                    </button>
                                   </div>
-                                  <button className="btn btn-teal" disabled={!!buildLoading}
-                                    style={{fontSize:12}}
-                                    onClick={()=>generateBuildStep('keywords')}>
-                                    {buildLoading==='keywords' ? '⏳ Generating…' : '✨ Generate Keywords'}
-                                  </button>
                                 </div>
                               ) : (
                                 <div>
@@ -4171,17 +4249,20 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           {detailTab==='ad_copy' && (
                             <div>
                               {!build.ad_copy ? (
-                                <div style={{textAlign:'center',padding:40}}>
-                                  <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>✍ Ad Copy</div>
-                                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
-                                    Sonnet will generate 15 RSA headlines and 4 descriptions per ad group.
-                                    {!build.keywords && <span style={{color:'#d97706'}}> Generate Keywords first for best results.</span>}
+                                <div>
+                                  <SnapshotBanner step="ad_copy" label="RSA ad copies"/>
+                                  <div style={{textAlign:'center',padding:40}}>
+                                    <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>✍ Ad Copy</div>
+                                    <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
+                                      Sonnet will generate 15 RSA headlines and 4 descriptions per ad group.
+                                      {!build.keywords && <span style={{color:'#d97706'}}> Generate Keywords first for best results.</span>}
+                                    </div>
+                                    <button className="btn btn-teal" disabled={!!buildLoading}
+                                      style={{fontSize:12}}
+                                      onClick={()=>generateBuildStep('ad_copy')}>
+                                      {buildLoading==='ad_copy' ? '⏳ Generating…' : '✨ Generate Ad Copy'}
+                                    </button>
                                   </div>
-                                  <button className="btn btn-teal" disabled={!!buildLoading}
-                                    style={{fontSize:12}}
-                                    onClick={()=>generateBuildStep('ad_copy')}>
-                                    {buildLoading==='ad_copy' ? '⏳ Generating…' : '✨ Generate Ad Copy'}
-                                  </button>
                                 </div>
                               ) : (
                                 <div>
@@ -4232,17 +4313,20 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           {detailTab==='ad_groups' && (
                             <div>
                               {!build.ad_groups ? (
-                                <div style={{textAlign:'center',padding:40}}>
-                                  <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>📂 Ad Group Structure</div>
-                                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
-                                    Sonnet will organize keywords into ad groups with bid recommendations.
-                                    {!build.keywords && <span style={{color:'#d97706'}}> Generate Keywords first for best results.</span>}
+                                <div>
+                                  <SnapshotBanner step="ad_groups" label="Ad groups"/>
+                                  <div style={{textAlign:'center',padding:40}}>
+                                    <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>📂 Ad Group Structure</div>
+                                    <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
+                                      Sonnet will organize keywords into ad groups with bid recommendations.
+                                      {!build.keywords && <span style={{color:'#d97706'}}> Generate Keywords first for best results.</span>}
+                                    </div>
+                                    <button className="btn btn-teal" disabled={!!buildLoading}
+                                      style={{fontSize:12}}
+                                      onClick={()=>generateBuildStep('ad_groups')}>
+                                      {buildLoading==='ad_groups' ? '⏳ Generating…' : '✨ Generate Structure'}
+                                    </button>
                                   </div>
-                                  <button className="btn btn-teal" disabled={!!buildLoading}
-                                    style={{fontSize:12}}
-                                    onClick={()=>generateBuildStep('ad_groups')}>
-                                    {buildLoading==='ad_groups' ? '⏳ Generating…' : '✨ Generate Structure'}
-                                  </button>
                                 </div>
                               ) : (
                                 <div>

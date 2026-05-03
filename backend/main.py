@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -2186,12 +2186,33 @@ class ImportCampaignsRequest(BaseModel):
     campaign_ids: list[str]   # GAds numeric campaign IDs to import
 
 
+def _backfill_campaign_snapshot(campaign_id: str, resource_name: str) -> None:
+    """
+    Background task: fetch keywords/ads/ad-groups from Google Ads and store
+    them in gads_campaign_snapshot.  Runs after import so the HTTP response
+    is not blocked by 10-20s of API calls.
+    """
+    from google_ads_create import fetch_campaign_build_data
+    from database import save_gads_campaign_snapshot
+    try:
+        snapshot = fetch_campaign_build_data(resource_name)
+        if snapshot.get("error"):
+            logger.warning(f"Snapshot backfill skipped for {campaign_id}: {snapshot['error']}")
+            return
+        save_gads_campaign_snapshot(campaign_id, snapshot)
+        logger.info(f"Snapshot backfill complete for campaign {campaign_id}")
+    except Exception as e:
+        logger.error(f"Snapshot backfill failed for {campaign_id}: {e}")
+
+
 @app.post("/api/admin/gads/import-campaigns", dependencies=[Depends(_require_admin)])
-def admin_import_campaigns(body: ImportCampaignsRequest):
+def admin_import_campaigns(body: ImportCampaignsRequest, background_tasks: BackgroundTasks):
     """
     Import selected Google Ads campaigns into the local managed campaigns table.
     Sets gads_campaign_resource + gads_campaign_numeric_id in one atomic INSERT.
     Skips already-imported campaigns silently.
+    After each import, a background task fetches keywords/ads/ad-groups from
+    Google Ads and stores them in gads_campaign_snapshot (non-blocking).
     """
     from google_ads_create import fetch_campaigns_from_gads
     from database import create_campaign, get_campaign_by_id
@@ -2246,12 +2267,55 @@ def admin_import_campaigns(body: ImportCampaignsRequest):
             create_campaign(data)
             logger.info(f"Imported GAds campaign: {cid} '{gads['campaign_name']}'")
             imported.append({"campaign_id": cid, "campaign_name": gads["campaign_name"]})
+            # Non-blocking snapshot backfill — fetches keywords/ads/ad-groups in background
+            background_tasks.add_task(_backfill_campaign_snapshot, cid, gads["resource_name"])
         except Exception as e:
             logger.error(f"Failed to import GAds campaign {cid}: {e}")
             errors.append({"campaign_id": cid, "error": str(e)})
 
     logger.info(f"GAds import complete: {len(imported)} imported, {len(skipped)} skipped, {len(errors)} errors")
     return {"imported": imported, "skipped": skipped, "errors": errors}
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/sync-from-gads", dependencies=[Depends(_require_admin)])
+def admin_sync_campaign_from_gads(campaign_id: str):
+    """
+    On-demand sync: re-fetch keywords, ad copies, and ad groups from Google Ads
+    for a campaign that was already imported.  Stores results in
+    gads_campaign_snapshot (does NOT touch campaign_build_json, so user edits
+    in the wizard are never clobbered).
+
+    Returns the updated snapshot so the frontend can render it immediately.
+    """
+    from database import get_campaign_by_id, save_gads_campaign_snapshot, get_gads_campaign_snapshot
+    from google_ads_create import fetch_campaign_build_data
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    resource_name = camp.get("gads_campaign_resource") or ""
+    if not resource_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Campaign is not linked to Google Ads — import it first"
+        )
+
+    snapshot = fetch_campaign_build_data(resource_name)
+    if snapshot.get("error"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Google Ads API error: {snapshot['error']}"
+        )
+
+    save_gads_campaign_snapshot(campaign_id, snapshot)
+    logger.info(f"Manual GAds sync complete for campaign {campaign_id}")
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "snapshot": snapshot,
+        "synced_at": snapshot.get("synced_from_gads_at"),
+    }
 
 
 # ─── Campaign detail (click-through from Managed Campaigns table) ────────────
@@ -2337,13 +2401,17 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
         lead_count = lead_row["cnt"] if lead_row else 0
 
     # Parse campaign_build_json
-    from database import get_campaign_build
+    from database import get_campaign_build, get_gads_campaign_snapshot
     build_data = get_campaign_build(campaign_id)
 
+    # Snapshot from Google Ads (raw imported state — separate from user-edited build)
+    gads_snapshot = get_gads_campaign_snapshot(campaign_id)
+
     return {
-        "campaign": {k: v for k, v in camp.items() if k not in ("strategy_json", "campaign_build_json")},
+        "campaign": {k: v for k, v in camp.items() if k not in ("strategy_json", "campaign_build_json", "gads_campaign_snapshot")},
         "strategy": strategy,
         "build": build_data,
+        "gads_snapshot": gads_snapshot,
         "summary": {
             "days": days,
             "impressions": total_impressions,
