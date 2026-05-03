@@ -2965,6 +2965,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [refineInput, setRefineInput] = useState('');
   const [refineLoading, setRefineLoading] = useState(false);
   const [refinedPreview, setRefinedPreview] = useState(null); // {step, data}
+  const [checklistEditing, setChecklistEditing] = useState(null); // {key, draftValue, originalValue, saving, saved}
+
   const [stopConfirm, setStopConfirm] = useState(null);
   const [gadsImportOpen, setGadsImportOpen] = useState(false);
   const [gadsImportList, setGadsImportList] = useState([]);
@@ -3042,9 +3044,11 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
   async function openCampaignDetail(campId, days) {
     const d = days || campDetailDays || 30;
+    const isSameCampaign = campDetail?.campaign?.campaign_id === campId;
     setCampDetailLoading(true);
     setCampDetail(null);
-    setDetailTab('strategy');
+    // Only reset tab when opening a different campaign; preserve tab on same-campaign reloads
+    if (!isSameCampaign) setDetailTab('strategy');
     setBuildLoading('');
     setCampEditMode(false);
     setCampEditFields({});
@@ -3987,17 +3991,6 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       }
                     }
 
-                    async function toggleLaunchItem(idx) {
-                      const list = [...(build.launch_checklist || [])];
-                      list[idx] = { ...list[idx], done: !list[idx].done };
-                      await api(`/api/admin/campaigns/${camp.campaign_id}/build-step`, {
-                        method: 'POST',
-                        body: JSON.stringify({ step: 'launch_checklist' }),
-                      });
-                      // optimistic: reload
-                      openCampaignDetail(camp.campaign_id, campDetailDays);
-                    }
-
                     // Wizard step completion helpers
                     const stepDone = {
                       strategy:    !!strategy,
@@ -4024,30 +4017,39 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                     async function handleRefine(step) {
                       if (!refineInput.trim()) return;
                       setRefineLoading(true);
-                      setRefinedPreview(null);
+                      // If there's already a preview for this step, refine from that
+                      // (not the saved version) — supports iterative refinement before committing
+                      const currentOverride = (refinedPreview?.step === step) ? refinedPreview.data : null;
                       try {
                         const res = await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-refine`, {
                           method: 'POST',
-                          body: JSON.stringify({ step, instruction: refineInput }),
+                          body: JSON.stringify({ step, instruction: refineInput, current_override: currentOverride }),
                         });
                         setRefinedPreview({ step, data: res.data });
+                        setRefineInput(''); // clear input so next instruction starts fresh
                       } catch(e) { alert('Refine failed: ' + e.message); }
                       finally { setRefineLoading(false); }
                     }
 
                     async function acceptRefined() {
                       if (!refinedPreview) return;
+                      const { step, data } = refinedPreview;
                       await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`, {
                         method: 'POST',
-                        body: JSON.stringify({ step: refinedPreview.step, data: refinedPreview.data }),
+                        body: JSON.stringify({ step, data }),
                       });
                       setRefinedPreview(null);
                       setRefineInput('');
+                      // Immediately update campDetail so strategy tab re-renders without full reload
+                      if (step === 'strategy') {
+                        setCampDetail(prev => prev ? { ...prev, strategy: data } : prev);
+                      }
                       await openCampaignDetail(camp.campaign_id, campDetailDays);
                     }
 
-                    // Refine box component (rendered at bottom of each refineable tab)
-                    function RefineBox({ step }) {
+                    // Refine box — called as a plain function (not a JSX component) to avoid
+                    // remount-on-keystroke caused by defining a component inside render.
+                    function renderRefineBox(step) {
                       const isThisStep = refinedPreview?.step === step;
                       return (
                         <div style={{marginTop:20,background:'#f5f3ff',border:'1px solid #c4b5fd',borderRadius:8,padding:'12px 14px'}}>
@@ -4185,7 +4187,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                 </div>
                               )}
                               {/* Refine box — only shown after strategy is generated */}
-                              {strategy && <RefineBox step="strategy"/>}
+                              {strategy && renderRefineBox('strategy')}
                             </div>
                           )}
 
@@ -4298,7 +4300,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     ))}
                                   </div>
                                 )}
-                                {build.keywords && <RefineBox step="keywords"/>}
+                                {build.keywords && renderRefineBox('keywords')}
                               </div>
                             );
                           })()}
@@ -4432,7 +4434,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     ))}
                                   </div>
                                 )}
-                                {build.ad_copy && <RefineBox step="ad_copy"/>}
+                                {build.ad_copy && renderRefineBox('ad_copy')}
                               </div>
                             );
                           })()}
@@ -4552,7 +4554,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     )}
                                   </div>
                                 )}
-                                {build.ad_groups && <RefineBox step="ad_groups"/>}
+                                {build.ad_groups && renderRefineBox('ad_groups')}
                               </div>
                             );
                           })()}
@@ -4592,35 +4594,147 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               transition:'width .3s',borderRadius:3}}/>
                                           </div>
                                         </div>
-                                        {items.map((item,i)=>(
-                                          <label key={i} style={{display:'flex',gap:10,alignItems:'flex-start',
-                                            padding:'10px 12px',marginBottom:6,background:item.done?'#f0fdf4':'#fff',
-                                            border:`1px solid ${item.done?'#bbf7d0':'var(--border)'}`,
-                                            borderRadius:7,cursor:'pointer',userSelect:'none'}}>
-                                            <input type="checkbox" checked={item.done} style={{marginTop:1,flexShrink:0}}
-                                              onChange={async()=>{
-                                                const newList = items.map((x,j)=>j===i?{...x,done:!x.done}:x);
-                                                await api(`/api/admin/campaigns/${camp.campaign_id}/build-step`,{
-                                                  method:'POST',
-                                                  body:JSON.stringify({step:'launch_checklist'})
-                                                });
-                                                openCampaignDetail(camp.campaign_id, campDetailDays);
-                                              }}/>
-                                            <span style={{fontSize:12,lineHeight:1.4,
-                                              textDecoration:item.done?'line-through':'none',
-                                              color:item.done?'var(--text-muted)':'var(--text)'}}>{item.item}</span>
-                                          </label>
-                                        ))}
-                                        {pct===100 && (
-                                          <div style={{marginTop:16,background:'#f0fdf4',border:'2px solid #86efac',
-                                            borderRadius:8,padding:'14px 16px',textAlign:'center'}}>
-                                            <div style={{fontSize:20,marginBottom:4}}>✅</div>
-                                            <div style={{fontSize:13,fontWeight:700,color:'#166534'}}>Ready to Launch!</div>
-                                            <div style={{fontSize:11,color:'#166534',marginTop:4}}>
-                                              All checklist items complete. Enable the campaign in Google Ads when ready.
-                                            </div>
+                                        {items.map((item,i)=>{
+                                          const catColor = item.category==='required'?'#dc2626':item.category==='recommended'?'#d97706':'#6b7280';
+                                          const catLabel = item.category==='required'?'Required':item.category==='recommended'?'Recommended':'Optional';
+                                          // Use item.item string as stable key (not array index)
+                                          const editKey = item.item;
+                                          const isEditing = checklistEditing?.key === editKey;
+                                          const isSaved = checklistEditing?.key === editKey && checklistEditing?.saved;
+                                          const isSaving = checklistEditing?.key === editKey && checklistEditing?.saving;
+
+                                          async function saveChecklistValue(newValue) {
+                                            const trimmed = (newValue||'').trim();
+                                            const newList = items.map((x,j)=>j===i?{...x,value:trimmed}:x);
+                                            setChecklistEditing(p=>({...p, saving:true}));
+                                            try {
+                                              setCampDetail(prev => {
+                                                if (!prev) return prev;
+                                                const b = prev.build || {};
+                                                return {...prev, build: {...b, launch_checklist: newList}};
+                                              });
+                                              await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`,{
+                                                method:'POST', body:JSON.stringify({step:'launch_checklist', data: newList})
+                                              });
+                                              setChecklistEditing(p=>({...p, saving:false, saved:true}));
+                                              setTimeout(()=>setChecklistEditing(null), 1200);
+                                            } catch(e) {
+                                              // Rollback on failure
+                                              const origList = items.map((x,j)=>j===i?{...x,value:checklistEditing.originalValue}:x);
+                                              setCampDetail(prev => {
+                                                if (!prev) return prev;
+                                                const b = prev.build || {};
+                                                return {...prev, build: {...b, launch_checklist: origList}};
+                                              });
+                                              setChecklistEditing(p=>({...p, saving:false}));
+                                              alert('Failed to save: ' + e.message);
+                                            }
+                                          }
+
+                                          return (
+                                          <div key={editKey} style={{marginBottom:6}}>
+                                            <label style={{display:'flex',gap:10,alignItems:'flex-start',
+                                              padding:'10px 12px',
+                                              background:item.done?'#f0fdf4':item.skippable?'#fafafa':'#fff',
+                                              border:`1px solid ${item.done?'#bbf7d0':item.skippable?'#e5e7eb':'var(--border)'}`,
+                                              borderRadius: isEditing ? '7px 7px 0 0' : 7,
+                                              cursor:'pointer',userSelect:'none',marginBottom:0}}>
+                                              <input type="checkbox" checked={!!item.done} style={{marginTop:3,flexShrink:0}}
+                                                onChange={async()=>{
+                                                  const newList = items.map((x,j)=>j===i?{...x,done:!x.done}:x);
+                                                  setCampDetail(prev => {
+                                                    if (!prev) return prev;
+                                                    const b = prev.build || {};
+                                                    return {...prev, build: {...b, launch_checklist: newList}};
+                                                  });
+                                                  await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`,{
+                                                    method:'POST',
+                                                    body:JSON.stringify({step:'launch_checklist', data: newList})
+                                                  });
+                                                }}/>
+                                              <div style={{flex:1,minWidth:0}}>
+                                                <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+                                                  <span style={{fontSize:12,lineHeight:1.4,
+                                                    textDecoration:item.done?'line-through':'none',
+                                                    color:item.done?'var(--text-muted)':'var(--text)',fontWeight:500}}>{item.item}</span>
+                                                  {/* Value pill — click to edit */}
+                                                  <button
+                                                    title="Click to edit value"
+                                                    onClick={e=>{
+                                                      e.preventDefault(); e.stopPropagation();
+                                                      if (!isEditing) setChecklistEditing({key:editKey, draftValue: item.value||'', originalValue: item.value||'', saving:false, saved:false});
+                                                    }}
+                                                    style={{fontSize:10,color: isSaved?'#059669': (item.value?'#374151':'#9ca3af'),
+                                                      background: isSaved?'#d1fae5': (item.value?'#f3f4f6':'#fafafa'),
+                                                      border: `1px solid ${isSaved?'#6ee7b7': (item.value?'#e5e7eb':'#e5e7eb')}`,
+                                                      padding:'1px 7px',borderRadius:10,cursor:'text',
+                                                      maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',
+                                                      whiteSpace:'nowrap',flexShrink:0,fontWeight:400,
+                                                      outline:'none',transition:'border-color .15s'}}>
+                                                    {isSaved ? '✓ Saved' : isSaving ? '…' : (item.value || '+ add value')}
+                                                  </button>
+                                                  <span style={{fontSize:9,fontWeight:700,color:catColor,
+                                                    background:catColor+'15',padding:'1px 5px',borderRadius:3,
+                                                    textTransform:'uppercase',letterSpacing:'.3px',flexShrink:0}}>{catLabel}</span>
+                                                  {item.skippable && !item.done && (
+                                                    <span style={{fontSize:9,color:'#6b7280',background:'#f3f4f6',
+                                                      padding:'1px 5px',borderRadius:3,flexShrink:0}}>Can skip for now</span>
+                                                  )}
+                                                </div>
+                                                {item.note && (
+                                                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2,lineHeight:1.4}}>{item.note}</div>
+                                                )}
+                                              </div>
+                                            </label>
+                                            {/* Inline edit row */}
+                                            {isEditing && (
+                                              <div style={{display:'flex',gap:6,alignItems:'center',padding:'8px 12px',
+                                                background:'#f8fafc',border:'1px solid var(--teal)',borderTop:'none',
+                                                borderRadius:'0 0 7px 7px'}}>
+                                                <input autoFocus
+                                                  value={checklistEditing.draftValue}
+                                                  onChange={e=>setChecklistEditing(p=>({...p,draftValue:e.target.value}))}
+                                                  onKeyDown={e=>{
+                                                    if(e.key==='Enter') saveChecklistValue(checklistEditing.draftValue);
+                                                    if(e.key==='Escape') setChecklistEditing(null);
+                                                  }}
+                                                  placeholder="Enter value…"
+                                                  style={{flex:1,fontSize:11,padding:'4px 8px',border:'1px solid var(--border)',
+                                                    borderRadius:5,outline:'none',background:'#fff'}}/>
+                                                <button className="btn btn-teal btn-sm" style={{fontSize:10,padding:'3px 10px'}}
+                                                  disabled={isSaving}
+                                                  onClick={()=>saveChecklistValue(checklistEditing.draftValue)}>
+                                                  {isSaving ? '…' : 'Save'}
+                                                </button>
+                                                <button className="btn btn-sm" style={{fontSize:10,padding:'3px 8px',
+                                                  background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                                  onClick={()=>setChecklistEditing(null)}>Cancel</button>
+                                              </div>
+                                            )}
                                           </div>
-                                        )}
+                                          );
+                                        })}
+                                        {(() => {
+                                          const requiredItems = items.filter(x=>x.category==='required');
+                                          const requiredDone = requiredItems.length > 0 && requiredItems.every(x=>x.done);
+                                          const allDone = pct === 100;
+                                          if (!requiredDone) return null;
+                                          return (
+                                            <div style={{marginTop:16,background: allDone?'#f0fdf4':'#fffbeb',
+                                              border:`2px solid ${allDone?'#86efac':'#fcd34d'}`,
+                                              borderRadius:8,padding:'14px 16px',textAlign:'center'}}>
+                                              <div style={{fontSize:20,marginBottom:4}}>{allDone?'✅':'🚀'}</div>
+                                              <div style={{fontSize:13,fontWeight:700,color:allDone?'#166534':'#92400e'}}>
+                                                {allDone ? 'Fully Ready to Launch!' : 'Ready to Launch'}
+                                              </div>
+                                              <div style={{fontSize:11,color:allDone?'#166534':'#78350f',marginTop:4}}>
+                                                {allDone
+                                                  ? 'All checklist items complete. Enable the campaign in Google Ads when ready.'
+                                                  : 'All required items are done. Optional items can be added after launch. Enable the campaign in Google Ads when ready.'}
+                                              </div>
+                                            </div>
+                                          );
+                                        })()}
 
                                         {/* ── AI Max Section ── */}
                                         {(() => {

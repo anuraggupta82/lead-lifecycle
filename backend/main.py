@@ -1628,8 +1628,9 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
 
 
 class CampaignBuildStepRefineRequest(BaseModel):
-    step: str          # "keywords" | "ad_copy" | "ad_groups"
-    instruction: str   # Natural language instruction from user
+    step: str                        # "keywords" | "ad_copy" | "ad_groups" | "strategy"
+    instruction: str                 # Natural language instruction from user
+    current_override: dict | list | None = None  # If set, use this as base instead of saved version (iterative refinement)
 
 
 @app.post("/api/admin/campaigns/{campaign_id}/build-step-refine", dependencies=[Depends(_require_admin)])
@@ -1650,8 +1651,11 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # Strategy is stored in strategy_json on the campaign row; others are in campaign_build_json
-    if body.step == "strategy":
+    # Use client-side preview as base if provided (iterative refinement before saving)
+    if body.current_override is not None:
+        current = body.current_override
+    elif body.step == "strategy":
+        # Strategy is stored in strategy_json on the campaign row
         raw_strat = camp.get("strategy_json") or {}
         current = _json.loads(raw_strat) if isinstance(raw_strat, str) else raw_strat
         if not current:
@@ -1672,13 +1676,31 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
     _api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
     ai_client = _anthropic.Anthropic(api_key=_api_key)
 
-    step_guidance = ""
     if body.step == "strategy":
-        step_guidance = """For the strategy step, the JSON schema is:
-{objective, target_audience, key_messages (list), ad_headlines (list), ad_descriptions (list), implementation_instructions}
-Keep all fields present. Modify only what the user instruction targets."""
+        prompt = f"""You are a Google Ads specialist refining a campaign strategy.
 
-    prompt = f"""You are a Google Ads specialist helping refine a campaign build step.
+Campaign: {camp.get("campaign_name", "")}
+Service Focus: {camp.get("service_focus", "")}
+
+Current strategy:
+{_json.dumps(current, indent=2)}
+
+User instruction: {body.instruction}
+
+Return the COMPLETE updated strategy as a JSON object with EXACTLY these keys (no extras, no campaign_name key):
+{{
+  "objective": "...",
+  "target_audience": "...",
+  "key_messages": ["...", "..."],
+  "ad_headlines": ["...", "..."],
+  "ad_descriptions": ["...", "..."],
+  "implementation_instructions": "..."
+}}
+
+Apply only the changes the user requested. Keep everything else identical to the current strategy.
+Return ONLY the JSON object, no explanation."""
+    else:
+        prompt = f"""You are a Google Ads specialist helping refine a campaign build step.
 
 Campaign: {camp.get("campaign_name", "")}
 Service Focus: {camp.get("service_focus", "")}
@@ -1689,7 +1711,6 @@ Current {body.step} content:
 
 User instruction: {body.instruction}
 
-{step_guidance}
 Apply the user's instruction to modify the {body.step} content. Return the complete updated {body.step} JSON structure — same format as the input, with the requested changes applied.
 
 Rules:
@@ -1860,16 +1881,111 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
 
     # Launch checklist is a static template — no AI needed
     if step == "launch_checklist":
-        checklist = [
-            {"item": "Campaign budget confirmed",               "done": False},
-            {"item": "Geographic targeting set",                "done": False},
-            {"item": "Ad schedule configured",                  "done": False},
-            {"item": "Negative keywords added",                 "done": False},
-            {"item": "Ad extensions added (call, location)",    "done": False},
-            {"item": "Conversion tracking verified",            "done": False},
-            {"item": "Landing page reviewed",                   "done": False},
-            {"item": "Campaign reviewed and approved",          "done": False},
-        ]
+        # AI-driven smart checklist: reviews what's built, auto-checks done items,
+        # marks optional items skippable, notes what's missing
+        import anthropic as _anthropic, json as _json, re as _re
+        build_data = get_campaign_build(campaign_id)
+        strategy_raw = camp.get("strategy_json") or {}
+        strategy_parsed = _json.loads(strategy_raw) if isinstance(strategy_raw, str) else strategy_raw
+
+        has_keywords  = bool(build_data.get("keywords"))
+        has_ad_copy   = bool(build_data.get("ad_copy"))
+        has_ad_groups = bool(build_data.get("ad_groups"))
+        landing_page  = camp.get("landing_page") or ""
+        budget        = camp.get("monthly_budget") or 0
+        service       = camp.get("service_focus") or ""
+        campaign_type = camp.get("campaign_type") or "SEARCH"
+        neg_kw        = []
+        if has_keywords:
+            kw_data = build_data["keywords"]
+            neg_kw = kw_data.get("negative_keywords", []) if isinstance(kw_data, dict) else []
+
+        # Pre-process landing page status so AI doesn't have to infer it
+        MAIN_SITE = "graftondentalcare.com"
+        lp_lower = landing_page.lower()
+        if not landing_page or MAIN_SITE in lp_lower:
+            landing_page_status = "main_site"
+            landing_page_note = f"Using main website ({landing_page or 'graftondentalcare.com'}) — acceptable for launch. No dedicated landing page required."
+            landing_page_done = True
+        else:
+            landing_page_status = "custom"
+            landing_page_note = f"Using custom landing page: {landing_page}"
+            landing_page_done = True  # custom URL is also acceptable
+
+        _api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        ai_client = _anthropic.Anthropic(api_key=_api_key)
+
+        checklist_prompt = f"""You are a Google Ads launch specialist reviewing a campaign before it goes live.
+
+Campaign: {camp.get("campaign_name", "")}
+Service: {service}
+Type: {campaign_type}
+Budget: ${budget}/month
+Landing page status: {landing_page_status} — {landing_page_note}
+Strategy: {_json.dumps(strategy_parsed, indent=2) if strategy_parsed else "Not generated"}
+
+What has been built so far:
+- Keywords: {"YES — " + str(len(build_data.get("keywords",{}).get("keywords",[]))) + " keywords, " + str(len(neg_kw)) + " negatives" if has_keywords else "NOT DONE"}
+- Ad Copy: {"YES" if has_ad_copy else "NOT DONE"}
+- Ad Groups: {"YES" if has_ad_groups else "NOT DONE"}
+- Landing page: DONE ({landing_page_note})
+
+Generate a smart launch checklist as a JSON array. Each item must have:
+- "item": short label (5-10 words), e.g. "Monthly budget set", "Geographic targeting"
+- "value": the current answer/value for this item — the actual fact (e.g. "$800/month", "graftondentalcare.com", "Not set yet", "42 keywords added", "United States"). Empty string if unknown.
+- "note": one sentence explaining what's needed or why it can be skipped
+- "done": true if already completed based on the build data above
+- "skippable": true if this item is optional or can be addressed after launch
+- "category": one of "required", "recommended", "optional"
+
+Rules:
+- Auto-check (done:true) items that are clearly complete from build data
+- For "value" use the actual data — budget in dollars, keyword count, landing page URL, etc. Not vague descriptions.
+- Landing page is DONE — mark it done:true, value: "{landing_page or 'graftondentalcare.com'}", note: "{landing_page_note}"
+- Mark "Conversion tracking" as skippable:true, category:"optional", value:"Not set up yet" — it can be added after launch; note that a new campaign can be cloned from this one once tracking is set up
+- Mark "Negative keywords" as done:true if negatives exist, value: "{len(neg_kw)} negatives added"
+- "Geographic targeting" should be category:"required", done:false, value:"Not set yet — set in Google Ads"
+- "Campaign reviewed and approved" must be category:"required", done:false, value:"Pending review"
+- Items with skippable:true should still appear so the user is aware of them
+- Be specific to this campaign's service and context
+- Return 8-12 items covering: budget, targeting, keywords, ad copy, ad extensions, conversion tracking, landing page, approval
+
+Return ONLY a JSON array, no explanation."""
+
+        try:
+            resp = ai_client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=1500,
+                messages=[{"role": "user", "content": checklist_prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            arr_match = _re.search(r'\[[\s\S]*\]', raw)
+            if not arr_match:
+                raise ValueError("No JSON array in response")
+            checklist = _json.loads(arr_match.group())
+            # Ensure required fields
+            for item in checklist:
+                item.setdefault("done", False)
+                item.setdefault("skippable", False)
+                item.setdefault("category", "required")
+                item.setdefault("note", "")
+                item.setdefault("value", "")
+        except Exception as e:
+            logger.error(f"AI checklist generation failed: {e}")
+            kw_count = len(build_data.get("keywords", {}).get("keywords", [])) if has_keywords else 0
+            # Fallback to basic checklist
+            checklist = [
+                {"item": "Campaign budget confirmed",            "value": f"${budget}/month" if budget else "Not set", "done": bool(budget), "skippable": False, "category": "required",    "note": f"${budget}/month set." if budget else "Set monthly budget before launching."},
+                {"item": "Keywords built and reviewed",          "value": f"{kw_count} keywords" if has_keywords else "Not done", "done": has_keywords,  "skippable": False, "category": "required",    "note": "Keywords have been generated." if has_keywords else "Complete the Keywords step first."},
+                {"item": "Ad copy created",                      "value": "Done" if has_ad_copy else "Not done", "done": has_ad_copy,   "skippable": False, "category": "required",    "note": "Ad copy has been generated." if has_ad_copy else "Complete the Ad Copy step first."},
+                {"item": "Negative keywords added",              "value": f"{len(neg_kw)} negatives" if neg_kw else "None added", "done": bool(neg_kw),  "skippable": False, "category": "recommended", "note": f"{len(neg_kw)} negatives set." if neg_kw else "Add negative keywords to avoid irrelevant clicks."},
+                {"item": "Geographic targeting set",             "value": "Not set yet", "done": False,         "skippable": False, "category": "required",    "note": "Set location targeting in Google Ads."},
+                {"item": "Ad extensions added (call, location)", "value": "Not set yet", "done": False,         "skippable": True,  "category": "recommended", "note": "Add call extension so patients can call directly."},
+                {"item": "Landing page reviewed",                "value": landing_page or "graftondentalcare.com", "done": landing_page_done, "skippable": False, "category": "recommended", "note": landing_page_note},
+                {"item": "Conversion tracking verified",         "value": "Not set up yet", "done": False,         "skippable": True,  "category": "optional",    "note": "Can be added after launch. Track calls and form submissions."},
+                {"item": "Campaign reviewed and approved",       "value": "Pending review", "done": False,         "skippable": False, "category": "required",    "note": "Final review before enabling campaign."},
+            ]
+
         save_campaign_build_step(campaign_id, step, checklist)
         return {"ok": True, "step": step, "data": checklist}
 
