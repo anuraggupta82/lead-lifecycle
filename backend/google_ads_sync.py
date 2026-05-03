@@ -505,6 +505,22 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
             keyword = click_data["keyword_text"]
             click_cost = keyword_costs.get(keyword, 0.0)
 
+            # Map Google Ads match_type → our search_term_type.
+            # "AI_MAX_KEYWORDLESS" and "AI_MAX_BROAD_MATCH" are returned by Google
+            # when the click came from an AI Max expanded query. Standard values are
+            # EXACT, PHRASE, BROAD (proto-plus returns these as enum names).
+            raw_match = (click_data.get("match_type") or "").upper()
+            if "AI_MAX" in raw_match or raw_match == "KEYWORDLESS":
+                search_term_type = "ai_max"
+            elif raw_match == "EXACT":
+                search_term_type = "exact"
+            elif raw_match == "PHRASE":
+                search_term_type = "phrase"
+            elif raw_match == "BROAD":
+                search_term_type = "broad"
+            else:
+                search_term_type = ""
+
             update_data = {
                 "id": lead["id"],
                 "keyword_text": keyword,
@@ -517,6 +533,7 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
                 "campaign_id": click_data.get("campaign_id", ""),
                 "click_cost": click_cost,
                 "gads_synced_at": now,
+                "search_term_type": search_term_type,
             }
 
             upsert_lead(update_data)

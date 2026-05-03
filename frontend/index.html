@@ -2953,6 +2953,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [showInactive, setShowInactive] = useState(false);
   const [unifiedDays, setUnifiedDays] = useState(30);
   const [aiReviewSaving, setAiReviewSaving] = useState({});
+  const [aiMaxSaving, setAiMaxSaving] = useState({});
   const [expandedStrategy, setExpandedStrategy] = useState(null);
   const [campActionLoading, setCampActionLoading] = useState({});
   const [detailTab, setDetailTab] = useState('strategy');
@@ -2999,6 +3000,39 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       alert('Could not update AI Review: ' + (e?.detail || e?.message));
     } finally {
       setAiReviewSaving(p => ({...p, [camp.campaign_id]: false}));
+    }
+  }
+
+  async function toggleAiMax(camp) {
+    if (!camp.campaign_id || camp.is_synthetic) return;
+    const next = !camp.ai_max_enabled;
+
+    // Confirm before enabling — AI Max can expand spend significantly
+    if (next) {
+      const confirmed = window.confirm(
+        `Enable AI Max for "${camp.campaign_name}"?\n\n` +
+        `This allows Google's AI to expand your campaign beyond your keyword list. ` +
+        `Spend may increase as more searches become eligible.\n\n` +
+        `Recommended: run for 30 days and review CPL before making permanent.`
+      );
+      if (!confirmed) return;
+    }
+
+    // Optimistic update
+    setUnifiedCamps(prev => prev.map(r =>
+      r.campaign_id === camp.campaign_id ? {...r, ai_max_enabled: next} : r));
+    setAiMaxSaving(p => ({...p, [camp.campaign_id]: true}));
+    try {
+      await api(`/api/admin/campaigns/${camp.campaign_id}/ai-max`, {
+        method: 'PATCH', body: JSON.stringify({enabled: next}),
+      });
+    } catch(e) {
+      // Revert on failure
+      setUnifiedCamps(prev => prev.map(r =>
+        r.campaign_id === camp.campaign_id ? {...r, ai_max_enabled: !next} : r));
+      alert('Could not update AI Max: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setAiMaxSaving(p => ({...p, [camp.campaign_id]: false}));
     }
   }
 
@@ -3322,15 +3356,16 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               <th className="num">CPL</th>
               <th className="num">ROI</th>
               <th style={{textAlign:'center',width:80}}>AI Review</th>
+              <th style={{textAlign:'center',width:76}}>AI Max</th>
               <th style={{width:190}}>Actions</th>
             </tr>
           </thead>
           <tbody>
             {unifiedLoading && (
-              <tr><td colSpan={12} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
+              <tr><td colSpan={13} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
             )}
             {!unifiedLoading && unifiedCamps.length === 0 && (
-              <tr><td colSpan={12} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
+              <tr><td colSpan={13} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
                 No campaigns yet — click "+ New Campaign" or "⬇ Import from Google Ads".
               </td></tr>
             )}
@@ -3407,6 +3442,34 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       )}
                     </td>
 
+                    {/* AI Max toggle */}
+                    {(() => {
+                      const maxSaving = !!aiMaxSaving[c.campaign_id];
+                      const isLinked = c.is_gads_linked && !c.is_synthetic && c.campaign_id;
+                      return (
+                        <td style={{textAlign:'center'}}>
+                          {!isLinked ? (
+                            <span style={{fontSize:9,color:'var(--text-muted)'}}
+                              title="Link to Google Ads to enable AI Max">—</span>
+                          ) : (
+                            <label style={{display:'inline-flex',alignItems:'center',gap:3,
+                              cursor:maxSaving?'wait':'pointer'}}
+                              title={c.ai_max_enabled
+                                ? 'AI Max ON — Google AI expanding keyword reach. Click to disable.'
+                                : 'Enable AI Max — Google AI will expand beyond your keyword list'}>
+                              <input type="checkbox" disabled={maxSaving}
+                                checked={!!c.ai_max_enabled}
+                                onChange={()=>toggleAiMax(c)} />
+                              {c.ai_max_enabled && !maxSaving && (
+                                <span style={{fontSize:9,color:'#4285f4',fontWeight:600}}>ON</span>
+                              )}
+                              {maxSaving && <span style={{fontSize:9,color:'var(--text-muted)'}}>…</span>}
+                            </label>
+                          )}
+                        </td>
+                      );
+                    })()}
+
                     {/* Actions */}
                     <td style={{textAlign:'right'}}>
                       {c.is_synthetic ? (
@@ -3460,7 +3523,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   {/* Strategy expansion row */}
                   {strategyOpen && parsedStrategy && (
                     <tr>
-                      <td colSpan={12} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
+                      <td colSpan={13} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
                         <div style={{padding:'16px 18px',borderLeft:'3px solid var(--teal)'}}>
                           <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
                             <span style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>🧠 Opus Strategy</span>
@@ -4304,6 +4367,54 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                             </div>
                                           </div>
                                         )}
+
+                                        {/* ── AI Max Section ── */}
+                                        {(() => {
+                                          const isLinked = !!(camp.gads_campaign_resource || camp.gads_campaign_numeric_id);
+                                          const maxOn = !!camp.ai_max_enabled;
+                                          const maxSav = !!aiMaxSaving[camp.campaign_id];
+                                          return (
+                                            <div style={{marginTop:22,borderTop:'1px solid var(--border)',paddingTop:18}}>
+                                              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🤖 Google AI Max</div>
+                                              {!isLinked ? (
+                                                <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',
+                                                  background:'#f9fafb',border:'1px solid var(--border)',borderRadius:7,
+                                                  padding:'10px 14px'}}>
+                                                  AI Max requires this campaign to be linked to Google Ads.
+                                                  Launch to Google Ads first.
+                                                </div>
+                                              ) : (
+                                                <div style={{background: maxOn ? '#eff6ff' : '#f9fafb',
+                                                  border:`1px solid ${maxOn ? '#bfdbfe' : 'var(--border)'}`,
+                                                  borderRadius:8, padding:'14px 16px'}}>
+                                                  <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',userSelect:'none'}}>
+                                                    <input type="checkbox" checked={maxOn} disabled={maxSav}
+                                                      style={{marginTop:2,flexShrink:0,accentColor:'#4285f4'}}
+                                                      onChange={()=>toggleAiMax(camp)}/>
+                                                    <div>
+                                                      <div style={{fontSize:12,fontWeight:600,
+                                                        color: maxOn ? '#1d4ed8' : 'var(--text)'}}>
+                                                        {maxOn ? '✓ AI Max enabled' : 'Enable AI Max search term matching'}
+                                                        {maxSav && <span style={{fontWeight:400,color:'var(--text-muted)',fontSize:11}}> — saving…</span>}
+                                                      </div>
+                                                      <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,lineHeight:1.5}}>
+                                                        {maxOn
+                                                          ? 'Google\'s AI is expanding your keyword reach. Check the Performance tab for AI Max vs. standard match type breakdown after 7+ days.'
+                                                          : 'Lets Google\'s AI find searchers beyond your keyword list. Recommended after 4+ weeks of baseline data. Start with this OFF, then enable once you have CPL benchmarks.'}
+                                                      </div>
+                                                      {!maxOn && (
+                                                        <div style={{fontSize:10,color:'#92400e',marginTop:6,
+                                                          background:'#fef3c7',padding:'4px 8px',borderRadius:4,display:'inline-block'}}>
+                                                          ⚠ Enabling may increase spend — confirm your daily budget cap first
+                                                        </div>
+                                                      )}
+                                                    </div>
+                                                  </label>
+                                                </div>
+                                              )}
+                                            </div>
+                                          );
+                                        })()}
                                       </>
                                     );
                                   })()}

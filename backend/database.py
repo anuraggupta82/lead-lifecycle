@@ -592,6 +592,8 @@ def _migrate(conn):
         ("od_relationship",     "TEXT DEFAULT 'cold'"),
         # Lead tags (JSON array of strings)
         ("tags",                "TEXT DEFAULT '[]'"),
+        # AI Max search term type — "exact","phrase","broad","ai_max",""
+        ("search_term_type",    "TEXT DEFAULT ''"),
     ]
 
     for col_name, col_type in new_columns:
@@ -887,6 +889,11 @@ def _migrate(conn):
         conn.execute("ALTER TABLE campaigns ADD COLUMN ai_review_enabled INTEGER NOT NULL DEFAULT 0")
     if "campaign_build_json" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN campaign_build_json TEXT DEFAULT NULL")
+
+    # AI Max columns (AI Max integration)
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "ai_max_enabled" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN ai_max_enabled INTEGER NOT NULL DEFAULT 0")
 
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
@@ -2003,6 +2010,7 @@ def get_unified_campaigns(days: int = 30) -> list:
         for r in managed:
             row = dict(r)
             row["ai_review_enabled"] = bool(row.get("ai_review_enabled") or 0)
+            row["ai_max_enabled"] = bool(row.get("ai_max_enabled") or 0)
             try:
                 row["strategy_json"] = _json.loads(row["strategy_json"]) if row.get("strategy_json") else None
             except Exception:
@@ -2075,6 +2083,7 @@ def get_unified_campaigns(days: int = 30) -> list:
                 "gads_campaign_resource": None,
                 "gads_campaign_numeric_id": None,
                 "ai_review_enabled": False,
+                "ai_max_enabled": False,
                 "is_synthetic": True,
                 "is_gads_linked": True,
                 "metrics": {
@@ -2104,6 +2113,39 @@ def set_campaign_ai_review(campaign_id: str, enabled: bool) -> bool:
             (1 if enabled else 0, now, campaign_id),
         )
         return cur.rowcount > 0
+
+
+def set_campaign_ai_max(campaign_id: str, enabled: bool) -> bool:
+    """
+    Update the local ai_max_enabled flag for a managed campaign.
+    Called ONLY after the Google Ads API mutate succeeds — never update
+    local state before confirming the API call worked.
+    """
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE campaigns SET ai_max_enabled=?, updated_at=? WHERE campaign_id=?",
+            (1 if enabled else 0, now, campaign_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_search_term_type_breakdown(campaign_id: str, days: int = 30) -> dict:
+    """
+    Return counts of leads per search_term_type for a campaign in the window.
+    Used by the Performance tab to show AI Max vs standard match type breakdown.
+    """
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                COALESCE(NULLIF(search_term_type, ''), 'unknown') AS stype,
+                COUNT(*) AS cnt
+            FROM leads
+            WHERE campaign_id = ?
+              AND created_at >= DATE('now', ?)
+            GROUP BY stype
+        """, (campaign_id, f"-{days} day")).fetchall()
+    return {r["stype"]: r["cnt"] for r in rows}
 
 
 def get_campaign_build(campaign_id: str) -> dict:

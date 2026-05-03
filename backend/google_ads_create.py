@@ -197,3 +197,143 @@ def set_campaign_status(campaign_resource_name: str, target_status: str) -> dict
     except Exception as e:
         logger.error(f"GAds set_campaign_status failed ({target_status}): {e}")
         return {"ok": False, "resource_name": campaign_resource_name, "error": str(e)}
+
+
+def _get_campaign_channel_type(campaign_resource_name: str) -> str:
+    """
+    Fetch the advertising_channel_type for a campaign resource name.
+    Returns the string value e.g. "SEARCH", "PERFORMANCE_MAX", "DISPLAY", or ""
+    on failure.
+    """
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    try:
+        client = _build_client()
+        service = client.get_service("GoogleAdsService")
+        query = f"""
+            SELECT campaign.advertising_channel_type
+            FROM campaign
+            WHERE campaign.resource_name = '{campaign_resource_name}'
+            LIMIT 1
+        """
+        rows = list(service.search(customer_id=customer_id, query=query))
+        if rows:
+            return str(rows[0].campaign.advertising_channel_type).upper()
+    except Exception as e:
+        logger.warning(f"_get_campaign_channel_type failed: {e}")
+    return ""
+
+
+def enable_ai_max(campaign_resource_name: str) -> dict:
+    """
+    Enable AI Max on an existing Google Search campaign.
+
+    AI Max expands reach beyond the keyword list using Google's AI for search
+    term matching. Only valid for SEARCH channel type campaigns.
+
+    Does NOT enable Final URL expansion — that is left OFF by default because
+    it breaks landing_url attribution. Implement separately when needed.
+
+    Respects the global kill switch.
+
+    Returns:
+        { "ok": bool, "resource_name": str, "error": str | None }
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        logger.warning(f"enable_ai_max blocked by kill switch: {e}")
+        return {"ok": False, "resource_name": campaign_resource_name, "error": str(e)}
+
+    # AI Max only works on Search campaigns
+    channel = _get_campaign_channel_type(campaign_resource_name)
+    if channel and channel != "SEARCH":
+        return {
+            "ok": False,
+            "resource_name": campaign_resource_name,
+            "error": f"AI Max only applies to Search campaigns (this is {channel})",
+        }
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+
+    try:
+        client = _build_client()
+        campaign_service = client.get_service("CampaignService")
+
+        campaign_operation = client.get_type("CampaignOperation")
+        campaign = campaign_operation.update
+        campaign.resource_name = campaign_resource_name
+
+        # Set the single AI Max master switch
+        campaign.ai_max_setting.enable_ai_max = True
+
+        client.copy_from(
+            campaign_operation.update_mask,
+            client.get_type("FieldMask")(paths=["ai_max_setting.enable_ai_max"]),
+        )
+
+        response = campaign_service.mutate_campaigns(
+            customer_id=customer_id,
+            operations=[campaign_operation],
+        )
+
+        updated = response.results[0].resource_name if response.results else campaign_resource_name
+        logger.info(f"AI Max ENABLED on campaign: {updated}")
+        return {"ok": True, "resource_name": updated, "error": None}
+
+    except Exception as e:
+        logger.error(f"enable_ai_max failed: {e}")
+        return {"ok": False, "resource_name": campaign_resource_name, "error": str(e)}
+
+
+def disable_ai_max(campaign_resource_name: str) -> dict:
+    """
+    Disable AI Max on a Google Search campaign.
+
+    Historical lead attribution (search_term_type='ai_max') is preserved as-is —
+    disabling AI Max only stops new AI-expanded queries, it does not retroactively
+    change historical data.
+
+    Respects the global kill switch.
+
+    Returns:
+        { "ok": bool, "resource_name": str, "error": str | None }
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        logger.warning(f"disable_ai_max blocked by kill switch: {e}")
+        return {"ok": False, "resource_name": campaign_resource_name, "error": str(e)}
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+
+    try:
+        client = _build_client()
+        campaign_service = client.get_service("CampaignService")
+
+        campaign_operation = client.get_type("CampaignOperation")
+        campaign = campaign_operation.update
+        campaign.resource_name = campaign_resource_name
+        campaign.ai_max_setting.enable_ai_max = False
+
+        client.copy_from(
+            campaign_operation.update_mask,
+            client.get_type("FieldMask")(paths=["ai_max_setting.enable_ai_max"]),
+        )
+
+        response = campaign_service.mutate_campaigns(
+            customer_id=customer_id,
+            operations=[campaign_operation],
+        )
+
+        updated = response.results[0].resource_name if response.results else campaign_resource_name
+        logger.info(f"AI Max DISABLED on campaign: {updated}")
+        return {"ok": True, "resource_name": updated, "error": None}
+
+    except Exception as e:
+        logger.error(f"disable_ai_max failed: {e}")
+        return {"ok": False, "resource_name": campaign_resource_name, "error": str(e)}

@@ -1725,6 +1725,70 @@ def admin_campaign_set_ai_review(campaign_id: str, body: CampaignAiReviewRequest
     return {"ok": True, "campaign_id": campaign_id, "ai_review_enabled": body.enabled}
 
 
+class CampaignAiMaxRequest(BaseModel):
+    enabled: bool
+
+
+@app.patch("/api/admin/campaigns/{campaign_id}/ai-max", dependencies=[Depends(_require_admin)])
+def admin_campaign_set_ai_max(campaign_id: str, body: CampaignAiMaxRequest):
+    """
+    Enable or disable Google Ads AI Max on a managed campaign.
+
+    AI Max allows Google's AI to expand search term matching beyond the keyword
+    list. Only works on Search campaigns linked to Google Ads.
+
+    When enabled=true → calls enable_ai_max() on the GAds API, then updates local DB.
+    When enabled=false → calls disable_ai_max(), then updates local DB.
+    DB is only updated when the API call succeeds.
+
+    Historical search_term_type='ai_max' data is never retroactively cleared
+    when disabling — only future syncs are affected.
+    """
+    from database import get_campaign_by_id, set_campaign_ai_max
+    from google_ads_create import enable_ai_max, disable_ai_max
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    resource_name = camp.get("gads_campaign_resource") or ""
+    if not resource_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Campaign is not yet linked to Google Ads. Launch it to Google Ads first."
+        )
+
+    if body.enabled:
+        result = enable_ai_max(resource_name)
+    else:
+        result = disable_ai_max(resource_name)
+
+    if not result.get("ok"):
+        error_msg = result.get("error") or "Google Ads API call failed"
+        logger.error(f"AI Max toggle failed for {campaign_id}: {error_msg}")
+        raise HTTPException(status_code=502, detail=error_msg)
+
+    # Only update local DB after confirmed API success
+    ok = set_campaign_ai_max(campaign_id, body.enabled)
+    if not ok:
+        logger.warning(f"AI Max API succeeded but local DB update failed for {campaign_id}")
+
+    action = "enabled" if body.enabled else "disabled"
+    logger.info(f"AI Max {action} for campaign {campaign_id} ({resource_name})")
+    return {"ok": True, "campaign_id": campaign_id, "ai_max_enabled": body.enabled}
+
+
+@app.get("/api/admin/campaigns/{campaign_id}/search-term-types", dependencies=[Depends(_require_admin)])
+def admin_campaign_search_term_types(campaign_id: str, days: int = 30):
+    """
+    Return a breakdown of leads by search_term_type for a campaign.
+    Used by the Performance tab to show AI Max vs standard match type attribution.
+    """
+    from database import get_search_term_type_breakdown
+    breakdown = get_search_term_type_breakdown(campaign_id, days)
+    return {"campaign_id": campaign_id, "days": days, "breakdown": breakdown}
+
+
 class CampaignBuildStepRequest(BaseModel):
     step: str  # "keywords" | "ad_copy" | "ad_groups" | "launch_checklist"
 
