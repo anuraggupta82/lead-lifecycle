@@ -843,6 +843,6 @@ def send_office_new_lead(lead: dict) -> bool:
       <tr><td style="padding:8px;color:#666">Campaign</td><td style="padding:8px">{campaign or 'organic'}</td></tr>
       <tr style="background:#f9f9f9"><td style="padding:8px;color:#666">Time</td><td style="padding:8px">{lead.get('created_at','')}</td></tr>
     </table>
-    <p style="margin-top:20px"><a href="http://localhost:7070" style="background:#0d7a7f;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none">View Pipeline Dashboard →</a></p>
+    <p style="margin-top:20px"><a href="{settings.base_url}" style="background:#0d7a7f;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none">View Pipeline Dashboard →</a></p>
     </body></html>"""
     return _send(settings.notify_email, f"🦷 New Lead: {name} ({source})", html)

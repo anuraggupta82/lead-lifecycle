@@ -2947,6 +2947,147 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [adCreativesDays, setAdCreativesDays] = useState(30);
   const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
   const [ga4Refreshing, setGa4Refreshing] = useState(false);
+  // Unified campaigns
+  const [unifiedCamps, setUnifiedCamps] = useState([]);
+  const [unifiedLoading, setUnifiedLoading] = useState(false);
+  const [showInactive, setShowInactive] = useState(false);
+  const [unifiedDays, setUnifiedDays] = useState(30);
+  const [aiReviewSaving, setAiReviewSaving] = useState({});
+  const [expandedStrategy, setExpandedStrategy] = useState(null);
+  const [campActionLoading, setCampActionLoading] = useState({});
+  const [detailTab, setDetailTab] = useState('strategy');
+  const [buildLoading, setBuildLoading] = useState('');
+  const [campEditMode, setCampEditMode] = useState(false);
+  const [campEditFields, setCampEditFields] = useState({});
+  const [campEditSaving, setCampEditSaving] = useState(false);
+  const [refineInput, setRefineInput] = useState('');
+  const [refineLoading, setRefineLoading] = useState(false);
+  const [refinedPreview, setRefinedPreview] = useState(null); // {step, data}
+  const [stopConfirm, setStopConfirm] = useState(null);
+  const [gadsImportOpen, setGadsImportOpen] = useState(false);
+  const [gadsImportList, setGadsImportList] = useState([]);
+  const [gadsImportLoading, setGadsImportLoading] = useState(false);
+  const [gadsImportSelected, setGadsImportSelected] = useState(new Set());
+  const [gadsImporting, setGadsImporting] = useState(false);
+  const [campDetail, setCampDetail] = useState(null);
+  const [campDetailLoading, setCampDetailLoading] = useState(false);
+  const [campDetailDays, setCampDetailDays] = useState(30);
+
+  async function loadUnifiedCamps() {
+    setUnifiedLoading(true);
+    try {
+      const d = await api(`/api/admin/campaigns/unified?days=${unifiedDays}&include_inactive=${showInactive}`);
+      setUnifiedCamps(d.campaigns || []);
+    } catch(e) { console.error('Failed to load unified campaigns', e); }
+    finally { setUnifiedLoading(false); }
+  }
+  useEffect(() => { loadUnifiedCamps(); }, [unifiedDays, showInactive]);
+
+  async function toggleAiReview(camp) {
+    if (!camp.campaign_id || camp.is_synthetic) return;
+    const next = !camp.ai_review_enabled;
+    setUnifiedCamps(prev => prev.map(r =>
+      r.campaign_id === camp.campaign_id ? {...r, ai_review_enabled: next} : r));
+    setAiReviewSaving(p => ({...p, [camp.campaign_id]: true}));
+    try {
+      await api(`/api/admin/campaigns/${camp.campaign_id}/ai-review`, {
+        method: 'PATCH', body: JSON.stringify({enabled: next}),
+      });
+    } catch(e) {
+      setUnifiedCamps(prev => prev.map(r =>
+        r.campaign_id === camp.campaign_id ? {...r, ai_review_enabled: !next} : r));
+      alert('Could not update AI Review: ' + (e?.detail || e?.message));
+    } finally {
+      setAiReviewSaving(p => ({...p, [camp.campaign_id]: false}));
+    }
+  }
+
+  // Keep loadManagedCamps as alias so wizard + other callers still work
+  async function loadManagedCamps() { await loadUnifiedCamps(); }
+
+  async function openCampaignDetail(campId, days) {
+    const d = days || campDetailDays || 30;
+    setCampDetailLoading(true);
+    setCampDetail(null);
+    setDetailTab('strategy');
+    setBuildLoading('');
+    setCampEditMode(false);
+    setCampEditFields({});
+    setRefineInput('');
+    setRefinedPreview(null);
+    try {
+      const data = await api(`/api/admin/campaigns/${campId}/detail?days=${d}`);
+      setCampDetail(data);
+      setCampDetailDays(d);
+    } catch(e) {
+      alert('Could not load campaign detail: ' + (e?.detail || e?.message));
+    } finally {
+      setCampDetailLoading(false);
+    }
+  }
+
+  async function openGadsImport() {
+    setGadsImportOpen(true);
+    setGadsImportList([]);
+    setGadsImportSelected(new Set());
+    setGadsImportLoading(true);
+    try {
+      const data = await api('/api/admin/gads/list-campaigns');
+      setGadsImportList(data.campaigns || []);
+    } catch(e) {
+      alert('Could not fetch Google Ads campaigns: ' + (e?.detail || e?.message));
+      setGadsImportOpen(false);
+    } finally {
+      setGadsImportLoading(false);
+    }
+  }
+
+  async function doGadsImport() {
+    if (gadsImportSelected.size === 0) return;
+    setGadsImporting(true);
+    try {
+      const result = await api('/api/admin/gads/import-campaigns', {
+        method: 'POST',
+        body: JSON.stringify({ campaign_ids: [...gadsImportSelected] }),
+      });
+      const msg = [
+        result.imported?.length ? `✅ Imported ${result.imported.length} campaign(s)` : null,
+        result.skipped?.length  ? `⏭ ${result.skipped.length} already imported` : null,
+        result.errors?.length   ? `❌ ${result.errors.length} error(s)` : null,
+      ].filter(Boolean).join(' · ');
+      alert(msg || 'Done');
+      setGadsImportOpen(false);
+      await loadManagedCamps();
+    } catch(e) {
+      alert('Import failed: ' + (e?.detail || e?.message));
+    } finally {
+      setGadsImporting(false);
+    }
+  }
+
+  async function campaignAction(campId, action) {
+    setCampActionLoading(prev => ({...prev, [campId]: action}));
+    try {
+      await api(`/api/admin/campaigns/${campId}/${action}`, { method: 'POST' });
+      await loadManagedCamps();
+    } catch(e) {
+      alert('Action failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setCampActionLoading(prev => ({...prev, [campId]: null}));
+      setStopConfirm(null);
+    }
+  }
+
+  async function deleteCampaign(campId, campName) {
+    if (!confirm(`Delete "${campName}" from the dashboard?\n\nThis only removes the local record — no changes are made in Google Ads.`)) return;
+    try {
+      await api(`/api/admin/campaigns/${campId}`, { method: 'DELETE' });
+      await loadManagedCamps();
+    } catch(e) {
+      alert('Delete failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    }
+  }
+
   // Campaign Creation Wizard
   const [showWizard, setShowWizard] = useState(false);
   const [wizardStep, setWizardStep] = useState(1);
@@ -2955,6 +3096,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [wizardStepError, setWizardStepError] = useState('');
   const [wizardWorkflows, setWizardWorkflows] = useState([]);
   const [wizardWfId, setWizardWfId] = useState('');
+  const [wizardStrategy, setWizardStrategy] = useState(null);
+  const [wizardStrategyLoading, setWizardStrategyLoading] = useState(false);
   const EMPTY_CAMP = {
     campaign_name:'', campaign_type:'MANUAL', campaign_id:'',
     service_focus:'', promo_offer:'', target_audience:'',
@@ -2985,6 +3128,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     setWizardWfId('');
     setCampSaveMsg('');
     setWizardStepError('');
+    setWizardStrategy(null);
+    setWizardStrategyLoading(false);
+    loadManagedCamps(); // refresh so new campaign + strategy appear immediately
   }
 
   function wizardNext() {
@@ -3007,20 +3153,54 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     setSavingCamp(true); setCampSaveMsg(''); setWizardStepError('');
     try {
       const wfIdVal = wizardWfId === '' ? null : parseInt(wizardWfId) || null;
-      const payload = { ...newCamp,
+      const savedCamp = { ...newCamp,
         monthly_budget: parseFloat(newCamp.monthly_budget) || 0,
         expected_cpl: parseFloat(newCamp.expected_cpl) || 0,
         workflow_id: wfIdVal,
       };
-      await api('/api/admin/campaigns/create', { method: 'POST', body: JSON.stringify(payload) });
-      setCampSaveMsg('✅ Campaign launched!');
-      setNewCamp(EMPTY_CAMP);
-      setWizardWfId('');
-      setTimeout(() => { closeWizard(); }, 1800);
+      const createRes = await api('/api/admin/campaigns/create', { method: 'POST', body: JSON.stringify(savedCamp) });
+      const createdCampId = createRes?.campaign?.campaign_id || null;
+      // Campaign saved — move to Step 4: Opus Strategy Review
+      setWizardStep(4);
+      setWizardStrategy(null);
+      setWizardStrategyLoading(true);
+      setSavingCamp(false);
+      try {
+        const budgetHint = savedCamp.monthly_budget
+          ? `$${savedCamp.monthly_budget}/month budget` + (savedCamp.expected_cpl ? `, target CPL $${savedCamp.expected_cpl}` : '')
+          : '';
+        const goalParts = [
+          savedCamp.objective || `Generate leads for ${savedCamp.service_focus || savedCamp.campaign_name}`,
+          savedCamp.target_audience ? `Target audience: ${savedCamp.target_audience}` : '',
+          savedCamp.promo_offer ? `Offer: ${savedCamp.promo_offer}` : '',
+          savedCamp.notes ? `Notes: ${savedCamp.notes}` : '',
+        ].filter(Boolean);
+        const res = await api('/api/admin/ai/campaign-strategy', {
+          method: 'POST',
+          body: JSON.stringify({
+            campaign_goal: goalParts.join('. '),
+            target_service: savedCamp.service_focus || 'Dental Implants',
+            budget_hint: budgetHint,
+            additional_context: `Campaign type: ${savedCamp.campaign_type}. Campaign name: ${savedCamp.campaign_name}.`,
+          }),
+        });
+        const strategy = res.strategy || null;
+        setWizardStrategy(strategy);
+        // Persist strategy to the campaign record so it's never lost
+        if (strategy && createdCampId) {
+          api(`/api/admin/campaigns/${createdCampId}/strategy`, {
+            method: 'PATCH',
+            body: JSON.stringify({ strategy }),
+          }).catch(() => {}); // best-effort, don't block UI
+        }
+      } catch(e) {
+        setWizardStrategy({ _error: e?.detail || e?.message || 'Strategy generation failed' });
+      }
+      setWizardStrategyLoading(false);
     } catch(e) {
       setCampSaveMsg('❌ ' + (e?.detail || e?.message || 'Save failed'));
+      setSavingCamp(false);
     }
-    setSavingCamp(false);
   }
 
   // Lazy-loaded ad-group and search-term data (fetched on first ReportsTab mount)
@@ -3103,112 +3283,1216 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>
       <div className="report-section">
+        {/* Header */}
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:12}}>
           <div style={{display:'flex',alignItems:'center',gap:8}}>
-            <div className="report-title" style={{marginBottom:0}}>Campaign Performance</div>
-            <button className="btn btn-teal btn-sm" style={{fontSize:11}} onClick={openWizard}>
-              + New Campaign
-            </button>
+            <div className="report-title" style={{marginBottom:0}}>Campaigns</div>
+            <button className="btn btn-teal btn-sm" style={{fontSize:11}} onClick={openWizard}>+ New Campaign</button>
+            <button className="btn btn-sm" style={{fontSize:10,background:'#4285f4',color:'#fff',border:'none',cursor:'pointer',padding:'3px 10px',borderRadius:4}}
+              onClick={openGadsImport}>⬇ Import from Google Ads</button>
           </div>
-          <div style={{display:'flex',gap:4,alignItems:'center',flexWrap:'wrap'}}>
+          <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
+            <label style={{fontSize:10,color:'var(--text-muted)',display:'flex',alignItems:'center',gap:4,cursor:'pointer',userSelect:'none'}}>
+              <input type="checkbox" checked={showInactive} onChange={e=>setShowInactive(e.target.checked)} />
+              Show inactive (90d+)
+            </label>
             {presets.map(p=>(
               <button key={p.label}
                 style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
-                  background:dateRange.start===defaultDateRange(p.days).start?'var(--teal)':'#fff',
-                  color:dateRange.start===defaultDateRange(p.days).start?'#fff':'var(--text-muted)'}}
-                onClick={()=>setDateRange(defaultDateRange(p.days))}>
-                {p.label}
-              </button>
+                  background:unifiedDays===p.days?'var(--teal)':'#fff',
+                  color:unifiedDays===p.days?'#fff':'var(--text-muted)'}}
+                onClick={()=>setUnifiedDays(p.days)}>{p.label}</button>
             ))}
-            <label style={{fontSize:10,color:'var(--text-muted)',marginLeft:4}}>From</label>
-            <input type="date" className="date-input" value={dateRange.start} onChange={e=>setDateRange(r=>({...r,start:e.target.value}))} />
-            <label style={{fontSize:10,color:'var(--text-muted)'}}>To</label>
-            <input type="date" className="date-input" value={dateRange.end} onChange={e=>setDateRange(r=>({...r,end:e.target.value}))} />
-            <button className="btn btn-ghost btn-sm" onClick={refreshGA4} disabled={ga4Refreshing} style={{marginLeft:4}}>
-              {ga4Refreshing?'Refreshing...':'Refresh GA4'}
-            </button>
+            <button className="btn btn-ghost btn-sm" onClick={loadUnifiedCamps} style={{fontSize:10}}>↻ Refresh</button>
           </div>
         </div>
 
+        {/* Table */}
         <table className="report-table">
           <thead>
             <tr>
               <th>Campaign</th>
+              <th>Status</th>
+              <th style={{width:90}}>Type</th>
+              <th style={{width:88}}>Start</th>
+              <th style={{width:88}}>End</th>
+              <th className="num">Budget/mo</th>
               <th className="num">Leads</th>
               <th className="num">Cost</th>
               <th className="num">CPL</th>
-              <th className="num">Collections</th>
               <th className="num">ROI</th>
-              <th className="num">Tx Accept %</th>
-              <th style={{width:160}}></th>
+              <th style={{textAlign:'center',width:80}}>AI Review</th>
+              <th style={{width:190}}>Actions</th>
             </tr>
           </thead>
           <tbody>
-            {campaignStats.map((c,i)=>{
-              const campKey = c.campaign||String(i);
-              const isOpen = expanded?.key === campKey;
-              const openTab = isOpen ? expanded.tab : null;
-
-              // Treatment acceptance: presented vs accepted
-              const presented = c.treatment_presented_count || 0;
-              const accepted  = c.treatment_accepted_count  || 0;
-              const txPct = presented > 0 ? Math.round(accepted/presented*100)+'%' : '—';
-
-              // ROI = (collections - cost) / cost
-              const collections = c.attributed_income || c.revenue || 0;
-              const cost = c.total_ad_spend || c.total_cost || 0;
-              const roi = cost > 0 ? ((collections - cost) / cost * 100).toFixed(0)+'%' : '—';
+            {unifiedLoading && (
+              <tr><td colSpan={12} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
+            )}
+            {!unifiedLoading && unifiedCamps.length === 0 && (
+              <tr><td colSpan={12} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
+                No campaigns yet — click "+ New Campaign" or "⬇ Import from Google Ads".
+              </td></tr>
+            )}
+            {!unifiedLoading && unifiedCamps.map((c,ci) => {
+              const m = c.metrics || {};
+              const statusColor = {
+                ACTIVE:'#059669', DRAFT:'#6b7280', PAUSED:'#d97706',
+                COMPLETED:'#2563eb', ARCHIVED:'#9ca3af', UNMANAGED:'#a855f7',
+              }[c.status] || '#6b7280';
+              const isLoading = !!campActionLoading[c.campaign_id];
+              const aiSaving = !!aiReviewSaving[c.campaign_id];
+              const rowKey = c.campaign_id || `synthetic_${ci}`;
+              const strategyOpen = expandedStrategy === c.campaign_id;
+              let parsedStrategy = null;
+              if (c.strategy_json && typeof c.strategy_json === 'object') {
+                parsedStrategy = c.strategy_json;
+              } else if (c.strategy_json && typeof c.strategy_json === 'string') {
+                try { parsedStrategy = JSON.parse(c.strategy_json); } catch(_) {}
+              }
 
               return (
-                <React.Fragment key={campKey}>
-                  <tr>
-                    <td style={{fontWeight:600}}>{(c.campaign||'').replace(/^grafton_nxtsmile_/,'')||'(unknown)'}</td>
-                    <td className="num">{c.lead_count||0}</td>
-                    <td className="num">{fmtMoney(cost)}</td>
-                    <td className="num">{c.cpl ? '$'+Number(c.cpl).toFixed(0) : '—'}</td>
-                    <td className="num money">{fmtMoney(collections)}</td>
-                    <td className="num" style={{color:parseFloat(roi)>0?'#059669':parseFloat(roi)<0?'var(--red)':'var(--text-muted)'}}>{roi}</td>
-                    <td className="num">{txPct}</td>
+                <React.Fragment key={rowKey}>
+                  <tr style={c.is_inactive_90d ? {opacity:0.5} : null}>
+                    {/* Campaign name */}
+                    <td style={{fontWeight:600,maxWidth:200}}>
+                      {c.campaign_id ? (
+                        <span style={{cursor:'pointer',color:'var(--teal)',textDecoration:'underline',
+                          textDecorationStyle:'dotted',wordBreak:'break-word'}}
+                          onClick={()=>openCampaignDetail(c.campaign_id, unifiedDays)}>{c.campaign_name}</span>
+                      ) : (
+                        <span style={{wordBreak:'break-word',color:'var(--text-muted)',fontStyle:'italic'}}
+                          title="Not yet imported into dashboard">{c.campaign_name}</span>
+                      )}
+                      {c.is_inactive_90d && (
+                        <span style={{fontSize:9,marginLeft:5,color:'var(--text-muted)'}}>· 90d inactive</span>
+                      )}
+                    </td>
+
+                    {/* Status */}
+                    <td>
+                      <span style={{fontSize:10,fontWeight:600,color:statusColor,
+                        background:statusColor+'18',padding:'2px 7px',borderRadius:3,whiteSpace:'nowrap'}}>
+                        {c.status}
+                      </span>
+                    </td>
+
+                    <td style={{fontSize:10,color:'var(--text-muted)'}}>{(c.campaign_type||'—').replace('GOOGLE_ADS','G-Ads')}</td>
+                    <td style={{fontSize:11}}>{c.start_date || '—'}</td>
+                    <td style={{fontSize:11}}>{c.end_date || '—'}</td>
+                    <td className="num">{c.monthly_budget > 0 ? '$'+Number(c.monthly_budget).toLocaleString() : '—'}</td>
+                    <td className="num">{m.leads > 0 ? m.leads : '—'}</td>
+                    <td className="num">{m.cost > 0 ? fmtMoney(m.cost) : '—'}</td>
+                    <td className="num">{m.cpl != null ? '$'+Number(m.cpl).toFixed(0) : '—'}</td>
+                    <td className="num" style={{
+                      color: m.roi == null ? 'var(--text-muted)'
+                           : m.roi > 0 ? '#059669' : m.roi < 0 ? 'var(--red)' : 'var(--text-muted)'
+                    }}>{m.roi != null ? Math.round(m.roi)+'%' : '—'}</td>
+
+                    {/* AI Review toggle */}
+                    <td style={{textAlign:'center'}}>
+                      {c.is_synthetic ? (
+                        <span style={{fontSize:9,color:'var(--text-muted)'}} title="Import this campaign to enable AI Review">—</span>
+                      ) : (
+                        <label style={{display:'inline-flex',alignItems:'center',gap:3,cursor:aiSaving?'wait':'pointer'}}
+                          title={c.ai_review_enabled ? 'AI actively monitoring — click to disable' : 'Click to enable AI monitoring'}>
+                          <input type="checkbox" disabled={aiSaving}
+                            checked={!!c.ai_review_enabled}
+                            onChange={()=>toggleAiReview(c)} />
+                          {c.ai_review_enabled && !aiSaving && (
+                            <span style={{fontSize:9,color:'#059669',fontWeight:600}}>ON</span>
+                          )}
+                          {aiSaving && <span style={{fontSize:9,color:'var(--text-muted)'}}>…</span>}
+                        </label>
+                      )}
+                    </td>
+
+                    {/* Actions */}
                     <td style={{textAlign:'right'}}>
-                      <button
-                        className={'btn-expand'+(openTab==='analytics'?' active':'')}
-                        style={{marginRight:4}}
-                        onClick={()=>togglePanel(campKey,'analytics')}>
-                        Analytics {openTab==='analytics'?'▲':'▼'}
-                      </button>
-                      <button
-                        className={'btn-expand'+(openTab==='keywords'?' active':'')}
-                        style={{marginRight:4}}
-                        onClick={()=>togglePanel(campKey,'keywords')}>
-                        Keywords {openTab==='keywords'?'▲':'▼'}
-                      </button>
-                      <button
-                        className={'btn-expand'+(openTab==='trend'?' active':'')}
-                        onClick={()=>togglePanel(campKey,'trend')}>
-                        Trend {openTab==='trend'?'▲':'▼'}
-                      </button>
+                      {c.is_synthetic ? (
+                        <button className="btn btn-sm" style={{fontSize:10,background:'#4285f4',color:'#fff',border:'none'}}
+                          onClick={openGadsImport}>⬇ Import</button>
+                      ) : (() => {
+                        if (c.status === 'ARCHIVED' || c.status === 'COMPLETED') return null;
+                        const loading = campActionLoading[c.campaign_id];
+                        return (
+                          <div style={{display:'flex',gap:3,justifyContent:'flex-end',flexWrap:'wrap'}}>
+                            {c.strategy_json && (
+                              <button className="btn btn-ghost btn-sm"
+                                style={{fontSize:10,color:'#7c3aed',borderColor:'#7c3aed'}}
+                                onClick={()=>setExpandedStrategy(strategyOpen ? null : c.campaign_id)}>
+                                🧠 {strategyOpen ? '▲' : '▼'}
+                              </button>
+                            )}
+                            {c.status === 'ACTIVE' && (
+                              <button className="btn btn-ghost btn-sm" disabled={isLoading}
+                                style={{fontSize:10,color:'#d97706',borderColor:'#d97706'}}
+                                onClick={()=>campaignAction(c.campaign_id,'pause')}>
+                                {loading==='pause'?'…':'⏸'}
+                              </button>
+                            )}
+                            {c.status === 'PAUSED' && (
+                              <button className="btn btn-sm" disabled={isLoading}
+                                style={{fontSize:10,background:'#059669',color:'#fff',border:'none'}}
+                                onClick={()=>campaignAction(c.campaign_id,'resume')}>
+                                {loading==='resume'?'…':'▶ Enable'}
+                              </button>
+                            )}
+                            {c.is_gads_linked ? (
+                              <button className="btn btn-ghost btn-sm" disabled={isLoading}
+                                style={{fontSize:10,color:'var(--red)',borderColor:'var(--red)'}}
+                                onClick={()=>setStopConfirm(c)}>
+                                {loading==='stop'?'…':'⏹ Stop'}
+                              </button>
+                            ) : (
+                              <button className="btn btn-ghost btn-sm" disabled={isLoading}
+                                style={{fontSize:10,color:'#9ca3af',borderColor:'#9ca3af'}}
+                                onClick={()=>deleteCampaign(c.campaign_id, c.campaign_name)}>
+                                🗑
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </td>
                   </tr>
-                  {isOpen && (
-                    <CampaignExpandedPanel
-                      campaign={c}
-                      keywordStats={keywordStats}
-                      ga4Data={ga4Data}
-                      dailyStats={dailyStats}
-                      colSpan={COLS}
-                    />
+
+                  {/* Strategy expansion row */}
+                  {strategyOpen && parsedStrategy && (
+                    <tr>
+                      <td colSpan={12} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
+                        <div style={{padding:'16px 18px',borderLeft:'3px solid var(--teal)'}}>
+                          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
+                            <span style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>🧠 Opus Strategy</span>
+                            <span style={{fontSize:10,background:'#ede9fe',color:'#5b21b6',padding:'2px 7px',borderRadius:3,fontWeight:600}}>claude-opus-4-5</span>
+                          </div>
+                          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+                            <div>
+                              {parsedStrategy.objective && (
+                                <div style={{marginBottom:10}}>
+                                  <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:4}}>Objective</div>
+                                  <div style={{fontSize:12,lineHeight:1.5}}>{parsedStrategy.objective}</div>
+                                </div>
+                              )}
+                              {parsedStrategy.target_audience && (
+                                <div style={{marginBottom:10}}>
+                                  <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:4}}>Target Audience</div>
+                                  <div style={{fontSize:12,lineHeight:1.5}}>{parsedStrategy.target_audience}</div>
+                                </div>
+                              )}
+                              {(parsedStrategy.key_messages||[]).length > 0 && (
+                                <div style={{marginBottom:10}}>
+                                  <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:4}}>Key Messages</div>
+                                  {(parsedStrategy.key_messages||[]).map((msg,i)=>(
+                                    <div key={i} style={{display:'flex',gap:6,marginBottom:3}}>
+                                      <span style={{color:'var(--teal)',fontWeight:700,fontSize:11}}>→</span>
+                                      <span style={{fontSize:11,lineHeight:1.4}}>{msg}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                            <div>
+                              {(parsedStrategy.ad_headlines||[]).length > 0 && (
+                                <div style={{marginBottom:10}}>
+                                  <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:4}}>Ad Headlines</div>
+                                  <div>{(parsedStrategy.ad_headlines||[]).map((h,i)=>(
+                                    <span key={i} style={{background:'#e0f2fe',color:'#0c4a6e',fontSize:10,
+                                      padding:'2px 7px',borderRadius:3,display:'inline-block',marginRight:4,marginBottom:4}}>{h}</span>
+                                  ))}</div>
+                                </div>
+                              )}
+                              {(parsedStrategy.ad_descriptions||[]).length > 0 && (
+                                <div style={{marginBottom:10}}>
+                                  <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:4}}>Ad Descriptions</div>
+                                  {(parsedStrategy.ad_descriptions||[]).map((d,i)=>(
+                                    <div key={i} style={{fontSize:11,color:'var(--text)',marginBottom:3,lineHeight:1.4}}>"{d}"</div>
+                                  ))}
+                                </div>
+                              )}
+                              {parsedStrategy.implementation_instructions && (
+                                <div style={{marginTop:6,background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:5,padding:'8px 10px'}}>
+                                  <div style={{fontSize:10,fontWeight:700,color:'#166534',marginBottom:3}}>📋 Implementation Instructions</div>
+                                  <div style={{fontSize:11,lineHeight:1.5}}>{parsedStrategy.implementation_instructions}</div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
                   )}
                 </React.Fragment>
               );
             })}
-            {campaignStats.length===0 && (
-              <tr><td colSpan={COLS} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
-                No campaign data yet — run Google Ads Sync to populate.
-              </td></tr>
-            )}
           </tbody>
         </table>
       </div>
+
+
+      {/* ── Google Ads Import Modal ── */}
+      {gadsImportOpen && (
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.45)',
+          zIndex:280,display:'flex',alignItems:'center',justifyContent:'center'}}
+          onClick={()=>{ if (!gadsImporting) setGadsImportOpen(false); }}>
+          <div style={{background:'#fff',borderRadius:12,width:620,maxWidth:'96vw',maxHeight:'88vh',
+            display:'flex',flexDirection:'column',boxShadow:'0 8px 40px rgba(0,0,0,.25)'}}
+            onClick={e=>e.stopPropagation()}>
+
+            {/* Header */}
+            <div style={{padding:'16px 20px',borderBottom:'1px solid var(--border)',flexShrink:0,
+              display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:700,display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{color:'#4285f4',fontSize:18}}>⬇</span>
+                  Import Campaigns from Google Ads
+                </div>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginTop:2}}>
+                  Select campaigns to bring into your dashboard with full Pause/Stop control
+                </div>
+              </div>
+              <button style={{background:'none',border:'none',fontSize:20,cursor:'pointer',
+                color:'var(--text-muted)',padding:'0 4px'}}
+                onClick={()=>setGadsImportOpen(false)}>×</button>
+            </div>
+
+            {/* Body */}
+            <div style={{flex:1,overflowY:'auto',padding:'12px 20px'}}>
+              {gadsImportLoading ? (
+                <div style={{display:'flex',alignItems:'center',justifyContent:'center',
+                  flexDirection:'column',gap:10,padding:'40px 0',color:'var(--text-muted)'}}>
+                  <div className="spinner" style={{width:24,height:24,borderWidth:3}}/>
+                  <div style={{fontSize:12}}>Fetching campaigns from Google Ads…</div>
+                </div>
+              ) : gadsImportList.length === 0 ? (
+                <div style={{textAlign:'center',padding:'32px 0',color:'var(--text-muted)',fontSize:12}}>
+                  No campaigns found in your Google Ads account.
+                </div>
+              ) : (
+                <>
+                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+                    {gadsImportList.length} campaign(s) found ·
+                    {gadsImportSelected.size > 0 ? ` ${gadsImportSelected.size} selected` : ' none selected'}
+                  </div>
+                  <table className="report-table">
+                    <thead>
+                      <tr>
+                        <th style={{width:32}}>
+                          <input type="checkbox"
+                            checked={gadsImportSelected.size === gadsImportList.filter(c=>!c.already_imported).length
+                              && gadsImportList.filter(c=>!c.already_imported).length > 0}
+                            onChange={e => {
+                              if (e.target.checked) {
+                                setGadsImportSelected(new Set(
+                                  gadsImportList.filter(c=>!c.already_imported).map(c=>c.campaign_id)
+                                ));
+                              } else {
+                                setGadsImportSelected(new Set());
+                              }
+                            }} />
+                        </th>
+                        <th>Campaign</th>
+                        <th>Status</th>
+                        <th>Type</th>
+                        <th className="num">Daily Budget</th>
+                        <th className="num">~Monthly</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {gadsImportList.map(camp => {
+                        const isImported = camp.already_imported;
+                        const isSelected = gadsImportSelected.has(camp.campaign_id);
+                        const statusColor = camp.gads_status === 'ENABLED' ? '#059669' : '#d97706';
+                        const statusLabel = camp.gads_status === 'ENABLED' ? 'ACTIVE' : 'PAUSED';
+                        return (
+                          <tr key={camp.campaign_id}
+                            style={{opacity: isImported ? 0.5 : 1,
+                              background: isSelected ? 'rgba(13,122,127,.04)' : 'transparent',
+                              cursor: isImported ? 'default' : 'pointer'}}
+                            onClick={() => {
+                              if (isImported) return;
+                              const s = new Set(gadsImportSelected);
+                              if (s.has(camp.campaign_id)) s.delete(camp.campaign_id);
+                              else s.add(camp.campaign_id);
+                              setGadsImportSelected(s);
+                            }}>
+                            <td onClick={e=>e.stopPropagation()}>
+                              <input type="checkbox"
+                                disabled={isImported}
+                                checked={isSelected}
+                                onChange={e => {
+                                  const s = new Set(gadsImportSelected);
+                                  if (e.target.checked) s.add(camp.campaign_id);
+                                  else s.delete(camp.campaign_id);
+                                  setGadsImportSelected(s);
+                                }} />
+                            </td>
+                            <td style={{fontWeight:600,fontSize:12}}>{camp.campaign_name}</td>
+                            <td>
+                              <span style={{fontSize:10,fontWeight:700,color:statusColor,
+                                background:statusColor+'18',padding:'2px 7px',borderRadius:3}}>
+                                {statusLabel}
+                              </span>
+                            </td>
+                            <td style={{fontSize:10,color:'var(--text-muted)'}}>{camp.channel_type}</td>
+                            <td className="num" style={{fontSize:11}}>${camp.daily_budget_usd}/d</td>
+                            <td className="num" style={{fontSize:11}}>${camp.monthly_budget_usd}</td>
+                            <td style={{fontSize:10}}>
+                              {isImported && (
+                                <span style={{color:'#059669',fontWeight:600}}>✓ Imported</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div style={{padding:'12px 20px',borderTop:'1px solid var(--border)',flexShrink:0,
+              display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+              <div style={{fontSize:11,color:'var(--text-muted)'}}>
+                Imported campaigns get Pause / Stop controls immediately.
+                Performance data syncs on next Google Ads sync run.
+              </div>
+              <div style={{display:'flex',gap:8}}>
+                <button className="btn btn-ghost btn-sm" style={{fontSize:11}}
+                  onClick={()=>setGadsImportOpen(false)}
+                  disabled={gadsImporting}>Cancel</button>
+                <button className="btn btn-sm" style={{fontSize:11,
+                  background: gadsImportSelected.size > 0 ? '#4285f4' : '#9ca3af',
+                  color:'#fff',border:'none'}}
+                  disabled={gadsImportSelected.size === 0 || gadsImporting}
+                  onClick={doGadsImport}>
+                  {gadsImporting
+                    ? 'Importing…'
+                    : `⬇ Import Selected (${gadsImportSelected.size})`}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Campaign Detail Drawer ── */}
+      {(campDetail || campDetailLoading) && (
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.35)',
+          zIndex:250,display:'flex',justifyContent:'flex-end'}}
+          onClick={()=>{setCampDetail(null);setCampDetailLoading(false);}}>
+          <div style={{background:'#fff',width:700,maxWidth:'96vw',height:'100%',overflowY:'auto',
+            boxShadow:'-4px 0 24px rgba(0,0,0,.18)',display:'flex',flexDirection:'column'}}
+            onClick={e=>e.stopPropagation()}>
+
+            {campDetailLoading ? (
+              <div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',
+                flexDirection:'column',gap:10,color:'var(--text-muted)'}}>
+                <div className="spinner" style={{width:28,height:28,borderWidth:3}}/>
+                <div style={{fontSize:12}}>Loading campaign details…</div>
+              </div>
+            ) : campDetail && (() => {
+              const cd = campDetail;
+              const camp = cd.campaign;
+              const summary = cd.summary;
+              const strategy = cd.strategy;
+              const statusColor = {ACTIVE:'#059669',DRAFT:'#6b7280',PAUSED:'#d97706',COMPLETED:'#2563eb',ARCHIVED:'#9ca3af'}[camp.status]||'#6b7280';
+              const loading = campActionLoading[camp.campaign_id];
+              const isLoading = !!loading;
+
+              return (
+                <>
+                  {/* ── Header ── */}
+                  <div style={{background:'var(--teal-dark)',color:'#fff',padding:'16px 20px',flexShrink:0}}>
+                    <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:12}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        {campEditMode ? (
+                          <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                            <input value={campEditFields.campaign_name ?? camp.campaign_name}
+                              onChange={e=>setCampEditFields(f=>({...f,campaign_name:e.target.value}))}
+                              style={{fontSize:15,fontWeight:700,background:'rgba(255,255,255,.15)',border:'1px solid rgba(255,255,255,.4)',
+                                color:'#fff',borderRadius:4,padding:'4px 8px',width:'100%'}}
+                              placeholder="Campaign name"/>
+                            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                              <input value={campEditFields.service_focus ?? (camp.service_focus||'')}
+                                onChange={e=>setCampEditFields(f=>({...f,service_focus:e.target.value}))}
+                                style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
+                                  color:'#fff',borderRadius:4,padding:'3px 7px',width:140}}
+                                placeholder="Service focus"/>
+                              <input type="number" value={campEditFields.monthly_budget ?? (camp.monthly_budget||'')}
+                                onChange={e=>setCampEditFields(f=>({...f,monthly_budget:parseFloat(e.target.value)||0}))}
+                                style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
+                                  color:'#fff',borderRadius:4,padding:'3px 7px',width:100}}
+                                placeholder="Budget/mo"/>
+                              <input value={campEditFields.start_date ?? (camp.start_date||'')}
+                                onChange={e=>setCampEditFields(f=>({...f,start_date:e.target.value}))}
+                                style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
+                                  color:'#fff',borderRadius:4,padding:'3px 7px',width:110}}
+                                placeholder="Start date"/>
+                              <input value={campEditFields.end_date ?? (camp.end_date||'')}
+                                onChange={e=>setCampEditFields(f=>({...f,end_date:e.target.value}))}
+                                style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
+                                  color:'#fff',borderRadius:4,padding:'3px 7px',width:110}}
+                                placeholder="End date"/>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div style={{fontSize:17,fontWeight:700,lineHeight:1.2,marginBottom:4}}>{camp.campaign_name}</div>
+                            <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+                              <span style={{fontSize:10,background:'rgba(255,255,255,.15)',padding:'2px 8px',borderRadius:3}}>
+                                {camp.campaign_type}
+                              </span>
+                              <span style={{fontSize:10,background:statusColor,padding:'2px 8px',borderRadius:3,fontWeight:700}}>
+                                {camp.status}
+                              </span>
+                              {camp.service_focus && (
+                                <span style={{fontSize:10,color:'rgba(255,255,255,.75)'}}>
+                                  Service: {camp.service_focus}
+                                </span>
+                              )}
+                              {camp.monthly_budget > 0 && (
+                                <span style={{fontSize:10,color:'#5eead4',fontWeight:600}}>
+                                  ${Number(camp.monthly_budget).toLocaleString()}/mo
+                                </span>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      <div style={{display:'flex',gap:4,flexShrink:0}}>
+                        {campEditMode ? (
+                          <>
+                            <button style={{background:'#059669',border:'none',color:'#fff',fontSize:11,
+                              padding:'4px 10px',borderRadius:4,cursor:'pointer'}}
+                              disabled={campEditSaving}
+                              onClick={async()=>{
+                                setCampEditSaving(true);
+                                try {
+                                  await api(`/api/admin/campaigns/${camp.campaign_id}`,{
+                                    method:'PATCH',
+                                    body:JSON.stringify(campEditFields)
+                                  });
+                                  await openCampaignDetail(camp.campaign_id, campDetailDays);
+                                  setCampEditMode(false); setCampEditFields({});
+                                } catch(e){alert('Save failed: '+e.message);}
+                                finally{setCampEditSaving(false);}
+                              }}>{campEditSaving?'Saving…':'✓ Save'}</button>
+                            <button style={{background:'rgba(255,255,255,.15)',border:'none',color:'#fff',fontSize:11,
+                              padding:'4px 10px',borderRadius:4,cursor:'pointer'}}
+                              onClick={()=>{setCampEditMode(false);setCampEditFields({});}}>Cancel</button>
+                          </>
+                        ) : (
+                          <button style={{background:'rgba(255,255,255,.12)',border:'1px solid rgba(255,255,255,.3)',color:'#fff',
+                            fontSize:10,padding:'3px 8px',borderRadius:4,cursor:'pointer'}}
+                            onClick={()=>setCampEditMode(true)}>✏ Edit</button>
+                        )}
+                        <button style={{background:'rgba(255,255,255,.15)',border:'none',color:'#fff',
+                          width:28,height:28,borderRadius:5,cursor:'pointer',fontSize:16}}
+                          onClick={()=>setCampDetail(null)}>×</button>
+                      </div>
+                    </div>
+
+                    {/* Action buttons */}
+                    <div style={{display:'flex',gap:6,marginTop:12,flexWrap:'wrap'}}>
+                      {camp.status === 'ACTIVE' && (
+                        <button className="btn btn-sm" disabled={isLoading}
+                          style={{fontSize:10,background:'rgba(255,255,255,.15)',color:'#fff',border:'1px solid rgba(255,255,255,.3)'}}
+                          onClick={async()=>{await campaignAction(camp.campaign_id,'pause');openCampaignDetail(camp.campaign_id);}}>
+                          {loading==='pause'?'…':'⏸ Pause'}
+                        </button>
+                      )}
+                      {camp.status === 'PAUSED' && (
+                        <button className="btn btn-sm" disabled={isLoading}
+                          style={{fontSize:10,background:'#059669',color:'#fff',border:'none'}}
+                          onClick={async()=>{await campaignAction(camp.campaign_id,'resume');openCampaignDetail(camp.campaign_id);}}>
+                          {loading==='resume'?'…':'▶ Enable'}
+                        </button>
+                      )}
+                      {(camp.status === 'ACTIVE' || camp.status === 'PAUSED') && (
+                        <button className="btn btn-sm" disabled={isLoading}
+                          style={{fontSize:10,background:'rgba(239,68,68,.8)',color:'#fff',border:'none'}}
+                          onClick={()=>setStopConfirm(camp)}>
+                          {loading==='stop'?'…':'⏹ Stop'}
+                        </button>
+                      )}
+                      {/* Days filter */}
+                      <div style={{marginLeft:'auto',display:'flex',gap:4}}>
+                        {[7,30,90].map(d=>(
+                          <button key={d} className="btn btn-sm" style={{fontSize:10,
+                            background: campDetailDays===d ? 'rgba(255,255,255,.3)':'rgba(255,255,255,.1)',
+                            color:'#fff',border:'1px solid rgba(255,255,255,.2)'}}
+                            onClick={()=>openCampaignDetail(camp.campaign_id, d)}>
+                            {d}d
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* ── Body ── */}
+                  {(() => {
+                    const build = cd.build || {};
+
+                    async function generateBuildStep(step) {
+                      setBuildLoading(step);
+                      try {
+                        await api(`/api/admin/campaigns/${camp.campaign_id}/build-step`, {
+                          method: 'POST',
+                          body: JSON.stringify({ step }),
+                        });
+                        // Reload detail to get fresh build data
+                        await openCampaignDetail(camp.campaign_id, campDetailDays);
+                      } catch(e) {
+                        alert('AI generation failed: ' + e.message);
+                      } finally {
+                        setBuildLoading('');
+                      }
+                    }
+
+                    async function toggleLaunchItem(idx) {
+                      const list = [...(build.launch_checklist || [])];
+                      list[idx] = { ...list[idx], done: !list[idx].done };
+                      await api(`/api/admin/campaigns/${camp.campaign_id}/build-step`, {
+                        method: 'POST',
+                        body: JSON.stringify({ step: 'launch_checklist' }),
+                      });
+                      // optimistic: reload
+                      openCampaignDetail(camp.campaign_id, campDetailDays);
+                    }
+
+                    // Wizard step completion helpers
+                    const stepDone = {
+                      strategy:    !!strategy,
+                      keywords:    !!build.keywords,
+                      ad_copy:     !!build.ad_copy,
+                      ad_groups:   !!build.ad_groups,
+                      launch:      !!(build.launch_checklist && build.launch_checklist.every(x=>x.done)),
+                      performance: true,
+                    };
+                    const WIZARD_ORDER = ['strategy','keywords','ad_copy','ad_groups','launch','performance'];
+                    const TABS = [
+                      { id: 'strategy',    label: '🧠 Strategy' },
+                      { id: 'keywords',    label: '🔍 Keywords' },
+                      { id: 'ad_copy',     label: '✍ Ad Copy' },
+                      { id: 'ad_groups',   label: '📂 Ad Groups' },
+                      { id: 'launch',      label: '🚀 Launch' },
+                      { id: 'performance', label: '📊 Performance' },
+                    ];
+                    const currentIdx = WIZARD_ORDER.indexOf(detailTab);
+                    const nextStep = WIZARD_ORDER[currentIdx + 1];
+                    const canAdvance = detailTab !== 'performance' && stepDone[detailTab];
+
+                    // Refine helpers (shared across keyword/ad_copy/ad_groups tabs)
+                    async function handleRefine(step) {
+                      if (!refineInput.trim()) return;
+                      setRefineLoading(true);
+                      setRefinedPreview(null);
+                      try {
+                        const res = await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-refine`, {
+                          method: 'POST',
+                          body: JSON.stringify({ step, instruction: refineInput }),
+                        });
+                        setRefinedPreview({ step, data: res.data });
+                      } catch(e) { alert('Refine failed: ' + e.message); }
+                      finally { setRefineLoading(false); }
+                    }
+
+                    async function acceptRefined() {
+                      if (!refinedPreview) return;
+                      await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`, {
+                        method: 'POST',
+                        body: JSON.stringify({ step: refinedPreview.step, data: refinedPreview.data }),
+                      });
+                      setRefinedPreview(null);
+                      setRefineInput('');
+                      await openCampaignDetail(camp.campaign_id, campDetailDays);
+                    }
+
+                    // Refine box component (rendered at bottom of each refineable tab)
+                    function RefineBox({ step }) {
+                      const isThisStep = refinedPreview?.step === step;
+                      return (
+                        <div style={{marginTop:20,background:'#f5f3ff',border:'1px solid #c4b5fd',borderRadius:8,padding:'12px 14px'}}>
+                          <div style={{fontSize:11,fontWeight:700,color:'#5b21b6',marginBottom:6}}>
+                            🤖 Ask AI to refine
+                          </div>
+                          <div style={{display:'flex',gap:6}}>
+                            <input value={refineInput} onChange={e=>setRefineInput(e.target.value)}
+                              onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();handleRefine(step);}}}
+                              placeholder={`e.g. "Remove all broad match keywords" or "Add keywords for weekend hours"`}
+                              style={{flex:1,fontSize:11,padding:'6px 10px',border:'1px solid #c4b5fd',borderRadius:5,outline:'none'}}/>
+                            <button className="btn btn-sm" disabled={refineLoading||!refineInput.trim()}
+                              style={{fontSize:11,background:'#7c3aed',color:'#fff',border:'none',whiteSpace:'nowrap'}}
+                              onClick={()=>handleRefine(step)}>
+                              {refineLoading?'⏳ Refining…':'✨ Refine'}
+                            </button>
+                          </div>
+                          {isThisStep && refinedPreview && (
+                            <div style={{marginTop:10,background:'#fff',border:'1px solid #a78bfa',borderRadius:6,padding:'10px 12px'}}>
+                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                                <span style={{fontSize:11,fontWeight:700,color:'#5b21b6'}}>✨ AI Suggestion (preview)</span>
+                                <div style={{display:'flex',gap:6}}>
+                                  <button className="btn btn-sm" style={{fontSize:10,background:'#059669',color:'#fff',border:'none'}}
+                                    onClick={acceptRefined}>✓ Accept & Save</button>
+                                  <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
+                                    onClick={()=>setRefinedPreview(null)}>✕ Discard</button>
+                                </div>
+                              </div>
+                              <pre style={{fontSize:10,lineHeight:1.4,color:'#374151',whiteSpace:'pre-wrap',
+                                maxHeight:200,overflowY:'auto',margin:0}}>
+                                {JSON.stringify(refinedPreview.data, null, 2)}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
+                        {/* Tab bar with wizard indicators */}
+                        <div style={{borderBottom:'2px solid var(--border)',background:'#fafafa',flexShrink:0}}>
+                          <div style={{display:'flex',overflowX:'auto',padding:'0 20px',gap:0}}>
+                            {TABS.map(t => {
+                              const done = stepDone[t.id];
+                              const active = detailTab === t.id;
+                              return (
+                                <button key={t.id}
+                                  style={{padding:'10px 14px',fontSize:11,fontWeight:active?700:400,
+                                    color:active?'var(--teal)':'var(--text-muted)',
+                                    background:'none',border:'none',cursor:'pointer',
+                                    borderBottom:active?'2px solid var(--teal)':'2px solid transparent',
+                                    marginBottom:-2,whiteSpace:'nowrap',display:'flex',alignItems:'center',gap:4}}
+                                  onClick={()=>{setDetailTab(t.id);setRefinedPreview(null);setRefineInput('');}}>
+                                  {t.label}
+                                  {done && t.id !== 'performance' && (
+                                    <span style={{fontSize:9,color:'#059669',fontWeight:700}}>✓</span>
+                                  )}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          {/* Next step bar */}
+                          {canAdvance && nextStep && (
+                            <div style={{padding:'6px 20px',background:'#f0fdf4',borderTop:'1px solid #bbf7d0',
+                              display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                              <span style={{fontSize:11,color:'#166534'}}>
+                                ✓ Step complete — ready to move on?
+                              </span>
+                              <button className="btn btn-sm"
+                                style={{fontSize:11,background:'#059669',color:'#fff',border:'none'}}
+                                onClick={()=>{setDetailTab(nextStep);setRefinedPreview(null);setRefineInput('');}}>
+                                Next: {TABS.find(t=>t.id===nextStep)?.label} →
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Tab content */}
+                        <div style={{flex:1,overflowY:'auto',padding:20}}>
+
+                          {/* ── Strategy tab ── */}
+                          {detailTab==='strategy' && (
+                            <div>
+                              {!strategy ? (
+                                <div style={{textAlign:'center',color:'var(--text-muted)',padding:40,fontStyle:'italic'}}>
+                                  No strategy generated yet. Use "+ New Campaign" and run Opus Strategy.
+                                </div>
+                              ) : (
+                                <div style={{background:'#fafafa',border:'1px solid var(--border)',borderRadius:8,
+                                  padding:16,borderLeft:'3px solid var(--teal)'}}>
+                                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+                                    <div>
+                                      {strategy.objective && (<div style={{marginBottom:10}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:3}}>Objective</div>
+                                        <div style={{fontSize:12,lineHeight:1.5}}>{strategy.objective}</div>
+                                      </div>)}
+                                      {strategy.target_audience && (<div style={{marginBottom:10}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:3}}>Target Audience</div>
+                                        <div style={{fontSize:12,lineHeight:1.5}}>{strategy.target_audience}</div>
+                                      </div>)}
+                                      {(strategy.key_messages||[]).length>0 && (<div style={{marginBottom:10}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:3}}>Key Messages</div>
+                                        {(strategy.key_messages||[]).map((m,i)=>(
+                                          <div key={i} style={{display:'flex',gap:5,marginBottom:3}}>
+                                            <span style={{color:'var(--teal)',fontWeight:700}}>→</span>
+                                            <span style={{fontSize:11,lineHeight:1.4}}>{m}</span>
+                                          </div>
+                                        ))}
+                                      </div>)}
+                                    </div>
+                                    <div>
+                                      {(strategy.ad_headlines||[]).length>0 && (<div style={{marginBottom:10}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:3}}>Strategy Headlines</div>
+                                        <div>{(strategy.ad_headlines||[]).map((h,i)=>(
+                                          <span key={i} style={{display:'inline-block',background:'#e0f2fe',color:'#0c4a6e',
+                                            fontSize:10,padding:'2px 7px',borderRadius:3,marginRight:4,marginBottom:4}}>{h}</span>
+                                        ))}</div>
+                                      </div>)}
+                                      {(strategy.ad_descriptions||[]).length>0 && (<div style={{marginBottom:10}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:3}}>Strategy Descriptions</div>
+                                        {(strategy.ad_descriptions||[]).map((d,i)=>(
+                                          <div key={i} style={{fontSize:11,padding:'3px 8px',background:'#fff',
+                                            border:'1px solid var(--border)',borderRadius:4,marginBottom:3,lineHeight:1.4}}>{d}</div>
+                                        ))}
+                                      </div>)}
+                                    </div>
+                                  </div>
+                                  {strategy.implementation_instructions && (
+                                    <div style={{marginTop:8,background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:5,padding:'8px 10px'}}>
+                                      <div style={{fontSize:10,fontWeight:700,color:'#166534',marginBottom:3}}>📋 Implementation Notes</div>
+                                      <div style={{fontSize:11,lineHeight:1.5}}>{strategy.implementation_instructions}</div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* ── Keywords tab ── */}
+                          {detailTab==='keywords' && (
+                            <div>
+                              {!build.keywords ? (
+                                <div style={{textAlign:'center',padding:40}}>
+                                  <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>🔍 Keyword Research</div>
+                                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
+                                    Sonnet will generate target keywords by match type plus negatives, based on your Opus Strategy.
+                                  </div>
+                                  <button className="btn btn-teal" disabled={!!buildLoading}
+                                    style={{fontSize:12}}
+                                    onClick={()=>generateBuildStep('keywords')}>
+                                    {buildLoading==='keywords' ? '⏳ Generating…' : '✨ Generate Keywords'}
+                                  </button>
+                                </div>
+                              ) : (
+                                <div>
+                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                    <div style={{fontSize:13,fontWeight:700}}>🔍 Keyword Research</div>
+                                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
+                                      disabled={!!buildLoading}
+                                      onClick={()=>generateBuildStep('keywords')}>
+                                      {buildLoading==='keywords'?'⏳ Regenerating…':'↺ Regenerate'}
+                                    </button>
+                                  </div>
+                                  {[
+                                    {key:'exact_match',      label:'Exact Match',           color:'#0c4a6e', bg:'#e0f2fe'},
+                                    {key:'phrase_match',     label:'Phrase Match',           color:'#065f46', bg:'#d1fae5'},
+                                    {key:'broad_match_modifier', label:'Broad Match',        color:'#713f12', bg:'#fef3c7'},
+                                    {key:'negative_keywords',label:'Negative Keywords',      color:'#7f1d1d', bg:'#fee2e2'},
+                                  ].map(({key,label,color,bg})=>(
+                                    (build.keywords[key]||[]).length > 0 && (
+                                      <div key={key} style={{marginBottom:16}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+                                          letterSpacing:'.5px',marginBottom:6}}>
+                                          {label} ({(build.keywords[key]||[]).length})
+                                        </div>
+                                        <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                                          {(build.keywords[key]||[]).map((kw,i)=>(
+                                            <span key={i} style={{background:bg,color,fontSize:11,
+                                              padding:'3px 9px',borderRadius:4,border:`1px solid ${color}30`}}>{kw}</span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )
+                                  ))}
+                                </div>
+                              )}
+                              {build.keywords && <RefineBox step="keywords"/>}
+                            </div>
+                          )}
+
+                          {/* ── Ad Copy tab ── */}
+                          {detailTab==='ad_copy' && (
+                            <div>
+                              {!build.ad_copy ? (
+                                <div style={{textAlign:'center',padding:40}}>
+                                  <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>✍ Ad Copy</div>
+                                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
+                                    Sonnet will generate 15 RSA headlines and 4 descriptions per ad group.
+                                    {!build.keywords && <span style={{color:'#d97706'}}> Generate Keywords first for best results.</span>}
+                                  </div>
+                                  <button className="btn btn-teal" disabled={!!buildLoading}
+                                    style={{fontSize:12}}
+                                    onClick={()=>generateBuildStep('ad_copy')}>
+                                    {buildLoading==='ad_copy' ? '⏳ Generating…' : '✨ Generate Ad Copy'}
+                                  </button>
+                                </div>
+                              ) : (
+                                <div>
+                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                    <div style={{fontSize:13,fontWeight:700}}>✍ RSA Ad Copy</div>
+                                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
+                                      disabled={!!buildLoading}
+                                      onClick={()=>generateBuildStep('ad_copy')}>
+                                      {buildLoading==='ad_copy'?'⏳ Regenerating…':'↺ Regenerate'}
+                                    </button>
+                                  </div>
+                                  {(build.ad_copy.ad_groups||[]).map((ag,i)=>(
+                                    <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
+                                      borderRadius:8,padding:'14px 16px',marginBottom:14}}>
+                                      <div style={{fontSize:12,fontWeight:700,marginBottom:3}}>{ag.name}</div>
+                                      <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:10}}>{ag.theme}</div>
+                                      <div style={{marginBottom:10}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
+                                          Headlines ({(ag.headlines||[]).length}/15)
+                                        </div>
+                                        <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                                          {(ag.headlines||[]).map((h,j)=>(
+                                            <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',
+                                              fontSize:10,padding:'3px 8px',borderRadius:4,
+                                              border:'1px solid #bae6fd'}}>{h}</span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                      <div>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
+                                          Descriptions ({(ag.descriptions||[]).length}/4)
+                                        </div>
+                                        {(ag.descriptions||[]).map((d,j)=>(
+                                          <div key={j} style={{fontSize:11,padding:'5px 10px',background:'#fff',
+                                            border:'1px solid var(--border)',borderRadius:5,marginBottom:4,
+                                            lineHeight:1.5,color:'var(--text)'}}>{d}</div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              {build.ad_copy && <RefineBox step="ad_copy"/>}
+                            </div>
+                          )}
+
+                          {/* ── Ad Groups tab ── */}
+                          {detailTab==='ad_groups' && (
+                            <div>
+                              {!build.ad_groups ? (
+                                <div style={{textAlign:'center',padding:40}}>
+                                  <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>📂 Ad Group Structure</div>
+                                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
+                                    Sonnet will organize keywords into ad groups with bid recommendations.
+                                    {!build.keywords && <span style={{color:'#d97706'}}> Generate Keywords first for best results.</span>}
+                                  </div>
+                                  <button className="btn btn-teal" disabled={!!buildLoading}
+                                    style={{fontSize:12}}
+                                    onClick={()=>generateBuildStep('ad_groups')}>
+                                    {buildLoading==='ad_groups' ? '⏳ Generating…' : '✨ Generate Structure'}
+                                  </button>
+                                </div>
+                              ) : (
+                                <div>
+                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                    <div style={{fontSize:13,fontWeight:700}}>📂 Ad Group Structure</div>
+                                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
+                                      disabled={!!buildLoading}
+                                      onClick={()=>generateBuildStep('ad_groups')}>
+                                      {buildLoading==='ad_groups'?'⏳ Regenerating…':'↺ Regenerate'}
+                                    </button>
+                                  </div>
+                                  {build.ad_groups.bidding_strategy && (
+                                    <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:7,
+                                      padding:'10px 14px',marginBottom:14}}>
+                                      <div style={{fontSize:10,fontWeight:700,color:'#1e40af',marginBottom:3}}>💡 Bidding Strategy</div>
+                                      <div style={{fontSize:11,lineHeight:1.5}}>{build.ad_groups.bidding_strategy}</div>
+                                    </div>
+                                  )}
+                                  {(build.ad_groups.ad_groups||[]).map((ag,i)=>(
+                                    <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
+                                      borderRadius:8,padding:'14px 16px',marginBottom:12}}>
+                                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
+                                        <div>
+                                          <div style={{fontSize:12,fontWeight:700}}>{ag.name}</div>
+                                          <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>{ag.theme}</div>
+                                        </div>
+                                        <div style={{textAlign:'right'}}>
+                                          <div style={{fontSize:13,fontWeight:700,color:'var(--teal)'}}>${ag.suggested_cpc_usd} CPC</div>
+                                          <div style={{fontSize:10,color:'var(--text-muted)'}}>{ag.daily_budget_pct}% of budget</div>
+                                        </div>
+                                      </div>
+                                      <div style={{marginBottom:8}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:4}}>
+                                          Keywords ({(ag.keywords||[]).length})
+                                        </div>
+                                        <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                                          {(ag.keywords||[]).map((kw,j)=>(
+                                            <span key={j} style={{background:'#f3f4f6',color:'var(--text)',
+                                              fontSize:10,padding:'2px 8px',borderRadius:3,
+                                              border:'1px solid var(--border)'}}>{kw}</span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                      {ag.notes && (
+                                        <div style={{fontSize:10,color:'var(--text-muted)',fontStyle:'italic',lineHeight:1.4}}>{ag.notes}</div>
+                                      )}
+                                    </div>
+                                  ))}
+                                  {build.ad_groups.budget_allocation_notes && (
+                                    <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.5,marginTop:8,
+                                      padding:'10px 14px',background:'#fafafa',borderRadius:6,border:'1px solid var(--border)'}}>
+                                      <strong>Budget notes:</strong> {build.ad_groups.budget_allocation_notes}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              {build.ad_groups && <RefineBox step="ad_groups"/>}
+                            </div>
+                          )}
+
+                          {/* ── Launch tab ── */}
+                          {detailTab==='launch' && (
+                            <div>
+                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                <div style={{fontSize:13,fontWeight:700}}>🚀 Launch Checklist</div>
+                                {!build.launch_checklist && (
+                                  <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                    disabled={!!buildLoading}
+                                    onClick={()=>generateBuildStep('launch_checklist')}>
+                                    {buildLoading==='launch_checklist'?'⏳ Loading…':'Initialize Checklist'}
+                                  </button>
+                                )}
+                              </div>
+                              {!build.launch_checklist ? (
+                                <div style={{textAlign:'center',color:'var(--text-muted)',padding:30,fontStyle:'italic',fontSize:12}}>
+                                  Click "Initialize Checklist" to set up the pre-launch checklist.
+                                </div>
+                              ) : (
+                                <div>
+                                  {(() => {
+                                    const items = build.launch_checklist || [];
+                                    const done = items.filter(x=>x.done).length;
+                                    const pct = items.length ? Math.round(done/items.length*100) : 0;
+                                    return (
+                                      <>
+                                        <div style={{marginBottom:16}}>
+                                          <div style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:4}}>
+                                            <span style={{color:'var(--text-muted)'}}>{done}/{items.length} completed</span>
+                                            <span style={{fontWeight:700,color:pct===100?'#059669':'var(--teal)'}}>{pct}%</span>
+                                          </div>
+                                          <div style={{height:6,background:'var(--border)',borderRadius:3,overflow:'hidden'}}>
+                                            <div style={{height:'100%',width:pct+'%',background:pct===100?'#059669':'var(--teal)',
+                                              transition:'width .3s',borderRadius:3}}/>
+                                          </div>
+                                        </div>
+                                        {items.map((item,i)=>(
+                                          <label key={i} style={{display:'flex',gap:10,alignItems:'flex-start',
+                                            padding:'10px 12px',marginBottom:6,background:item.done?'#f0fdf4':'#fff',
+                                            border:`1px solid ${item.done?'#bbf7d0':'var(--border)'}`,
+                                            borderRadius:7,cursor:'pointer',userSelect:'none'}}>
+                                            <input type="checkbox" checked={item.done} style={{marginTop:1,flexShrink:0}}
+                                              onChange={async()=>{
+                                                const newList = items.map((x,j)=>j===i?{...x,done:!x.done}:x);
+                                                await api(`/api/admin/campaigns/${camp.campaign_id}/build-step`,{
+                                                  method:'POST',
+                                                  body:JSON.stringify({step:'launch_checklist'})
+                                                });
+                                                openCampaignDetail(camp.campaign_id, campDetailDays);
+                                              }}/>
+                                            <span style={{fontSize:12,lineHeight:1.4,
+                                              textDecoration:item.done?'line-through':'none',
+                                              color:item.done?'var(--text-muted)':'var(--text)'}}>{item.item}</span>
+                                          </label>
+                                        ))}
+                                        {pct===100 && (
+                                          <div style={{marginTop:16,background:'#f0fdf4',border:'2px solid #86efac',
+                                            borderRadius:8,padding:'14px 16px',textAlign:'center'}}>
+                                            <div style={{fontSize:20,marginBottom:4}}>✅</div>
+                                            <div style={{fontSize:13,fontWeight:700,color:'#166534'}}>Ready to Launch!</div>
+                                            <div style={{fontSize:11,color:'#166534',marginTop:4}}>
+                                              All checklist items complete. Enable the campaign in Google Ads when ready.
+                                            </div>
+                                          </div>
+                                        )}
+                                      </>
+                                    );
+                                  })()}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* ── Performance tab ── */}
+                          {detailTab==='performance' && (
+                            <div>
+                              {/* Performance KPIs */}
+                              {!cd.has_gads_data ? (
+                                <div style={{background:'#fefce8',border:'1px solid #fde68a',borderRadius:7,
+                                  padding:'12px 16px',marginBottom:16,fontSize:12,color:'#92400e'}}>
+                                  <strong>⚠ No Google Ads data yet</strong> — this campaign hasn't synced
+                                  Google Ads performance. Data will appear here after the campaign is live and
+                                  the daily sync runs.
+                                </div>
+                              ) : (
+                                <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,
+                                  display:'flex',overflow:'hidden',marginBottom:16}}>
+                                  {[
+                                    {label:'Impressions', val: (summary.impressions||0).toLocaleString(), color:'var(--teal)'},
+                                    {label:'Clicks',      val: (summary.clicks||0).toLocaleString(),      color:'var(--teal)'},
+                                    {label:'CTR',         val: (summary.ctr||0)+'%',                      color:'#059669'},
+                                    {label:'Cost',        val: '$'+(summary.cost||0).toFixed(2),          color:'var(--text)'},
+                                    {label:'CPC',         val: '$'+(summary.cpc||0).toFixed(2),           color:'var(--text)'},
+                                    {label:'Leads',       val: (summary.leads||0).toLocaleString(),       color:'var(--purple)'},
+                                    {label:'CPL',         val: summary.leads ? '$'+(summary.cpl||0).toFixed(2) : '—', color:'var(--purple)'},
+                                  ].map(({label,val,color})=>(
+                                    <div key={label} style={{flex:1,padding:'10px 8px',textAlign:'center',
+                                      borderRight:'1px solid var(--border)'}}>
+                                      <div style={{fontSize:14,fontWeight:700,color}}>{val}</div>
+                                      <div style={{fontSize:9,color:'var(--text-muted)',textTransform:'uppercase',
+                                        letterSpacing:'.3px',marginTop:2}}>{label}</div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              {/* Ad Groups */}
+                              {cd.ad_groups && cd.ad_groups.length > 0 && (
+                                <div style={{marginBottom:20}}>
+                                  <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>📊 Ad Groups ({cd.ad_groups.length})</div>
+                                  <table className="report-table">
+                                    <thead>
+                                      <tr>
+                                        <th>Ad Group</th>
+                                        <th className="num">Impressions</th>
+                                        <th className="num">Clicks</th>
+                                        <th className="num">CTR</th>
+                                        <th className="num">Cost</th>
+                                        <th className="num">Leads</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {cd.ad_groups.map((ag,i)=>{
+                                        const impr = ag.impressions||0;
+                                        const clk = ag.clicks||0;
+                                        const cost = (ag.cost_micros||0)/1e6;
+                                        const ctr = impr>0?((clk/impr)*100).toFixed(1)+'%':'—';
+                                        return (
+                                          <tr key={i}>
+                                            <td style={{fontWeight:500}}>{ag.ad_group_name||ag.ad_group_id||'—'}</td>
+                                            <td className="num">{impr.toLocaleString()}</td>
+                                            <td className="num">{clk.toLocaleString()}</td>
+                                            <td className="num">{ctr}</td>
+                                            <td className="num">${cost.toFixed(2)}</td>
+                                            <td className="num">{ag.lead_count||0}</td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              )}
+
+                              {/* Ad Creatives */}
+                              {cd.ads && cd.ads.length > 0 && (
+                                <div style={{marginBottom:20}}>
+                                  <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>📝 Live Ad Creatives ({cd.ads.length})</div>
+                                  {cd.ads.map((ad,i)=>{
+                                    const assets = ad.assets_json || {};
+                                    const headlines = assets.headlines||[];
+                                    const descs = assets.descriptions||[];
+                                    return (
+                                      <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
+                                        borderRadius:7,padding:'12px 14px',marginBottom:8}}>
+                                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
+                                          <div>
+                                            <div style={{fontSize:11,fontWeight:600,color:'var(--text)',marginBottom:2}}>
+                                              {ad.ad_group_name || 'Ad Group'} — RSA #{i+1}
+                                            </div>
+                                            <span style={{fontSize:10,padding:'1px 6px',borderRadius:3,fontWeight:600,
+                                              background: ad.status==='ENABLED'?'#d1fae5':'#f3f4f6',
+                                              color: ad.status==='ENABLED'?'#065f46':'#6b7280'}}>
+                                              {ad.status||'UNKNOWN'}
+                                            </span>
+                                          </div>
+                                          <div style={{display:'flex',gap:12,fontSize:10,color:'var(--text-muted)',textAlign:'right'}}>
+                                            <div><div style={{fontWeight:700,color:'var(--text)'}}>{(ad.impressions||0).toLocaleString()}</div>impr</div>
+                                            <div><div style={{fontWeight:700,color:'var(--text)'}}>{ad.ctr||0}%</div>CTR</div>
+                                            <div><div style={{fontWeight:700,color:'var(--text)'}}>{'$'+(ad.cost||0).toFixed(2)}</div>cost</div>
+                                            <div><div style={{fontWeight:700,color:'var(--purple)'}}>{ad.leads||0}</div>leads</div>
+                                          </div>
+                                        </div>
+                                        {headlines.length>0 && (
+                                          <div style={{marginBottom:6}}>
+                                            <div style={{fontSize:9,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',marginBottom:3}}>Headlines</div>
+                                            <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                                              {headlines.map((h,j)=>(
+                                                <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',fontSize:10,
+                                                  padding:'2px 7px',borderRadius:3}}>{h}</span>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        )}
+                                        {descs.length>0 && (
+                                          <div>
+                                            <div style={{fontSize:9,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',marginBottom:3}}>Descriptions</div>
+                                            {descs.map((d,j)=>(
+                                              <div key={j} style={{fontSize:11,padding:'3px 8px',background:'#fff',
+                                                border:'1px solid var(--border)',borderRadius:4,marginBottom:2,lineHeight:1.4}}>{d}</div>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              {cd.has_gads_data && cd.ad_groups.length===0 && cd.ads.length===0 && (
+                                <div style={{fontSize:12,color:'var(--text-muted)',fontStyle:'italic',textAlign:'center',padding:'24px 0'}}>
+                                  No ad group or creative data yet for the selected period ({campDetailDays}d).
+                                  Run a Google Ads sync to populate performance data.
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {/* ── Stop Campaign Confirmation Modal ── */}
+      {stopConfirm && (
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.5)',
+          zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}
+          onClick={()=>setStopConfirm(null)}>
+          <div style={{background:'#fff',borderRadius:10,padding:24,width:400,maxWidth:'92vw',
+            boxShadow:'0 8px 40px rgba(0,0,0,.25)'}}
+            onClick={e=>e.stopPropagation()}>
+            <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:14}}>
+              <span style={{fontSize:22}}>⏹</span>
+              <div>
+                <div style={{fontSize:15,fontWeight:700,color:'var(--text)'}}>Stop Campaign</div>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginTop:2}}>This action is irreversible</div>
+              </div>
+            </div>
+            <div style={{fontSize:12,lineHeight:1.6,color:'var(--text)',marginBottom:16,
+              background:'#fff5f5',border:'1px solid #fecaca',borderRadius:6,padding:'10px 12px'}}>
+              <strong>Warning:</strong> Stopping <em>{stopConfirm.campaign_name}</em> will permanently
+              remove it from Google Ads (<code>REMOVED</code> status). This cannot be undone.
+              The campaign will be archived locally. All spending stops immediately.
+            </div>
+            <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+              <button className="btn btn-ghost btn-sm" style={{fontSize:11}}
+                onClick={()=>setStopConfirm(null)}>Cancel</button>
+              <button
+                className="btn btn-sm"
+                style={{fontSize:11,background:'var(--red)',color:'#fff',border:'none'}}
+                disabled={!!campActionLoading[stopConfirm.campaign_id]}
+                onClick={()=>campaignAction(stopConfirm.campaign_id, 'stop')}>
+                {campActionLoading[stopConfirm.campaign_id]==='stop' ? 'Stopping…' : '⏹ Yes, Stop Campaign'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Campaign Creation Wizard ── */}
       {showWizard && (
@@ -3221,7 +4505,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
             {/* Progress bar */}
             <div style={{display:'flex',gap:4,marginBottom:18}}>
-              {[1,2,3].map(s=>(
+              {[1,2,3,4].map(s=>(
                 <div key={s} style={{flex:1,height:4,borderRadius:2,
                   background: s <= wizardStep ? 'var(--teal)' : 'var(--border)',
                   transition:'background .2s'}} />
@@ -3230,7 +4514,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
             {/* Step labels */}
             <div style={{display:'flex',justifyContent:'space-between',marginBottom:16}}>
-              {[['1','Identity'],['2','Budget & Targeting'],['3','Workflow']].map(([n,lbl])=>(
+              {[['1','Identity'],['2','Budget & Targeting'],['3','Workflow'],['4','Opus Strategy']].map(([n,lbl])=>(
                 <div key={n} style={{fontSize:10,color: parseInt(n)===wizardStep ? 'var(--teal)' : 'var(--text-muted)',fontWeight: parseInt(n)===wizardStep ? 700 : 400}}>
                   Step {n}: {lbl}
                 </div>
@@ -3423,6 +4707,116 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               </div>
             )}
 
+            {/* ── Step 4: Opus Strategy Review ── */}
+            {wizardStep === 4 && (
+              <div>
+                <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>🧠 Opus Strategy Review</div>
+                <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>
+                  Campaign saved. Opus is reviewing your campaign inputs and generating a full execution plan.
+                </div>
+
+                {wizardStrategyLoading && (
+                  <div style={{textAlign:'center',padding:'32px 0'}}>
+                    <div style={{fontSize:28,marginBottom:10}}>⏳</div>
+                    <div style={{fontSize:13,color:'var(--text-muted)',fontWeight:500}}>Opus is thinking…</div>
+                    <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4}}>Analyzing your campaign details, practice data, and performance history.</div>
+                  </div>
+                )}
+
+                {!wizardStrategyLoading && wizardStrategy && wizardStrategy._error && (
+                  <div style={{background:'#fee2e2',border:'1px solid #fca5a5',borderRadius:8,padding:'12px 14px',fontSize:12,color:'#dc2626'}}>
+                    ❌ Strategy generation failed: {wizardStrategy._error}
+                    <div style={{marginTop:8,fontSize:11,color:'#6b7280'}}>
+                      Your campaign was saved successfully. You can generate a strategy from the AI Campaign tab at any time.
+                    </div>
+                  </div>
+                )}
+
+                {!wizardStrategyLoading && wizardStrategy && !wizardStrategy._error && (() => {
+                  const s = wizardStrategy;
+                  const Section = ({title, children}) => (
+                    <div style={{marginBottom:14}}>
+                      <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.6px',marginBottom:5}}>{title}</div>
+                      {children}
+                    </div>
+                  );
+                  const Pill = ({children, color='#e0f2fe', text='#0c4a6e'}) => (
+                    <span style={{background:color,color:text,fontSize:10,padding:'2px 8px',borderRadius:3,display:'inline-block',marginRight:4,marginBottom:4}}>{children}</span>
+                  );
+                  return (
+                    <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:8,padding:'14px 16px',maxHeight:400,overflowY:'auto'}}>
+                      {s.campaign_name && (
+                        <div style={{fontWeight:700,fontSize:14,marginBottom:12,color:'var(--text)'}}>
+                          📋 {s.campaign_name}
+                        </div>
+                      )}
+
+                      {s.objective && (
+                        <Section title="Objective">
+                          <div style={{fontSize:12,color:'var(--text)',lineHeight:1.5}}>{s.objective}</div>
+                        </Section>
+                      )}
+
+                      {s.target_audience && (
+                        <Section title="Target Audience">
+                          <div style={{fontSize:12,color:'var(--text)',lineHeight:1.5}}>{s.target_audience}</div>
+                        </Section>
+                      )}
+
+                      {(s.key_messages||[]).length > 0 && (
+                        <Section title="Key Messages">
+                          <div>{(s.key_messages||[]).map((m,i)=>(
+                            <div key={i} style={{display:'flex',gap:6,marginBottom:4,alignItems:'flex-start'}}>
+                              <span style={{color:'var(--teal)',fontWeight:700,fontSize:12,minWidth:14}}>→</span>
+                              <span style={{fontSize:12,color:'var(--text)',lineHeight:1.4}}>{m}</span>
+                            </div>
+                          ))}</div>
+                        </Section>
+                      )}
+
+                      {(s.ad_headlines||[]).length > 0 && (
+                        <Section title="Ad Headlines">
+                          <div>{(s.ad_headlines||[]).map((h,i)=><Pill key={i}>{h}</Pill>)}</div>
+                        </Section>
+                      )}
+
+                      {(s.ad_descriptions||[]).length > 0 && (
+                        <Section title="Ad Descriptions">
+                          {(s.ad_descriptions||[]).map((d,i)=>(
+                            <div key={i} style={{fontSize:11,color:'var(--text)',padding:'4px 8px',background:'#fff',border:'1px solid var(--border)',borderRadius:4,marginBottom:4,lineHeight:1.4}}>{d}</div>
+                          ))}
+                        </Section>
+                      )}
+
+                      {s.sms_sequence_brief && (
+                        <Section title="SMS Sequence Strategy">
+                          <div style={{fontSize:11,color:'var(--text)',lineHeight:1.5,padding:'6px 10px',background:'#f5f3ff',borderRadius:5,border:'1px solid #e9d5ff'}}>
+                            💬 {s.sms_sequence_brief}
+                          </div>
+                        </Section>
+                      )}
+
+                      {s.email_sequence_brief && (
+                        <Section title="Email Sequence Strategy">
+                          <div style={{fontSize:11,color:'var(--text)',lineHeight:1.5,padding:'6px 10px',background:'#eff6ff',borderRadius:5,border:'1px solid #bfdbfe'}}>
+                            ✉ {s.email_sequence_brief}
+                          </div>
+                        </Section>
+                      )}
+
+                      {s.implementation_instructions && (
+                        <Section title="Implementation Instructions">
+                          <div style={{fontSize:11,color:'var(--text)',lineHeight:1.5,padding:'6px 10px',background:'#f0fdf4',borderRadius:5,border:'1px solid #bbf7d0'}}>
+                            {s.implementation_instructions}
+                          </div>
+                        </Section>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
             {/* Error / success messages */}
             {wizardStepError && (
               <div style={{fontSize:11,padding:'6px 10px',borderRadius:4,marginTop:12,background:'#fee2e2',color:'#dc2626'}}>
@@ -3439,18 +4833,27 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
             {/* Navigation buttons */}
             <div style={{display:'flex',gap:8,justifyContent:'space-between',marginTop:20}}>
-              <button className="btn btn-ghost btn-sm" onClick={closeWizard}>Cancel</button>
+              {wizardStep < 4 && (
+                <button className="btn btn-ghost btn-sm" onClick={closeWizard}>Cancel</button>
+              )}
+              {wizardStep === 4 && <div />}
               <div style={{display:'flex',gap:8}}>
-                {wizardStep > 1 && (
+                {wizardStep > 1 && wizardStep < 4 && (
                   <button className="btn btn-ghost btn-sm" onClick={()=>{setWizardStep(s=>s-1); setWizardStepError('');}}>← Back</button>
                 )}
-                {wizardStep < 3 ? (
+                {wizardStep < 3 && (
                   <button className="btn btn-teal btn-sm" onClick={wizardNext}>
                     Next →
                   </button>
-                ) : (
+                )}
+                {wizardStep === 3 && (
                   <button className="btn btn-teal btn-sm" disabled={savingCamp} onClick={wizardLaunch}>
                     {savingCamp ? 'Launching…' : '🚀 Launch Campaign'}
+                  </button>
+                )}
+                {wizardStep === 4 && (
+                  <button className="btn btn-teal btn-sm" disabled={wizardStrategyLoading} onClick={closeWizard}>
+                    {wizardStrategyLoading ? 'Generating…' : '✅ Done — Close'}
                   </button>
                 )}
               </div>

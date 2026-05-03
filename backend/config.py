@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     port: int = 7070
     secret_key: str = "changeme-pipeline-secret"
     admin_password: str = "GDC-pipeline-2026!"
+    # Public-facing base URL — used for unsubscribe links in emails.
+    # Set to Cloud Run service URL in prod .env, e.g.:
+    #   BASE_URL=https://marketing-backend-xxxx-uc.a.run.app
+    base_url: str = "http://localhost:7070"
 
     # Database
     db_path: str = os.path.expanduser("~/grafton_pipeline/pipeline.db")

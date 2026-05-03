@@ -496,6 +496,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     end_date        TEXT DEFAULT '',        -- YYYY-MM-DD (optional)
     landing_page    TEXT DEFAULT '',        -- URL
     notes           TEXT DEFAULT '',
+    -- AI Review
+    ai_review_enabled INTEGER NOT NULL DEFAULT 0,  -- 1 = Opus actively monitors this campaign
     -- Meta
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -867,6 +869,24 @@ def _migrate(conn):
     camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
     if "workflow_id" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN workflow_id INTEGER DEFAULT NULL")
+
+    # Add strategy_json to campaigns (Opus Strategy migration)
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "strategy_json" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN strategy_json TEXT DEFAULT NULL")
+
+    # Add Google Ads resource columns to campaigns (Campaign Controls migration)
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "gads_campaign_resource" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN gads_campaign_resource TEXT DEFAULT NULL")
+    if "gads_campaign_numeric_id" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN gads_campaign_numeric_id TEXT DEFAULT NULL")
+    if "deep_research_json" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN deep_research_json TEXT DEFAULT NULL")
+    if "ai_review_enabled" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN ai_review_enabled INTEGER NOT NULL DEFAULT 0")
+    if "campaign_build_json" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN campaign_build_json TEXT DEFAULT NULL")
 
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
@@ -1915,6 +1935,207 @@ def get_all_campaigns_with_workflows() -> list:
         return [dict(r) for r in rows]
 
 
+def get_unified_campaigns(days: int = 30) -> list:
+    """
+    Unified campaign view — merges managed campaigns table with gads_daily_stats.
+    Returns managed rows with embedded metrics, plus synthetic rows for GAds
+    campaigns that exist in gads_daily_stats but were never imported.
+    Computes is_inactive_90d from full history (not just the window).
+    """
+    import json as _json
+    days = max(1, int(days))
+    today = datetime.now(timezone.utc).date()
+    cutoff_90d = (today - timedelta(days=90)).isoformat()
+
+    with _conn() as conn:
+        # ── Window aggregates from gads_daily_stats ──────────────────────
+        window_rows = conn.execute("""
+            SELECT
+                LOWER(TRIM(campaign_name)) AS k,
+                campaign_name              AS gads_name,
+                SUM(impressions)           AS impressions,
+                SUM(clicks)                AS clicks,
+                SUM(cost_micros)           AS cost_micros,
+                SUM(conversions)           AS conversions
+            FROM gads_daily_stats
+            WHERE date >= DATE('now', ?)
+              AND campaign_name != ''
+            GROUP BY LOWER(TRIM(campaign_name))
+        """, (f"-{days} day",)).fetchall()
+        window_by_key = {r["k"]: dict(r) for r in window_rows}
+
+        # ── Lifetime last-activity date (for 90-day rule) ────────────────
+        lifetime_rows = conn.execute("""
+            SELECT
+                LOWER(TRIM(campaign_name)) AS k,
+                MAX(date)                  AS last_activity_date
+            FROM gads_daily_stats
+            WHERE campaign_name != ''
+              AND (clicks > 0 OR cost_micros > 0)
+            GROUP BY LOWER(TRIM(campaign_name))
+        """).fetchall()
+        last_activity_by_key = {r["k"]: r["last_activity_date"] for r in lifetime_rows}
+
+        # ── Lead counts per campaign in the window ───────────────────────
+        lead_rows = conn.execute("""
+            SELECT
+                LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign))) AS k,
+                COUNT(*)               AS lead_count,
+                SUM(attributed_income) AS attributed_income
+            FROM leads
+            WHERE created_at >= DATE('now', ?)
+              AND (campaign_name != '' OR utm_campaign != '')
+            GROUP BY LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign)))
+        """, (f"-{days} day",)).fetchall()
+        leads_by_key = {r["k"]: dict(r) for r in lead_rows}
+
+        # ── Managed campaigns ─────────────────────────────────────────────
+        managed = conn.execute("""
+            SELECT c.*, w.name AS workflow_name
+            FROM campaigns c
+            LEFT JOIN workflows w ON c.workflow_id = w.id
+            ORDER BY c.created_at DESC
+        """).fetchall()
+
+        out = []
+        managed_keys = set()
+
+        for r in managed:
+            row = dict(r)
+            row["ai_review_enabled"] = bool(row.get("ai_review_enabled") or 0)
+            try:
+                row["strategy_json"] = _json.loads(row["strategy_json"]) if row.get("strategy_json") else None
+            except Exception:
+                row["strategy_json"] = None
+
+            name_key = (row.get("campaign_name") or "").strip().lower()
+            managed_keys.add(name_key)
+
+            wm = window_by_key.get(name_key, {})
+            lm = leads_by_key.get(name_key, {})
+            cost = (wm.get("cost_micros") or 0) / 1_000_000.0
+            leads = lm.get("lead_count") or 0
+            revenue = lm.get("attributed_income") or 0
+            cpl = round(cost / leads, 2) if leads > 0 else None
+            roi = round((revenue - cost) / cost * 100, 1) if cost > 0 else None
+
+            is_gads_linked = bool(row.get("gads_campaign_resource") or row.get("gads_campaign_numeric_id"))
+            last = last_activity_by_key.get(name_key)
+            if is_gads_linked:
+                if last:
+                    is_inactive_90d = last < cutoff_90d
+                else:
+                    created = (row.get("created_at") or "")[:10]
+                    is_inactive_90d = bool(created and created < cutoff_90d)
+            else:
+                is_inactive_90d = False
+
+            row.update({
+                "is_synthetic": False,
+                "is_gads_linked": is_gads_linked,
+                "metrics": {
+                    "impressions": wm.get("impressions") or 0,
+                    "clicks": wm.get("clicks") or 0,
+                    "cost": round(cost, 2),
+                    "leads": leads,
+                    "revenue": round(revenue, 2),
+                    "cpl": cpl,
+                    "roi": roi,
+                },
+                "last_activity_date": last,
+                "is_inactive_90d": is_inactive_90d,
+            })
+            out.append(row)
+
+        # ── Synthetic rows: GAds names not yet imported ───────────────────
+        for k, wm in window_by_key.items():
+            if k in managed_keys:
+                continue
+            lm = leads_by_key.get(k, {})
+            cost = (wm.get("cost_micros") or 0) / 1_000_000.0
+            leads = lm.get("lead_count") or 0
+            revenue = lm.get("attributed_income") or 0
+            cpl = round(cost / leads, 2) if leads > 0 else None
+            roi = round((revenue - cost) / cost * 100, 1) if cost > 0 else None
+            last = last_activity_by_key.get(k)
+            is_inactive_90d = (last is None) or (last < cutoff_90d)
+
+            out.append({
+                "campaign_id": None,
+                "campaign_name": wm["gads_name"],
+                "campaign_type": "GOOGLE_ADS",
+                "status": "UNMANAGED",
+                "service_focus": "",
+                "monthly_budget": 0.0,
+                "start_date": "",
+                "end_date": "",
+                "workflow_id": None,
+                "workflow_name": None,
+                "strategy_json": None,
+                "gads_campaign_resource": None,
+                "gads_campaign_numeric_id": None,
+                "ai_review_enabled": False,
+                "is_synthetic": True,
+                "is_gads_linked": True,
+                "metrics": {
+                    "impressions": wm.get("impressions") or 0,
+                    "clicks": wm.get("clicks") or 0,
+                    "cost": round(cost, 2),
+                    "leads": leads,
+                    "revenue": round(revenue, 2),
+                    "cpl": cpl,
+                    "roi": roi,
+                },
+                "last_activity_date": last,
+                "is_inactive_90d": is_inactive_90d,
+                "created_at": "",
+                "updated_at": "",
+            })
+
+        return out
+
+
+def set_campaign_ai_review(campaign_id: str, enabled: bool) -> bool:
+    """Toggle the AI Review flag for a managed campaign."""
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE campaigns SET ai_review_enabled=?, updated_at=? WHERE campaign_id=?",
+            (1 if enabled else 0, now, campaign_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_campaign_build(campaign_id: str) -> dict:
+    """Return the campaign_build_json for a campaign, or {} if not set."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT campaign_build_json FROM campaigns WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def save_campaign_build_step(campaign_id: str, step: str, data) -> bool:
+    """
+    Merge `data` into the campaign_build_json blob under key `step`.
+    step: one of "keywords", "ad_copy", "ad_groups", "launch_checklist"
+    """
+    now = _now()
+    build = get_campaign_build(campaign_id)
+    build[step] = data
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE campaigns SET campaign_build_json=?, updated_at=? WHERE campaign_id=?",
+            (json.dumps(build), now, campaign_id),
+        )
+        return cur.rowcount > 0
+
+
 def update_campaign_workflow(campaign_id: str, workflow_id) -> bool:
     """Set or clear the workflow attached to a campaign. workflow_id=None clears it."""
     now = _now()
@@ -1924,6 +2145,18 @@ def update_campaign_workflow(campaign_id: str, workflow_id) -> bool:
         cur = conn.execute(
             "UPDATE campaigns SET workflow_id=?, updated_at=? WHERE campaign_id=?",
             (wf_val, now, campaign_id)
+        )
+        return cur.rowcount > 0
+
+
+def update_campaign_strategy(campaign_id: str, strategy: dict) -> bool:
+    """Persist the Opus-generated strategy JSON to the campaign record."""
+    import json as _json
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE campaigns SET strategy_json=?, updated_at=? WHERE campaign_id=?",
+            (_json.dumps(strategy), now, campaign_id)
         )
         return cur.rowcount > 0
 
@@ -1947,14 +2180,19 @@ def create_campaign(data: dict) -> dict:
     raw_wf = data.get("workflow_id")
     workflow_id = int(raw_wf) if raw_wf not in (None, "", 0, "0") else None
 
+    gads_resource = data.get("gads_campaign_resource") or None
+    gads_numeric  = data.get("gads_campaign_numeric_id") or None
+
     with _conn() as conn:
         conn.execute("""
             INSERT INTO campaigns
                 (campaign_id, campaign_name, status, campaign_type,
                  service_focus, promo_offer, target_audience, objective,
                  monthly_budget, expected_cpl, start_date, end_date,
-                 landing_page, notes, workflow_id, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 landing_page, notes, workflow_id,
+                 gads_campaign_resource, gads_campaign_numeric_id,
+                 created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             campaign_id,
             data["campaign_name"],
@@ -1971,12 +2209,39 @@ def create_campaign(data: dict) -> dict:
             data.get("landing_page", ""),
             data.get("notes", ""),
             workflow_id,
+            gads_resource,
+            gads_numeric,
             now, now,
         ))
         row = conn.execute(
             "SELECT * FROM campaigns WHERE campaign_id=?", (campaign_id,)
         ).fetchone()
         return dict(row)
+
+
+def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
+    """
+    Update editable campaign fields: campaign_name, service_focus, monthly_budget,
+    start_date, end_date, notes, promo_offer, landing_page, objective, target_audience.
+    Only columns explicitly passed in `fields` are updated.
+    """
+    ALLOWED = {
+        "campaign_name", "service_focus", "monthly_budget", "start_date",
+        "end_date", "notes", "promo_offer", "landing_page", "objective",
+        "target_audience", "expected_cpl",
+    }
+    safe = {k: v for k, v in fields.items() if k in ALLOWED}
+    if not safe:
+        return False
+    now = _now()
+    safe["updated_at"] = now
+    set_clause = ", ".join(f"{k}=?" for k in safe)
+    vals = list(safe.values()) + [campaign_id]
+    with _conn() as conn:
+        cur = conn.execute(
+            f"UPDATE campaigns SET {set_clause} WHERE campaign_id=?", vals
+        )
+        return cur.rowcount > 0
 
 
 def update_campaign_status(campaign_id: str, status: str) -> bool:
@@ -1990,6 +2255,22 @@ def update_campaign_status(campaign_id: str, status: str) -> bool:
         return conn.execute(
             "SELECT COUNT(*) FROM campaigns WHERE campaign_id=?", (campaign_id,)
         ).fetchone()[0] > 0
+
+
+def get_campaign_by_id(campaign_id: str):
+    """Fetch a single campaign row by logical campaign_id. Returns dict or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM campaigns WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_campaign(campaign_id: str) -> bool:
+    """Permanently delete a campaign row. Returns True if a row was deleted."""
+    with _conn() as conn:
+        cur = conn.execute("DELETE FROM campaigns WHERE campaign_id=?", (campaign_id,))
+        return cur.rowcount > 0
 
 
 def get_distinct_sources() -> list:

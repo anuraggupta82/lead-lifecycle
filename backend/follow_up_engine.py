@@ -40,7 +40,8 @@ LEGACY_TEMPLATES = {
 
 def _unsubscribe_url(lead_id: str, channel: str) -> str:
     settings = get_settings()
-    return f"http://localhost:{settings.port}/unsubscribe/{lead_id}/{channel}"
+    base = settings.base_url.rstrip("/")
+    return f"{base}/unsubscribe/{lead_id}/{channel}"
 
 
 def _render_template(template: str, lead: dict, unsub_url: str) -> str:

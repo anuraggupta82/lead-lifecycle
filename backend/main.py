@@ -1575,19 +1575,727 @@ def admin_campaign_set_workflow(campaign_id: str, body: CampaignUpdateWorkflowRe
     return {"ok": True}
 
 
+class CampaignStrategyUpdateRequest(BaseModel):
+    strategy: dict
+
+
+@app.get("/api/admin/campaigns/unified", dependencies=[Depends(_require_admin)])
+def admin_campaigns_unified(days: int = 30, include_inactive: bool = False):
+    """
+    Unified campaigns view — replaces the old split between Campaign Performance
+    and Managed Campaigns. Returns each campaign with aggregated GAds metrics,
+    lead counts, last_activity_date, and is_inactive_90d flag.
+    Synthetic rows are emitted for GAds campaigns in gads_daily_stats that were
+    never imported into the campaigns table.
+    """
+    from database import get_unified_campaigns
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=422, detail="days must be between 1 and 365")
+    rows = get_unified_campaigns(days=days)
+    if not include_inactive:
+        rows = [r for r in rows if not r.get("is_inactive_90d")]
+    return {"campaigns": rows, "days": days, "include_inactive": include_inactive}
+
+
+class CampaignUpdateFieldsRequest(BaseModel):
+    campaign_name: str | None = None
+    service_focus: str | None = None
+    monthly_budget: float | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    notes: str | None = None
+    promo_offer: str | None = None
+    landing_page: str | None = None
+    objective: str | None = None
+    target_audience: str | None = None
+    expected_cpl: float | None = None
+
+
+@app.patch("/api/admin/campaigns/{campaign_id}", dependencies=[Depends(_require_admin)])
+def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsRequest):
+    """Update editable fields on a campaign (name, budget, service focus, dates, etc.)."""
+    from database import update_campaign_fields, get_campaign_by_id
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    ok = update_campaign_fields(campaign_id, fields)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Update failed")
+    return {"ok": True, "campaign_id": campaign_id, "updated": list(fields.keys())}
+
+
+class CampaignBuildStepRefineRequest(BaseModel):
+    step: str          # "keywords" | "ad_copy" | "ad_groups"
+    instruction: str   # Natural language instruction from user
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/build-step-refine", dependencies=[Depends(_require_admin)])
+async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuildStepRefineRequest):
+    """
+    Iteratively refine a build step using a user instruction.
+    Reads current content for the step, applies the instruction via Sonnet,
+    returns the refined content WITHOUT saving — caller decides to accept or discard.
+    """
+    from database import get_campaign_by_id, get_campaign_build
+    import anthropic as _anthropic, json as _json, re as _re
+
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups"}
+    if body.step not in VALID_STEPS:
+        raise HTTPException(status_code=400, detail=f"Refinement only supported for: {VALID_STEPS}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    build = get_campaign_build(campaign_id)
+    current = build.get(body.step)
+    if not current:
+        raise HTTPException(status_code=400, detail=f"No existing {body.step} to refine. Generate it first.")
+
+    strategy = camp.get("strategy_json") or {}
+    if isinstance(strategy, str):
+        try:
+            strategy = _json.loads(strategy)
+        except Exception:
+            strategy = {}
+
+    settings = get_settings()
+    ai_client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+    prompt = f"""You are a Google Ads specialist helping refine a campaign build step.
+
+Campaign: {camp.get("campaign_name", "")}
+Service Focus: {camp.get("service_focus", "")}
+Objective: {strategy.get("objective", "")}
+
+Current {body.step} content:
+{_json.dumps(current, indent=2)}
+
+User instruction: {body.instruction}
+
+Apply the user's instruction to modify the {body.step} content. Return the complete updated {body.step} JSON structure — same format as the input, with the requested changes applied.
+
+Rules:
+- Keep all existing items unless the user asked to remove specific ones
+- Add new items where instructed
+- Maintain the exact same JSON structure/schema as the current content
+- Return ONLY the JSON object, no explanation."""
+
+    try:
+        response = ai_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        json_match = _re.search(r'\{[\s\S]*\}|\[[\s\S]*\]', raw)
+        if not json_match:
+            raise ValueError("No JSON found in AI response")
+        refined = _json.loads(json_match.group())
+    except Exception as e:
+        logger.error(f"build-step-refine AI call failed ({body.step}): {e}")
+        raise HTTPException(status_code=500, detail=f"AI refinement failed: {e}")
+
+    logger.info(f"Campaign {campaign_id} step '{body.step}' refined (not yet saved)")
+    return {"ok": True, "step": body.step, "data": refined}
+
+
+class CampaignAiReviewRequest(BaseModel):
+    enabled: bool
+
+
+@app.patch("/api/admin/campaigns/{campaign_id}/ai-review", dependencies=[Depends(_require_admin)])
+def admin_campaign_set_ai_review(campaign_id: str, body: CampaignAiReviewRequest):
+    """
+    Toggle the AI Review flag on a managed campaign.
+    When enabled=true, the nightly ai_optimizer restricts keyword analysis
+    to this campaign (plus any others also flagged on).
+    """
+    from database import set_campaign_ai_review, get_campaign_by_id
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    ok = set_campaign_ai_review(campaign_id, body.enabled)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to update AI Review flag")
+    logger.info(f"AI Review flag for {campaign_id} → {body.enabled}")
+    return {"ok": True, "campaign_id": campaign_id, "ai_review_enabled": body.enabled}
+
+
+class CampaignBuildStepRequest(BaseModel):
+    step: str  # "keywords" | "ad_copy" | "ad_groups" | "launch_checklist"
+
+
+class CampaignBuildStepSaveRequest(BaseModel):
+    step: str
+    data: dict | list  # the accepted refined content to persist
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/build-step-save", dependencies=[Depends(_require_admin)])
+def admin_campaign_build_step_save(campaign_id: str, body: CampaignBuildStepSaveRequest):
+    """Save accepted refined build step data into campaign_build_json."""
+    from database import get_campaign_by_id, save_campaign_build_step
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist"}
+    if body.step not in VALID_STEPS:
+        raise HTTPException(status_code=400, detail=f"Invalid step")
+    save_campaign_build_step(campaign_id, body.step, body.data)
+    return {"ok": True, "step": body.step}
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/build-step", dependencies=[Depends(_require_admin)])
+async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepRequest):
+    """
+    AI-generate one stage of the campaign build pipeline using Claude Sonnet.
+
+    Steps:
+      keywords      — target keywords by match type + negatives
+      ad_copy       — finalized RSA headlines (15) + descriptions (4) per ad group
+      ad_groups     — keyword → ad group mapping with bid suggestions
+      launch_checklist — readiness checklist (returns template, not AI-generated)
+
+    Uses the campaign's strategy_json as context for all AI steps.
+    Result is saved into campaign_build_json[step] and returned.
+    """
+    from database import get_campaign_by_id, get_campaign_build, save_campaign_build_step
+    import anthropic as _anthropic
+
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist"}
+    if body.step not in VALID_STEPS:
+        raise HTTPException(status_code=400, detail=f"Invalid step. Must be one of {VALID_STEPS}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    step = body.step
+
+    # Launch checklist is a static template — no AI needed
+    if step == "launch_checklist":
+        checklist = [
+            {"item": "Campaign budget confirmed",               "done": False},
+            {"item": "Geographic targeting set",                "done": False},
+            {"item": "Ad schedule configured",                  "done": False},
+            {"item": "Negative keywords added",                 "done": False},
+            {"item": "Ad extensions added (call, location)",    "done": False},
+            {"item": "Conversion tracking verified",            "done": False},
+            {"item": "Landing page reviewed",                   "done": False},
+            {"item": "Campaign reviewed and approved",          "done": False},
+        ]
+        save_campaign_build_step(campaign_id, step, checklist)
+        return {"ok": True, "step": step, "data": checklist}
+
+    # Build AI prompt using strategy context
+    strategy = camp.get("strategy_json") or {}
+    if isinstance(strategy, str):
+        try:
+            import json as _json
+            strategy = _json.loads(strategy)
+        except Exception:
+            strategy = {}
+
+    # Existing build data for context
+    build = get_campaign_build(campaign_id)
+
+    settings = get_settings()
+    ai_client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+    campaign_name = camp.get("campaign_name", "")
+    service_focus = camp.get("service_focus", "")
+    budget = camp.get("monthly_budget", 0)
+    objective = strategy.get("objective", "")
+    target_audience = strategy.get("target_audience", "")
+    key_messages = strategy.get("key_messages", [])
+    impl_notes = strategy.get("implementation_instructions", "")
+
+    if step == "keywords":
+        prompt = f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
+
+Campaign: {campaign_name}
+Service Focus: {service_focus}
+Monthly Budget: ${budget}
+Objective: {objective}
+Target Audience: {target_audience}
+Key Messages: {', '.join(key_messages)}
+Implementation Notes: {impl_notes}
+
+Return a JSON object with this exact structure:
+{{
+  "exact_match": ["keyword1", "keyword2", ...],
+  "phrase_match": ["keyword1", "keyword2", ...],
+  "broad_match_modifier": ["keyword1", "keyword2", ...],
+  "negative_keywords": ["keyword1", "keyword2", ...]
+}}
+
+Rules:
+- exact_match: 8-12 high-intent, specific keywords (e.g. "emergency dentist near me")
+- phrase_match: 10-15 moderate-intent phrases
+- broad_match_modifier: 5-8 broader terms to capture volume
+- negative_keywords: 15-20 terms to exclude (jobs, DIY, insurance-only, etc.)
+- All keywords should be relevant to the dental service and local search intent
+- Return ONLY the JSON object, no explanation."""
+
+    elif step == "ad_copy":
+        keywords = build.get("keywords", {})
+        kw_context = f"Target keywords: {', '.join(keywords.get('exact_match', [])[:8])}" if keywords else ""
+        headlines_from_strategy = strategy.get("ad_headlines", [])
+        descs_from_strategy = strategy.get("ad_descriptions", [])
+
+        prompt = f"""You are a Google Ads copywriter. Generate complete RSA ad copy for this dental campaign.
+
+Campaign: {campaign_name}
+Service Focus: {service_focus}
+Objective: {objective}
+Target Audience: {target_audience}
+{kw_context}
+Strategy Headlines: {', '.join(headlines_from_strategy)}
+Strategy Descriptions: {'; '.join(descs_from_strategy)}
+Implementation Notes: {impl_notes}
+
+Return a JSON object with this exact structure:
+{{
+  "ad_groups": [
+    {{
+      "name": "Ad Group Name",
+      "theme": "What this group targets",
+      "headlines": ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8", "H9", "H10", "H11", "H12", "H13", "H14", "H15"],
+      "descriptions": ["D1 (90 chars max)", "D2 (90 chars max)", "D3 (90 chars max)", "D4 (90 chars max)"]
+    }}
+  ]
+}}
+
+Rules:
+- Create 2-3 ad groups based on keyword themes
+- Headlines: exactly 15 per ad group, max 30 characters each
+- Descriptions: exactly 4 per ad group, max 90 characters each
+- Include the practice service, urgency, differentiators, and CTAs
+- No punctuation at end of headlines
+- Return ONLY the JSON object, no explanation."""
+
+    elif step == "ad_groups":
+        keywords = build.get("keywords", {})
+        ad_copy = build.get("ad_copy", {})
+        kw_context = f"Keywords: {keywords}" if keywords else "No keywords generated yet."
+        groups_context = f"Ad groups from copy: {[g.get('name') for g in ad_copy.get('ad_groups', [])]}" if ad_copy else ""
+
+        prompt = f"""You are a Google Ads account manager. Create the final ad group structure for this campaign.
+
+Campaign: {campaign_name}
+Service Focus: {service_focus}
+Monthly Budget: ${budget}
+{kw_context}
+{groups_context}
+Implementation Notes: {impl_notes}
+
+Return a JSON object with this exact structure:
+{{
+  "ad_groups": [
+    {{
+      "name": "Ad Group Name",
+      "theme": "Brief theme description",
+      "match_types": ["exact", "phrase"],
+      "keywords": ["keyword1", "keyword2", ...],
+      "suggested_cpc_usd": 3.50,
+      "daily_budget_pct": 40,
+      "notes": "Why this group and bidding rationale"
+    }}
+  ],
+  "bidding_strategy": "Recommended bidding strategy and rationale",
+  "budget_allocation_notes": "How to split the monthly budget across groups"
+}}
+
+Rules:
+- Create 2-3 ad groups that map to the keyword themes
+- daily_budget_pct values should sum to 100
+- suggested_cpc_usd should be realistic for dental keywords ($2-8 range)
+- Return ONLY the JSON object, no explanation."""
+
+    try:
+        response = ai_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+
+        # Extract JSON
+        import re as _re, json as _json
+        json_match = _re.search(r'\{[\s\S]*\}', raw)
+        if not json_match:
+            raise ValueError("No JSON found in AI response")
+        data = _json.loads(json_match.group())
+
+    except Exception as e:
+        logger.error(f"build-step AI call failed ({step}): {e}")
+        raise HTTPException(status_code=500, detail=f"AI generation failed: {e}")
+
+    save_campaign_build_step(campaign_id, step, data)
+    logger.info(f"Campaign {campaign_id} build step '{step}' generated and saved")
+    return {"ok": True, "step": step, "data": data}
+
+
+@app.patch("/api/admin/campaigns/{campaign_id}/strategy", dependencies=[Depends(_require_admin)])
+def admin_campaign_save_strategy(campaign_id: str, body: CampaignStrategyUpdateRequest):
+    """Persist the Opus-generated strategy JSON to the campaign record."""
+    from database import update_campaign_strategy
+    found = update_campaign_strategy(campaign_id, body.strategy)
+    if not found:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"ok": True}
+
+
 @app.patch("/api/admin/campaigns/{campaign_id}/status", dependencies=[Depends(_require_admin)])
 def admin_campaign_status(campaign_id: str, status: str = Body(..., embed=True)):
     """Update a campaign's status (ACTIVE, PAUSED, COMPLETED, ARCHIVED).
     Accepts JSON body: {"status": "PAUSED"}
     """
     from database import update_campaign_status
-    allowed = {"DRAFT", "ACTIVE", "PAUSED", "COMPLETED", "ARCHIVED"}
+    # ACTIVE and PAUSED must go through the /pause and /resume endpoints
+    # which also sync Google Ads. Only allow non-GAds transitions here.
+    allowed = {"DRAFT", "COMPLETED", "ARCHIVED"}
     if status.upper() not in allowed:
-        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(allowed)}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Use /pause or /resume for ACTIVE/PAUSED transitions. This endpoint only accepts {sorted(allowed)}"
+        )
     found = update_campaign_status(campaign_id, status.upper())
     if not found:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return {"ok": True}
+
+
+# ─── Campaign lifecycle controls (Pause / Resume / Stop) ─────────────────────
+
+@app.post("/api/admin/campaigns/{campaign_id}/pause", dependencies=[Depends(_require_admin)])
+def admin_campaign_pause(campaign_id: str):
+    """Pause a campaign — locally and in Google Ads if linked."""
+    from database import get_campaign_by_id, update_campaign_status
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Idempotency guard — already paused, nothing to do
+    if camp["status"] == "PAUSED":
+        return {"ok": True, "status": "PAUSED", "gads_updated": False, "note": "already paused"}
+
+    gads_updated = False
+    gads_error = None
+    if camp.get("gads_campaign_resource"):
+        from google_ads_create import set_campaign_status
+        result = set_campaign_status(camp["gads_campaign_resource"], "PAUSED")
+        gads_updated = result["ok"]
+        gads_error = result.get("error")
+        if not gads_updated:
+            # Don't flip local status if the remote call failed for a linked campaign
+            raise HTTPException(
+                status_code=502,
+                detail=f"Google Ads pause failed: {gads_error}. Local status unchanged."
+            )
+
+    update_campaign_status(campaign_id, "PAUSED")
+    return {"ok": True, "status": "PAUSED", "gads_updated": gads_updated}
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/resume", dependencies=[Depends(_require_admin)])
+def admin_campaign_resume(campaign_id: str):
+    """Resume (enable) a campaign — locally and in Google Ads if linked."""
+    from database import get_campaign_by_id, update_campaign_status
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Idempotency guard — already active, nothing to do
+    if camp["status"] == "ACTIVE":
+        return {"ok": True, "status": "ACTIVE", "gads_updated": False, "note": "already active"}
+    # Prevent resuming a stopped campaign
+    if camp["status"] in ("ARCHIVED", "COMPLETED"):
+        raise HTTPException(status_code=422, detail=f"Cannot resume a campaign with status {camp['status']}")
+
+    gads_updated = False
+    gads_error = None
+    if camp.get("gads_campaign_resource"):
+        from google_ads_create import set_campaign_status
+        result = set_campaign_status(camp["gads_campaign_resource"], "ENABLED")
+        gads_updated = result["ok"]
+        gads_error = result.get("error")
+        if not gads_updated:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Google Ads resume failed: {gads_error}. Local status unchanged."
+            )
+
+    update_campaign_status(campaign_id, "ACTIVE")
+    return {"ok": True, "status": "ACTIVE", "gads_updated": gads_updated}
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/stop", dependencies=[Depends(_require_admin)])
+def admin_campaign_stop(campaign_id: str):
+    """Permanently stop a campaign. REMOVED in Google Ads (irreversible), ARCHIVED locally."""
+    from database import get_campaign_by_id, update_campaign_status
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Idempotency guard — already stopped, nothing to do (and GAds won't accept a REMOVED mutate)
+    if camp["status"] == "ARCHIVED":
+        return {"ok": True, "status": "ARCHIVED", "gads_updated": False, "note": "already stopped"}
+
+    gads_updated = False
+    gads_error = None
+    if camp.get("gads_campaign_resource"):
+        from google_ads_create import set_campaign_status
+        result = set_campaign_status(camp["gads_campaign_resource"], "REMOVED")
+        gads_updated = result["ok"]
+        gads_error = result.get("error")
+        if not gads_updated:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Google Ads stop failed: {gads_error}. Local status unchanged."
+            )
+
+    update_campaign_status(campaign_id, "ARCHIVED")
+    return {"ok": True, "status": "ARCHIVED", "gads_updated": gads_updated}
+
+
+@app.delete("/api/admin/campaigns/{campaign_id}", dependencies=[Depends(_require_admin)])
+def admin_campaign_delete(campaign_id: str):
+    """
+    Permanently delete a campaign from the local dashboard.
+    Does NOT touch Google Ads — only removes the local DB record.
+    Use for cleaning up unlinked/test campaigns.
+    """
+    from database import get_campaign_by_id, delete_campaign
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.get("gads_campaign_resource"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete a campaign linked to Google Ads. Use Stop instead."
+        )
+    deleted = delete_campaign(campaign_id)
+    return {"ok": deleted, "campaign_id": campaign_id}
+
+
+# ─── Google Ads Campaign Import ──────────────────────────────────────────────
+
+@app.get("/api/admin/gads/list-campaigns", dependencies=[Depends(_require_admin)])
+def admin_gads_list_campaigns():
+    """
+    Fetch all non-REMOVED campaigns from the Google Ads account.
+    Marks each one as already_imported if it exists in local campaigns table.
+    READ-ONLY — no kill switch required.
+    """
+    from google_ads_create import fetch_campaigns_from_gads
+    from database import get_all_campaigns_with_workflows
+
+    try:
+        gads_campaigns = fetch_campaigns_from_gads()
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not fetch campaigns from Google Ads: {e}"
+        )
+
+    # Build already-imported set from both gads_campaign_numeric_id AND campaign_id
+    # (handles manual campaigns that used a numeric ID as campaign_id)
+    local = get_all_campaigns_with_workflows()
+    already_imported = set()
+    for c in local:
+        if c.get("gads_campaign_numeric_id"):
+            already_imported.add(c["gads_campaign_numeric_id"])
+        if c.get("campaign_id"):
+            already_imported.add(c["campaign_id"])
+
+    for c in gads_campaigns:
+        c["already_imported"] = c["campaign_id"] in already_imported
+
+    return {"campaigns": gads_campaigns, "total": len(gads_campaigns)}
+
+
+class ImportCampaignsRequest(BaseModel):
+    campaign_ids: list[str]   # GAds numeric campaign IDs to import
+
+
+@app.post("/api/admin/gads/import-campaigns", dependencies=[Depends(_require_admin)])
+def admin_import_campaigns(body: ImportCampaignsRequest):
+    """
+    Import selected Google Ads campaigns into the local managed campaigns table.
+    Sets gads_campaign_resource + gads_campaign_numeric_id in one atomic INSERT.
+    Skips already-imported campaigns silently.
+    """
+    from google_ads_create import fetch_campaigns_from_gads
+    from database import create_campaign, get_campaign_by_id
+
+    if not body.campaign_ids:
+        raise HTTPException(status_code=422, detail="No campaign IDs provided")
+
+    try:
+        gads_campaigns = fetch_campaigns_from_gads()
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not fetch campaigns from Google Ads: {e}"
+        )
+
+    gads_map = {c["campaign_id"]: c for c in gads_campaigns}
+
+    imported = []
+    skipped  = []
+    errors   = []
+
+    for cid in body.campaign_ids:
+        if cid not in gads_map:
+            errors.append({"campaign_id": cid, "error": "Not found in Google Ads"})
+            continue
+
+        gads = gads_map[cid]
+
+        # Already imported? (use numeric ID as campaign_id, so get_campaign_by_id works)
+        existing = get_campaign_by_id(cid)
+        if existing:
+            skipped.append(cid)
+            continue
+
+        # Map GAds status → local status
+        local_status = "ACTIVE" if gads["gads_status"] == "ENABLED" else "PAUSED"
+
+        data = {
+            "campaign_id":               cid,              # GAds numeric ID = local logical key
+            "campaign_name":             gads["campaign_name"],
+            "status":                    local_status,
+            "campaign_type":             "GOOGLE_ADS",
+            "monthly_budget":            gads["monthly_budget_usd"],   # daily × 30 approx
+            "start_date":                gads["start_date"],
+            "end_date":                  gads["end_date"],
+            "notes":                     f"Imported from Google Ads. Channel: {gads['channel_type']}. Daily budget: ${gads['daily_budget_usd']}/day.",
+            "gads_campaign_resource":    gads["resource_name"],
+            "gads_campaign_numeric_id":  cid,
+        }
+
+        try:
+            create_campaign(data)
+            logger.info(f"Imported GAds campaign: {cid} '{gads['campaign_name']}'")
+            imported.append({"campaign_id": cid, "campaign_name": gads["campaign_name"]})
+        except Exception as e:
+            logger.error(f"Failed to import GAds campaign {cid}: {e}")
+            errors.append({"campaign_id": cid, "error": str(e)})
+
+    logger.info(f"GAds import complete: {len(imported)} imported, {len(skipped)} skipped, {len(errors)} errors")
+    return {"imported": imported, "skipped": skipped, "errors": errors}
+
+
+# ─── Campaign detail (click-through from Managed Campaigns table) ────────────
+
+@app.get("/api/admin/campaigns/{campaign_id}/detail", dependencies=[Depends(_require_admin)])
+def admin_campaign_detail(campaign_id: str, days: int = 30):
+    """
+    Full campaign detail: base info + strategy + GAds performance + ad groups + ad creatives.
+    Returns everything needed for the campaign detail drawer in one request.
+    """
+    from database import (
+        get_campaign_by_id, get_daily_stats, get_ad_group_stats, get_ads_with_metrics
+    )
+    import json as _json
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Parse strategy_json if stored as string
+    strategy = None
+    if camp.get("strategy_json"):
+        try:
+            strategy = _json.loads(camp["strategy_json"]) if isinstance(camp["strategy_json"], str) else camp["strategy_json"]
+        except Exception:
+            strategy = None
+
+    # Daily stats filtered to this campaign
+    daily_stats = get_daily_stats(days=days, campaign_id=campaign_id)
+    for row in daily_stats:
+        row["cost"] = round((row.get("cost_micros") or 0) / 1_000_000.0, 2)
+
+    # Aggregate summary from daily stats
+    total_impressions = sum(r.get("impressions") or 0 for r in daily_stats)
+    total_clicks      = sum(r.get("clicks") or 0 for r in daily_stats)
+    total_cost        = sum(r.get("cost") or 0.0 for r in daily_stats)
+    total_conversions = sum(r.get("conversions") or 0 for r in daily_stats)
+    ctr  = round(total_clicks / total_impressions * 100, 2) if total_impressions > 0 else 0.0
+    cpc  = round(total_cost / total_clicks, 2) if total_clicks > 0 else 0.0
+    cpl  = round(total_cost / total_conversions, 2) if total_conversions > 0 else 0.0
+
+    # Ad groups for this campaign (filter from all ad groups by campaign_id)
+    all_ag = get_ad_group_stats(days=days)
+    # gads_daily_stats uses campaign_id column; filter by numeric id or name match
+    gads_num_id = camp.get("gads_campaign_numeric_id") or ""
+    camp_name   = camp.get("campaign_name") or ""
+    ad_groups = [
+        ag for ag in all_ag
+        if ag.get("campaign_id") == gads_num_id
+        or ag.get("campaign_name", "").lower() == camp_name.lower()
+    ]
+
+    # Ad creatives for this campaign
+    all_ads = get_ads_with_metrics(days=days)
+    ads = [
+        ad for ad in all_ads
+        if ad.get("campaign_id") == gads_num_id
+        or ad.get("campaign_name", "").lower() == camp_name.lower()
+    ]
+    for ad in ads:
+        impressions = ad.get("impressions") or 0
+        clicks      = ad.get("clicks") or 0
+        cost_micros = ad.get("cost_micros") or 0
+        leads       = ad.get("leads") or 0
+        cost        = cost_micros / 1_000_000.0
+        ad["cost"]  = round(cost, 2)
+        ad["ctr"]   = round(clicks / impressions * 100, 2) if impressions > 0 else 0.0
+        ad["cpc"]   = round(cost / clicks, 2) if clicks > 0 else 0.0
+        ad["cpl"]   = round(cost / leads, 2)  if leads  > 0 else 0.0
+        if isinstance(ad.get("assets_json"), str):
+            try:
+                ad["assets_json"] = _json.loads(ad["assets_json"])
+            except Exception:
+                ad["assets_json"] = {"headlines": [], "descriptions": []}
+        if not isinstance(ad.get("assets_json"), dict):
+            ad["assets_json"] = {"headlines": [], "descriptions": []}
+
+    # Lead attribution: count leads linked to this campaign_id
+    with __import__("database")._conn() as conn:
+        lead_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM leads WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()
+        lead_count = lead_row["cnt"] if lead_row else 0
+
+    # Parse campaign_build_json
+    from database import get_campaign_build
+    build_data = get_campaign_build(campaign_id)
+
+    return {
+        "campaign": {k: v for k, v in camp.items() if k not in ("strategy_json", "campaign_build_json")},
+        "strategy": strategy,
+        "build": build_data,
+        "summary": {
+            "days": days,
+            "impressions": total_impressions,
+            "clicks": total_clicks,
+            "cost": round(total_cost, 2),
+            "conversions": total_conversions,
+            "ctr": ctr,
+            "cpc": cpc,
+            "cpl": cpl,
+            "leads": lead_count,
+        },
+        "daily_stats": daily_stats,
+        "ad_groups": ad_groups,
+        "ads": ads,
+        "has_gads_data": bool(camp.get("gads_campaign_resource")),
+    }
 
 
 # ─── Google Ads extended reporting ───────────────────────────────────────────

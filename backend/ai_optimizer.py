@@ -741,6 +741,27 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     logger.info("Building lead attribution...")
     attribution = _get_keyword_attribution()
 
+    # ── AI Review allow-list filter ────────────────────────────────────────────
+    # Only analyze campaigns with ai_review_enabled=1. If none are flagged,
+    # skip the run entirely to avoid wasted Anthropic calls.
+    try:
+        from database import _conn as _db_conn
+        with _db_conn() as _c:
+            _allow_rows = _c.execute(
+                "SELECT campaign_name FROM campaigns WHERE ai_review_enabled=1"
+            ).fetchall()
+        ai_allow = {r[0].strip().lower() for r in _allow_rows if r[0]}
+    except Exception as _e:
+        logger.warning(f"AI Review allow-list fetch failed, proceeding without filter: {_e}")
+        ai_allow = set()
+
+    if ai_allow:
+        logger.info(f"AI Review allow-list: {ai_allow}")
+        keyword_perf = [k for k in keyword_perf if k.get("campaign", "").strip().lower() in ai_allow]
+        search_terms = [s for s in search_terms if s.get("campaign", "").strip().lower() in ai_allow]
+    else:
+        logger.info("No AI Review campaigns enabled — optimizer will run across all campaigns (legacy mode)")
+
     # Determine the primary campaign name for memory scoping
     campaign_spend: dict = {}
     for kw in keyword_perf:
