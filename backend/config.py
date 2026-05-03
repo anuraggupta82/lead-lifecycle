@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_from_number: str = ""   # e.g. +15083184477
+    whatsapp_sandbox_number: str = ""  # Set to +14155238886 in dev to use WhatsApp sandbox
 
     # Firestore (GCP) — for syncing existing nxtsmile leads
     gcp_project: str = "marketing-landing-page-491721"

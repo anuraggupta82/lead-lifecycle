@@ -31,7 +31,10 @@ def _send_sms(to_number: str, body: str) -> bool:
 
     # Dev-mode redirect — reroute to test phone, prefix body with original target
     original_e164 = e164
-    if getattr(settings, "env", "dev").lower() == "dev":
+    is_dev = getattr(settings, "env", "dev").lower() == "dev"
+    use_whatsapp = is_dev and bool(getattr(settings, "whatsapp_sandbox_number", ""))
+
+    if is_dev:
         redirect = getattr(settings, "test_redirect_phone", "") or e164
         if redirect and redirect != e164:
             body = f"[DEV → {original_e164}] {body}"
@@ -40,12 +43,24 @@ def _send_sms(to_number: str, body: str) -> bool:
     try:
         from twilio.rest import Client
         client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
-        message = client.messages.create(
-            body=body,
-            from_=settings.twilio_from_number,
-            to=e164,
-        )
-        logger.info(f"SMS sent to {e164} (orig={original_e164}): SID {message.sid}")
+
+        if use_whatsapp:
+            # Send via WhatsApp sandbox — bypasses A2P 10DLC requirement
+            sandbox_from = f"whatsapp:{settings.whatsapp_sandbox_number}"
+            sandbox_to = f"whatsapp:{e164}"
+            message = client.messages.create(
+                body=body,
+                from_=sandbox_from,
+                to=sandbox_to,
+            )
+            logger.info(f"WhatsApp sandbox sent to {sandbox_to} (orig={original_e164}): SID {message.sid}")
+        else:
+            message = client.messages.create(
+                body=body,
+                from_=settings.twilio_from_number,
+                to=e164,
+            )
+            logger.info(f"SMS sent to {e164} (orig={original_e164}): SID {message.sid}")
         return True
     except Exception as e:
         logger.error(f"SMS failed to {e164} (orig={original_e164}): {e}")
