@@ -439,7 +439,6 @@ def fetch_campaign_build_data(campaign_resource_name: str) -> dict:
                 ad_group_ad.resource_name,
                 ad_group_ad.status,
                 ad_group_ad.ad.id,
-                ad_group_ad.ad.name,
                 ad_group_ad.ad.type,
                 ad_group_ad.ad.responsive_search_ad.headlines,
                 ad_group_ad.ad.responsive_search_ad.descriptions,
@@ -488,7 +487,6 @@ def fetch_campaign_build_data(campaign_resource_name: str) -> dict:
             ads_list.append({
                 "resource_name":  row.ad_group_ad.resource_name,
                 "ad_id":          str(ad.id),
-                "ad_name":        ad.name or "",
                 "ad_type":        str(ad.type).upper(),
                 "ad_group":       row.ad_group.name or "",
                 "ad_group_id":    str(row.ad_group.id),
@@ -517,9 +515,7 @@ def fetch_campaign_build_data(campaign_resource_name: str) -> dict:
                 ad_group.status,
                 ad_group.type,
                 ad_group.cpc_bid_micros,
-                ad_group.target_cpa_micros,
-                ad_group.target_roas,
-                ad_group.cpc_bid_ceiling_micros
+                ad_group.target_cpa_micros
             FROM ad_group
             WHERE campaign.resource_name = '{campaign_resource_name}'
               AND ad_group.status IN (ENABLED, PAUSED)
@@ -531,19 +527,16 @@ def fetch_campaign_build_data(campaign_resource_name: str) -> dict:
             ag = row.ad_group
             cpc_micros = ag.cpc_bid_micros or 0
             target_cpa_micros = ag.target_cpa_micros or 0
-            ceiling_micros = ag.cpc_bid_ceiling_micros or 0
 
             ad_groups_list.append({
-                "resource_name":      ag.resource_name,
-                "ad_group_id":        str(ag.id),
-                "ad_group_name":      ag.name or "",
-                "status":             str(ag.status).upper(),
-                "type":               str(ag.type).upper(),
-                "cpc_bid_usd":        round(cpc_micros / 1_000_000.0, 2) if cpc_micros else None,
-                "target_cpa_usd":     round(target_cpa_micros / 1_000_000.0, 2) if target_cpa_micros else None,
-                "target_roas":        ag.target_roas if ag.target_roas else None,
-                "cpc_bid_ceiling_usd": round(ceiling_micros / 1_000_000.0, 2) if ceiling_micros else None,
-                "source":             "imported_from_google_ads",
+                "resource_name":  ag.resource_name,
+                "ad_group_id":    str(ag.id),
+                "ad_group_name":  ag.name or "",
+                "status":         str(ag.status).upper(),
+                "type":           str(ag.type).upper(),
+                "cpc_bid_usd":    round(cpc_micros / 1_000_000.0, 2) if cpc_micros else None,
+                "target_cpa_usd": round(target_cpa_micros / 1_000_000.0, 2) if target_cpa_micros else None,
+                "source":         "imported_from_google_ads",
             })
 
         ad_groups_step = {

@@ -4191,11 +4191,72 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           )}
 
                           {/* ── Keywords tab ── */}
-                          {detailTab==='keywords' && (
-                            <div>
-                              {!build.keywords ? (
+                          {detailTab==='keywords' && (() => {
+                            // Imported campaign: show live Google Ads keywords from snapshot
+                            const snapKw = gadsSnap.keywords;
+                            const hasSnapKw = snapKw && ((snapKw.keywords||[]).length > 0 || (snapKw.negative_keywords||[]).length > 0);
+                            if (hasSnapKw) {
+                              const allKw = snapKw.keywords || [];
+                              const negKw = snapKw.negative_keywords || [];
+                              // Group by match type
+                              const byMatch = {};
+                              allKw.forEach(k => {
+                                const mt = k.match_type || 'Broad';
+                                if (!byMatch[mt]) byMatch[mt] = [];
+                                byMatch[mt].push(k);
+                              });
+                              const matchColors = {
+                                'Exact': {color:'#0c4a6e', bg:'#e0f2fe'},
+                                'Phrase': {color:'#065f46', bg:'#d1fae5'},
+                                'Broad': {color:'#713f12', bg:'#fef3c7'},
+                              };
+                              return (
                                 <div>
-                                  <SnapshotBanner step="keywords" label="Keywords and negative keywords"/>
+                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                    <div style={{fontSize:13,fontWeight:700}}>🔍 Keywords</div>
+                                    <span style={{fontSize:10,color:'var(--text-muted)'}}>
+                                      Synced from Google Ads{snapSyncedAt ? ` · ${snapSyncedAt}` : ''}
+                                    </span>
+                                  </div>
+                                  {Object.entries(byMatch).map(([mt, kws]) => {
+                                    const {color, bg} = matchColors[mt] || {color:'#374151', bg:'#f3f4f6'};
+                                    return (
+                                      <div key={mt} style={{marginBottom:16}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:6}}>
+                                          {mt} Match ({kws.length})
+                                        </div>
+                                        <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                                          {kws.map((k,i) => (
+                                            <span key={i} style={{background:bg,color,fontSize:11,padding:'3px 9px',borderRadius:4,border:`1px solid ${color}30`}}>
+                                              {k.keyword}
+                                              {k.cpc_bid ? <span style={{marginLeft:4,fontWeight:700}}>${k.cpc_bid}</span> : null}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                  {negKw.length > 0 && (
+                                    <div style={{marginBottom:16}}>
+                                      <div style={{fontSize:10,fontWeight:700,color:'#7f1d1d',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:6}}>
+                                        Negative Keywords ({negKw.length})
+                                      </div>
+                                      <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                                        {negKw.map((k,i) => (
+                                          <span key={i} style={{background:'#fee2e2',color:'#7f1d1d',fontSize:11,padding:'3px 9px',borderRadius:4,border:'1px solid #fca5a530'}}>
+                                            -{k.keyword}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            }
+                            // New campaign: show AI generation wizard
+                            return (
+                              <div>
+                                {!build.keywords ? (
                                   <div style={{textAlign:'center',padding:40}}>
                                     <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>🔍 Keyword Research</div>
                                     <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
@@ -4207,50 +4268,119 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       {buildLoading==='keywords' ? '⏳ Generating…' : '✨ Generate Keywords'}
                                     </button>
                                   </div>
-                                </div>
-                              ) : (
-                                <div>
-                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
-                                    <div style={{fontSize:13,fontWeight:700}}>🔍 Keyword Research</div>
-                                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
-                                      disabled={!!buildLoading}
-                                      onClick={()=>generateBuildStep('keywords')}>
-                                      {buildLoading==='keywords'?'⏳ Regenerating…':'↺ Regenerate'}
-                                    </button>
+                                ) : (
+                                  <div>
+                                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                      <div style={{fontSize:13,fontWeight:700}}>🔍 Keyword Research</div>
+                                      <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
+                                        disabled={!!buildLoading}
+                                        onClick={()=>generateBuildStep('keywords')}>
+                                        {buildLoading==='keywords'?'⏳ Regenerating…':'↺ Regenerate'}
+                                      </button>
+                                    </div>
+                                    {[
+                                      {key:'exact_match',          label:'Exact Match',   color:'#0c4a6e', bg:'#e0f2fe'},
+                                      {key:'phrase_match',         label:'Phrase Match',  color:'#065f46', bg:'#d1fae5'},
+                                      {key:'broad_match_modifier', label:'Broad Match',   color:'#713f12', bg:'#fef3c7'},
+                                      {key:'negative_keywords',    label:'Negatives',     color:'#7f1d1d', bg:'#fee2e2'},
+                                    ].map(({key,label,color,bg})=>(
+                                      (build.keywords[key]||[]).length > 0 && (
+                                        <div key={key} style={{marginBottom:16}}>
+                                          <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:6}}>
+                                            {label} ({(build.keywords[key]||[]).length})
+                                          </div>
+                                          <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                                            {(build.keywords[key]||[]).map((kw,i)=>(
+                                              <span key={i} style={{background:bg,color,fontSize:11,padding:'3px 9px',borderRadius:4,border:`1px solid ${color}30`}}>{kw}</span>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      )
+                                    ))}
                                   </div>
-                                  {[
-                                    {key:'exact_match',      label:'Exact Match',           color:'#0c4a6e', bg:'#e0f2fe'},
-                                    {key:'phrase_match',     label:'Phrase Match',           color:'#065f46', bg:'#d1fae5'},
-                                    {key:'broad_match_modifier', label:'Broad Match',        color:'#713f12', bg:'#fef3c7'},
-                                    {key:'negative_keywords',label:'Negative Keywords',      color:'#7f1d1d', bg:'#fee2e2'},
-                                  ].map(({key,label,color,bg})=>(
-                                    (build.keywords[key]||[]).length > 0 && (
-                                      <div key={key} style={{marginBottom:16}}>
-                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
-                                          letterSpacing:'.5px',marginBottom:6}}>
-                                          {label} ({(build.keywords[key]||[]).length})
-                                        </div>
-                                        <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
-                                          {(build.keywords[key]||[]).map((kw,i)=>(
-                                            <span key={i} style={{background:bg,color,fontSize:11,
-                                              padding:'3px 9px',borderRadius:4,border:`1px solid ${color}30`}}>{kw}</span>
-                                          ))}
-                                        </div>
-                                      </div>
-                                    )
-                                  ))}
-                                </div>
-                              )}
-                              {build.keywords && <RefineBox step="keywords"/>}
-                            </div>
-                          )}
+                                )}
+                                {build.keywords && <RefineBox step="keywords"/>}
+                              </div>
+                            );
+                          })()}
 
                           {/* ── Ad Copy tab ── */}
-                          {detailTab==='ad_copy' && (
-                            <div>
-                              {!build.ad_copy ? (
+                          {detailTab==='ad_copy' && (() => {
+                            const snapAds = gadsSnap.ad_copy;
+                            const hasSnapAds = snapAds && (snapAds.ads||[]).length > 0;
+                            if (hasSnapAds) {
+                              return (
                                 <div>
-                                  <SnapshotBanner step="ad_copy" label="RSA ad copies"/>
+                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                    <div style={{fontSize:13,fontWeight:700}}>✍ RSA Ad Copy</div>
+                                    <span style={{fontSize:10,color:'var(--text-muted)'}}>
+                                      Synced from Google Ads{snapSyncedAt ? ` · ${snapSyncedAt}` : ''}
+                                    </span>
+                                  </div>
+                                  {(snapAds.ads||[]).map((ad, i) => (
+                                    <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
+                                      borderRadius:8,padding:'14px 16px',marginBottom:14}}>
+                                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
+                                        <div>
+                                          <div style={{fontSize:12,fontWeight:700}}>{ad.ad_group || `Ad ${i+1}`}</div>
+                                          <div style={{fontSize:10,color:'var(--text-muted)',marginTop:1}}>{ad.ad_type}</div>
+                                        </div>
+                                        <div style={{display:'flex',gap:5,alignItems:'center'}}>
+                                          {ad.ad_strength && ad.ad_strength !== 'UNSPECIFIED' && (
+                                            <span style={{fontSize:9,padding:'2px 7px',borderRadius:3,fontWeight:700,
+                                              background: ad.ad_strength==='EXCELLENT'?'#d1fae5':ad.ad_strength==='GOOD'?'#fef3c7':'#f3f4f6',
+                                              color: ad.ad_strength==='EXCELLENT'?'#065f46':ad.ad_strength==='GOOD'?'#713f12':'#374151'}}>
+                                              {ad.ad_strength}
+                                            </span>
+                                          )}
+                                          {ad.approval_status && ad.approval_status !== 'UNSPECIFIED' && (
+                                            <span style={{fontSize:9,padding:'2px 7px',borderRadius:3,
+                                              background: ad.approval_status==='APPROVED'?'#d1fae5':'#fee2e2',
+                                              color: ad.approval_status==='APPROVED'?'#065f46':'#7f1d1d'}}>
+                                              {ad.approval_status}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                      {(ad.headlines||[]).length > 0 && (
+                                        <div style={{marginBottom:10}}>
+                                          <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
+                                            Headlines ({ad.headlines.length})
+                                          </div>
+                                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                                            {ad.headlines.map((h,j)=>(
+                                              <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',
+                                                fontSize:10,padding:'3px 8px',borderRadius:4,border:'1px solid #bae6fd'}}>{h}</span>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      )}
+                                      {(ad.descriptions||[]).length > 0 && (
+                                        <div style={{marginBottom:8}}>
+                                          <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
+                                            Descriptions ({ad.descriptions.length})
+                                          </div>
+                                          {ad.descriptions.map((d,j)=>(
+                                            <div key={j} style={{fontSize:11,padding:'5px 10px',background:'#fff',
+                                              border:'1px solid var(--border)',borderRadius:5,marginBottom:4,lineHeight:1.5}}>{d}</div>
+                                          ))}
+                                        </div>
+                                      )}
+                                      {(ad.final_urls||[]).length > 0 && (
+                                        <div style={{fontSize:10,color:'var(--text-muted)'}}>
+                                          🔗 {ad.final_urls[0]}
+                                          {(ad.path1||ad.path2) && <span> / {[ad.path1,ad.path2].filter(Boolean).join(' / ')}</span>}
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              );
+                            }
+                            // New campaign wizard
+                            return (
+                              <div>
+                                {!build.ad_copy ? (
                                   <div style={{textAlign:'center',padding:40}}>
                                     <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>✍ Ad Copy</div>
                                     <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
@@ -4263,58 +4393,99 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       {buildLoading==='ad_copy' ? '⏳ Generating…' : '✨ Generate Ad Copy'}
                                     </button>
                                   </div>
-                                </div>
-                              ) : (
-                                <div>
-                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
-                                    <div style={{fontSize:13,fontWeight:700}}>✍ RSA Ad Copy</div>
-                                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
-                                      disabled={!!buildLoading}
-                                      onClick={()=>generateBuildStep('ad_copy')}>
-                                      {buildLoading==='ad_copy'?'⏳ Regenerating…':'↺ Regenerate'}
-                                    </button>
-                                  </div>
-                                  {(build.ad_copy.ad_groups||[]).map((ag,i)=>(
-                                    <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
-                                      borderRadius:8,padding:'14px 16px',marginBottom:14}}>
-                                      <div style={{fontSize:12,fontWeight:700,marginBottom:3}}>{ag.name}</div>
-                                      <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:10}}>{ag.theme}</div>
-                                      <div style={{marginBottom:10}}>
-                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
-                                          Headlines ({(ag.headlines||[]).length}/15)
+                                ) : (
+                                  <div>
+                                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                      <div style={{fontSize:13,fontWeight:700}}>✍ RSA Ad Copy</div>
+                                      <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
+                                        disabled={!!buildLoading}
+                                        onClick={()=>generateBuildStep('ad_copy')}>
+                                        {buildLoading==='ad_copy'?'⏳ Regenerating…':'↺ Regenerate'}
+                                      </button>
+                                    </div>
+                                    {(build.ad_copy.ad_groups||[]).map((ag,i)=>(
+                                      <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
+                                        borderRadius:8,padding:'14px 16px',marginBottom:14}}>
+                                        <div style={{fontSize:12,fontWeight:700,marginBottom:3}}>{ag.name}</div>
+                                        <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:10}}>{ag.theme}</div>
+                                        <div style={{marginBottom:10}}>
+                                          <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
+                                            Headlines ({(ag.headlines||[]).length}/15)
+                                          </div>
+                                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                                            {(ag.headlines||[]).map((h,j)=>(
+                                              <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',
+                                                fontSize:10,padding:'3px 8px',borderRadius:4,border:'1px solid #bae6fd'}}>{h}</span>
+                                            ))}
+                                          </div>
                                         </div>
-                                        <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
-                                          {(ag.headlines||[]).map((h,j)=>(
-                                            <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',
-                                              fontSize:10,padding:'3px 8px',borderRadius:4,
-                                              border:'1px solid #bae6fd'}}>{h}</span>
+                                        <div>
+                                          <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
+                                            Descriptions ({(ag.descriptions||[]).length}/4)
+                                          </div>
+                                          {(ag.descriptions||[]).map((d,j)=>(
+                                            <div key={j} style={{fontSize:11,padding:'5px 10px',background:'#fff',
+                                              border:'1px solid var(--border)',borderRadius:5,marginBottom:4,
+                                              lineHeight:1.5,color:'var(--text)'}}>{d}</div>
                                           ))}
                                         </div>
                                       </div>
-                                      <div>
-                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:5}}>
-                                          Descriptions ({(ag.descriptions||[]).length}/4)
+                                    ))}
+                                  </div>
+                                )}
+                                {build.ad_copy && <RefineBox step="ad_copy"/>}
+                              </div>
+                            );
+                          })()}
+
+                          {/* ── Ad Groups tab ── */}
+                          {detailTab==='ad_groups' && (() => {
+                            const snapAG = gadsSnap.ad_groups;
+                            const hasSnapAG = snapAG && (snapAG.ad_groups||[]).length > 0;
+                            if (hasSnapAG) {
+                              return (
+                                <div>
+                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                    <div style={{fontSize:13,fontWeight:700}}>📂 Ad Groups</div>
+                                    <span style={{fontSize:10,color:'var(--text-muted)'}}>
+                                      Synced from Google Ads{snapSyncedAt ? ` · ${snapSyncedAt}` : ''}
+                                    </span>
+                                  </div>
+                                  {(snapAG.ad_groups||[]).map((ag, i) => (
+                                    <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
+                                      borderRadius:8,padding:'14px 16px',marginBottom:12}}>
+                                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+                                        <div>
+                                          <div style={{fontSize:12,fontWeight:700}}>{ag.ad_group_name}</div>
+                                          <div style={{fontSize:10,color:'var(--text-muted)',marginTop:1}}>{ag.type}</div>
                                         </div>
-                                        {(ag.descriptions||[]).map((d,j)=>(
-                                          <div key={j} style={{fontSize:11,padding:'5px 10px',background:'#fff',
-                                            border:'1px solid var(--border)',borderRadius:5,marginBottom:4,
-                                            lineHeight:1.5,color:'var(--text)'}}>{d}</div>
-                                        ))}
+                                        <div style={{textAlign:'right',flexShrink:0}}>
+                                          {ag.cpc_bid_usd && (
+                                            <div style={{fontSize:12,fontWeight:700,color:'var(--teal)'}}>
+                                              ${ag.cpc_bid_usd} CPC
+                                            </div>
+                                          )}
+                                          {ag.target_cpa_usd && (
+                                            <div style={{fontSize:10,color:'var(--text-muted)'}}>
+                                              Target CPA: ${ag.target_cpa_usd}
+                                            </div>
+                                          )}
+                                          <span style={{fontSize:9,padding:'2px 6px',borderRadius:3,
+                                            background: ag.status==='ENABLED'?'#d1fae5':'#fef3c7',
+                                            color: ag.status==='ENABLED'?'#065f46':'#713f12',fontWeight:700}}>
+                                            {ag.status}
+                                          </span>
+                                        </div>
                                       </div>
                                     </div>
                                   ))}
                                 </div>
-                              )}
-                              {build.ad_copy && <RefineBox step="ad_copy"/>}
-                            </div>
-                          )}
-
-                          {/* ── Ad Groups tab ── */}
-                          {detailTab==='ad_groups' && (
-                            <div>
-                              {!build.ad_groups ? (
-                                <div>
-                                  <SnapshotBanner step="ad_groups" label="Ad groups"/>
+                              );
+                            }
+                            // New campaign wizard
+                            return (
+                              <div>
+                                {!build.ad_groups ? (
                                   <div style={{textAlign:'center',padding:40}}>
                                     <div style={{fontSize:13,color:'var(--text)',marginBottom:8,fontWeight:600}}>📂 Ad Group Structure</div>
                                     <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:20}}>
@@ -4327,65 +4498,65 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       {buildLoading==='ad_groups' ? '⏳ Generating…' : '✨ Generate Structure'}
                                     </button>
                                   </div>
-                                </div>
-                              ) : (
-                                <div>
-                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
-                                    <div style={{fontSize:13,fontWeight:700}}>📂 Ad Group Structure</div>
-                                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
-                                      disabled={!!buildLoading}
-                                      onClick={()=>generateBuildStep('ad_groups')}>
-                                      {buildLoading==='ad_groups'?'⏳ Regenerating…':'↺ Regenerate'}
-                                    </button>
+                                ) : (
+                                  <div>
+                                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                      <div style={{fontSize:13,fontWeight:700}}>📂 Ad Group Structure</div>
+                                      <button className="btn btn-ghost btn-sm" style={{fontSize:10}}
+                                        disabled={!!buildLoading}
+                                        onClick={()=>generateBuildStep('ad_groups')}>
+                                        {buildLoading==='ad_groups'?'⏳ Regenerating…':'↺ Regenerate'}
+                                      </button>
+                                    </div>
+                                    {build.ad_groups.bidding_strategy && (
+                                      <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:7,
+                                        padding:'10px 14px',marginBottom:14}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'#1e40af',marginBottom:3}}>💡 Bidding Strategy</div>
+                                        <div style={{fontSize:11,lineHeight:1.5}}>{build.ad_groups.bidding_strategy}</div>
+                                      </div>
+                                    )}
+                                    {(build.ad_groups.ad_groups||[]).map((ag,i)=>(
+                                      <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
+                                        borderRadius:8,padding:'14px 16px',marginBottom:12}}>
+                                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
+                                          <div>
+                                            <div style={{fontSize:12,fontWeight:700}}>{ag.name}</div>
+                                            <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>{ag.theme}</div>
+                                          </div>
+                                          <div style={{textAlign:'right'}}>
+                                            <div style={{fontSize:13,fontWeight:700,color:'var(--teal)'}}>${ag.suggested_cpc_usd} CPC</div>
+                                            <div style={{fontSize:10,color:'var(--text-muted)'}}>{ag.daily_budget_pct}% of budget</div>
+                                          </div>
+                                        </div>
+                                        <div style={{marginBottom:8}}>
+                                          <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:4}}>
+                                            Keywords ({(ag.keywords||[]).length})
+                                          </div>
+                                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                                            {(ag.keywords||[]).map((kw,j)=>(
+                                              <span key={j} style={{background:'#f3f4f6',color:'var(--text)',
+                                                fontSize:10,padding:'2px 8px',borderRadius:3,
+                                                border:'1px solid var(--border)'}}>{kw}</span>
+                                            ))}
+                                          </div>
+                                        </div>
+                                        {ag.notes && (
+                                          <div style={{fontSize:10,color:'var(--text-muted)',fontStyle:'italic',lineHeight:1.4}}>{ag.notes}</div>
+                                        )}
+                                      </div>
+                                    ))}
+                                    {build.ad_groups.budget_allocation_notes && (
+                                      <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.5,marginTop:8,
+                                        padding:'10px 14px',background:'#fafafa',borderRadius:6,border:'1px solid var(--border)'}}>
+                                        <strong>Budget notes:</strong> {build.ad_groups.budget_allocation_notes}
+                                      </div>
+                                    )}
                                   </div>
-                                  {build.ad_groups.bidding_strategy && (
-                                    <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:7,
-                                      padding:'10px 14px',marginBottom:14}}>
-                                      <div style={{fontSize:10,fontWeight:700,color:'#1e40af',marginBottom:3}}>💡 Bidding Strategy</div>
-                                      <div style={{fontSize:11,lineHeight:1.5}}>{build.ad_groups.bidding_strategy}</div>
-                                    </div>
-                                  )}
-                                  {(build.ad_groups.ad_groups||[]).map((ag,i)=>(
-                                    <div key={i} style={{background:'#fafafa',border:'1px solid var(--border)',
-                                      borderRadius:8,padding:'14px 16px',marginBottom:12}}>
-                                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
-                                        <div>
-                                          <div style={{fontSize:12,fontWeight:700}}>{ag.name}</div>
-                                          <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>{ag.theme}</div>
-                                        </div>
-                                        <div style={{textAlign:'right'}}>
-                                          <div style={{fontSize:13,fontWeight:700,color:'var(--teal)'}}>${ag.suggested_cpc_usd} CPC</div>
-                                          <div style={{fontSize:10,color:'var(--text-muted)'}}>{ag.daily_budget_pct}% of budget</div>
-                                        </div>
-                                      </div>
-                                      <div style={{marginBottom:8}}>
-                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.4px',marginBottom:4}}>
-                                          Keywords ({(ag.keywords||[]).length})
-                                        </div>
-                                        <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
-                                          {(ag.keywords||[]).map((kw,j)=>(
-                                            <span key={j} style={{background:'#f3f4f6',color:'var(--text)',
-                                              fontSize:10,padding:'2px 8px',borderRadius:3,
-                                              border:'1px solid var(--border)'}}>{kw}</span>
-                                          ))}
-                                        </div>
-                                      </div>
-                                      {ag.notes && (
-                                        <div style={{fontSize:10,color:'var(--text-muted)',fontStyle:'italic',lineHeight:1.4}}>{ag.notes}</div>
-                                      )}
-                                    </div>
-                                  ))}
-                                  {build.ad_groups.budget_allocation_notes && (
-                                    <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.5,marginTop:8,
-                                      padding:'10px 14px',background:'#fafafa',borderRadius:6,border:'1px solid var(--border)'}}>
-                                      <strong>Budget notes:</strong> {build.ad_groups.budget_allocation_notes}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-                              {build.ad_groups && <RefineBox step="ad_groups"/>}
-                            </div>
-                          )}
+                                )}
+                                {build.ad_groups && <RefineBox step="ad_groups"/>}
+                              </div>
+                            );
+                          })()}
 
                           {/* ── Launch tab ── */}
                           {detailTab==='launch' && (
