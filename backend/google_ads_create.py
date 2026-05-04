@@ -70,8 +70,8 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         campaign_name    = campaign.get("campaign_name", "New Campaign")
         monthly_budget   = float(campaign.get("monthly_budget") or 0)
         daily_budget_usd = round(monthly_budget / 30.4, 2) if monthly_budget else 10.0
-        landing_page     = campaign.get("landing_page") or settings.practice_website or "https://graftondentalcare.com"
-        call_phone       = campaign.get("call_extension_phone") or getattr(settings, "practice_phone", "") or ""
+        landing_page     = campaign.get("landing_page") or settings.practice_url or "https://graftondentalcare.com"
+        call_phone       = campaign.get("call_extension_phone") or settings.office_phone or ""
         geo_json         = campaign.get("geographic_targeting") or ""
         start_date       = campaign.get("start_date") or ""
 
@@ -96,19 +96,34 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         log.append(f"  ✓ Budget created: {budget_resource}")
 
         # ── Step 2: Campaign (PAUSED) ─────────────────────────────────────────
-        log.append(f"Step 2: Creating campaign '{campaign_name}' (PAUSED)")
+        # Append a short timestamp suffix so retries never hit DUPLICATE_CAMPAIGN_NAME.
+        # Previous partial attempts leave a paused campaign with the bare name.
+        from datetime import datetime as _dt
+        gads_campaign_name = f"{campaign_name} ({_dt.now().strftime('%m/%d %H:%M')})"
+        log.append(f"Step 2: Creating campaign '{gads_campaign_name}' (PAUSED)")
         camp_service = client.get_service("CampaignService")
         camp_op      = client.get_type("CampaignOperation")
         camp         = camp_op.create
-        camp.name    = campaign_name
+        camp.name    = gads_campaign_name
         camp.status  = client.enums.CampaignStatusEnum.PAUSED
         camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
         camp.campaign_budget = budget_resource
 
-        # Manual CPC bidding — use copy_from to activate the oneof so Google
-        # recognises this as the selected bidding strategy (proto-plus oneof
-        # requires a non-default field assignment or copy_from to be "set").
-        client.copy_from(camp.manual_cpc, client.get_type("ManualCpc")())
+        # Manual CPC bidding — setting any field on camp.manual_cpc activates
+        # the bidding_strategy oneof in proto-plus. enhanced_cpc_enabled=False
+        # is the explicit field assignment that marks the oneof as selected.
+        camp.manual_cpc.enhanced_cpc_enabled = False
+
+        # Required in Google Ads API v24+ — this is an ENUM, not a bool.
+        # UNSPECIFIED (0) is the proto-plus default so Google rejects it as
+        # "REQUIRED field not present". Must set the explicit non-EU value (3).
+        # client.enums.EuPoliticalAdvertisingStatusEnum already returns the
+        # inner EuPoliticalAdvertisingStatus ProtoEnumMeta — access values
+        # directly (no .EuPoliticalAdvertisingStatus sub-attribute needed).
+        camp.contains_eu_political_advertising = (
+            client.enums.EuPoliticalAdvertisingStatusEnum
+            .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
+        )
 
         # Network settings — search only, no display, no partners
         camp.network_settings.target_google_search     = True
@@ -277,6 +292,13 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
                 kw_ops.append(op)
 
             if kw_ops:
+                # Dental keywords trigger HEALTH_IN_PERSONALIZED_ADS policy
+                # (is_exemptible=True). Add exemption key to every operation
+                # so Google allows them without blocking the entire batch.
+                exempt_key = client.get_type("PolicyViolationKey")
+                exempt_key.policy_name = "HEALTH_IN_PERSONALIZED_ADS"
+                for op in kw_ops:
+                    op.exempt_policy_violation_keys.append(exempt_key)
                 kw_response = kw_service.mutate_ad_group_criteria(
                     customer_id=customer_id, operations=kw_ops
                 )
@@ -600,11 +622,13 @@ def set_campaign_status(campaign_resource_name: str, target_status: str) -> dict
         }
         campaign.status = status_map[target_status]
 
-        # Explicit field mask — only update `status`, never touch other fields
-        # Pattern from ai_optimizer.py (same codebase, confirmed working)
+        # Explicit field mask — only update `status`, never touch other fields.
+        # FieldMask is a protobuf well-known type, NOT a Google Ads API type;
+        # client.get_type("FieldMask") doesn't exist in v24.
+        from google.protobuf import field_mask_pb2
         client.copy_from(
             campaign_operation.update_mask,
-            client.get_type("FieldMask")(paths=["status"]),
+            field_mask_pb2.FieldMask(paths=["status"]),
         )
 
         # Single-operation mutate — no partial_failure needed for one op
@@ -693,9 +717,10 @@ def enable_ai_max(campaign_resource_name: str) -> dict:
         # Set the single AI Max master switch
         campaign.ai_max_setting.enable_ai_max = True
 
+        from google.protobuf import field_mask_pb2
         client.copy_from(
             campaign_operation.update_mask,
-            client.get_type("FieldMask")(paths=["ai_max_setting.enable_ai_max"]),
+            field_mask_pb2.FieldMask(paths=["ai_max_setting.enable_ai_max"]),
         )
 
         response = campaign_service.mutate_campaigns(
@@ -744,9 +769,10 @@ def disable_ai_max(campaign_resource_name: str) -> dict:
         campaign.resource_name = campaign_resource_name
         campaign.ai_max_setting.enable_ai_max = False
 
+        from google.protobuf import field_mask_pb2
         client.copy_from(
             campaign_operation.update_mask,
-            client.get_type("FieldMask")(paths=["ai_max_setting.enable_ai_max"]),
+            field_mask_pb2.FieldMask(paths=["ai_max_setting.enable_ai_max"]),
         )
 
         response = campaign_service.mutate_campaigns(

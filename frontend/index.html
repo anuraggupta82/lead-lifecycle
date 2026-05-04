@@ -5351,7 +5351,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                 <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>Name this campaign and tell us what type it is.</div>
 
                 {/* ── Copy from existing campaign ── */}
-                {(managedCamps||[]).length > 0 && (
+                {(unifiedCamps||[]).length > 0 && (
                   <div style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:7,padding:'10px 12px',marginBottom:14,display:'flex',alignItems:'center',gap:10}}>
                     <span style={{fontSize:11,fontWeight:600,color:'#0369a1',whiteSpace:'nowrap'}}>📋 Copy from:</span>
                     <select style={{flex:1,fontSize:12,padding:'6px 8px',border:'1px solid #bae6fd',borderRadius:5,background:'white'}}
@@ -5360,7 +5360,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                         const campId = e.target.value;
                         setWizardCopyFrom(campId);
                         if (!campId) return;
-                        const src = (managedCamps||[]).find(c => c.campaign_id === campId);
+                        const src = (unifiedCamps||[]).find(c => c.campaign_id === campId);
                         if (!src) return;
                         // Pre-fill all editable fields from source campaign (keep name blank for user to name)
                         setNewCamp(p => ({
@@ -5380,7 +5380,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                         if (src.skip_workflow) setWizardSkipWorkflow(true);
                       }}>
                       <option value="">— Start from scratch —</option>
-                      {(managedCamps||[]).filter(c=>c.campaign_id).map(c=>(
+                      {(unifiedCamps||[]).filter(c=>c.campaign_id).map(c=>(
                         <option key={c.campaign_id} value={c.campaign_id}>{c.campaign_name}</option>
                       ))}
                     </select>
