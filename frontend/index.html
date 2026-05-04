@@ -3188,6 +3188,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [wizardStepError, setWizardStepError] = useState('');
   const [wizardWorkflows, setWizardWorkflows] = useState([]);
   const [wizardWfId, setWizardWfId] = useState('');
+  const [wizardSkipWorkflow, setWizardSkipWorkflow] = useState(false);
+  const [wizardCopyFrom, setWizardCopyFrom] = useState(''); // campaign_id to copy settings from
   const [wizardStrategy, setWizardStrategy] = useState(null);
   const [wizardStrategyLoading, setWizardStrategyLoading] = useState(false);
   const EMPTY_CAMP = {
@@ -3216,6 +3218,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     setNewCamp(initial);
     setWizardDailyBudget('');
     setWizardWfId('');
+    setWizardSkipWorkflow(false);
+    setWizardCopyFrom('');
     setCampSaveMsg('');
     setWizardStepError('');
     try {
@@ -3230,6 +3234,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     setNewCamp(EMPTY_CAMP);
     setWizardDailyBudget('');
     setWizardWfId('');
+    setWizardSkipWorkflow(false);
+    setWizardCopyFrom('');
     setCampSaveMsg('');
     setWizardStepError('');
     setWizardStrategy(null);
@@ -3256,11 +3262,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   async function wizardLaunch() {
     setSavingCamp(true); setCampSaveMsg(''); setWizardStepError('');
     try {
-      const wfIdVal = wizardWfId === '' ? null : parseInt(wizardWfId) || null;
+      const wfIdVal = wizardSkipWorkflow ? null : (wizardWfId === '' ? null : parseInt(wizardWfId) || null);
       const savedCamp = { ...newCamp,
         monthly_budget: parseFloat(newCamp.monthly_budget) || 0,
         expected_cpl: parseFloat(newCamp.expected_cpl) || 0,
         workflow_id: wfIdVal,
+        skip_workflow: wizardSkipWorkflow,
       };
       const createRes = await api('/api/admin/campaigns/create', { method: 'POST', body: JSON.stringify(savedCamp) });
       const createdCampId = createRes?.campaign?.campaign_id || null;
@@ -5343,6 +5350,49 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                 <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>Campaign Identity</div>
                 <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:16}}>Name this campaign and tell us what type it is.</div>
 
+                {/* ── Copy from existing campaign ── */}
+                {(managedCamps||[]).length > 0 && (
+                  <div style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:7,padding:'10px 12px',marginBottom:14,display:'flex',alignItems:'center',gap:10}}>
+                    <span style={{fontSize:11,fontWeight:600,color:'#0369a1',whiteSpace:'nowrap'}}>📋 Copy from:</span>
+                    <select style={{flex:1,fontSize:12,padding:'6px 8px',border:'1px solid #bae6fd',borderRadius:5,background:'white'}}
+                      value={wizardCopyFrom}
+                      onChange={e => {
+                        const campId = e.target.value;
+                        setWizardCopyFrom(campId);
+                        if (!campId) return;
+                        const src = (managedCamps||[]).find(c => c.campaign_id === campId);
+                        if (!src) return;
+                        // Pre-fill all editable fields from source campaign (keep name blank for user to name)
+                        setNewCamp(p => ({
+                          ...p,
+                          campaign_type: src.campaign_type || 'MANUAL',
+                          service_focus: src.service_focus || '',
+                          promo_offer: src.promo_offer || '',
+                          target_audience: src.target_audience || '',
+                          objective: src.objective || '',
+                          monthly_budget: src.monthly_budget || '',
+                          expected_cpl: src.expected_cpl || '',
+                          landing_page: src.landing_page || '',
+                          notes: src.notes || '',
+                        }));
+                        if (src.monthly_budget) setWizardDailyBudget(String(monthlyToDaily(src.monthly_budget)));
+                        if (src.workflow_id) setWizardWfId(String(src.workflow_id));
+                        if (src.skip_workflow) setWizardSkipWorkflow(true);
+                      }}>
+                      <option value="">— Start from scratch —</option>
+                      {(managedCamps||[]).filter(c=>c.campaign_id).map(c=>(
+                        <option key={c.campaign_id} value={c.campaign_id}>{c.campaign_name}</option>
+                      ))}
+                    </select>
+                    {wizardCopyFrom && (
+                      <button style={{fontSize:11,color:'#64748b',background:'none',border:'none',cursor:'pointer',whiteSpace:'nowrap'}}
+                        onClick={()=>{ setWizardCopyFrom(''); setNewCamp(p=>({...EMPTY_CAMP,campaign_name:p.campaign_name})); setWizardDailyBudget(''); setWizardWfId(''); setWizardSkipWorkflow(false); }}>
+                        ✕ Clear
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
                   <div>
                     <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Campaign Name *</label>
@@ -5492,6 +5542,25 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   Leave blank to use the default workflow.
                 </div>
 
+                {/* ── Skip workflow toggle ── */}
+                <div style={{marginBottom:14,padding:'10px 14px',border:`2px solid ${wizardSkipWorkflow ? '#f97316' : 'var(--border)'}`,borderRadius:8,background: wizardSkipWorkflow ? '#fff7ed' : 'var(--bg)',cursor:'pointer',transition:'all .15s'}}
+                  onClick={()=>{ setWizardSkipWorkflow(p=>!p); if(!wizardSkipWorkflow) setWizardWfId(''); }}>
+                  <div style={{display:'flex',alignItems:'center',gap:10}}>
+                    <div style={{width:36,height:20,borderRadius:10,background: wizardSkipWorkflow ? '#f97316' : '#d1d5db',transition:'background .15s',position:'relative',flexShrink:0}}>
+                      <div style={{position:'absolute',top:2,left: wizardSkipWorkflow ? 18 : 2,width:16,height:16,borderRadius:'50%',background:'white',transition:'left .15s',boxShadow:'0 1px 3px rgba(0,0,0,.2)'}}/>
+                    </div>
+                    <div>
+                      <div style={{fontSize:12,fontWeight:700,color: wizardSkipWorkflow ? '#ea580c' : 'var(--text)'}}>
+                        🚫 No follow-up needed
+                      </div>
+                      <div style={{fontSize:10,color:'var(--text-muted)',marginTop:1}}>
+                        Leads from this campaign will NOT receive automated emails or SMS. Use for emergency campaigns where patients call the office directly.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {!wizardSkipWorkflow && (
                 <div style={{marginBottom:14}}>
                   <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Workflow</label>
                   <select style={{width:'100%',fontSize:12,padding:'8px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
@@ -5505,9 +5574,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                     ))}
                   </select>
                 </div>
+                )}
 
                 {/* Workflow step preview */}
-                {wizardWfId && (() => {
+                {!wizardSkipWorkflow && wizardWfId && (() => {
                   const wf = wizardWorkflows.find(w => String(w.id) === wizardWfId);
                   if (!wf || !(wf.steps||[]).length) return (
                     <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',padding:'10px 0'}}>No steps in this workflow yet.</div>
@@ -5529,10 +5599,15 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   );
                 })()}
 
-                {!wizardWfId && (
+                {!wizardSkipWorkflow && !wizardWfId && (
                   <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,padding:'10px 14px',fontSize:11,color:'#166534'}}>
                     ✅ The default workflow will fire automatically for leads from this campaign.
                     You can attach a specific workflow later from the Campaigns table.
+                  </div>
+                )}
+                {wizardSkipWorkflow && (
+                  <div style={{background:'#fff7ed',border:'1px solid #fed7aa',borderRadius:8,padding:'10px 14px',fontSize:11,color:'#c2410c'}}>
+                    🚫 No follow-up emails or SMS will be sent for leads from this campaign. Leads will still appear in the pipeline.
                   </div>
                 )}
               </div>
@@ -7438,14 +7513,19 @@ function LaunchButtonGroup({campaignId, canLaunch, onLaunched}) {
   const [schedDate, setSchedDate] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState('');
+  const [launchLog, setLaunchLog] = React.useState(null); // creation log from API
 
   async function doLaunch(mode, launch_date) {
-    setBusy(true); setErr('');
+    setBusy(true); setErr(''); setLaunchLog(null);
     try {
       const r = await api(`/api/admin/campaigns/${campaignId}/launch`, {
         method: 'POST',
         body: JSON.stringify({mode, launch_date: launch_date || null})
       });
+      // Show creation log if a new campaign was pushed to Google Ads
+      if (r.gads_action === 'created' && r.log) {
+        setLaunchLog({log: r.log, keywords: r.keywords_added, ads: r.ads_created, resource: r.resource_name, enabled: r.enabled});
+      }
       if (typeof onLaunched === 'function') onLaunched(r.status, r.launch_date || '');
     } catch(e) {
       setErr(e.message || 'Launch failed');
@@ -7458,6 +7538,20 @@ function LaunchButtonGroup({campaignId, canLaunch, onLaunched}) {
   return (
     <div style={{position:'relative'}}>
       {err && <div style={{color:'#dc2626',fontSize:12,marginBottom:6}}>{err}</div>}
+      {launchLog && (
+        <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,padding:'12px 14px',marginBottom:12,fontSize:11}}>
+          <div style={{fontWeight:700,color:'#15803d',marginBottom:6}}>
+            ✅ Campaign live in Google Ads! {launchLog.keywords} keywords · {launchLog.ads} RSA ad(s)
+          </div>
+          <div style={{fontFamily:'monospace',fontSize:10,color:'#374151',lineHeight:1.6,maxHeight:140,overflowY:'auto'}}>
+            {(launchLog.log||[]).map((line,i)=><div key={i}>{line}</div>)}
+          </div>
+          {!launchLog.enabled && (
+            <div style={{color:'#d97706',marginTop:6,fontSize:11}}>⚠ Campaign created but not auto-enabled — please enable manually in Google Ads.</div>
+          )}
+          <button onClick={()=>setLaunchLog(null)} style={{marginTop:8,fontSize:10,color:'#6b7280',background:'none',border:'none',cursor:'pointer'}}>Dismiss</button>
+        </div>
+      )}
       <div style={{display:'flex',borderRadius:8,overflow:'hidden'}}>
         <button
           disabled={!canLaunch || busy}

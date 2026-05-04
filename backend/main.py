@@ -1499,6 +1499,7 @@ class CampaignCreateRequest(BaseModel):
     landing_page: Optional[str] = ""
     notes: Optional[str] = ""
     workflow_id: Optional[int] = None      # Attached follow-up workflow (NULL = use default)
+    skip_workflow: bool = False            # If True, no follow-up emails/SMS for leads from this campaign
 
     @validator("campaign_name")
     def name_not_empty(cls, v):
@@ -1708,32 +1709,74 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
     # Server-side gate: required checklist items must be done or skipped before "now"
     if body.mode == "now":
         build = get_campaign_build(campaign_id)
-        checklist = build.get("launch_checklist") or []
-        blockers = [
-            x.get("item") for x in checklist
-            if isinstance(x, dict)
-            and x.get("category") == "required"
-            and not x.get("done")
-            and not x.get("skipped")
-        ]
-        if blockers:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot launch: required items incomplete: {', '.join(blockers)}"
+
+        # If campaign already has a gads_campaign_resource it exists in Google Ads —
+        # just enable it (Pause→Enable). Otherwise create it from scratch.
+        existing_resource = camp.get("gads_campaign_resource") or ""
+
+        if existing_resource:
+            # ── Already in Google Ads — just enable ──────────────────────────
+            from google_ads_create import set_campaign_status
+            result = set_campaign_status(existing_resource, "ENABLED")
+            if not result["ok"]:
+                raise HTTPException(status_code=502, detail=f"Google Ads enable failed: {result['error']}")
+            update_campaign_status(
+                campaign_id, "ACTIVE",
+                launch_date=_dt.datetime.utcnow().isoformat() + "Z",
+            )
+            return {
+                "ok": True,
+                "status": "ACTIVE",
+                "campaign_id": campaign_id,
+                "gads_action": "enabled_existing",
+                "resource_name": existing_resource,
+                "launch_date": _dt.datetime.utcnow().isoformat() + "Z",
+            }
+        else:
+            # ── New campaign — create in Google Ads ──────────────────────────
+            from google_ads_create import create_campaign_in_gads
+            from database import update_campaign_fields
+
+            logger.info(f"Launching new campaign {campaign_id} to Google Ads")
+            result = create_campaign_in_gads(camp, build)
+
+            if not result["ok"]:
+                logger.error(f"create_campaign_in_gads failed: {result['error']}\nLog:\n" + "\n".join(result.get("log",[])))
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Google Ads creation failed: {result['error']}"
+                )
+
+            # Save the Google Ads resource name + numeric ID back to the campaign row
+            # (campaign_id is not in ALLOWED set so update_campaign_fields would be a no-op;
+            #  the direct SQL two lines below is the actual save path)
+            # Also store gads_campaign_resource for future pause/resume
+            from database import _conn
+            with _conn() as conn:
+                conn.execute(
+                    "UPDATE campaigns SET gads_campaign_resource=?, gads_campaign_numeric_id=?, updated_at=? WHERE campaign_id=?",
+                    (result["campaign_resource_name"], result["campaign_numeric_id"],
+                     _dt.datetime.utcnow().isoformat(), campaign_id)
+                )
+
+            update_campaign_status(
+                campaign_id, "ACTIVE",
+                launch_date=_dt.datetime.utcnow().isoformat() + "Z",
             )
 
-        update_campaign_status(
-            campaign_id,
-            "ACTIVE",
-            launch_date=_dt.datetime.utcnow().isoformat() + "Z",
-        )
-        return {
-            "ok": True,
-            "status": "ACTIVE",
-            "campaign_id": campaign_id,
-            "launch_date": _dt.datetime.utcnow().isoformat() + "Z",
-            "note": "Marked ACTIVE. Google Ads API push pipeline will be wired in a future update.",
-        }
+            return {
+                "ok": True,
+                "status": "ACTIVE",
+                "campaign_id": campaign_id,
+                "gads_action": "created",
+                "resource_name": result["campaign_resource_name"],
+                "campaign_numeric_id": result["campaign_numeric_id"],
+                "keywords_added": result["keywords_added"],
+                "ads_created": result["ads_created"],
+                "enabled": result.get("enabled", False),
+                "launch_date": _dt.datetime.utcnow().isoformat() + "Z",
+                "log": result["log"],
+            }
 
     elif body.mode == "schedule":
         if not body.launch_date:

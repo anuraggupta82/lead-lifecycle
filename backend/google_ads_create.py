@@ -4,18 +4,442 @@ Google Ads campaign creation and lifecycle management.
 Handles:
   - Campaign status changes (pause / resume / remove)
   - Fetching existing campaigns from Google Ads account (read-only)
-  - (Future) Campaign creation, ad group, keywords, RSA creation
+  - Full campaign creation: budget → campaign → geo → ad groups → keywords → RSAs → extensions
 
 All write operations check the kill switch before executing.
-New campaigns are always created as PAUSED — never go live automatically.
+New campaigns are always created as PAUSED first, then ENABLED at the end.
 """
 import logging
+import json
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # GAds sentinel dates that mean "not set" — strip these when importing
 _GADS_DATE_SENTINELS = {"2037-12-30", "1970-01-01", "0001-01-01", ""}
+
+
+def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
+    """
+    Create a full Google Search campaign in Google Ads from dashboard data.
+
+    Steps:
+      1. Budget resource (daily budget)
+      2. Campaign (PAUSED, Search, manual CPC)
+      3. Geographic targeting (from geographic_targeting JSON)
+      4. Ad groups (from build.ad_groups)
+      5. Keywords — exact, phrase, broad per ad group (from build.keywords)
+      6. Negative keywords (campaign-level)
+      7. RSA ads (from build.ad_copy, one per ad group)
+      8. Call extension (from call_extension_phone or practice phone)
+      9. Enable campaign (ENABLED) — only after all assets created
+
+    Args:
+        campaign: dict from campaigns DB row (campaign_name, monthly_budget,
+                  landing_page, call_extension_phone, geographic_targeting, etc.)
+        build:    dict from campaign_build_json (keywords, ad_copy, ad_groups keys)
+
+    Returns:
+        {
+            "ok": bool,
+            "campaign_resource_name": str,
+            "campaign_numeric_id": str,
+            "ad_group_resources": [...],
+            "keywords_added": int,
+            "ads_created": int,
+            "error": str | None,
+            "log": [str, ...]   # step-by-step progress log
+        }
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        return {"ok": False, "error": str(e), "log": [f"Blocked: {e}"]}
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    if not customer_id:
+        return {"ok": False, "error": "google_ads_customer_id not configured", "log": []}
+
+    log = []
+
+    try:
+        client = _build_client()
+
+        campaign_name    = campaign.get("campaign_name", "New Campaign")
+        monthly_budget   = float(campaign.get("monthly_budget") or 0)
+        daily_budget_usd = round(monthly_budget / 30.4, 2) if monthly_budget else 10.0
+        landing_page     = campaign.get("landing_page") or settings.practice_website or "https://graftondentalcare.com"
+        call_phone       = campaign.get("call_extension_phone") or getattr(settings, "practice_phone", "") or ""
+        geo_json         = campaign.get("geographic_targeting") or ""
+        start_date       = campaign.get("start_date") or ""
+
+        kw_data    = build.get("keywords") or {}
+        ac_data    = build.get("ad_copy") or {}
+        ag_data    = build.get("ad_groups") or {}
+
+        # ── Step 1: Budget resource ───────────────────────────────────────────
+        log.append(f"Step 1: Creating daily budget ${daily_budget_usd}/day")
+        budget_service = client.get_service("CampaignBudgetService")
+        budget_op      = client.get_type("CampaignBudgetOperation")
+        budget         = budget_op.create
+        budget.name    = f"{campaign_name} Budget"
+        budget.amount_micros = int(daily_budget_usd * 1_000_000)
+        budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+        budget.explicitly_shared = False
+
+        budget_response = budget_service.mutate_campaign_budgets(
+            customer_id=customer_id, operations=[budget_op]
+        )
+        budget_resource = budget_response.results[0].resource_name
+        log.append(f"  ✓ Budget created: {budget_resource}")
+
+        # ── Step 2: Campaign (PAUSED) ─────────────────────────────────────────
+        log.append(f"Step 2: Creating campaign '{campaign_name}' (PAUSED)")
+        camp_service = client.get_service("CampaignService")
+        camp_op      = client.get_type("CampaignOperation")
+        camp         = camp_op.create
+        camp.name    = campaign_name
+        camp.status  = client.enums.CampaignStatusEnum.PAUSED
+        camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
+        camp.campaign_budget = budget_resource
+
+        # Manual CPC bidding — use copy_from to activate the oneof so Google
+        # recognises this as the selected bidding strategy (proto-plus oneof
+        # requires a non-default field assignment or copy_from to be "set").
+        client.copy_from(camp.manual_cpc, client.get_type("ManualCpc")())
+
+        # Network settings — search only, no display, no partners
+        camp.network_settings.target_google_search     = True
+        camp.network_settings.target_search_network    = True
+        camp.network_settings.target_content_network   = False
+        camp.network_settings.target_partner_search_network = False
+
+        # Start date
+        if start_date:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(start_date[:10], "%Y-%m-%d")
+                camp.start_date = dt.strftime("%Y%m%d")
+            except Exception:
+                pass
+
+        camp_response = camp_service.mutate_campaigns(
+            customer_id=customer_id, operations=[camp_op]
+        )
+        camp_resource = camp_response.results[0].resource_name
+        camp_numeric  = camp_resource.split("/campaigns/")[-1]
+        log.append(f"  ✓ Campaign created: {camp_resource} (id={camp_numeric})")
+
+        # ── Step 3: Geographic targeting ──────────────────────────────────────
+        log.append("Step 3: Setting geographic targeting")
+        geo_criterion_service = client.get_service("CampaignCriterionService")
+        geo_ops = []
+
+        # Parse geo_json — list of {type, value, radius, include}
+        geo_locs = []
+        if geo_json:
+            try:
+                parsed = json.loads(geo_json) if isinstance(geo_json, str) else geo_json
+                geo_locs = parsed.get("locations", []) if isinstance(parsed, dict) else []
+            except Exception:
+                pass
+
+        if geo_locs:
+            # Use GeoTargetConstant lookup for postal codes and named places
+            geo_target_service = client.get_service("GeoTargetConstantService")
+            for loc in geo_locs:
+                loc_type  = loc.get("type", "postal")
+                loc_value = str(loc.get("value", "")).strip()
+                include   = loc.get("include", True)
+                if not loc_value:
+                    continue
+                try:
+                    # Suggest geo targets by name/postal code
+                    suggest_req = client.get_type("SuggestGeoTargetConstantsRequest")
+                    suggest_req.locale = "en"
+                    suggest_req.country_code = "US"
+                    # SuggestGeoTargetConstantsRequest uses location_names.names
+                    # (not geo_targets.names — that proto path does not exist)
+                    suggest_req.location_names.names.append(loc_value)
+
+                    suggest_resp = geo_target_service.suggest_geo_target_constants(request=suggest_req)
+                    for suggestion in (suggest_resp.geo_target_constant_suggestions or []):
+                        geo_const = suggestion.geo_target_constant
+                        crit_op   = client.get_type("CampaignCriterionOperation")
+                        crit      = crit_op.create
+                        crit.campaign = camp_resource
+                        crit.location.geo_target_constant = geo_const.resource_name
+                        if not include:
+                            crit.negative = True
+                        geo_ops.append(crit_op)
+                        break  # take first match only
+                except Exception as ge:
+                    log.append(f"  ⚠ Geo lookup failed for '{loc_value}': {ge}")
+        else:
+            # Default: 15-mile radius around Grafton MA (42.2012° N, 71.6870° W)
+            log.append("  No geo targets set — defaulting to 15-mile radius around Grafton MA")
+            crit_op = client.get_type("CampaignCriterionOperation")
+            crit    = crit_op.create
+            crit.campaign = camp_resource
+            crit.proximity.address.city_name     = "Grafton"
+            crit.proximity.address.province_code = "MA"
+            crit.proximity.address.country_code  = "US"
+            crit.proximity.radius               = 15
+            crit.proximity.radius_units         = client.enums.ProximityRadiusUnitsEnum.MILES
+            geo_ops.append(crit_op)
+
+        if geo_ops:
+            geo_response = geo_criterion_service.mutate_campaign_criteria(
+                customer_id=customer_id, operations=geo_ops
+            )
+            log.append(f"  ✓ {len(geo_response.results)} geo target(s) applied")
+
+        # ── Step 4 & 5: Ad Groups + Keywords ─────────────────────────────────
+        log.append("Step 4: Creating ad groups and keywords")
+        ag_service  = client.get_service("AdGroupService")
+        kw_service  = client.get_service("AdGroupCriterionService")
+
+        # Build ad group name → keywords map from build data
+        # build.keywords has: exact_match[], phrase_match[], broad_match_modifier[], negative_keywords[]
+        # build.ad_groups has: ad_groups[{name, keywords[], cpc_bid}]
+        # Strategy: one ad group per build.ad_groups entry; assign keywords to it
+
+        ag_entries = ag_data.get("ad_groups", [])
+        if not ag_entries:
+            # Fallback: single ad group with all keywords
+            ag_entries = [{"name": f"{campaign.get('service_focus','General')} - Search", "cpc_bid": 3.0}]
+
+        ad_group_resources = []
+        keywords_added     = 0
+
+        # All keywords from build (flat lists)
+        exact_kws  = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("exact_match", [])]
+        phrase_kws = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("phrase_match", [])]
+        broad_kws  = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("broad_match_modifier", [])]
+        neg_kws    = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("negative_keywords", [])]
+
+        # Split keywords evenly across ad groups if multiple groups
+        # (Simple approach: all groups get all keywords — Google doesn't mind)
+        for ag_entry in ag_entries:
+            ag_name    = ag_entry.get("name") or ag_entry.get("ad_group_name") or "Ad Group 1"
+            cpc_bid    = float(ag_entry.get("cpc_bid") or ag_entry.get("cpc_bid_usd") or 3.0)
+
+            # Create ad group
+            ag_op      = client.get_type("AdGroupOperation")
+            ag         = ag_op.create
+            ag.name    = ag_name
+            ag.campaign = camp_resource
+            ag.status  = client.enums.AdGroupStatusEnum.ENABLED
+            ag.type_   = client.enums.AdGroupTypeEnum.SEARCH_STANDARD
+            ag.cpc_bid_micros = int(cpc_bid * 1_000_000)
+
+            ag_response = ag_service.mutate_ad_groups(
+                customer_id=customer_id, operations=[ag_op]
+            )
+            ag_resource = ag_response.results[0].resource_name
+            ad_group_resources.append(ag_resource)
+            log.append(f"  ✓ Ad group '{ag_name}': {ag_resource}")
+
+            # Add keywords to this ad group
+            kw_ops = []
+            match_enum = client.enums.KeywordMatchTypeEnum
+
+            for kw in exact_kws:
+                if not kw.strip(): continue
+                op = client.get_type("AdGroupCriterionOperation")
+                c  = op.create
+                c.ad_group = ag_resource
+                c.status   = client.enums.AdGroupCriterionStatusEnum.ENABLED
+                c.keyword.text       = kw.strip()
+                c.keyword.match_type = match_enum.EXACT
+                kw_ops.append(op)
+
+            for kw in phrase_kws:
+                if not kw.strip(): continue
+                op = client.get_type("AdGroupCriterionOperation")
+                c  = op.create
+                c.ad_group = ag_resource
+                c.status   = client.enums.AdGroupCriterionStatusEnum.ENABLED
+                c.keyword.text       = kw.strip()
+                c.keyword.match_type = match_enum.PHRASE
+                kw_ops.append(op)
+
+            for kw in broad_kws:
+                if not kw.strip(): continue
+                op = client.get_type("AdGroupCriterionOperation")
+                c  = op.create
+                c.ad_group = ag_resource
+                c.status   = client.enums.AdGroupCriterionStatusEnum.ENABLED
+                c.keyword.text       = kw.strip()
+                c.keyword.match_type = match_enum.BROAD
+                kw_ops.append(op)
+
+            if kw_ops:
+                kw_response = kw_service.mutate_ad_group_criteria(
+                    customer_id=customer_id, operations=kw_ops
+                )
+                count = len(kw_response.results)
+                keywords_added += count
+                log.append(f"    ✓ {count} keywords added to '{ag_name}'")
+
+        # ── Step 6: Campaign-level negative keywords ──────────────────────────
+        log.append("Step 6: Adding campaign-level negative keywords")
+        camp_crit_service = client.get_service("CampaignCriterionService")
+        neg_ops = []
+        for kw in neg_kws:
+            kw = kw.strip()
+            if not kw: continue
+            op = client.get_type("CampaignCriterionOperation")
+            c  = op.create
+            c.campaign = camp_resource
+            c.negative = True
+            c.keyword.text       = kw
+            c.keyword.match_type = client.enums.KeywordMatchTypeEnum.BROAD
+            neg_ops.append(op)
+
+        if neg_ops:
+            neg_response = camp_crit_service.mutate_campaign_criteria(
+                customer_id=customer_id, operations=neg_ops
+            )
+            log.append(f"  ✓ {len(neg_response.results)} negative keywords added")
+        else:
+            log.append("  (no negative keywords)")
+
+        # ── Step 7: RSA ads ───────────────────────────────────────────────────
+        log.append("Step 7: Creating RSA ads")
+        ad_service  = client.get_service("AdGroupAdService")
+        ads_created = 0
+
+        ac_groups = ac_data.get("ad_groups", [])
+
+        for i, ag_resource in enumerate(ad_group_resources):
+            # Match ad copy group by index (or use first if only one)
+            ac_group = ac_groups[i] if i < len(ac_groups) else (ac_groups[0] if ac_groups else {})
+
+            headlines_raw    = ac_group.get("headlines", [])
+            descriptions_raw = ac_group.get("descriptions", [])
+
+            # Normalise: each item may be str or {text:...}
+            headlines    = [h if isinstance(h, str) else h.get("text","") for h in headlines_raw]
+            descriptions = [d if isinstance(d, str) else d.get("text","") for d in descriptions_raw]
+
+            # Filter empty, cap at 15 headlines / 4 descriptions (API limits)
+            headlines    = [h.strip() for h in headlines    if h.strip()][:15]
+            descriptions = [d.strip() for d in descriptions if d.strip()][:4]
+
+            if not headlines:
+                log.append(f"  ⚠ Ad group {i+1}: no headlines — skipping RSA creation")
+                continue
+            if not descriptions:
+                log.append(f"  ⚠ Ad group {i+1}: no descriptions — skipping RSA creation")
+                continue
+
+            # Need at least 3 headlines
+            if len(headlines) < 3:
+                log.append(f"  ⚠ Ad group {i+1}: only {len(headlines)} headline(s) — need 3+ for RSA")
+                continue
+
+            ad_op = client.get_type("AdGroupAdOperation")
+            ad    = ad_op.create
+            ad.ad_group = ag_resource
+            ad.status   = client.enums.AdGroupAdStatusEnum.ENABLED
+
+            rsa = ad.ad.responsive_search_ad
+            # Parse display path from landing page
+            from urllib.parse import urlparse
+            parsed_url = urlparse(landing_page)
+            path_parts = [p for p in parsed_url.path.strip("/").split("/") if p]
+            # Only assign path1/path2 when non-empty — Google rejects empty string
+            if path_parts:
+                rsa.path1 = path_parts[0][:15]
+            if len(path_parts) > 1:
+                rsa.path2 = path_parts[1][:15]
+
+            # Add headlines
+            for h_text in headlines:
+                asset = client.get_type("AdTextAsset")
+                asset.text = h_text[:30]  # Google max 30 chars
+                rsa.headlines.append(asset)
+
+            # Add descriptions
+            for d_text in descriptions:
+                asset = client.get_type("AdTextAsset")
+                asset.text = d_text[:90]  # Google max 90 chars
+                rsa.descriptions.append(asset)
+
+            ad.ad.final_urls.append(landing_page)
+
+            ad_response = ad_service.mutate_ad_group_ads(
+                customer_id=customer_id, operations=[ad_op]
+            )
+            ads_created += 1
+            log.append(f"  ✓ RSA created for ad group {i+1}: {len(headlines)} headlines, {len(descriptions)} descriptions")
+
+        # ── Step 8: Call extension ────────────────────────────────────────────
+        if call_phone:
+            log.append(f"Step 8: Adding call extension ({call_phone})")
+            try:
+                asset_service = client.get_service("AssetService")
+                asset_op      = client.get_type("AssetOperation")
+                asset         = asset_op.create
+                # Strip non-digits for the phone_number field
+                phone_digits  = "".join(ch for ch in call_phone if ch.isdigit() or ch == "+")
+                asset.call_asset.phone_number    = phone_digits  # E.164 digits only
+                asset.call_asset.country_code    = "US"
+                asset.name = f"{campaign_name} Call"
+
+                asset_response   = asset_service.mutate_assets(
+                    customer_id=customer_id, operations=[asset_op]
+                )
+                asset_resource = asset_response.results[0].resource_name
+
+                # Link asset to campaign
+                camp_asset_service = client.get_service("CampaignAssetService")
+                link_op  = client.get_type("CampaignAssetOperation")
+                link     = link_op.create
+                link.campaign      = camp_resource
+                link.asset         = asset_resource
+                link.field_type    = client.enums.AssetFieldTypeEnum.CALL
+                camp_asset_service.mutate_campaign_assets(
+                    customer_id=customer_id, operations=[link_op]
+                )
+                log.append(f"  ✓ Call extension linked to campaign")
+            except Exception as ce:
+                log.append(f"  ⚠ Call extension failed (non-fatal): {ce}")
+        else:
+            log.append("Step 8: No phone configured — skipping call extension")
+
+        # ── Step 9: Enable campaign ───────────────────────────────────────────
+        log.append("Step 9: Enabling campaign (PAUSED → ENABLED)")
+        enable_result = set_campaign_status(camp_resource, "ENABLED")
+        if enable_result["ok"]:
+            log.append(f"  ✓ Campaign ENABLED and live in Google Ads")
+        else:
+            log.append(f"  ⚠ Enable failed: {enable_result['error']} — campaign remains PAUSED in Google Ads. Enable manually.")
+
+        logger.info(
+            f"create_campaign_in_gads: '{campaign_name}' created. "
+            f"resource={camp_resource} kw={keywords_added} ads={ads_created}"
+        )
+
+        return {
+            "ok":                     True,
+            "campaign_resource_name": camp_resource,
+            "campaign_numeric_id":    camp_numeric,
+            "ad_group_resources":     ad_group_resources,
+            "keywords_added":         keywords_added,
+            "ads_created":            ads_created,
+            "enabled":                enable_result["ok"],
+            "error":                  None if enable_result["ok"] else f"Created but not enabled: {enable_result['error']}",
+            "log":                    log,
+        }
+
+    except Exception as e:
+        logger.error(f"create_campaign_in_gads failed: {e}", exc_info=True)
+        log.append(f"FATAL ERROR: {e}")
+        return {"ok": False, "error": str(e), "log": log}
 
 
 def _build_client():

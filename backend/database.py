@@ -913,6 +913,8 @@ def _migrate(conn):
         conn.execute("ALTER TABLE campaigns ADD COLUMN launch_date TEXT DEFAULT ''")
     if "call_extension_phone" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN call_extension_phone TEXT DEFAULT ''")
+    if "skip_workflow" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN skip_workflow INTEGER NOT NULL DEFAULT 0")
 
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
@@ -1652,6 +1654,16 @@ def enqueue_follow_ups(lead: dict, created_at: str):
         base = datetime.now(timezone.utc)
 
     with _conn() as conn:
+        # Check if the matched campaign has skip_workflow=1 — if so, don't enqueue anything
+        camp_id = (lead.get("utm_campaign") or "").strip()
+        if camp_id:
+            skip_row = conn.execute(
+                "SELECT skip_workflow FROM campaigns WHERE campaign_id=? LIMIT 1", (camp_id,)
+            ).fetchone()
+            if skip_row and skip_row["skip_workflow"]:
+                _log.info(f"enqueue_follow_ups: skipping lead {lead['id']} — campaign '{camp_id}' has skip_workflow=1")
+                return
+
         steps = _get_workflow_steps_for_lead(conn, lead)
         if not steps:
             return  # No workflow configured — nothing to enqueue
@@ -2297,10 +2309,10 @@ def create_campaign(data: dict) -> dict:
                 (campaign_id, campaign_name, status, campaign_type,
                  service_focus, promo_offer, target_audience, objective,
                  monthly_budget, expected_cpl, start_date, end_date,
-                 landing_page, notes, workflow_id,
+                 landing_page, notes, workflow_id, skip_workflow,
                  gads_campaign_resource, gads_campaign_numeric_id,
                  created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             campaign_id,
             data["campaign_name"],
@@ -2317,6 +2329,7 @@ def create_campaign(data: dict) -> dict:
             data.get("landing_page", ""),
             data.get("notes", ""),
             workflow_id,
+            1 if data.get("skip_workflow") else 0,
             gads_resource,
             gads_numeric,
             now, now,
@@ -2337,7 +2350,7 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
         "campaign_name", "service_focus", "monthly_budget", "start_date",
         "end_date", "notes", "promo_offer", "landing_page", "objective",
         "target_audience", "expected_cpl", "geographic_targeting",
-        "launch_date", "call_extension_phone",
+        "launch_date", "call_extension_phone", "skip_workflow",
     }
     safe = {k: v for k, v in fields.items() if k in ALLOWED}
     if not safe:
