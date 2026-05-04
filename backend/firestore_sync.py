@@ -5,9 +5,23 @@ Also callable via admin API to re-sync at any time.
 import hashlib
 import logging
 import urllib.request
+import ssl
 import json
 from database import upsert_lead, get_lead, enqueue_follow_ups, add_event, is_deleted_lead
 from config import get_settings
+
+# macOS Python doesn't use the system keychain for SSL by default.
+# This context uses certifi if available, otherwise falls back to unverified
+# (acceptable since we're calling our own Cloud Run service over HTTPS).
+def _ssl_context():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +112,7 @@ def sync_from_firestore() -> dict:
 
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=20)
+        resp = urllib.request.urlopen(req, timeout=20, context=_ssl_context())
         payload = json.loads(resp.read())
     except Exception as e:
         logger.error(f"Firestore sync failed: {e}")

@@ -902,6 +902,18 @@ def _migrate(conn):
     if "gads_synced_build_at" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN gads_synced_build_at TEXT DEFAULT NULL")
 
+    # Geographic targeting — campaign-level field edited from Launch checklist
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "geographic_targeting" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN geographic_targeting TEXT DEFAULT ''")
+
+    # Launch tab v2 — launch state columns (May 2026)
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "launch_date" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN launch_date TEXT DEFAULT ''")
+    if "call_extension_phone" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN call_extension_phone TEXT DEFAULT ''")
+
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
     conn.execute("""
@@ -1156,6 +1168,20 @@ def _migrate(conn):
                 "INSERT INTO optimizer_memory (category, key, value, reason, campaign, author, active, created_at, updated_at) VALUES (?,?,?,?,?,?,1,?,?)",
                 (category, key, value, reason, campaign, author, now, now)
             )
+
+    # ── One-time cleanup: remove tombstones for known test emails so they ─────
+    # ── can re-submit fresh leads after a successful Firestore delete.     ─────
+    _TEST_EMAILS_TO_CLEAR = [
+        "anurag82@gmail.com",
+        "anuraggupta@graftondentalcare.com",
+    ]
+    for _te in _TEST_EMAILS_TO_CLEAR:
+        cur = conn.execute(
+            "DELETE FROM deleted_leads WHERE email=? COLLATE NOCASE",
+            (_te.strip().lower(),),
+        )
+        if cur.rowcount:
+            print(f"[db] Cleared tombstone for test email: {_te} ({cur.rowcount} row(s))")
 
 
 def _seed_default_workflow(conn):
@@ -2310,7 +2336,8 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
     ALLOWED = {
         "campaign_name", "service_focus", "monthly_budget", "start_date",
         "end_date", "notes", "promo_offer", "landing_page", "objective",
-        "target_audience", "expected_cpl",
+        "target_audience", "expected_cpl", "geographic_targeting",
+        "launch_date", "call_extension_phone",
     }
     safe = {k: v for k, v in fields.items() if k in ALLOWED}
     if not safe:
@@ -2326,14 +2353,24 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
         return cur.rowcount > 0
 
 
-def update_campaign_status(campaign_id: str, status: str) -> bool:
-    """Patch a campaign's status (ACTIVE, PAUSED, COMPLETED, ARCHIVED)."""
+def update_campaign_status(campaign_id: str, status: str, launch_date: str | None = None) -> bool:
+    """
+    Patch a campaign's status (ACTIVE, PAUSED, COMPLETED, ARCHIVED, SCHEDULED, QUEUED).
+    Optionally also set launch_date (used by the Launch flow for SCHEDULED + ACTIVE).
+    Pass launch_date="" to explicitly clear it (e.g. when moving back to QUEUED).
+    """
     now = _now()
     with _conn() as conn:
-        conn.execute(
-            "UPDATE campaigns SET status=?, updated_at=? WHERE campaign_id=?",
-            (status, now, campaign_id)
-        )
+        if launch_date is not None:
+            conn.execute(
+                "UPDATE campaigns SET status=?, updated_at=?, launch_date=? WHERE campaign_id=?",
+                (status, now, launch_date, campaign_id)
+            )
+        else:
+            conn.execute(
+                "UPDATE campaigns SET status=?, updated_at=? WHERE campaign_id=?",
+                (status, now, campaign_id)
+            )
         return conn.execute(
             "SELECT COUNT(*) FROM campaigns WHERE campaign_id=?", (campaign_id,)
         ).fetchone()[0] > 0
@@ -2943,6 +2980,16 @@ def add_deleted_lead_tombstone(lead_id: str, email: str = "", deleted_by: str = 
             "VALUES (?,?,?,?,?)",
             (lead_id, (email or "").strip().lower(), now, deleted_by, reason),
         )
+
+
+def clear_tombstone(email: str) -> int:
+    """Remove tombstone rows for the given email. Returns number of rows deleted."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM deleted_leads WHERE email=? COLLATE NOCASE",
+            (email.strip().lower(),),
+        )
+        return cur.rowcount
 
 
 # ─── Conversations + Messages (Step 5 — bi-directional email inbox) ──────────

@@ -169,6 +169,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Scheduled OD sync failed: {e}")
 
+    # Every 15 min — Re-sync Firestore leads (picks up new smile design / form submissions)
+    def _firestore_sync_job():
+        _stamp("firestore_sync")
+        try:
+            result = sync_from_firestore()
+            if result.get("synced", 0) > 0:
+                logger.info(f"Scheduled Firestore sync: {result}")
+        except Exception as e:
+            logger.error(f"Scheduled Firestore sync failed: {e}")
+
     # Every 5 min — Poll IMAP inbox for inbound emails
     def _imap_poll_job():
         _stamp("imap_poll")
@@ -190,6 +200,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Scheduled conversion upload failed: {e}")
 
+    ads_scheduler.add_job(_firestore_sync_job, CronTrigger(minute="0,15,30,45"),
+                          id="firestore_sync", name="Firestore Lead Sync",
+                          max_instances=1, coalesce=True, replace_existing=True)
     ads_scheduler.add_job(_imap_poll_job, CronTrigger(minute="0,5,10,15,20,25,30,35,40,45,50,55"),
                           id="imap_poll", name="IMAP Inbox Poll",
                           max_instances=1, coalesce=True, replace_existing=True)
@@ -1216,21 +1229,6 @@ def admin_delete_lead(lead_id: str):
 
     settings = get_settings()
 
-    # Tombstone first — even if Firestore delete or GCS delete fails below,
-    # the next Firestore sync will refuse to re-import this lead.
-    tombstone_written = False
-    try:
-        add_deleted_lead_tombstone(
-            lead_id,
-            email=lead.get("email", ""),
-            deleted_by="admin",
-            reason="admin_delete_lead",
-        )
-        tombstone_written = True
-        logger.info(f"Tombstone written for lead {lead_id} ({lead.get('email','')})")
-    except Exception as e:
-        logger.warning(f"Could not write tombstone for lead {lead_id}: {e}")
-
     # Delete smile image from GCS using blob name (preferred) or parse from URL (legacy)
     gcs_blob_name = lead.get("smile_blob_name", "")
     image_url = lead.get("smile_image_url", "")
@@ -1250,8 +1248,14 @@ def admin_delete_lead(lead_id: str):
             logger.warning(f"Could not delete GCS image for lead {lead_id}: {e}")
 
     # Delete from Firestore via nxtsmile API
-    # Pass email in X-Lead-Email header so old docs (no 'id' field) can be found by email
+    # Pass email in X-Lead-Email header so old docs (no 'id' field) can be found by email.
+    # If Firestore delete succeeds we do NOT write a tombstone — the lead is truly gone and
+    # a fresh form submission should create a brand-new lead normally.
+    # If Firestore delete fails we write a tombstone as a safety net to block re-import
+    # until the Firestore delete can be retried manually.
     firestore_deleted = False
+    tombstone_written = False
+    lead_email = lead.get("email", "")
     try:
         import requests as _req
         delete_url = f"{settings.nxtsmile_api}/api/leads/{lead_id}"
@@ -1260,7 +1264,7 @@ def admin_delete_lead(lead_id: str):
             delete_url,
             headers={
                 "X-Secret": settings.firestore_secret,
-                "X-Lead-Email": lead.get("email", ""),
+                "X-Lead-Email": lead_email,
             },
             timeout=15,
         )
@@ -1274,6 +1278,23 @@ def admin_delete_lead(lead_id: str):
     except Exception as e:
         logger.warning(f"Could not delete lead {lead_id} from Firestore: {e}")
 
+    # Write tombstone only when Firestore delete failed — prevents re-import until manually resolved
+    if not firestore_deleted:
+        try:
+            add_deleted_lead_tombstone(
+                lead_id,
+                email=lead_email,
+                deleted_by="admin",
+                reason="admin_delete_lead_firestore_failed",
+            )
+            tombstone_written = True
+            logger.warning(
+                f"Tombstone written for lead {lead_id} ({lead_email}) because Firestore delete failed. "
+                f"Re-submission is blocked until Firestore is cleaned up."
+            )
+        except Exception as e:
+            logger.warning(f"Could not write tombstone for lead {lead_id}: {e}")
+
     # Delete all associated local records then the lead itself
     from database import _conn
     with _conn() as conn:
@@ -1283,7 +1304,10 @@ def admin_delete_lead(lead_id: str):
         conn.execute("DELETE FROM conversion_uploads WHERE lead_id = ?", (lead_id,))
         conn.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
 
-    logger.info(f"Lead {lead_id} ({lead.get('email','')}) permanently deleted by admin (tombstone={tombstone_written}, firestore={'yes' if firestore_deleted else 'FAILED'})")
+    logger.info(
+        f"Lead {lead_id} ({lead_email}) permanently deleted by admin "
+        f"(firestore={'yes' if firestore_deleted else 'FAILED'}, tombstone={'written' if tombstone_written else 'not_needed'})"
+    )
     return {"status": "deleted", "lead_id": lead_id, "tombstone_written": tombstone_written, "firestore_deleted": firestore_deleted}
 
 
@@ -1609,6 +1633,29 @@ class CampaignUpdateFieldsRequest(BaseModel):
     objective: str | None = None
     target_audience: str | None = None
     expected_cpl: float | None = None
+    geographic_targeting: str | None = None
+    launch_date: str | None = None
+    call_extension_phone: str | None = None
+
+    @validator("geographic_targeting")
+    def validate_geographic_targeting(cls, v):
+        if v is None or v == "":
+            return v
+        # Accept legacy freetext (no JSON) — just cap length
+        if len(v) > 4096:
+            raise ValueError("geographic_targeting too long (max 4096 chars)")
+        # If it looks like JSON, validate structure
+        if v.strip().startswith('{'):
+            import json as _json
+            try:
+                parsed = _json.loads(v)
+                if not isinstance(parsed, dict):
+                    raise ValueError("geographic_targeting JSON must be an object")
+                if "locations" in parsed and not isinstance(parsed["locations"], list):
+                    raise ValueError("locations must be an array")
+            except _json.JSONDecodeError:
+                raise ValueError("geographic_targeting is not valid JSON")
+        return v
 
 
 @app.patch("/api/admin/campaigns/{campaign_id}", dependencies=[Depends(_require_admin)])
@@ -1625,6 +1672,88 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
     if not ok:
         raise HTTPException(status_code=500, detail="Update failed")
     return {"ok": True, "campaign_id": campaign_id, "updated": list(fields.keys())}
+
+
+# ─── Campaign Launch (now / schedule / queue) ────────────────────────────────
+
+class LaunchCampaignRequest(BaseModel):
+    mode: str  # "now" | "schedule" | "queue"
+    launch_date: Optional[str] = None
+
+    @validator("mode")
+    def mode_valid(cls, v):
+        if v not in {"now", "schedule", "queue"}:
+            raise ValueError("mode must be one of: now, schedule, queue")
+        return v
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/launch", dependencies=[Depends(_require_admin)])
+def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
+    """
+    Launch a campaign:
+      - now      → status ACTIVE, launch_date = now (UTC ISO)
+      - schedule → status SCHEDULED, launch_date = body.launch_date (required)
+      - queue    → status QUEUED, launch_date cleared
+
+    For "now" mode, validates that all REQUIRED checklist items are done or skipped
+    before allowing launch. Google Ads API push is stubbed — sets status in DB only.
+    """
+    from database import get_campaign_by_id, get_campaign_build, update_campaign_status
+    import datetime as _dt
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Server-side gate: required checklist items must be done or skipped before "now"
+    if body.mode == "now":
+        build = get_campaign_build(campaign_id)
+        checklist = build.get("launch_checklist") or []
+        blockers = [
+            x.get("item") for x in checklist
+            if isinstance(x, dict)
+            and x.get("category") == "required"
+            and not x.get("done")
+            and not x.get("skipped")
+        ]
+        if blockers:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot launch: required items incomplete: {', '.join(blockers)}"
+            )
+
+        update_campaign_status(
+            campaign_id,
+            "ACTIVE",
+            launch_date=_dt.datetime.utcnow().isoformat() + "Z",
+        )
+        return {
+            "ok": True,
+            "status": "ACTIVE",
+            "campaign_id": campaign_id,
+            "launch_date": _dt.datetime.utcnow().isoformat() + "Z",
+            "note": "Marked ACTIVE. Google Ads API push pipeline will be wired in a future update.",
+        }
+
+    elif body.mode == "schedule":
+        if not body.launch_date:
+            raise HTTPException(status_code=400, detail="launch_date required for schedule mode")
+        update_campaign_status(campaign_id, "SCHEDULED", launch_date=body.launch_date)
+        return {
+            "ok": True,
+            "status": "SCHEDULED",
+            "campaign_id": campaign_id,
+            "launch_date": body.launch_date,
+        }
+
+    elif body.mode == "queue":
+        update_campaign_status(campaign_id, "QUEUED", launch_date="")
+        return {
+            "ok": True,
+            "status": "QUEUED",
+            "campaign_id": campaign_id,
+            "launch_date": "",
+        }
 
 
 class CampaignBuildStepRefineRequest(BaseModel):
@@ -1879,128 +2008,252 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
 
     step = body.step
 
-    # Launch checklist is a static template — no AI needed
+    # Launch checklist — static template, no AI, deterministic
     if step == "launch_checklist":
-        # AI-driven smart checklist: reviews what's built, auto-checks done items,
-        # marks optional items skippable, notes what's missing
-        import anthropic as _anthropic, json as _json, re as _re
         build_data = get_campaign_build(campaign_id)
-        strategy_raw = camp.get("strategy_json") or {}
-        strategy_parsed = _json.loads(strategy_raw) if isinstance(strategy_raw, str) else strategy_raw
 
-        has_keywords  = bool(build_data.get("keywords"))
+        landing_page  = camp.get("landing_page") or ""
+        geo           = camp.get("geographic_targeting") or ""
+        budget        = camp.get("monthly_budget") or 0
+
+        # geo is done if it has at least one location (JSON) or non-empty freetext
+        geo_done = False
+        if geo:
+            try:
+                import json as _json
+                geo_parsed = _json.loads(geo)
+                geo_done = len(geo_parsed.get("locations", [])) > 0
+            except Exception:
+                geo_done = bool(geo.strip())
+
+        # Keyword counts — keywords step produces {exact_match, phrase_match, broad_match_modifier, negative_keywords}
+        kw_data   = build_data.get("keywords") or {}
+        if isinstance(kw_data, dict):
+            kw_count  = (len(kw_data.get("exact_match", [])) +
+                         len(kw_data.get("phrase_match", [])) +
+                         len(kw_data.get("broad_match_modifier", [])))
+            neg_count = len(kw_data.get("negative_keywords", []))
+        else:
+            kw_count  = 0
+            neg_count = 0
+
+        has_keywords  = kw_count > 0
         has_ad_copy   = bool(build_data.get("ad_copy"))
         has_ad_groups = bool(build_data.get("ad_groups"))
-        landing_page  = camp.get("landing_page") or ""
-        budget        = camp.get("monthly_budget") or 0
-        service       = camp.get("service_focus") or ""
-        campaign_type = camp.get("campaign_type") or "SEARCH"
-        neg_kw        = []
-        if has_keywords:
-            kw_data = build_data["keywords"]
-            neg_kw = kw_data.get("negative_keywords", []) if isinstance(kw_data, dict) else []
 
-        # Pre-process landing page status so AI doesn't have to infer it
-        MAIN_SITE = "graftondentalcare.com"
+        # Ad copy/groups counts
+        ac_data    = build_data.get("ad_copy") or {}
+        ag_data    = build_data.get("ad_groups") or {}
+        ac_groups  = ac_data.get("ad_groups", []) if isinstance(ac_data, dict) else []
+        ag_groups  = ag_data.get("ad_groups", []) if isinstance(ag_data, dict) else []
+        headline_count    = sum(len(g.get("headlines", [])) for g in ac_groups)
+        description_count = sum(len(g.get("descriptions", [])) for g in ac_groups)
+
+        # Practice info for extension defaults — read from Admin → Practice Information
+        # Keys match _PRACTICE_FIELDS: "phone" → stored as "practice_phone", "address" → "practice_address"
+        practice_phone = get_setting("practice_phone") or ""
+        practice_address = get_setting("practice_address") or ""
+
+        # Landing page: main site or custom — both count as done
+        # Always ensure scheme prefix so the URL validator never rejects it on PATCH.
+        # Source MAIN_SITE from Practice Info → Website (fallback to legacy default).
+        practice_website = get_setting("practice_website") or ""
+        _main_site_raw = practice_website or "https://graftondentalcare.com"
+        MAIN_SITE = (
+            _main_site_raw.lower()
+            .replace("https://", "")
+            .replace("http://", "")
+            .rstrip("/")
+        )
         lp_lower = landing_page.lower()
-        if not landing_page or MAIN_SITE in lp_lower:
-            landing_page_status = "main_site"
-            landing_page_note = f"Using main website ({landing_page or 'graftondentalcare.com'}) — acceptable for launch. No dedicated landing page required."
-            landing_page_done = True
+        if not landing_page or (MAIN_SITE and MAIN_SITE in lp_lower):
+            # Ensure scheme present
+            if landing_page.startswith("http"):
+                lp_value = landing_page
+            else:
+                lp_value = _main_site_raw if _main_site_raw.startswith("http") else f"https://{_main_site_raw}"
+            lp_note  = "Using main website — no dedicated landing page required."
         else:
-            landing_page_status = "custom"
-            landing_page_note = f"Using custom landing page: {landing_page}"
-            landing_page_done = True  # custom URL is also acceptable
+            lp_value = landing_page
+            lp_note  = "Using custom landing page."
+        lp_valid = lp_value.startswith("https://") or lp_value.startswith("http://")
 
-        _api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-        ai_client = _anthropic.Anthropic(api_key=_api_key)
+        # Bidding strategy — read from campaign if stored, else default
+        bid_strategy = camp.get("bidding_strategy") or "Maximize Conversions"
 
-        checklist_prompt = f"""You are a Google Ads launch specialist reviewing a campaign before it goes live.
+        # Ad copy done: require ≥3 headlines AND ≥2 descriptions per Google Ads minimums
+        ad_copy_done = headline_count >= 3 and description_count >= 2
 
-Campaign: {camp.get("campaign_name", "")}
-Service: {service}
-Type: {campaign_type}
-Budget: ${budget}/month
-Landing page status: {landing_page_status} — {landing_page_note}
-Strategy: {_json.dumps(strategy_parsed, indent=2) if strategy_parsed else "Not generated"}
+        # Daily budget display (Google Ads bills daily; monthly / 30.4)
+        daily_budget = round(budget / 30.4, 2) if budget else 0
+        # Daily leads, monthly cap shown as reference
+        budget_display = f"${daily_budget}/day (≈${budget}/mo cap)" if budget else ""
 
-What has been built so far:
-- Keywords: {"YES — " + str(len(build_data.get("keywords",{}).get("keywords",[]))) + " keywords, " + str(len(neg_kw)) + " negatives" if has_keywords else "NOT DONE"}
-- Ad Copy: {"YES" if has_ad_copy else "NOT DONE"}
-- Ad Groups: {"YES" if has_ad_groups else "NOT DONE"}
-- Landing page: DONE ({landing_page_note})
+        # Practice info for extension defaults
+        practice_hours = get_setting("practice_hours") or ""
 
-Generate a smart launch checklist as a JSON array. Each item must have:
-- "item": short label (5-10 words), e.g. "Monthly budget set", "Geographic targeting"
-- "value": the current answer/value for this item — the actual fact (e.g. "$800/month", "graftondentalcare.com", "Not set yet", "42 keywords added", "United States"). Empty string if unknown.
-- "note": one sentence explaining what's needed or why it can be skipped
-- "done": true if already completed based on the build data above
-- "skippable": true if this item is optional or can be addressed after launch
-- "category": one of "required", "recommended", "optional"
+        checklist = [
+            # ── REQUIRED ────────────────────────────────────────────────────────
+            {
+                "key":      "budget",
+                "item":     "Daily budget",
+                "value":    budget_display,
+                "done":     budget > 0,
+                "skippable": False,
+                "category": "required",
+                "action":   "auto",
+                "note":     "Daily spend cap set by Google Ads. Monthly cap shown for reference.",
+            },
+            {
+                "key":      "bidding",
+                "item":     "Bidding strategy",
+                "value":    bid_strategy,
+                "done":     bool(bid_strategy),
+                "skippable": False,
+                "category": "required",
+                "action":   "auto",
+                "note":     "Applied at launch. Options: Maximize Conversions, Maximize Clicks, Target CPA, Manual CPC.",
+            },
+            {
+                "key":      "keywords",
+                "item":     "Keywords built",
+                "value":    f"{kw_count} keywords · {neg_count} negatives" if has_keywords else "",
+                "done":     bool(has_keywords),
+                "skippable": False,
+                "category": "required",
+                "action":   "built",
+                "note":     f"{kw_count} positive + {neg_count} negative keywords built in wizard." if has_keywords else "Complete the Keywords step first.",
+            },
+            {
+                "key":      "ad_copy",
+                "item":     "Ad copy",
+                "value":    f"{headline_count} headlines, {description_count} descriptions across {len(ac_groups)} ad group(s)" if has_ad_copy else "",
+                "done":     ad_copy_done,
+                "skippable": False,
+                "category": "required",
+                "action":   "built",
+                "note":     "Google Ads requires ≥3 headlines and ≥2 descriptions per RSA." if not ad_copy_done else "Built in the Ad Copy wizard step.",
+            },
+            {
+                "key":      "ad_groups",
+                "item":     "Ad groups",
+                "value":    f"{len(ag_groups)} ad groups" if has_ad_groups else "",
+                "done":     bool(has_ad_groups) and len(ag_groups) > 0,
+                "skippable": False,
+                "category": "required",
+                "action":   "built",
+                "note":     "Built in the Ad Groups wizard step." if has_ad_groups else "Complete the Ad Groups step first.",
+            },
+            {
+                "key":      "landing_page",
+                "item":     "Landing page",
+                "value":    lp_value,
+                "done":     lp_valid,
+                "skippable": False,
+                "category": "required",
+                "action":   "auto",
+                "note":     lp_note + " Edit to use a different URL.",
+            },
+            {
+                "key":      "geo",
+                "item":     "Geographic targeting",
+                "value":    geo,
+                "done":     geo_done,
+                "skippable": False,
+                "category": "required",
+                "action":   "auto",
+                "note":     "Add postal codes, cities, or addresses. Use the builder to set include/exclude radii. Defaults to your practice location.",
+            },
+            # ── RECOMMENDED ─────────────────────────────────────────────────────
+            {
+                "key":      "call_extension",
+                "item":     "Call extension",
+                "value":    practice_phone,
+                "done":     bool(practice_phone),
+                "skippable": True,
+                "category": "recommended",
+                "action":   "auto",
+                "note":     "Your practice phone shown directly in the ad. Applied automatically at launch.",
+            },
+            {
+                "key":      "location_extension",
+                "item":     "Location extension",
+                "value":    practice_address,
+                "done":     bool(practice_address),
+                "skippable": True,
+                "category": "recommended",
+                "action":   "auto",
+                "note":     "Your practice address linked to ads. Applied automatically at launch.",
+            },
+            {
+                "key":      "sitelinks",
+                "item":     "Sitelink extensions",
+                "value":    "",
+                "done":     False,
+                "skippable": True,
+                "category": "recommended",
+                "action":   "manual",
+                "note":     "Add 4 quick links below your ad (e.g. Book Appointment, Patient Forms, Financing).",
+            },
+            {
+                "key":      "callouts",
+                "item":     "Callout extensions",
+                "value":    "",
+                "done":     False,
+                "skippable": True,
+                "category": "recommended",
+                "action":   "manual",
+                "note":     "Short highlights shown with the ad (e.g. Same-Day Appointments, Accepts Insurance).",
+            },
+            # ── OPTIONAL ────────────────────────────────────────────────────────
+            {
+                "key":      "ad_schedule",
+                "item":     "Ad schedule",
+                "value":    practice_hours,
+                "done":     bool(practice_hours),
+                "skippable": True,
+                "category": "optional",
+                "action":   "auto",
+                "note":     "Limits ads to your office hours so calls come when you can answer. Pulled from Practice Info.",
+            },
+            {
+                "key":      "utm_tagging",
+                "item":     "UTM tagging",
+                "value":    "",
+                "done":     False,
+                "skippable": True,
+                "category": "optional",
+                "action":   "auto",
+                "note":     "utm_source=google&utm_medium=cpc appended automatically at launch for Analytics tracking.",
+            },
+        ]
+        # Conversion tracking is NOT on the pre-launch checklist.
+        # After launch, the Performance tab shows live Google Ads status including
+        # conversion tracking, ad approvals, and extension serving state.
 
-Rules:
-- Auto-check (done:true) items that are clearly complete from build data
-- For "value" use the actual data — budget in dollars, keyword count, landing page URL, etc. Not vague descriptions.
-- Landing page is DONE — mark it done:true, value: "{landing_page or 'graftondentalcare.com'}", note: "{landing_page_note}"
-- Mark "Conversion tracking" as skippable:true, category:"optional", value:"Not set up yet" — it can be added after launch; note that a new campaign can be cloned from this one once tracking is set up
-- Mark "Negative keywords" as done:true if negatives exist, value: "{len(neg_kw)} negatives added"
-- "Geographic targeting" should be category:"required", done:false, value:"Not set yet — set in Google Ads"
-- "Campaign reviewed and approved" must be category:"required", done:false, value:"Pending review"
-- Items with skippable:true should still appear so the user is aware of them
-- Be specific to this campaign's service and context
-- Return 8-12 items covering: budget, targeting, keywords, ad copy, ad extensions, conversion tracking, landing page, approval
-
-Return ONLY a JSON array, no explanation."""
-
-        try:
-            resp = ai_client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=1500,
-                messages=[{"role": "user", "content": checklist_prompt}],
-            )
-            raw = resp.content[0].text.strip()
-            arr_match = _re.search(r'\[[\s\S]*\]', raw)
-            if not arr_match:
-                raise ValueError("No JSON array in response")
-            checklist = _json.loads(arr_match.group())
-            # Ensure required fields
-            for item in checklist:
-                item.setdefault("done", False)
-                item.setdefault("skippable", False)
-                item.setdefault("category", "required")
-                item.setdefault("note", "")
-                item.setdefault("value", "")
-        except Exception as e:
-            logger.error(f"AI checklist generation failed: {e}")
-            kw_count = len(build_data.get("keywords", {}).get("keywords", [])) if has_keywords else 0
-            # Fallback to basic checklist
-            checklist = [
-                {"item": "Campaign budget confirmed",            "value": f"${budget}/month" if budget else "Not set", "done": bool(budget), "skippable": False, "category": "required",    "note": f"${budget}/month set." if budget else "Set monthly budget before launching."},
-                {"item": "Keywords built and reviewed",          "value": f"{kw_count} keywords" if has_keywords else "Not done", "done": has_keywords,  "skippable": False, "category": "required",    "note": "Keywords have been generated." if has_keywords else "Complete the Keywords step first."},
-                {"item": "Ad copy created",                      "value": "Done" if has_ad_copy else "Not done", "done": has_ad_copy,   "skippable": False, "category": "required",    "note": "Ad copy has been generated." if has_ad_copy else "Complete the Ad Copy step first."},
-                {"item": "Negative keywords added",              "value": f"{len(neg_kw)} negatives" if neg_kw else "None added", "done": bool(neg_kw),  "skippable": False, "category": "recommended", "note": f"{len(neg_kw)} negatives set." if neg_kw else "Add negative keywords to avoid irrelevant clicks."},
-                {"item": "Geographic targeting set",             "value": "Not set yet", "done": False,         "skippable": False, "category": "required",    "note": "Set location targeting in Google Ads."},
-                {"item": "Ad extensions added (call, location)", "value": "Not set yet", "done": False,         "skippable": True,  "category": "recommended", "note": "Add call extension so patients can call directly."},
-                {"item": "Landing page reviewed",                "value": landing_page or "graftondentalcare.com", "done": landing_page_done, "skippable": False, "category": "recommended", "note": landing_page_note},
-                {"item": "Conversion tracking verified",         "value": "Not set up yet", "done": False,         "skippable": True,  "category": "optional",    "note": "Can be added after launch. Track calls and form submissions."},
-                {"item": "Campaign reviewed and approved",       "value": "Pending review", "done": False,         "skippable": False, "category": "required",    "note": "Final review before enabling campaign."},
-            ]
-
-        # Merge with existing checklist: preserve user-typed values and done state
-        # for items whose label still exists in the new AI list
+        # Merge with existing: preserve user-typed values, skipped flags, and done state
         existing = get_campaign_build(campaign_id).get("launch_checklist") or []
         if existing:
-            existing_by_key = {x["item"]: x for x in existing if isinstance(x, dict)}
+            existing_by_key = {x.get("key") or x.get("item"): x for x in existing if isinstance(x, dict)}
             for item in checklist:
-                old = existing_by_key.get(item["item"])
+                merge_key = item.get("key") or item.get("item")
+                old = existing_by_key.get(merge_key)
                 if old:
-                    # Preserve value if user typed something custom
-                    if old.get("value") and not item.get("value"):
+                    # Preserve user-entered value (unless item has authoritative auto-value)
+                    # NOTE: budget is always re-derived from daily_budget so stale "$X/mo"
+                    # strings get replaced on every refresh after the daily-budget switch.
+                    if (
+                        old.get("value")
+                        and item["action"] not in ("built",)
+                        and merge_key != "budget"
+                    ):
                         item["value"] = old["value"]
-                    # Preserve done state for user-manually-checked items
-                    # (only preserve False→True, not True→False which AI may have corrected)
-                    if old.get("done") and not item.get("done"):
+                    # Preserve done=True for non-wizard items (user manually checked)
+                    if old.get("done") and item["action"] == "manual" and not item["done"]:
                         item["done"] = True
+                    # Preserve skipped flag
+                    if old.get("skipped"):
+                        item["skipped"] = True
 
         save_campaign_build_step(campaign_id, step, checklist)
         return {"ok": True, "step": step, "data": checklist}
@@ -3118,6 +3371,7 @@ class AIGenerateRequest(BaseModel):
 
 _PRACTICE_FIELDS = [
     "name", "phone", "email", "doctor_name", "address", "hours", "review_link",
+    "website",
     "booking_link_consult", "booking_link_exam", "booking_link_implant",
     "booking_link_ortho", "booking_link_general",
 ]
@@ -3130,6 +3384,7 @@ class PracticeSettingsRequest(BaseModel):
     address:              str = ""
     hours:                str = ""
     review_link:          str = ""
+    website:              str = ""
     booking_link_consult: str = ""
     booking_link_exam:    str = ""
     booking_link_implant: str = ""
@@ -3255,7 +3510,7 @@ def admin_seed_nxtsmile(workflow_id: int):
 
     # Load practice booking link from DB settings
     booking_link = get_setting("practice_booking_link_consult") or get_setting("practice_booking_link_general") or "https://visitgdc.com"
-    office_phone = get_setting("practice_phone") or "(508) 839-9900"
+    office_phone = get_setting("practice_phone") or ""
 
     seed_steps = [
         (1, "email",

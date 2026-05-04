@@ -424,6 +424,51 @@ function fmtDateTime(iso) {
 function fmtMoney(v) { if (!v) return '$0'; return '$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}); }
 function pct(a,b) { if (!b) return '0%'; return Math.round(a/b*100)+'%'; }
 
+// ── Daily-budget helpers (Google Ads bills daily; canonical storage is monthly_budget) ──
+const DAYS_PER_MONTH = 30.4;
+const monthlyToDaily = (m) => Math.round(((+m||0) / DAYS_PER_MONTH) * 100) / 100;
+const dailyToMonthly = (d) => Math.round(((+d||0) * DAYS_PER_MONTH) * 100) / 100;
+const fmtDailyBudget = (monthly) => {
+  const d = monthlyToDaily(monthly);
+  return d > 0 ? `$${d.toFixed(0)}/day` : '';
+};
+
+// ── Shared practice settings hook (for landing page default, phone fallback, etc.) ──
+function usePracticeSettings() {
+  const [practice, setPractice] = React.useState({});
+  React.useEffect(() => {
+    api('/api/admin/practice-settings')
+      .then(d => { if (d) setPractice(d); })
+      .catch(() => {});
+  }, []);
+  return practice;
+}
+
+// ── Geo targeting helpers ──
+function parseGeoTargeting(raw) {
+  if (!raw) return {unit:'miles', locations:[]};
+  try {
+    const p = JSON.parse(raw);
+    if (p && Array.isArray(p.locations)) return p;
+  } catch(e) {}
+  // Legacy freetext fallback
+  return {unit:'miles', locations:[{type:'city', value:raw, radius:15, include:true}]};
+}
+
+function serializeGeoTargeting(state) {
+  return JSON.stringify({unit: state.unit, locations: state.locations});
+}
+
+function formatGeoSummary(raw) {
+  const geo = parseGeoTargeting(raw);
+  if (!geo.locations.length) return '';
+  const first = geo.locations[0];
+  const suffix = first.radius ? ` · ${first.radius} ${geo.unit === 'miles' ? 'mi' : 'km'}` : '';
+  const tag = first.include ? '' : ' (excl.)';
+  const rest = geo.locations.length > 1 ? ` +${geo.locations.length - 1} more` : '';
+  return `${first.value}${suffix}${tag}${rest}`;
+}
+
 function srcClass(s) {
   if (!s) return 'src-default';
   const l = s.toLowerCase();
@@ -2966,6 +3011,14 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [refineLoading, setRefineLoading] = useState(false);
   const [refinedPreview, setRefinedPreview] = useState(null); // {step, data}
   const [checklistEditing, setChecklistEditing] = useState(null); // {key, draftValue, originalValue, saving, saved}
+  const [geoEditValue, setGeoEditValue] = useState(''); // serialized geo JSON during edit
+  const practiceSettings = usePracticeSettings();
+  // Launch review card inline-edit state: {field, draft, saving, saved}
+  const [launchCardEdit, setLaunchCardEdit] = useState(null);
+  // Ad preview panel mode: 'search' | 'pmax'
+  const [adPreviewMode, setAdPreviewMode] = useState('search');
+  // Custom values card expand state
+  const [customValsOpen, setCustomValsOpen] = useState(false);
 
   const [stopConfirm, setStopConfirm] = useState(null);
   const [gadsImportOpen, setGadsImportOpen] = useState(false);
@@ -3146,11 +3199,22 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   };
   const [newCamp, setNewCamp] = useState(EMPTY_CAMP);
   const setNC = (k, v) => setNewCamp(p => ({...p, [k]: v}));
+  // Raw daily-budget value the user is typing in the wizard (kept locally; canonical
+  // monthly_budget on newCamp is derived from this on every keystroke).
+  const [wizardDailyBudget, setWizardDailyBudget] = useState('');
+  // Practice settings — used to default landing page + show practice phone in wizard
+  const wizardPractice = usePracticeSettings();
 
   async function openWizard() {
     setShowWizard(true);
     setWizardStep(1);
-    setNewCamp(EMPTY_CAMP);
+    // Pre-fill landing_page from practice_website if available; otherwise leave blank
+    const initial = {...EMPTY_CAMP};
+    if (wizardPractice && wizardPractice.website) {
+      initial.landing_page = wizardPractice.website;
+    }
+    setNewCamp(initial);
+    setWizardDailyBudget('');
     setWizardWfId('');
     setCampSaveMsg('');
     setWizardStepError('');
@@ -3164,6 +3228,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     setShowWizard(false);
     setWizardStep(1);
     setNewCamp(EMPTY_CAMP);
+    setWizardDailyBudget('');
     setWizardWfId('');
     setCampSaveMsg('');
     setWizardStepError('');
@@ -3206,7 +3271,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       setSavingCamp(false);
       try {
         const budgetHint = savedCamp.monthly_budget
-          ? `$${savedCamp.monthly_budget}/month budget` + (savedCamp.expected_cpl ? `, target CPL $${savedCamp.expected_cpl}` : '')
+          ? `$${monthlyToDaily(savedCamp.monthly_budget).toFixed(0)}/day budget (~$${Math.round(savedCamp.monthly_budget)}/mo)` + (savedCamp.expected_cpl ? `, target CPL $${savedCamp.expected_cpl}` : '')
           : '';
         const goalParts = [
           savedCamp.objective || `Generate leads for ${savedCamp.service_focus || savedCamp.campaign_name}`,
@@ -3352,7 +3417,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               <th style={{width:90}}>Type</th>
               <th style={{width:88}}>Start</th>
               <th style={{width:88}}>End</th>
-              <th className="num">Budget/mo</th>
+              <th className="num">Daily Budget</th>
               <th className="num">Leads</th>
               <th className="num">Cost</th>
               <th className="num">CPL</th>
@@ -3376,6 +3441,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               const statusColor = {
                 ACTIVE:'#059669', DRAFT:'#6b7280', PAUSED:'#d97706',
                 COMPLETED:'#2563eb', ARCHIVED:'#9ca3af', UNMANAGED:'#a855f7',
+                SCHEDULED:'#7c3aed', QUEUED:'#0891b2',
               }[c.status] || '#6b7280';
               const isLoading = !!campActionLoading[c.campaign_id];
               const aiSaving = !!aiReviewSaving[c.campaign_id];
@@ -3417,7 +3483,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                     <td style={{fontSize:10,color:'var(--text-muted)'}}>{(c.campaign_type||'—').replace('GOOGLE_ADS','G-Ads')}</td>
                     <td style={{fontSize:11}}>{c.start_date || '—'}</td>
                     <td style={{fontSize:11}}>{c.end_date || '—'}</td>
-                    <td className="num">{c.monthly_budget > 0 ? '$'+Number(c.monthly_budget).toLocaleString() : '—'}</td>
+                    <td className="num">{c.monthly_budget > 0 ? fmtDailyBudget(c.monthly_budget) : '—'}</td>
                     <td className="num">{m.leads > 0 ? m.leads : '—'}</td>
                     <td className="num">{m.cost > 0 ? fmtMoney(m.cost) : '—'}</td>
                     <td className="num">{m.cpl != null ? '$'+Number(m.cpl).toFixed(0) : '—'}</td>
@@ -3763,7 +3829,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               const camp = cd.campaign;
               const summary = cd.summary;
               const strategy = cd.strategy;
-              const statusColor = {ACTIVE:'#059669',DRAFT:'#6b7280',PAUSED:'#d97706',COMPLETED:'#2563eb',ARCHIVED:'#9ca3af'}[camp.status]||'#6b7280';
+              const statusColor = {ACTIVE:'#059669',DRAFT:'#6b7280',PAUSED:'#d97706',COMPLETED:'#2563eb',ARCHIVED:'#9ca3af',SCHEDULED:'#7c3aed',QUEUED:'#0891b2'}[camp.status]||'#6b7280';
               const loading = campActionLoading[camp.campaign_id];
               const isLoading = !!loading;
 
@@ -3786,11 +3852,15 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                 style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
                                   color:'#fff',borderRadius:4,padding:'3px 7px',width:140}}
                                 placeholder="Service focus"/>
-                              <input type="number" value={campEditFields.monthly_budget ?? (camp.monthly_budget||'')}
-                                onChange={e=>setCampEditFields(f=>({...f,monthly_budget:parseFloat(e.target.value)||0}))}
+                              <input type="number" min="0" step="0.01"
+                                value={campEditFields.monthly_budget != null
+                                  ? monthlyToDaily(campEditFields.monthly_budget)
+                                  : (camp.monthly_budget ? monthlyToDaily(camp.monthly_budget) : '')}
+                                onChange={e=>setCampEditFields(f=>({...f,monthly_budget: dailyToMonthly(parseFloat(e.target.value)||0)}))}
                                 style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
-                                  color:'#fff',borderRadius:4,padding:'3px 7px',width:100}}
-                                placeholder="Budget/mo"/>
+                                  color:'#fff',borderRadius:4,padding:'3px 7px',width:110}}
+                                placeholder="Daily budget"
+                                title="Daily budget — Google Ads bills daily"/>
                               <input value={campEditFields.start_date ?? (camp.start_date||'')}
                                 onChange={e=>setCampEditFields(f=>({...f,start_date:e.target.value}))}
                                 style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
@@ -3820,7 +3890,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               )}
                               {camp.monthly_budget > 0 && (
                                 <span style={{fontSize:10,color:'#5eead4',fontWeight:600}}>
-                                  ${Number(camp.monthly_budget).toLocaleString()}/mo
+                                  {fmtDailyBudget(camp.monthly_budget)}
+                                </span>
+                              )}
+                              {camp.status === 'SCHEDULED' && camp.launch_date && (
+                                <span style={{fontSize:11,color:'rgba(255,255,255,.7)',marginLeft:6}}>
+                                  Scheduled: {new Date(camp.launch_date).toLocaleDateString()}
                                 </span>
                               )}
                             </div>
@@ -4561,239 +4636,497 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             );
                           })()}
 
-                          {/* ── Launch tab ── */}
-                          {detailTab==='launch' && (
-                            <div>
-                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
-                                <div style={{fontSize:13,fontWeight:700}}>🚀 Launch Checklist</div>
-                                <button className="btn btn-teal btn-sm" style={{fontSize:11}}
-                                  disabled={!!buildLoading}
-                                  onClick={()=>generateBuildStep('launch_checklist')}>
-                                  {buildLoading==='launch_checklist'
-                                    ? '⏳ Analyzing…'
-                                    : build.launch_checklist ? '🤖 AI Re-verify' : 'Initialize Checklist'}
-                                </button>
-                              </div>
-                              {!build.launch_checklist ? (
-                                <div style={{textAlign:'center',color:'var(--text-muted)',padding:30,fontStyle:'italic',fontSize:12}}>
-                                  Click "Initialize Checklist" to set up the pre-launch checklist.
+                          {/* ── Launch tab (PR 4 — card-based review layout) ── */}
+                          {detailTab==='launch' && (() => {
+                            // ── helpers ──────────────────────────────────────────────────────
+                            const isLinkedAlready = !!(camp.gads_campaign_resource || camp.gads_campaign_numeric_id);
+
+                            // Keyword counts
+                            const kw = build.keywords || {};
+                            const kwExact   = (kw.exact_match           || []).length;
+                            const kwPhrase  = (kw.phrase_match          || []).length;
+                            const kwBroad   = (kw.broad_match_modifier  || []).length;
+                            const kwNeg     = (kw.negative_keywords     || []).length;
+                            const kwTotal   = kwExact + kwPhrase + kwBroad;
+
+                            // Ad copy / ad group counts
+                            const adCopy = build.ad_copy || {};
+                            const adGroups = build.ad_groups || {};
+                            const adGroupCount  = (adGroups.ad_groups || []).length;
+                            const headlineCount = (adCopy.ad_groups || []).reduce((sum, ag) => {
+                              return sum + (ag.headlines || []).length;
+                            }, 0);
+
+                            // Ready-to-launch check
+                            const hasCampaignName  = !!(camp.campaign_name && camp.campaign_name.trim());
+                            const hasBudget        = (camp.monthly_budget || 0) > 0;
+                            const hasKeywords      = kwTotal > 0;
+                            const hasAdGroups      = adGroupCount > 0;
+                            const readyToLaunch    = hasCampaignName && hasBudget && hasKeywords && hasAdGroups;
+                            const canLaunch        = readyToLaunch && !isLinkedAlready;
+
+                            // Card save helper
+                            async function saveCardField(fieldName, value) {
+                              setLaunchCardEdit(p => ({...p, saving: true}));
+                              try {
+                                await api(`/api/admin/campaigns/${camp.campaign_id}`, {
+                                  method: 'PATCH',
+                                  body: JSON.stringify({[fieldName]: value})
+                                });
+                                setCampDetail(prev => prev ? {
+                                  ...prev,
+                                  campaign: {...prev.campaign, [fieldName]: value}
+                                } : prev);
+                                setLaunchCardEdit(p => ({...p, saving: false, saved: true}));
+                                setTimeout(() => setLaunchCardEdit(curr =>
+                                  curr?.field === fieldName && curr?.saved ? null : curr
+                                ), 1200);
+                              } catch(e) {
+                                setLaunchCardEdit(p => ({...p, saving: false}));
+                                alert('Save failed: ' + e.message);
+                              }
+                            }
+
+                            // Shared card wrapper style
+                            const cardStyle = {
+                              background: '#fff',
+                              border: '1px solid var(--border)',
+                              borderRadius: 10,
+                              marginBottom: 12,
+                              overflow: 'hidden',
+                              boxShadow: '0 1px 3px rgba(0,0,0,.06)'
+                            };
+                            const cardHeaderStyle = {
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              padding: '10px 14px',
+                              borderBottom: '1px solid var(--border)',
+                              background: '#fafafa'
+                            };
+                            const cardBodyStyle = {padding: '14px 16px'};
+                            const pencilBtn = (field, currentVal) => (
+                              <button
+                                style={{background:'none',border:'none',cursor:'pointer',padding:'2px 6px',
+                                  color:'var(--text-muted)',fontSize:13,borderRadius:4,lineHeight:1}}
+                                title="Edit"
+                                onClick={()=>setLaunchCardEdit({field, draft: currentVal||'', saving:false, saved:false})}>
+                                ✏
+                              </button>
+                            );
+
+                            // ── Render ────────────────────────────────────────────────────
+                            return (
+                              <div style={{display:'flex', gap:24, alignItems:'flex-start'}}>
+                                {/* Left column — review cards */}
+                                <div style={{flex:'1 1 65%', minWidth:0}}>
+                                {/* Ready-to-launch banner */}
+                                {readyToLaunch && camp.status !== 'ACTIVE' && (
+                                  <div style={{display:'flex',alignItems:'center',gap:10,padding:'10px 14px',
+                                    background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,marginBottom:14}}>
+                                    <span style={{fontSize:15,color:'#059669',fontWeight:700}}>✓ Ready to launch</span>
+                                    <span style={{fontSize:11,color:'#166534'}}>All required items are set. Use the launch controls below.</span>
+                                  </div>
+                                )}
+
+                                {/* Card 1 — Campaign Name */}
+                                <div style={cardStyle}>
+                                  <div style={cardHeaderStyle}>
+                                    <span style={{fontSize:12,fontWeight:700}}>📝 Campaign Name</span>
+                                    {launchCardEdit?.field !== 'campaign_name' && pencilBtn('campaign_name', camp.campaign_name)}
+                                  </div>
+                                  <div style={cardBodyStyle}>
+                                    {launchCardEdit?.field === 'campaign_name' ? (
+                                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                                        <input autoFocus
+                                          value={launchCardEdit.draft}
+                                          onChange={e=>setLaunchCardEdit(p=>({...p, draft: e.target.value}))}
+                                          onKeyDown={e=>{
+                                            if (e.key==='Enter') saveCardField('campaign_name', launchCardEdit.draft);
+                                            if (e.key==='Escape') setLaunchCardEdit(null);
+                                          }}
+                                          style={{flex:1,fontSize:14,fontWeight:600,padding:'5px 9px',border:'1px solid var(--teal)',
+                                            borderRadius:6,outline:'none'}}/>
+                                        <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                          disabled={launchCardEdit.saving}
+                                          onClick={()=>saveCardField('campaign_name', launchCardEdit.draft)}>
+                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                        </button>
+                                        <button className="btn btn-sm" style={{fontSize:11,
+                                          background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                          onClick={()=>setLaunchCardEdit(null)}>Cancel</button>
+                                      </div>
+                                    ) : (
+                                      <div style={{fontSize:16,fontWeight:700,color: hasCampaignName ? 'var(--text)' : '#9ca3af'}}>
+                                        {hasCampaignName ? camp.campaign_name : <em style={{fontWeight:400}}>Not set</em>}
+                                      </div>
+                                    )}
+                                  </div>
                                 </div>
-                              ) : (
-                                <div>
-                                  {(() => {
-                                    const items = build.launch_checklist || [];
-                                    const done = items.filter(x=>x.done).length;
-                                    const pct = items.length ? Math.round(done/items.length*100) : 0;
-                                    return (
-                                      <>
-                                        <div style={{marginBottom:16}}>
-                                          <div style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:4}}>
-                                            <span style={{color:'var(--text-muted)'}}>{done}/{items.length} completed</span>
-                                            <span style={{fontWeight:700,color:pct===100?'#059669':'var(--teal)'}}>{pct}%</span>
-                                          </div>
-                                          <div style={{height:6,background:'var(--border)',borderRadius:3,overflow:'hidden'}}>
-                                            <div style={{height:'100%',width:pct+'%',background:pct===100?'#059669':'var(--teal)',
-                                              transition:'width .3s',borderRadius:3}}/>
+
+                                {/* Card 2 — Daily Budget */}
+                                <div style={cardStyle}>
+                                  <div style={cardHeaderStyle}>
+                                    <span style={{fontSize:12,fontWeight:700}}>💰 Daily Budget</span>
+                                    {launchCardEdit?.field !== 'monthly_budget' && pencilBtn('monthly_budget', camp.monthly_budget ? String(monthlyToDaily(camp.monthly_budget)) : '')}
+                                  </div>
+                                  <div style={cardBodyStyle}>
+                                    {launchCardEdit?.field === 'monthly_budget' ? (
+                                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                                        <div style={{display:'flex',alignItems:'center',gap:6}}>
+                                          <span style={{fontSize:13,color:'var(--text-muted)'}}>$</span>
+                                          <input autoFocus type="number" min="0" step="1"
+                                            value={launchCardEdit.draft}
+                                            onChange={e=>setLaunchCardEdit(p=>({...p, draft: e.target.value}))}
+                                            onKeyDown={e=>{
+                                              if (e.key==='Enter') saveCardField('monthly_budget', dailyToMonthly(parseFloat(launchCardEdit.draft)||0));
+                                              if (e.key==='Escape') setLaunchCardEdit(null);
+                                            }}
+                                            placeholder="Daily budget"
+                                            style={{width:110,fontSize:14,fontWeight:600,padding:'5px 9px',border:'1px solid var(--teal)',
+                                              borderRadius:6,outline:'none'}}/>
+                                          <span style={{fontSize:12,color:'var(--text-muted)'}}>/day</span>
+                                          {launchCardEdit.draft > 0 && (
+                                            <span style={{fontSize:11,color:'var(--text-muted)'}}>
+                                              (~${dailyToMonthly(parseFloat(launchCardEdit.draft)||0).toFixed(0)}/mo)
+                                            </span>
+                                          )}
+                                        </div>
+                                        <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                          disabled={launchCardEdit.saving}
+                                          onClick={()=>saveCardField('monthly_budget', dailyToMonthly(parseFloat(launchCardEdit.draft)||0))}>
+                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                        </button>
+                                        <button className="btn btn-sm" style={{fontSize:11,
+                                          background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                          onClick={()=>setLaunchCardEdit(null)}>Cancel</button>
+                                      </div>
+                                    ) : (
+                                      <div style={{display:'flex',alignItems:'baseline',gap:10}}>
+                                        {hasBudget ? (
+                                          <>
+                                            <span style={{fontSize:22,fontWeight:800,color:'var(--teal-dark)'}}>
+                                              ${monthlyToDaily(camp.monthly_budget).toFixed(0)}/day
+                                            </span>
+                                            <span style={{fontSize:13,color:'var(--text-muted)'}}>
+                                              ≈ ${Math.round(camp.monthly_budget)}/mo
+                                            </span>
+                                          </>
+                                        ) : (
+                                          <span style={{fontSize:14,color:'#9ca3af',fontStyle:'italic'}}>Not set</span>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {/* Card 3 — Geographic Targeting */}
+                                <div style={cardStyle}>
+                                  <div style={cardHeaderStyle}>
+                                    <span style={{fontSize:12,fontWeight:700}}>📍 Geographic Targeting</span>
+                                    {launchCardEdit?.field !== 'geographic_targeting' && (
+                                      <button
+                                        style={{background:'none',border:'none',cursor:'pointer',padding:'2px 6px',
+                                          color:'var(--text-muted)',fontSize:13,borderRadius:4,lineHeight:1}}
+                                        title="Edit geographic targeting"
+                                        onClick={()=>{
+                                          const raw = camp.geographic_targeting || '';
+                                          setGeoEditValue(raw);
+                                          setLaunchCardEdit({field:'geographic_targeting', draft: raw, saving:false, saved:false});
+                                        }}>
+                                        ✏
+                                      </button>
+                                    )}
+                                  </div>
+                                  <div style={cardBodyStyle}>
+                                    {launchCardEdit?.field === 'geographic_targeting' ? (
+                                      <div>
+                                        <GeoTargetingBuilder
+                                          value={geoEditValue}
+                                          onChange={val => { setGeoEditValue(val); setLaunchCardEdit(p=>({...p, draft: val})); }}
+                                          practiceAddress={practiceSettings.practice_address || practiceSettings.address || ''}
+                                        />
+                                        <div style={{display:'flex',gap:8,marginTop:10}}>
+                                          <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                            disabled={launchCardEdit.saving}
+                                            onClick={async()=>{
+                                              const val = geoEditValue;
+                                              await saveCardField('geographic_targeting', val);
+                                            }}>
+                                            {launchCardEdit.saving ? '…' : 'Save'}
+                                          </button>
+                                          <button className="btn btn-sm" style={{fontSize:11,
+                                            background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                            onClick={()=>setLaunchCardEdit(null)}>Cancel</button>
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div style={{fontSize:13,color: camp.geographic_targeting ? 'var(--text)' : '#9ca3af'}}>
+                                        {camp.geographic_targeting
+                                          ? (formatGeoSummary(camp.geographic_targeting) || camp.geographic_targeting)
+                                          : <em style={{fontWeight:400}}>Not set — click ✏ to add targeting</em>}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {/* Card 4 — Website / Landing Page */}
+                                <div style={cardStyle}>
+                                  <div style={cardHeaderStyle}>
+                                    <span style={{fontSize:12,fontWeight:700}}>🌐 Website / Landing Page</span>
+                                    {launchCardEdit?.field !== 'landing_page' && pencilBtn('landing_page', camp.landing_page || practiceSettings.website || '')}
+                                  </div>
+                                  <div style={cardBodyStyle}>
+                                    {launchCardEdit?.field === 'landing_page' ? (
+                                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                                        <input autoFocus
+                                          value={launchCardEdit.draft}
+                                          onChange={e=>setLaunchCardEdit(p=>({...p, draft: e.target.value}))}
+                                          onKeyDown={e=>{
+                                            if (e.key==='Enter') saveCardField('landing_page', launchCardEdit.draft);
+                                            if (e.key==='Escape') setLaunchCardEdit(null);
+                                          }}
+                                          placeholder="https://…"
+                                          style={{flex:1,fontSize:13,padding:'5px 9px',border:'1px solid var(--teal)',
+                                            borderRadius:6,outline:'none'}}/>
+                                        <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                          disabled={launchCardEdit.saving}
+                                          onClick={()=>saveCardField('landing_page', launchCardEdit.draft)}>
+                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                        </button>
+                                        <button className="btn btn-sm" style={{fontSize:11,
+                                          background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                          onClick={()=>setLaunchCardEdit(null)}>Cancel</button>
+                                      </div>
+                                    ) : (
+                                      <div style={{fontSize:13}}>
+                                        {(camp.landing_page || practiceSettings.website)
+                                          ? <a href={camp.landing_page || practiceSettings.website} target="_blank" rel="noopener noreferrer"
+                                              style={{color:'var(--teal)',textDecoration:'none',wordBreak:'break-all'}}>
+                                              {camp.landing_page || practiceSettings.website}
+                                            </a>
+                                          : <span style={{color:'#9ca3af',fontStyle:'italic'}}>Not set</span>}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {/* Card 5 — Phone / Call Extension */}
+                                <div style={cardStyle}>
+                                  <div style={cardHeaderStyle}>
+                                    <span style={{fontSize:12,fontWeight:700}}>📞 Call Extension</span>
+                                    {launchCardEdit?.field !== 'call_extension_phone' && pencilBtn('call_extension_phone', camp.call_extension_phone || practiceSettings.phone || '')}
+                                  </div>
+                                  <div style={cardBodyStyle}>
+                                    {launchCardEdit?.field === 'call_extension_phone' ? (
+                                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                                        <input autoFocus
+                                          value={launchCardEdit.draft}
+                                          onChange={e=>setLaunchCardEdit(p=>({...p, draft: e.target.value}))}
+                                          onKeyDown={e=>{
+                                            if (e.key==='Enter') saveCardField('call_extension_phone', launchCardEdit.draft);
+                                            if (e.key==='Escape') setLaunchCardEdit(null);
+                                          }}
+                                          placeholder="(508) 555-0100"
+                                          style={{width:200,fontSize:13,padding:'5px 9px',border:'1px solid var(--teal)',
+                                            borderRadius:6,outline:'none'}}/>
+                                        <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                          disabled={launchCardEdit.saving}
+                                          onClick={()=>saveCardField('call_extension_phone', launchCardEdit.draft)}>
+                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                        </button>
+                                        <button className="btn btn-sm" style={{fontSize:11,
+                                          background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                          onClick={()=>setLaunchCardEdit(null)}>Cancel</button>
+                                      </div>
+                                    ) : (
+                                      <div style={{fontSize:14,fontWeight:600,color: (camp.call_extension_phone || practiceSettings.phone) ? 'var(--text)' : '#9ca3af'}}>
+                                        {camp.call_extension_phone || practiceSettings.phone || <em style={{fontWeight:400}}>Not set</em>}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {/* Card 6 — Custom Values (collapsed accordion) */}
+                                <div style={cardStyle}>
+                                  <div style={{...cardHeaderStyle, cursor:'pointer'}}
+                                    onClick={()=>setCustomValsOpen(o=>!o)}>
+                                    <span style={{fontSize:12,fontWeight:700}}>⚙ Custom Values</span>
+                                    <span style={{fontSize:11,color:'var(--text-muted)',userSelect:'none'}}>
+                                      {customValsOpen ? '▲ collapse' : '▼ expand'}
+                                    </span>
+                                  </div>
+                                  {customValsOpen && (
+                                    <div style={cardBodyStyle}>
+                                      {[
+                                        {label:'Bidding Strategy', val: adGroups.bidding_strategy || camp.bidding_strategy || ''},
+                                        {label:'Sitelinks',        val: camp.sitelinks || ''},
+                                        {label:'Callouts',         val: camp.callouts || ''},
+                                        {label:'Ad Schedule',      val: camp.ad_schedule || ''},
+                                        {label:'UTM Parameters',   val: camp.utm_params || ''},
+                                      ].map(({label, val}) => (
+                                        <div key={label} style={{display:'flex',gap:10,padding:'7px 0',
+                                          borderBottom:'1px solid var(--border)'}}>
+                                          <div style={{width:140,fontSize:11,fontWeight:600,color:'var(--text-muted)',flexShrink:0}}>{label}</div>
+                                          <div style={{fontSize:12,color: val ? 'var(--text)' : '#9ca3af',flex:1,
+                                            wordBreak:'break-word',lineHeight:1.5}}>
+                                            {val || <em>Not configured</em>}
                                           </div>
                                         </div>
-                                        {items.map((item,i)=>{
-                                          const catColor = item.category==='required'?'#dc2626':item.category==='recommended'?'#d97706':'#6b7280';
-                                          const catLabel = item.category==='required'?'Required':item.category==='recommended'?'Recommended':'Optional';
-                                          // Use item.item string as stable key (not array index)
-                                          const editKey = item.item;
-                                          const isEditing = checklistEditing?.key === editKey;
-                                          const isSaved = checklistEditing?.key === editKey && checklistEditing?.saved;
-                                          const isSaving = checklistEditing?.key === editKey && checklistEditing?.saving;
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
 
-                                          async function saveChecklistValue(newValue) {
-                                            const trimmed = (newValue||'').trim();
-                                            const newList = items.map((x,j)=>j===i?{...x,value:trimmed}:x);
-                                            setChecklistEditing(p=>({...p, saving:true}));
-                                            try {
-                                              setCampDetail(prev => {
-                                                if (!prev) return prev;
-                                                const b = prev.build || {};
-                                                return {...prev, build: {...b, launch_checklist: newList}};
-                                              });
-                                              await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`,{
-                                                method:'POST', body:JSON.stringify({step:'launch_checklist', data: newList})
-                                              });
-                                              setChecklistEditing(p=>({...p, saving:false, saved:true}));
-                                              setTimeout(()=>setChecklistEditing(curr=>
-                                                curr?.key===editKey && curr?.saved ? null : curr
-                                              ), 1200);
-                                            } catch(e) {
-                                              // Rollback on failure
-                                              const origList = items.map((x,j)=>j===i?{...x,value:checklistEditing.originalValue}:x);
-                                              setCampDetail(prev => {
-                                                if (!prev) return prev;
-                                                const b = prev.build || {};
-                                                return {...prev, build: {...b, launch_checklist: origList}};
-                                              });
-                                              setChecklistEditing(p=>({...p, saving:false}));
-                                              alert('Failed to save: ' + e.message);
-                                            }
-                                          }
-
-                                          return (
-                                          <div key={editKey} style={{marginBottom:6}}>
-                                            <label style={{display:'flex',gap:10,alignItems:'flex-start',
-                                              padding:'10px 12px',
-                                              background:item.done?'#f0fdf4':item.skippable?'#fafafa':'#fff',
-                                              border:`1px solid ${item.done?'#bbf7d0':item.skippable?'#e5e7eb':'var(--border)'}`,
-                                              borderRadius: isEditing ? '7px 7px 0 0' : 7,
-                                              cursor:'pointer',userSelect:'none',marginBottom:0}}>
-                                              <input type="checkbox" checked={!!item.done} style={{marginTop:3,flexShrink:0}}
-                                                onChange={async()=>{
-                                                  const newList = items.map((x,j)=>j===i?{...x,done:!x.done}:x);
-                                                  setCampDetail(prev => {
-                                                    if (!prev) return prev;
-                                                    const b = prev.build || {};
-                                                    return {...prev, build: {...b, launch_checklist: newList}};
-                                                  });
-                                                  await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`,{
-                                                    method:'POST',
-                                                    body:JSON.stringify({step:'launch_checklist', data: newList})
-                                                  });
-                                                }}/>
-                                              <div style={{flex:1,minWidth:0}}>
-                                                <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
-                                                  <span style={{fontSize:12,lineHeight:1.4,
-                                                    textDecoration:item.done?'line-through':'none',
-                                                    color:item.done?'var(--text-muted)':'var(--text)',fontWeight:500}}>{item.item}</span>
-                                                  {/* Value pill — click to edit */}
-                                                  <button
-                                                    title="Click to edit value"
-                                                    onClick={e=>{
-                                                      e.preventDefault(); e.stopPropagation();
-                                                      if (!isEditing) setChecklistEditing({key:editKey, draftValue: item.value||'', originalValue: item.value||'', saving:false, saved:false});
-                                                    }}
-                                                    style={{fontSize:10,color: isSaved?'#059669': (item.value?'#374151':'#9ca3af'),
-                                                      background: isSaved?'#d1fae5': (item.value?'#f3f4f6':'#fafafa'),
-                                                      border: `1px solid ${isSaved?'#6ee7b7': (item.value?'#e5e7eb':'#e5e7eb')}`,
-                                                      padding:'1px 7px',borderRadius:10,cursor:'pointer',
-                                                      maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',
-                                                      whiteSpace:'nowrap',flexShrink:0,fontWeight:400,
-                                                      outline:'none',transition:'border-color .15s'}}>
-                                                    {isSaved ? '✓ Saved' : isSaving ? '…' : (item.value || '+ add value')}
-                                                  </button>
-                                                  <span style={{fontSize:9,fontWeight:700,color:catColor,
-                                                    background:catColor+'15',padding:'1px 5px',borderRadius:3,
-                                                    textTransform:'uppercase',letterSpacing:'.3px',flexShrink:0}}>{catLabel}</span>
-                                                  {item.skippable && !item.done && (
-                                                    <span style={{fontSize:9,color:'#6b7280',background:'#f3f4f6',
-                                                      padding:'1px 5px',borderRadius:3,flexShrink:0}}>Can skip for now</span>
-                                                  )}
-                                                </div>
-                                                {item.note && (
-                                                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2,lineHeight:1.4}}>{item.note}</div>
-                                                )}
-                                              </div>
-                                            </label>
-                                            {/* Inline edit row */}
-                                            {isEditing && (
-                                              <div style={{display:'flex',gap:6,alignItems:'center',padding:'8px 12px',
-                                                background:'#f8fafc',border:'1px solid var(--teal)',borderTop:'none',
-                                                borderRadius:'0 0 7px 7px'}}>
-                                                <input autoFocus
-                                                  value={checklistEditing.draftValue}
-                                                  onChange={e=>setChecklistEditing(p=>({...p,draftValue:e.target.value}))}
-                                                  onKeyDown={e=>{
-                                                    if(e.key==='Enter') saveChecklistValue(checklistEditing.draftValue);
-                                                    if(e.key==='Escape') setChecklistEditing(null);
-                                                  }}
-                                                  placeholder="Enter value…"
-                                                  style={{flex:1,fontSize:11,padding:'4px 8px',border:'1px solid var(--border)',
-                                                    borderRadius:5,outline:'none',background:'#fff'}}/>
-                                                <button className="btn btn-teal btn-sm" style={{fontSize:10,padding:'3px 10px'}}
-                                                  disabled={isSaving}
-                                                  onClick={()=>saveChecklistValue(checklistEditing.draftValue)}>
-                                                  {isSaving ? '…' : 'Save'}
-                                                </button>
-                                                <button className="btn btn-sm" style={{fontSize:10,padding:'3px 8px',
-                                                  background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
-                                                  onClick={()=>setChecklistEditing(null)}>Cancel</button>
-                                              </div>
-                                            )}
+                                {/* Card 7 — Built Summary */}
+                                <div style={cardStyle}>
+                                  <div style={cardHeaderStyle}>
+                                    <span style={{fontSize:12,fontWeight:700}}>📊 Build Summary</span>
+                                  </div>
+                                  <div style={cardBodyStyle}>
+                                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+                                      {[
+                                        {label:'Keywords',  val: kwTotal > 0 ? kwTotal : null,      tab:'keywords',  sub: kwNeg > 0 ? `+ ${kwNeg} negatives` : null},
+                                        {label:'Ad Groups', val: adGroupCount > 0 ? adGroupCount : null, tab:'ad_groups', sub: null},
+                                        {label:'Headlines', val: headlineCount > 0 ? headlineCount : null, tab:'ad_copy',   sub: null},
+                                        {label:'Negatives', val: kwNeg > 0 ? kwNeg : null,          tab:'keywords',  sub: null},
+                                      ].map(({label, val, tab, sub}) => (
+                                        <div key={label} style={{background:'#f9fafb',border:'1px solid var(--border)',
+                                          borderRadius:8,padding:'12px 14px'}}>
+                                          <div style={{fontSize:20,fontWeight:800,color: val ? 'var(--teal-dark)' : '#9ca3af'}}>
+                                            {val != null ? val : '—'}
                                           </div>
-                                          );
-                                        })}
-                                        {(() => {
-                                          const requiredItems = items.filter(x=>x.category==='required');
-                                          const requiredDone = requiredItems.length > 0 && requiredItems.every(x=>x.done);
-                                          const allDone = pct === 100;
-                                          if (!requiredDone) return null;
-                                          return (
-                                            <div style={{marginTop:16,background: allDone?'#f0fdf4':'#fffbeb',
-                                              border:`2px solid ${allDone?'#86efac':'#fcd34d'}`,
-                                              borderRadius:8,padding:'14px 16px',textAlign:'center'}}>
-                                              <div style={{fontSize:20,marginBottom:4}}>{allDone?'✅':'🚀'}</div>
-                                              <div style={{fontSize:13,fontWeight:700,color:allDone?'#166534':'#92400e'}}>
-                                                {allDone ? 'Fully Ready to Launch!' : 'Ready to Launch'}
-                                              </div>
-                                              <div style={{fontSize:11,color:allDone?'#166534':'#78350f',marginTop:4}}>
-                                                {allDone
-                                                  ? 'All checklist items complete. Enable the campaign in Google Ads when ready.'
-                                                  : 'All required items are done. Optional items can be added after launch. Enable the campaign in Google Ads when ready.'}
-                                              </div>
-                                            </div>
-                                          );
-                                        })()}
+                                          <div style={{fontSize:11,color:'var(--text-muted)',marginTop:2}}>{label}</div>
+                                          {sub && <div style={{fontSize:10,color:'#6b7280',marginTop:1}}>{sub}</div>}
+                                          <button
+                                            onClick={()=>setDetailTab(tab)}
+                                            style={{fontSize:10,color:'var(--teal)',background:'none',border:'none',
+                                              cursor:'pointer',padding:'4px 0 0',textDecoration:'underline'}}>
+                                            {val != null ? `View ${label} →` : 'Not built yet →'}
+                                          </button>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
 
-                                        {/* ── AI Max Section ── */}
-                                        {(() => {
-                                          const isLinked = !!(camp.gads_campaign_resource || camp.gads_campaign_numeric_id);
-                                          const maxOn = !!camp.ai_max_enabled;
-                                          const maxSav = !!aiMaxSaving[camp.campaign_id];
-                                          return (
-                                            <div style={{marginTop:22,borderTop:'1px solid var(--border)',paddingTop:18}}>
-                                              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🤖 Google AI Max</div>
-                                              {!isLinked ? (
-                                                <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',
-                                                  background:'#f9fafb',border:'1px solid var(--border)',borderRadius:7,
-                                                  padding:'10px 14px'}}>
-                                                  AI Max requires this campaign to be linked to Google Ads.
-                                                  Launch to Google Ads first.
-                                                </div>
-                                              ) : (
-                                                <div style={{background: maxOn ? '#eff6ff' : '#f9fafb',
-                                                  border:`1px solid ${maxOn ? '#bfdbfe' : 'var(--border)'}`,
-                                                  borderRadius:8, padding:'14px 16px'}}>
-                                                  <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',userSelect:'none'}}>
-                                                    <input type="checkbox" checked={maxOn} disabled={maxSav}
-                                                      style={{marginTop:2,flexShrink:0,accentColor:'#4285f4'}}
-                                                      onChange={()=>toggleAiMax(camp)}/>
-                                                    <div>
-                                                      <div style={{fontSize:12,fontWeight:600,
-                                                        color: maxOn ? '#1d4ed8' : 'var(--text)'}}>
-                                                        {maxOn ? '✓ AI Max enabled' : 'Enable AI Max search term matching'}
-                                                        {maxSav && <span style={{fontWeight:400,color:'var(--text-muted)',fontSize:11}}> — saving…</span>}
-                                                      </div>
-                                                      <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,lineHeight:1.5}}>
-                                                        {maxOn
-                                                          ? 'Google\'s AI is expanding your keyword reach. Check the Performance tab for AI Max vs. standard match type breakdown after 7+ days.'
-                                                          : 'Lets Google\'s AI find searchers beyond your keyword list. Recommended after 4+ weeks of baseline data. Start with this OFF, then enable once you have CPL benchmarks.'}
-                                                      </div>
-                                                      {!maxOn && (
-                                                        <div style={{fontSize:10,color:'#92400e',marginTop:6,
-                                                          background:'#fef3c7',padding:'4px 8px',borderRadius:4,display:'inline-block'}}>
-                                                          ⚠ Enabling may increase spend — confirm your daily budget cap first
-                                                        </div>
-                                                      )}
-                                                    </div>
-                                                  </label>
+                                {/* Launch controls */}
+                                <div style={{marginTop:6,borderTop:'1px solid var(--border)',paddingTop:16}}>
+                                  {isLinkedAlready ? (
+                                    <div style={{display:'flex',alignItems:'center',gap:8,padding:'10px 14px',
+                                      background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8}}>
+                                      <span style={{fontSize:16}}>✅</span>
+                                      <div>
+                                        <div style={{fontSize:12,fontWeight:700,color:'#166534'}}>Launched to Google Ads</div>
+                                        <div style={{fontSize:10,color:'#166534',marginTop:1}}>Campaign is live in Google Ads. Manage status with the controls above.</div>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <>
+                                      {!readyToLaunch && (
+                                        <div style={{fontSize:11,color:'#dc2626',marginBottom:8,lineHeight:1.5,
+                                          background:'#fef2f2',border:'1px solid #fecaca',borderRadius:6,padding:'8px 12px'}}>
+                                          <strong>Missing required items:</strong>{' '}
+                                          {[
+                                            !hasCampaignName && 'Campaign name',
+                                            !hasBudget       && 'Budget',
+                                            !hasKeywords     && 'Keywords (generate in Keywords tab)',
+                                            !hasAdGroups     && 'Ad Groups (generate in Ad Groups tab)',
+                                          ].filter(Boolean).join(' · ')}
+                                        </div>
+                                      )}
+                                      <LaunchButtonGroup
+                                        campaignId={camp.campaign_id}
+                                        canLaunch={canLaunch}
+                                        onLaunched={(newStatus, newLaunchDate) => {
+                                          setCampDetail(prev => prev ? {
+                                            ...prev,
+                                            campaign: {...prev.campaign, status: newStatus, launch_date: newLaunchDate || ''}
+                                          } : prev);
+                                          if (typeof loadManagedCamps === 'function') loadManagedCamps();
+                                        }}
+                                      />
+                                      <div style={{fontSize:10,color:'var(--text-muted)',textAlign:'center',marginTop:6}}>
+                                        Launch now, schedule, or save as queued. Google Ads API push pipeline coming soon.
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+
+                                {/* AI Max Section (retained from previous version) */}
+                                {(() => {
+                                  const isLinked = !!(camp.gads_campaign_resource || camp.gads_campaign_numeric_id);
+                                  const maxOn = !!camp.ai_max_enabled;
+                                  const maxSav = !!aiMaxSaving[camp.campaign_id];
+                                  return (
+                                    <div style={{marginTop:22,borderTop:'1px solid var(--border)',paddingTop:18}}>
+                                      <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🤖 Google AI Max</div>
+                                      {!isLinked ? (
+                                        <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',
+                                          background:'#f9fafb',border:'1px solid var(--border)',borderRadius:7,
+                                          padding:'10px 14px'}}>
+                                          AI Max requires this campaign to be linked to Google Ads.
+                                          Launch to Google Ads first.
+                                        </div>
+                                      ) : (
+                                        <div style={{background: maxOn ? '#eff6ff' : '#f9fafb',
+                                          border:`1px solid ${maxOn ? '#bfdbfe' : 'var(--border)'}`,
+                                          borderRadius:8, padding:'14px 16px'}}>
+                                          <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',userSelect:'none'}}>
+                                            <input type="checkbox" checked={maxOn} disabled={maxSav}
+                                              style={{marginTop:2,flexShrink:0,accentColor:'#4285f4'}}
+                                              onChange={()=>toggleAiMax(camp)}/>
+                                            <div>
+                                              <div style={{fontSize:12,fontWeight:600,
+                                                color: maxOn ? '#1d4ed8' : 'var(--text)'}}>
+                                                {maxOn ? '✓ AI Max enabled' : 'Enable AI Max search term matching'}
+                                                {maxSav && <span style={{fontWeight:400,color:'var(--text-muted)',fontSize:11}}> — saving…</span>}
+                                              </div>
+                                              <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,lineHeight:1.5}}>
+                                                {maxOn
+                                                  ? 'Google\'s AI is expanding your keyword reach. Check the Performance tab for AI Max vs. standard match type breakdown after 7+ days.'
+                                                  : 'Lets Google\'s AI find searchers beyond your keyword list. Recommended after 4+ weeks of baseline data. Start with this OFF, then enable once you have CPL benchmarks.'}
+                                              </div>
+                                              {!maxOn && (
+                                                <div style={{fontSize:10,color:'#92400e',marginTop:6,
+                                                  background:'#fef3c7',padding:'4px 8px',borderRadius:4,display:'inline-block'}}>
+                                                  ⚠ Enabling may increase spend — confirm your daily budget cap first
                                                 </div>
                                               )}
                                             </div>
-                                          );
-                                        })()}
-                                      </>
-                                    );
-                                  })()}
+                                          </label>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })()}
+
+                                {/* ── OLD checklist render (commented out — kept for reference) ──
+                                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                                  <div style={{fontSize:13,fontWeight:700}}>🚀 Launch Checklist</div>
+                                  <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                    disabled={!!buildLoading}
+                                    onClick={()=>generateBuildStep('launch_checklist')}>
+                                    {buildLoading==='launch_checklist' ? '⏳ Analyzing…' : build.launch_checklist ? '🤖 AI Re-verify' : 'Initialize Checklist'}
+                                  </button>
                                 </div>
-                              )}
-                            </div>
-                          )}
+                                ... (checklist rows were here — see git history) ...
+                                ── END OLD checklist render ── */}
+                                </div>{/* end left column */}
+
+                                {/* Right column — Ad Preview Panel */}
+                                <div style={{flex:'0 0 35%', minWidth:260}}>
+                                  <AdPreviewPanel
+                                    campDetail={campDetail}
+                                    practiceSettings={practiceSettings}
+                                    adPreviewMode={adPreviewMode}
+                                    setAdPreviewMode={setAdPreviewMode}
+                                    setDetailTab={setDetailTab}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })()}
 
                           {/* ── Performance tab ── */}
                           {detailTab==='performance' && (
@@ -5064,11 +5397,21 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
                 <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
                   <div>
-                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Monthly Budget ($)</label>
-                    <input type="number" min="0" style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                      placeholder="e.g. 3000"
-                      value={newCamp.monthly_budget} onChange={e=>setNC('monthly_budget',e.target.value)} />
-                    {newCamp.monthly_budget > 0 && <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>~${Math.round(newCamp.monthly_budget/30)}/day</div>}
+                    <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Daily Budget ($)</label>
+                    <input type="number" min="0" step="0.01" style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
+                      placeholder="e.g. 100"
+                      value={wizardDailyBudget}
+                      onChange={e=>{
+                        const raw = e.target.value;
+                        setWizardDailyBudget(raw);
+                        const d = parseFloat(raw)||0;
+                        setNewCamp(p => ({...p, monthly_budget: dailyToMonthly(d)}));
+                      }} />
+                    {parseFloat(wizardDailyBudget) > 0 && (
+                      <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                        ~${dailyToMonthly(parseFloat(wizardDailyBudget)).toFixed(0)}/mo
+                      </div>
+                    )}
                   </div>
                   <div>
                     <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Target CPL ($)</label>
@@ -5110,8 +5453,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   <div>
                     <label style={{fontSize:11,fontWeight:600,display:'block',marginBottom:3}}>Landing Page URL</label>
                     <input style={{width:'100%',fontSize:12,padding:'7px 10px',border:'1px solid var(--border)',borderRadius:5,boxSizing:'border-box'}}
-                      placeholder="https://nxtsmile.com"
+                      placeholder={wizardPractice?.website || 'https://yourpractice.com'}
                       value={newCamp.landing_page} onChange={e=>setNC('landing_page',e.target.value)} />
+                    {wizardPractice?.website && !newCamp.landing_page && (
+                      <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                        Defaults to your practice website ({wizardPractice.website}) if left blank.
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -6795,10 +7143,386 @@ function WorkflowsSection() {
 }
 
 
+// ── Geo Targeting Builder ──────────────────────────────────────────────────
+function GeoTargetingBuilder({value, onChange, practiceAddress}) {
+  const geo = React.useMemo(() => parseGeoTargeting(value), [value]);
+  const [unit, setUnit] = React.useState(geo.unit || 'miles');
+  const [locations, setLocations] = React.useState(geo.locations || []);
+  const [locType, setLocType] = React.useState('postal');
+  const [searchVal, setSearchVal] = React.useState('');
+  const [radius, setRadius] = React.useState(15);
+
+  // Sync state back up whenever locations or unit change
+  React.useEffect(() => {
+    onChange(serializeGeoTargeting({unit, locations}));
+  }, [unit, locations]);
+
+  function addLocation() {
+    const trimmed = searchVal.trim();
+    if (!trimmed) return;
+    const needsRadius = !['state','country'].includes(locType);
+    setLocations(prev => [...prev, {
+      type: locType,
+      value: trimmed,
+      radius: needsRadius ? Number(radius) : null,
+      include: true
+    }]);
+    setSearchVal('');
+  }
+
+  function removeLocation(idx) {
+    setLocations(prev => prev.filter((_,i) => i !== idx));
+  }
+
+  function toggleInclude(idx) {
+    setLocations(prev => prev.map((l,i) => i===idx ? {...l, include:!l.include} : l));
+  }
+
+  function updateRadius(idx, val) {
+    setLocations(prev => prev.map((l,i) => i===idx ? {...l, radius:Number(val)} : l));
+  }
+
+  function switchUnit(newUnit) {
+    if (newUnit === unit) return;
+    // Convert radii
+    const factor = newUnit === 'miles' ? 0.621371 : 1.60934;
+    setLocations(prev => prev.map(l => l.radius ? {...l, radius: Math.round(l.radius * factor)} : l));
+    setUnit(newUnit);
+  }
+
+  const typeLabels = {postal:'Postal Code', city:'City/County', address:'Address', state:'State', country:'Country'};
+  const showRadius = !['state','country'].includes(locType);
+
+  return (
+    <div style={{fontSize:13}}>
+      {/* Unit toggle */}
+      <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:10}}>
+        <span style={{color:'var(--text-muted)', fontSize:12}}>Distance unit:</span>
+        {['miles','kilometers'].map(u => (
+          <button key={u} onClick={()=>switchUnit(u)}
+            style={{padding:'3px 10px', borderRadius:20, border:'0.5px solid var(--border)',
+                    background: unit===u ? 'var(--accent)' : 'transparent',
+                    color: unit===u ? '#fff' : 'var(--text-muted)',
+                    cursor:'pointer', fontSize:12}}>
+            {u === 'miles' ? 'Miles' : 'Kilometers'}
+          </button>
+        ))}
+      </div>
+
+      {/* Add row */}
+      <div style={{display:'flex', gap:6, marginBottom:8, flexWrap:'wrap'}}>
+        <select value={locType} onChange={e=>setLocType(e.target.value)}
+          style={{fontSize:12, padding:'5px 8px', border:'0.5px solid var(--border)',
+                  borderRadius:6, background:'var(--surface)'}}>
+          {Object.entries(typeLabels).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
+        </select>
+        <input value={searchVal} onChange={e=>setSearchVal(e.target.value)}
+          onKeyDown={e=>e.key==='Enter'&&addLocation()}
+          placeholder={locType==='postal'?'e.g. 01536':locType==='city'?'e.g. Grafton, MA':'Search…'}
+          style={{flex:1, minWidth:120, fontSize:12, padding:'5px 8px',
+                  border:'0.5px solid var(--border)', borderRadius:6}} />
+        {showRadius && (
+          <>
+            <input type="number" value={radius} onChange={e=>setRadius(e.target.value)}
+              min={1} max={500}
+              style={{width:52, fontSize:12, padding:'5px 6px',
+                      border:'0.5px solid var(--border)', borderRadius:6, textAlign:'center'}} />
+            <span style={{alignSelf:'center', fontSize:12, color:'var(--text-muted)'}}>
+              {unit==='miles'?'mi':'km'}
+            </span>
+          </>
+        )}
+        <button onClick={addLocation}
+          style={{padding:'5px 12px', background:'var(--accent)', color:'#fff',
+                  border:'none', borderRadius:6, cursor:'pointer', fontSize:12, fontWeight:500}}>
+          + Add
+        </button>
+      </div>
+
+      {/* Locations list */}
+      {locations.length === 0 ? (
+        <div style={{color:'var(--text-muted)', fontSize:12, padding:'8px 0'}}>
+          No locations added yet.
+          {practiceAddress && (
+            <span> Suggested: <button onClick={()=>setLocations([{type:'city',value:practiceAddress,radius:15,include:true}])}
+              style={{background:'none',border:'none',color:'var(--accent)',cursor:'pointer',fontSize:12,padding:0}}>
+              Use practice address ({practiceAddress})
+            </button></span>
+          )}
+        </div>
+      ) : (
+        <div style={{display:'flex', flexDirection:'column', gap:4}}>
+          {locations.map((loc, idx) => (
+            <div key={idx} style={{display:'flex', alignItems:'center', gap:6, padding:'6px 8px',
+                                    background:'var(--bg)', border:'0.5px solid var(--border)',
+                                    borderRadius:6, fontSize:12}}>
+              <span style={{fontSize:10, padding:'1px 6px', borderRadius:10, fontWeight:500,
+                            background: loc.include ? '#dcfce7' : '#fee2e2',
+                            color: loc.include ? '#15803d' : '#b91c1c'}}>
+                {typeLabels[loc.type] || loc.type}
+              </span>
+              <span style={{flex:1, color:'var(--text)'}}>{loc.value}</span>
+              {loc.radius != null && (
+                <>
+                  <input type="number" value={loc.radius} min={1} max={500}
+                    onChange={e=>updateRadius(idx, e.target.value)}
+                    style={{width:44, fontSize:11, padding:'2px 4px', textAlign:'center',
+                            border:'0.5px solid var(--border)', borderRadius:4}} />
+                  <span style={{fontSize:11, color:'var(--text-muted)'}}>{unit==='miles'?'mi':'km'}</span>
+                </>
+              )}
+              <button onClick={()=>toggleInclude(idx)}
+                style={{padding:'2px 8px', borderRadius:10, fontSize:11, cursor:'pointer', border:'none',
+                        background: loc.include ? '#dcfce7' : '#fee2e2',
+                        color: loc.include ? '#15803d' : '#b91c1c', fontWeight:500}}>
+                {loc.include ? 'Include' : 'Exclude'}
+              </button>
+              <button onClick={()=>removeLocation(idx)}
+                style={{background:'none', border:'none', color:'var(--text-muted)',
+                        cursor:'pointer', fontSize:14, padding:'0 2px', lineHeight:1}}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Ad Preview Panel ──────────────────────────────────────────────────────────
+function AdPreviewPanel({campDetail, practiceSettings, adPreviewMode, setAdPreviewMode, setDetailTab}) {
+  const camp = campDetail?.campaign || {};
+  const build = campDetail?.build || {};
+
+  // Derive display URL: strip https://, show domain + first path segment
+  const rawUrl = camp.landing_page || practiceSettings?.website || 'graftondentalcare.com';
+  const stripped = rawUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  const parts = stripped.split('/');
+  const displayUrl = parts.length > 1 ? `${parts[0]} › ${parts[1]}` : parts[0];
+
+  // Safely extract text from a headline/description item (object with .text or plain string)
+  const getText = (item) => (item && typeof item === 'object' ? item.text || '' : item || '');
+
+  // Pull ad copy data
+  const adGroups = build?.ad_copy?.ad_groups || [];
+  const firstGroup = adGroups[0] || null;
+  const headlines = firstGroup ? (firstGroup.headlines || []).slice(0, 3).map(getText).filter(Boolean) : [];
+  const description = firstGroup ? getText((firstGroup.descriptions || [])[0]) : '';
+  const phone = camp.call_extension_phone || practiceSettings?.phone || '';
+
+  const hasAdCopy = headlines.length > 0;
+
+  const panelStyle = {
+    background: '#fff',
+    border: '1px solid #e0e0e0',
+    borderRadius: 10,
+    overflow: 'hidden',
+    boxShadow: '0 1px 4px rgba(0,0,0,.08)',
+    position: 'sticky',
+    top: 80,
+    alignSelf: 'flex-start',
+    minWidth: 0,
+  };
+
+  const headerStyle = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '10px 14px',
+    borderBottom: '1px solid #e0e0e0',
+    background: '#fafafa',
+  };
+
+  const toggleBtnStyle = (active) => ({
+    fontSize: 11,
+    fontWeight: active ? 700 : 500,
+    padding: '3px 10px',
+    border: `1px solid ${active ? '#4285f4' : '#dadce0'}`,
+    borderRadius: 20,
+    background: active ? '#e8f0fe' : '#fff',
+    color: active ? '#1a73e8' : '#5f6368',
+    cursor: 'pointer',
+    outline: 'none',
+  });
+
+  return (
+    <div style={panelStyle}>
+      {/* Header */}
+      <div style={headerStyle}>
+        <span style={{fontSize: 12, fontWeight: 700}}>Ad Preview</span>
+        <div style={{display: 'flex', gap: 5}}>
+          <button style={toggleBtnStyle(adPreviewMode === 'search')}
+            onClick={() => setAdPreviewMode('search')}>Search</button>
+          <button style={toggleBtnStyle(adPreviewMode === 'pmax')}
+            onClick={() => setAdPreviewMode('pmax')}>PMax</button>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{padding: 16}}>
+        {adPreviewMode === 'pmax' ? (
+          /* PMax placeholder */
+          <div style={{textAlign: 'center', color: '#5f6368'}}>
+            <div style={{fontSize: 22, marginBottom: 8}}>📸</div>
+            <div style={{fontWeight: 700, fontSize: 13, marginBottom: 6}}>Performance Max</div>
+            <div style={{background: '#f1f3f4', borderRadius: 8, height: 160, marginBottom: 12,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, color: '#9aa0a6'}}>
+              Image / Video placeholder
+            </div>
+            <div style={{fontSize: 11, lineHeight: 1.5, color: '#5f6368'}}>
+              Add images and videos to preview your Performance Max creative. (Coming soon)
+            </div>
+          </div>
+        ) : !hasAdCopy ? (
+          /* Empty state */
+          <div style={{textAlign: 'center', padding: '20px 8px',
+            border: '2px dashed #dadce0', borderRadius: 8, color: '#9aa0a6'}}>
+            <div style={{fontSize: 28, marginBottom: 8}}>🔍</div>
+            <div style={{fontSize: 12, lineHeight: 1.5, marginBottom: 10}}>
+              Build your ad copy in the Ad Copy tab to preview your ad here.
+            </div>
+            <button
+              onClick={() => setDetailTab('ad_copy')}
+              style={{fontSize: 12, color: '#1a73e8', background: 'none', border: 'none',
+                cursor: 'pointer', textDecoration: 'underline', padding: 0}}>
+              Go to Ad Copy →
+            </button>
+          </div>
+        ) : (
+          /* Google Search ad preview */
+          <div style={{border: '1px solid #e0e0e0', borderRadius: 8, padding: 16, background: '#fff'}}>
+            {/* Top line: Ad badge + URL */}
+            <div style={{display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4}}>
+              <span style={{fontSize: 11, color: '#0d652d', border: '1px solid #0d652d',
+                borderRadius: 3, padding: '1px 4px', lineHeight: 1.4, fontWeight: 500}}>Ad</span>
+              <span style={{fontSize: 14, color: '#202124'}}>{displayUrl}</span>
+            </div>
+            {/* Headlines */}
+            <div style={{fontSize: 20, fontWeight: 500, color: '#1a0dab', lineHeight: 1.3,
+              marginBottom: 6, cursor: 'pointer'}}
+              onMouseEnter={e => e.currentTarget.style.textDecoration = 'underline'}
+              onMouseLeave={e => e.currentTarget.style.textDecoration = 'none'}>
+              {headlines.join(' | ')}
+            </div>
+            {/* Description */}
+            {description && (
+              <div style={{fontSize: 14, color: '#4d5156', lineHeight: 1.4, marginBottom: 8}}>
+                {description}
+              </div>
+            )}
+            {/* Phone */}
+            {phone && (
+              <div style={{fontSize: 12, color: '#4d5156', marginBottom: 10}}>📞 {phone}</div>
+            )}
+            {/* Sitelink chips */}
+            <div style={{display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6}}>
+              {['Book Now', 'Our Services', 'About Us', 'Contact'].map(sl => (
+                <span key={sl} style={{fontSize: 12, color: '#1a0dab', textDecoration: 'underline',
+                  cursor: 'pointer'}}>
+                  {sl}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Launch Button Group (split button: Launch / Schedule / Queue) ─────────────
+function LaunchButtonGroup({campaignId, canLaunch, onLaunched}) {
+  const [open, setOpen] = React.useState(false);
+  const [showSchedule, setShowSchedule] = React.useState(false);
+  const [schedDate, setSchedDate] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState('');
+
+  async function doLaunch(mode, launch_date) {
+    setBusy(true); setErr('');
+    try {
+      const r = await api(`/api/admin/campaigns/${campaignId}/launch`, {
+        method: 'POST',
+        body: JSON.stringify({mode, launch_date: launch_date || null})
+      });
+      if (typeof onLaunched === 'function') onLaunched(r.status, r.launch_date || '');
+    } catch(e) {
+      setErr(e.message || 'Launch failed');
+    }
+    setBusy(false);
+    setOpen(false);
+    setShowSchedule(false);
+  }
+
+  return (
+    <div style={{position:'relative'}}>
+      {err && <div style={{color:'#dc2626',fontSize:12,marginBottom:6}}>{err}</div>}
+      <div style={{display:'flex',borderRadius:8,overflow:'hidden'}}>
+        <button
+          disabled={!canLaunch || busy}
+          onClick={() => doLaunch('now')}
+          style={{flex:1, background: canLaunch ? '#16a34a' : '#9ca3af', color:'#fff', border:'none',
+                  padding:'12px 18px', fontSize:14, fontWeight:500,
+                  cursor: canLaunch && !busy ? 'pointer' : 'not-allowed', textAlign:'left'}}>
+          {busy ? '⏳ Launching…' : '▶ Launch Campaign'}
+        </button>
+        <button
+          disabled={busy}
+          onClick={() => setOpen(o => !o)}
+          style={{background: canLaunch ? '#15803d' : '#6b7280', color:'#fff', border:'none',
+                  borderLeft:'1px solid rgba(255,255,255,0.2)', padding:'12px 14px',
+                  cursor:'pointer', fontSize:14}}>
+          ▾
+        </button>
+      </div>
+      {open && (
+        <div style={{position:'absolute', bottom:'calc(100% + 4px)', left:0, right:0,
+                     background:'var(--surface, #fff)',
+                     border:'0.5px solid var(--border, #e5e7eb)',
+                     boxShadow:'0 4px 12px rgba(0,0,0,0.08)',
+                     borderRadius:8, zIndex:50, overflow:'hidden'}}>
+          <div onClick={() => { setOpen(false); doLaunch('now'); }}
+               style={{padding:'10px 14px', cursor:'pointer', fontSize:13,
+                       borderBottom:'0.5px solid var(--border, #e5e7eb)'}}>
+            ▶ Launch now
+          </div>
+          <div onClick={() => setShowSchedule(s => !s)}
+               style={{padding:'10px 14px', cursor:'pointer', fontSize:13,
+                       borderBottom:'0.5px solid var(--border, #e5e7eb)'}}>
+            🕐 Schedule for later…
+          </div>
+          {showSchedule && (
+            <div style={{padding:'8px 14px', borderBottom:'0.5px solid var(--border, #e5e7eb)'}}>
+              <input type="datetime-local" value={schedDate}
+                onChange={e => setSchedDate(e.target.value)}
+                style={{width:'100%', fontSize:13, padding:'6px 8px',
+                        border:'0.5px solid var(--border, #e5e7eb)', borderRadius:6}} />
+              <button onClick={() => schedDate && doLaunch('schedule', schedDate)}
+                disabled={!schedDate}
+                style={{marginTop:6, width:'100%', background:'#7c3aed', color:'#fff',
+                        border:'none', borderRadius:6, padding:'8px', fontSize:13,
+                        cursor: schedDate ? 'pointer' : 'not-allowed'}}>
+                Schedule →
+              </button>
+            </div>
+          )}
+          <div onClick={() => { setOpen(false); doLaunch('queue'); }}
+               style={{padding:'10px 14px', cursor:'pointer', fontSize:13}}>
+            💾 Save as Queued
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── Practice Information Card ─────────────────────────────────────────────────
 function PracticeSettingsCard() {
   const emptyForm = {
     name:'', phone:'', email:'', doctor_name:'', address:'', hours:'', review_link:'',
+    website:'',
     booking_link_consult:'', booking_link_exam:'', booking_link_implant:'',
     booking_link_ortho:'', booking_link_general:'',
   };
@@ -6862,6 +7586,7 @@ function PracticeSettingsCard() {
           {field('email','Email','info@graftondentalcare.com',null)}
           {field('hours','Office Hours','Mon–Fri 8am–5pm',null)}
           {field('review_link','Google Review Link','https://g.page/r/...',null)}
+          {field('website','Practice Website','https://graftondentalcare.com','{practice_website}')}
         </div>
         {field('address','Address (city/state)','Grafton, MA',null)}
 
