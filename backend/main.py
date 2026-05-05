@@ -1754,8 +1754,8 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
             from database import _conn
             with _conn() as conn:
                 conn.execute(
-                    "UPDATE campaigns SET gads_campaign_resource=?, gads_campaign_numeric_id=?, updated_at=? WHERE campaign_id=?",
-                    (result["campaign_resource_name"], result["campaign_numeric_id"],
+                    "UPDATE campaigns SET campaign_name=?, gads_campaign_resource=?, gads_campaign_numeric_id=?, updated_at=? WHERE campaign_id=?",
+                    (result["gads_campaign_name"], result["campaign_resource_name"], result["campaign_numeric_id"],
                      _dt.datetime.utcnow().isoformat(), campaign_id)
                 )
 
@@ -2578,16 +2578,20 @@ def admin_campaign_delete(campaign_id: str):
     """
     Permanently delete a campaign from the local dashboard.
     Does NOT touch Google Ads — only removes the local DB record.
-    Use for cleaning up unlinked/test campaigns.
+    UNMANAGED campaigns (status=UNMANAGED) can always be deleted — they are orphaned import rows.
+    Managed campaigns with a GAds resource must use Stop instead.
     """
     from database import get_campaign_by_id, delete_campaign
     camp = get_campaign_by_id(campaign_id)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.get("gads_campaign_resource"):
+    # Block deletion of actively managed GAds-linked campaigns (use Stop instead)
+    # UNMANAGED rows are orphaned/duplicate imports — always deletable
+    is_managed = camp.get("gads_campaign_resource") and camp.get("status") != "UNMANAGED"
+    if is_managed:
         raise HTTPException(
             status_code=400,
-            detail="Cannot delete a campaign linked to Google Ads. Use Stop instead."
+            detail="Cannot delete a managed campaign linked to Google Ads. Use Stop instead."
         )
     deleted = delete_campaign(campaign_id)
     return {"ok": deleted, "campaign_id": campaign_id}
@@ -2626,7 +2630,20 @@ def admin_gads_list_campaigns():
     for c in gads_campaigns:
         c["already_imported"] = c["campaign_id"] in already_imported
 
-    return {"campaigns": gads_campaigns, "total": len(gads_campaigns)}
+    # Local campaigns with no Google Ads link yet — offered as "link to existing" targets in the import modal
+    unlinked_local = [
+        {
+            "campaign_id":   c["campaign_id"],
+            "campaign_name": c["campaign_name"],
+            "status":        c.get("status"),
+        }
+        for c in local
+        if not c.get("gads_campaign_numeric_id")
+        and not c.get("gads_campaign_resource")
+        and c.get("campaign_type") != "GOOGLE_ADS"
+    ]
+
+    return {"campaigns": gads_campaigns, "total": len(gads_campaigns), "unlinked_local_campaigns": unlinked_local}
 
 
 class ImportCampaignsRequest(BaseModel):
@@ -2724,6 +2741,73 @@ def admin_import_campaigns(body: ImportCampaignsRequest, background_tasks: Backg
     return {"imported": imported, "skipped": skipped, "errors": errors}
 
 
+class LinkGadsCampaignRequest(BaseModel):
+    gads_campaign_id: str    # GAds numeric campaign ID
+    local_campaign_id: str   # Existing dashboard campaign_id to link it to
+
+
+@app.post("/api/admin/gads/link-campaign", dependencies=[Depends(_require_admin)])
+def admin_link_gads_campaign(body: LinkGadsCampaignRequest, background_tasks: BackgroundTasks):
+    """
+    Link an existing local dashboard campaign to a Google Ads campaign.
+    Sets gads_campaign_resource + gads_campaign_numeric_id + syncs campaign_name.
+    Does NOT create a new row — links to the existing one.
+    """
+    import datetime as _dt2
+    from google_ads_create import fetch_campaigns_from_gads
+    from database import get_campaign_by_id, get_all_campaigns_with_workflows, _conn
+
+    # 1. Validate local campaign exists and is not already linked
+    local = get_campaign_by_id(body.local_campaign_id)
+    if not local:
+        raise HTTPException(status_code=404, detail="Local campaign not found")
+    if local.get("gads_campaign_numeric_id") or local.get("gads_campaign_resource"):
+        raise HTTPException(status_code=409, detail="Local campaign is already linked to a Google Ads campaign")
+
+    # 2. Fetch GAds campaigns and validate the target exists
+    try:
+        gads_campaigns = fetch_campaigns_from_gads()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not fetch campaigns from Google Ads: {e}")
+
+    gads = next((g for g in gads_campaigns if g["campaign_id"] == body.gads_campaign_id), None)
+    if not gads:
+        raise HTTPException(status_code=404, detail="Google Ads campaign not found in account")
+
+    # 3. Ensure no other local row already owns this GAds numeric ID
+    for c in get_all_campaigns_with_workflows():
+        if (c.get("gads_campaign_numeric_id") == body.gads_campaign_id
+                and str(c["campaign_id"]) != str(body.local_campaign_id)):
+            raise HTTPException(
+                status_code=409,
+                detail=f"GAds campaign is already linked to dashboard campaign '{c['campaign_name']}'"
+            )
+
+    # 4. Update local row: resource name, numeric ID, and sync campaign_name to match Google Ads
+    now = _dt2.datetime.utcnow().isoformat()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE campaigns SET gads_campaign_resource=?, gads_campaign_numeric_id=?, "
+            "campaign_name=?, updated_at=? WHERE campaign_id=?",
+            (gads["resource_name"], body.gads_campaign_id,
+             gads["campaign_name"], now, body.local_campaign_id)
+        )
+
+    logger.info(f"Linked local campaign '{body.local_campaign_id}' to GAds campaign '{body.gads_campaign_id}' ('{gads['campaign_name']}')")
+
+    # 5. Backfill keywords/ads/ad-groups snapshot in background (mirrors import flow)
+    background_tasks.add_task(_backfill_campaign_snapshot, body.local_campaign_id, gads["resource_name"])
+
+    return {
+        "ok":                True,
+        "local_campaign_id": body.local_campaign_id,
+        "gads_campaign_id":  body.gads_campaign_id,
+        "campaign_name":     gads["campaign_name"],
+        "resource_name":     gads["resource_name"],
+    }
+
+
+
 @app.post("/api/admin/campaigns/{campaign_id}/sync-from-gads", dependencies=[Depends(_require_admin)])
 def admin_sync_campaign_from_gads(campaign_id: str):
     """
@@ -2774,13 +2858,18 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
     Returns everything needed for the campaign detail drawer in one request.
     """
     from database import (
-        get_campaign_by_id, get_daily_stats, get_ad_group_stats, get_ads_with_metrics
+        get_campaign_by_id, get_daily_stats, get_ad_group_stats, get_ads_with_metrics,
+        get_search_term_stats
     )
     import json as _json
 
     camp = get_campaign_by_id(campaign_id)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Resolve Google Ads numeric ID and campaign name for downstream filtering
+    gads_num_id = camp.get("gads_campaign_numeric_id") or ""
+    camp_name   = camp.get("campaign_name") or ""
 
     # Parse strategy_json if stored as string
     strategy = None
@@ -2790,8 +2879,8 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
         except Exception:
             strategy = None
 
-    # Daily stats filtered to this campaign
-    daily_stats = get_daily_stats(days=days, campaign_id=campaign_id)
+    # Daily stats filtered by numeric GAds campaign ID (not local UUID)
+    daily_stats = get_daily_stats(days=days, campaign_id=gads_num_id or None)
     for row in daily_stats:
         row["cost"] = round((row.get("cost_micros") or 0) / 1_000_000.0, 2)
 
@@ -2806,14 +2895,31 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
 
     # Ad groups for this campaign (filter from all ad groups by campaign_id)
     all_ag = get_ad_group_stats(days=days)
-    # gads_daily_stats uses campaign_id column; filter by numeric id or name match
-    gads_num_id = camp.get("gads_campaign_numeric_id") or ""
-    camp_name   = camp.get("campaign_name") or ""
     ad_groups = [
         ag for ag in all_ag
         if ag.get("campaign_id") == gads_num_id
         or ag.get("campaign_name", "").lower() == camp_name.lower()
     ]
+
+    # Enrich ad_groups with resource_name + status from snapshot (needed for pause/enable)
+    from database import get_gads_campaign_snapshot as _get_snap
+    snap_preview = _get_snap(campaign_id)
+    # snap["ad_groups"] = {"ad_groups": [...], "source": "..."} — list is nested one level deep
+    ag_block = snap_preview.get("ad_groups") or {}
+    snap_ag_list = (ag_block.get("ad_groups") if isinstance(ag_block, dict) else ag_block) or []
+    snap_ag_map = {}      # ad_group_id (numeric str) → resource_name
+    snap_status_map = {}  # ad_group_id (numeric str) → status string (ENABLED/PAUSED)
+    for sag in snap_ag_list:
+        rn = sag.get("resource_name") or ""
+        # resource_name format: customers/NNNN/adGroups/MMMM
+        if rn and "/adGroups/" in rn:
+            ag_id = rn.split("/adGroups/")[-1]
+            snap_ag_map[ag_id] = rn
+            snap_status_map[ag_id] = (sag.get("status") or "ENABLED").upper()
+    for ag in ad_groups:
+        ag_id = str(ag.get("ad_group_id") or "")
+        ag["resource_name"] = snap_ag_map.get(ag_id, "")
+        ag["gads_status"] = snap_status_map.get(ag_id, "")
 
     # Ad creatives for this campaign
     all_ads = get_ads_with_metrics(days=days)
@@ -2839,6 +2945,10 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
                 ad["assets_json"] = {"headlines": [], "descriptions": []}
         if not isinstance(ad.get("assets_json"), dict):
             ad["assets_json"] = {"headlines": [], "descriptions": []}
+        # Normalize {text, pinned} objects → plain strings for frontend rendering
+        assets = ad["assets_json"]
+        assets["headlines"]    = [h["text"] if isinstance(h, dict) else h for h in assets.get("headlines", [])]
+        assets["descriptions"] = [d["text"] if isinstance(d, dict) else d for d in assets.get("descriptions", [])]
 
     # Lead attribution: count leads linked to this campaign_id
     with __import__("database")._conn() as conn:
@@ -2854,8 +2964,19 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
     # Snapshot from Google Ads (raw imported state — separate from user-edited build)
     gads_snapshot = get_gads_campaign_snapshot(campaign_id)
 
+    # Search terms for this campaign (filtered by campaign name)
+    search_terms = get_search_term_stats(campaign_name=camp_name, days=days) if camp_name else []
+
+    # Inject computed daily_budget_usd into the campaign dict for the budget editor.
+    # Prefer the value from the most recent daily_stats row (reflects actual live budget),
+    # then fall back to monthly_budget / 30.4 (local approximation).
+    camp_out = dict(camp)
+    if not camp_out.get("daily_budget_usd"):
+        monthly = camp_out.get("monthly_budget") or 0
+        camp_out["daily_budget_usd"] = round(monthly / 30.4, 2) if monthly else 0.0
+
     return {
-        "campaign": {k: v for k, v in camp.items() if k not in ("strategy_json", "campaign_build_json", "gads_campaign_snapshot")},
+        "campaign": {k: v for k, v in camp_out.items() if k not in ("strategy_json", "campaign_build_json", "gads_campaign_snapshot")},
         "strategy": strategy,
         "build": build_data,
         "gads_snapshot": gads_snapshot,
@@ -2873,8 +2994,510 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
         "daily_stats": daily_stats,
         "ad_groups": ad_groups,
         "ads": ads,
+        "search_terms": search_terms,
         "has_gads_data": bool(camp.get("gads_campaign_resource")),
     }
+
+
+# ─── Per-campaign performance sync ───────────────────────────────────────────
+
+@app.post("/api/admin/campaigns/{campaign_id}/sync-perf", dependencies=[Depends(_require_admin)])
+def admin_campaign_sync_perf(campaign_id: str):
+    """
+    Re-fetch performance data (search terms + daily stats) for a single campaign
+    directly from Google Ads and update the local cache tables.
+    Returns counts of rows updated.
+    """
+    from database import (
+        get_campaign_by_id, save_gads_search_terms_cache, save_gads_daily_stats
+    )
+    from datetime import datetime, timezone, timedelta
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource  = camp.get("gads_campaign_resource") or ""
+    gads_num_id    = camp.get("gads_campaign_numeric_id") or ""
+    camp_name      = camp.get("campaign_name") or ""
+
+    if not gads_resource or not gads_num_id:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    # gads_campaign_resource format: "customers/NNNN/campaigns/MMMM"
+    parts = gads_resource.split("/")
+    customer_id = parts[1] if len(parts) >= 2 else ""
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Cannot determine Google Ads customer ID")
+
+    from google_ads_sync import _build_client
+    client = _build_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    search_terms_updated = 0
+    daily_stats_updated  = 0
+    errors = []
+
+    # Compute explicit date range — LAST_N_DAYS is not a valid GAQL DURING literal for N>30.
+    # Google Ads supports LAST_7_DAYS, LAST_14_DAYS, LAST_30_DAYS but NOT LAST_90_DAYS.
+    # Use BETWEEN with explicit yyyy-mm-dd strings instead.
+    _today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _since_90d = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    # ── 1. Re-fetch search terms for this campaign ────────────────────────────
+    try:
+        st_query = f"""
+            SELECT
+                search_term_view.search_term,
+                campaign.name,
+                ad_group.name,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                search_term_view.status
+            FROM search_term_view
+            WHERE campaign.id = {gads_num_id}
+              AND segments.date BETWEEN '{_since_90d}' AND '{_today}'
+            ORDER BY metrics.cost_micros DESC
+            LIMIT 500
+        """
+        st_response = ga_service.search(customer_id=customer_id, query=st_query)
+        st_rows = []
+        for row in st_response:
+            clicks     = row.metrics.clicks or 0
+            cost_dollars = (row.metrics.cost_micros or 0) / 1_000_000.0
+            cpc        = (cost_dollars / clicks) if clicks else 0.0
+            st_rows.append({
+                "search_term":   row.search_term_view.search_term,
+                "campaign_name": row.campaign.name,
+                "ad_group_name": row.ad_group.name,
+                "impressions":   row.metrics.impressions,
+                "clicks":        clicks,
+                "cost":          cost_dollars,          # dollars — matches save_gads_search_terms_cache
+                "cpc":           round(cpc, 4),
+                "conversions":   row.metrics.conversions,
+                "status":        str(row.search_term_view.status.name),
+            })
+        if st_rows:
+            save_gads_search_terms_cache(st_rows, days=30)
+            search_terms_updated = len(st_rows)
+    except Exception as e:
+        errors.append(f"search_terms: {str(e)}")
+
+    # ── 2. Re-fetch daily stats for this campaign ─────────────────────────────
+    try:
+        ds_query = f"""
+            SELECT
+                campaign.id,
+                campaign.name,
+                ad_group.id,
+                ad_group.name,
+                segments.date,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions
+            FROM ad_group
+            WHERE campaign.id = {gads_num_id}
+              AND segments.date BETWEEN '{_since_90d}' AND '{_today}'
+            ORDER BY segments.date DESC
+        """
+        ds_response = ga_service.search(customer_id=customer_id, query=ds_query)
+        ds_rows = []
+        for row in ds_response:
+            ds_rows.append({
+                "date":          row.segments.date,
+                "campaign_id":   str(row.campaign.id),
+                "campaign_name": row.campaign.name,
+                "ad_group_id":   str(row.ad_group.id),
+                "ad_group_name": row.ad_group.name,
+                "impressions":   row.metrics.impressions,
+                "clicks":        row.metrics.clicks,
+                "cost_micros":   row.metrics.cost_micros,
+                "conversions":   row.metrics.conversions,
+            })
+        if ds_rows:
+            # save_gads_daily_stats handles ON CONFLICT upsert + synced_at automatically
+            daily_stats_updated = save_gads_daily_stats(ds_rows)
+    except Exception as e:
+        errors.append(f"daily_stats: {str(e)}")
+
+    return {
+        "ok": len(errors) == 0,
+        "campaign_id": campaign_id,
+        "campaign_name": camp_name,
+        "search_terms_updated": search_terms_updated,
+        "daily_stats_updated": daily_stats_updated,
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+        "errors": errors,
+    }
+
+
+# ─── Campaign write-back endpoints (PR 1) ────────────────────────────────────
+
+class NegativeKeywordRequest(BaseModel):
+    keyword_text: str
+    match_type: str = "EXACT"   # EXACT | PHRASE | BROAD
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/negative-keywords",
+          dependencies=[Depends(_require_admin)])
+def admin_add_negative_keyword(campaign_id: str, body: NegativeKeywordRequest):
+    """
+    Add a campaign-level negative keyword (e.g. from a search term in the Performance tab).
+    Immediately executes against the Google Ads API and logs to gads_audit_log.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from google_ads_write import add_negative_keyword_to_campaign
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    keyword_text = (body.keyword_text or "").strip()
+    if not keyword_text:
+        raise HTTPException(status_code=422, detail="keyword_text is required")
+
+    match_type = (body.match_type or "EXACT").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise HTTPException(status_code=422, detail="match_type must be EXACT, PHRASE, or BROAD")
+
+    action_id = log_admin_manual_action(
+        operation="add_negative_keyword",
+        entity_type="campaign",
+        entity_id=gads_resource,
+        entity_name=camp.get("campaign_name", ""),
+        before={},
+        after={"keyword_text": keyword_text, "match_type": match_type,
+               "campaign_resource": gads_resource},
+        reason="manual_negate_from_search_terms",
+    )
+
+    try:
+        add_negative_keyword_to_campaign(gads_resource, keyword_text, match_type)
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "add_negative_keyword",
+            "keyword_text": keyword_text,
+            "match_type": match_type,
+        }
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+class AdGroupStatusRequest(BaseModel):
+    ad_group_resource: str
+    status: str    # PAUSED | ENABLED
+    ad_group_name: str = ""
+    campaign_id: str = ""
+
+
+@app.post("/api/admin/ad-groups/set-status", dependencies=[Depends(_require_admin)])
+def admin_set_ad_group_status(body: AdGroupStatusRequest):
+    """
+    Pause or enable an ad group directly in Google Ads.
+    ad_group_resource: full resource name e.g. 'customers/1234/adGroups/5678'
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from google_ads_write import set_ad_group_status
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    ad_group_resource = (body.ad_group_resource or "").strip()
+    if not ad_group_resource or not ad_group_resource.startswith("customers/"):
+        raise HTTPException(status_code=422,
+                            detail="ad_group_resource must be a full resource name (customers/NNNN/adGroups/MMMM)")
+
+    new_status = (body.status or "").upper()
+    if new_status not in ("PAUSED", "ENABLED"):
+        raise HTTPException(status_code=422, detail="status must be PAUSED or ENABLED")
+
+    old_status = "ENABLED" if new_status == "PAUSED" else "PAUSED"
+    operation = "pause_ad_group" if new_status == "PAUSED" else "enable_ad_group"
+
+    action_id = log_admin_manual_action(
+        operation=operation,
+        entity_type="ad_group",
+        entity_id=ad_group_resource,
+        entity_name=body.ad_group_name or ad_group_resource,
+        before={"status": old_status},
+        after={"status": new_status},
+        reason="manual_status_change_via_dashboard",
+    )
+
+    try:
+        set_ad_group_status(ad_group_resource, new_status)
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": operation,
+            "ad_group_resource": ad_group_resource,
+            "status": new_status,
+        }
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+# ─── PR 2: Budget edit + Add keyword ─────────────────────────────────────────
+
+class SetBudgetRequest(BaseModel):
+    campaign_resource: str       # "customers/NNNN/campaigns/MMMM"
+    new_daily_budget_usd: float
+    current_daily_budget_usd: float = 0.0  # used for guardrail; 0 means unverified
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/set-budget",
+          dependencies=[Depends(_require_admin)])
+def admin_set_campaign_budget(campaign_id: str, body: SetBudgetRequest):
+    """
+    Update the daily budget for a live Google Ads campaign.
+    Runs kill switch + budget-change guardrails before mutating.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError, \
+        check_budget_change_safe, check_proposed_spend_under_cap
+    from database import get_campaign_by_id, log_admin_manual_action, \
+        update_gads_action_result, set_audit_approval
+    from google_ads_write import set_campaign_daily_budget
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    campaign_resource = (body.campaign_resource or "").strip()
+    if not campaign_resource or not campaign_resource.startswith("customers/"):
+        raise HTTPException(status_code=422,
+                            detail="campaign_resource must be a full resource name (customers/NNNN/campaigns/MMMM)")
+
+    new_usd = body.new_daily_budget_usd
+    if new_usd < 1.0:
+        raise HTTPException(status_code=422, detail="Daily budget must be at least $1.00")
+
+    # Budget-change safety guardrails
+    current_micros = int((body.current_daily_budget_usd or 0) * 1_000_000)
+    new_micros     = int(new_usd * 1_000_000)
+
+    if not check_budget_change_safe(current_micros, new_micros):
+        raise HTTPException(status_code=403,
+                            detail="Budget increase exceeds 25% or increases from zero — change rejected by safety guardrail")
+
+    allowed, cap_usd = check_proposed_spend_under_cap(campaign_id, new_micros)
+    if not allowed:
+        raise HTTPException(status_code=403,
+                            detail=f"Proposed budget ${new_usd:.2f}/day exceeds the ${cap_usd:.2f} spend cap for this campaign")
+
+    action_id = log_admin_manual_action(
+        operation="set_campaign_budget",
+        entity_type="campaign",
+        entity_id=campaign_resource,
+        entity_name=camp.get("campaign_name", ""),
+        before={"daily_budget_usd": body.current_daily_budget_usd},
+        after={"daily_budget_usd": new_usd},
+        reason="manual_budget_edit_via_dashboard",
+    )
+
+    try:
+        set_campaign_daily_budget(campaign_resource, new_usd)
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        # Persist the new budget back to the local campaigns table so the detail
+        # drawer shows the correct value after reload (monthly_budget = daily * 30.4)
+        from database import update_campaign_fields as _ucf
+        _ucf(campaign_id, {"monthly_budget": round(new_usd * 30.4, 2)})
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "set_campaign_budget",
+            "campaign_resource": campaign_resource,
+            "new_daily_budget_usd": new_usd,
+        }
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+class AddKeywordRequest(BaseModel):
+    ad_group_resource: str       # "customers/NNNN/adGroups/MMMM"
+    ad_group_name: str = ""
+    keyword_text: str
+    match_type: str = "EXACT"    # EXACT | PHRASE | BROAD
+    cpc_bid_micros: int = 0      # 0 = use ad group default
+
+
+@app.post("/api/admin/ad-groups/add-keyword", dependencies=[Depends(_require_admin)])
+def admin_add_keyword_to_ad_group(body: AddKeywordRequest):
+    """
+    Add a positive keyword to a Google Ads ad group.
+    Immediately executes and logs to gads_audit_log.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from google_ads_write import add_keyword_to_ad_group
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    ad_group_resource = (body.ad_group_resource or "").strip()
+    if not ad_group_resource or not ad_group_resource.startswith("customers/"):
+        raise HTTPException(status_code=422,
+                            detail="ad_group_resource must be a full resource name (customers/NNNN/adGroups/MMMM)")
+
+    keyword_text = (body.keyword_text or "").strip()
+    if not keyword_text:
+        raise HTTPException(status_code=422, detail="keyword_text is required")
+
+    match_type = (body.match_type or "EXACT").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise HTTPException(status_code=422, detail="match_type must be EXACT, PHRASE, or BROAD")
+
+    action_id = log_admin_manual_action(
+        operation="add_keyword",
+        entity_type="ad_group",
+        entity_id=ad_group_resource,
+        entity_name=body.ad_group_name or ad_group_resource,
+        before={},
+        after={"keyword_text": keyword_text, "match_type": match_type,
+               "cpc_bid_micros": body.cpc_bid_micros},
+        reason="manual_add_keyword_via_dashboard",
+    )
+
+    try:
+        add_keyword_to_ad_group(
+            ad_group_resource,
+            keyword_text,
+            match_type,
+            body.cpc_bid_micros,
+        )
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "add_keyword",
+            "ad_group_resource": ad_group_resource,
+            "keyword_text": keyword_text,
+            "match_type": match_type,
+        }
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+# ── 3. Replace geographic targeting (PR 3) ───────────────────────────────────
+
+class SetLocationsRequest(BaseModel):
+    campaign_resource: str   # "customers/NNNN/campaigns/MMMM"
+    geo_json: str            # {"unit":"miles","locations":[{type,value,radius,include}]}
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/set-locations",
+          dependencies=[Depends(_require_admin)])
+def admin_set_campaign_locations(campaign_id: str, body: SetLocationsRequest):
+    """
+    Atomically replace geographic targeting (LOCATION + PROXIMITY criteria)
+    on a Google Ads campaign.
+    Rejects saves with zero resolved locations to prevent worldwide targeting.
+    Logs to gads_audit_log and persists geo_json back to local DB.
+    """
+    import json as _json
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import (log_admin_manual_action, update_gads_action_result,
+                          set_audit_approval, get_campaign_by_id, update_campaign_fields)
+    from google_ads_write import replace_campaign_locations
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    campaign_resource = (body.campaign_resource or "").strip()
+    if not campaign_resource or not campaign_resource.startswith("customers/"):
+        raise HTTPException(status_code=422,
+                            detail="campaign_resource must be a full resource name (customers/NNNN/campaigns/MMMM)")
+
+    # Validate campaign exists locally
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail=f"Campaign {campaign_id} not found")
+
+    # Parse geo_json and enforce non-empty locations guard (Opus M3)
+    geo_json_str = (body.geo_json or "").strip()
+    try:
+        parsed = _json.loads(geo_json_str) if geo_json_str else {}
+        locations = parsed.get("locations") or []
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid geo_json: {e}")
+
+    if not locations:
+        raise HTTPException(status_code=422,
+                            detail="At least one location is required — saving zero locations would make the campaign worldwide")
+
+    action_id = log_admin_manual_action(
+        operation="set_campaign_locations",
+        entity_type="campaign",
+        entity_id=campaign_resource,
+        entity_name=camp.get("campaign_name") or campaign_resource,
+        before={"geographic_targeting": camp.get("geographic_targeting")},
+        after={"geo_json": geo_json_str},
+        reason="manual_location_edit_via_dashboard",
+    )
+
+    try:
+        result = replace_campaign_locations(campaign_resource, geo_json_str)
+        added = result.get("added", 0)
+        errs  = result.get("errors", [])
+        # "partial_success" if soft errors occurred (some locations failed to resolve)
+        exec_result = "partial_success" if errs else "success"
+        update_gads_action_result(action_id, executed=True, execution_result=exec_result)
+        set_audit_approval(action_id, "admin")
+        # M7: Only persist geo_json to local DB if at least one location was actually applied.
+        # If added==0, the DB would show the user's submitted JSON but Google Ads has no new criteria.
+        if added > 0:
+            update_campaign_fields(campaign_id, {"geographic_targeting": geo_json_str})
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "set_campaign_locations",
+            "removed": result.get("removed", 0),
+            "added": added,
+            "errors": errs,
+        }
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
 
 
 # ─── Google Ads extended reporting ───────────────────────────────────────────

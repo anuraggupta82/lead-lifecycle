@@ -3026,9 +3026,32 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [gadsImportLoading, setGadsImportLoading] = useState(false);
   const [gadsImportSelected, setGadsImportSelected] = useState(new Set());
   const [gadsImporting, setGadsImporting] = useState(false);
+  const [gadsUnlinkedLocal, setGadsUnlinkedLocal] = useState([]);   // local campaigns without a GAds link
+  const [gadsLinkMap, setGadsLinkMap] = useState({});               // { [gadsCampaignId]: localCampaignId }
   const [campDetail, setCampDetail] = useState(null);
   const [campDetailLoading, setCampDetailLoading] = useState(false);
   const [campDetailDays, setCampDetailDays] = useState(30);
+  const [syncPerfLoading, setSyncPerfLoading] = useState(false);
+  const [syncPerfResult, setSyncPerfResult] = useState(null);
+  // Write-back state
+  const [negatePopover, setNegatePopover]     = useState(null);  // {term, matchType}
+  const [negateLoading, setNegateLoading]     = useState(false);
+  const [negatedTerms, setNegatedTerms]       = useState(new Set()); // locally-negated search terms
+  const [agStatusLoading, setAgStatusLoading] = useState({});    // {resource_name: true/false}
+  const [agStatusOverride, setAgStatusOverride] = useState({});  // {resource_name: 'PAUSED'|'ENABLED'}
+  // PR 2: budget edit
+  const [budgetEdit, setBudgetEdit]           = useState(null);  // {campaign_id, campaign_resource, current_usd}
+  const [budgetEditValue, setBudgetEditValue] = useState('');
+  const [budgetSaving, setBudgetSaving]       = useState(false);
+  // PR 2: add keyword to ad group
+  const [addKwPopover, setAddKwPopover]       = useState(null);  // {ad_group_resource, ad_group_name}
+  const [addKwText, setAddKwText]             = useState('');
+  const [addKwMatchType, setAddKwMatchType]   = useState('EXACT');
+  const [addKwLoading, setAddKwLoading]       = useState(false);
+  // PR 3: geographic targeting edit (Performance tab)
+  const [geoEditOpen, setGeoEditOpen]         = useState(false);
+  const [geoEditDraft, setGeoEditDraft]       = useState('');   // geo_json string being edited
+  const [geoSaving, setGeoSaving]             = useState(false);
 
   async function loadUnifiedCamps() {
     setUnifiedLoading(true);
@@ -3100,8 +3123,20 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     const isSameCampaign = campDetail?.campaign?.campaign_id === campId;
     setCampDetailLoading(true);
     setCampDetail(null);
-    // Only reset tab when opening a different campaign; preserve tab on same-campaign reloads
-    if (!isSameCampaign) setDetailTab('strategy');
+    // Only reset tab + local write-state when opening a different campaign
+    if (!isSameCampaign) {
+      setDetailTab('strategy');
+      setNegatedTerms(new Set());
+      setAgStatusOverride({});
+      setBudgetEdit(null);
+      setBudgetEditValue('');
+      setAddKwPopover(null);
+      setAddKwText('');
+      setAddKwMatchType('EXACT');
+      setGeoEditOpen(false);
+      setGeoEditDraft('');
+      setGeoSaving(false);
+    }
     setBuildLoading('');
     setCampEditMode(false);
     setCampEditFields({});
@@ -3118,14 +3153,157 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     }
   }
 
+  async function negateSearchTerm(campId, keywordText, matchType) {
+    setNegateLoading(true);
+    try {
+      await api(`/api/admin/campaigns/${campId}/negative-keywords`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({keyword_text: keywordText, match_type: matchType}),
+      });
+      setNegatedTerms(prev => new Set([...prev, keywordText]));
+      setNegatePopover(null);
+    } catch(e) {
+      alert('Negate failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setNegateLoading(false);
+    }
+  }
+
+  async function toggleAdGroupStatus(campId, agResourceName, agName, currentStatus) {
+    const newStatus = currentStatus === 'PAUSED' ? 'ENABLED' : 'PAUSED';
+    if (currentStatus === 'ENABLED') {
+      if (!window.confirm(`Pause "${agName}"? Ads in this group will stop serving immediately.`)) return;
+    }
+    setAgStatusLoading(prev => ({...prev, [agResourceName]: true}));
+    try {
+      await api('/api/admin/ad-groups/set-status', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          ad_group_resource: agResourceName,
+          status: newStatus,
+          ad_group_name: agName,
+          campaign_id: campId,
+        }),
+      });
+      setAgStatusOverride(prev => ({...prev, [agResourceName]: newStatus}));
+    } catch(e) {
+      alert('Status change failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setAgStatusLoading(prev => ({...prev, [agResourceName]: false}));
+    }
+  }
+
+  // PR 2: Save daily budget
+  async function saveBudget(campId) {
+    const usd = parseFloat(budgetEditValue);
+    if (!usd || usd < 1) { alert('Minimum budget is $1.00/day'); return; }
+    setBudgetSaving(true);
+    try {
+      await api(`/api/admin/campaigns/${campId}/set-budget`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          campaign_resource: budgetEdit.campaign_resource,
+          new_daily_budget_usd: usd,
+          current_daily_budget_usd: budgetEdit.current_usd || 0,
+        }),
+      });
+      alert(`✓ Budget updated to $${usd.toFixed(2)}/day`);
+      setBudgetEdit(null);
+      setBudgetEditValue('');
+      // Reload detail so displayed budget reflects the write
+      openCampaignDetail(campId, campDetailDays);
+    } catch(e) {
+      alert('Budget update failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setBudgetSaving(false);
+    }
+  }
+
+  // PR 2: Add positive keyword to ad group
+  async function addKeyword(campId) {
+    const text = addKwText.trim();
+    if (!text) return;
+    setAddKwLoading(true);
+    try {
+      await api('/api/admin/ad-groups/add-keyword', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          ad_group_resource: addKwPopover.ad_group_resource,
+          ad_group_name: addKwPopover.ad_group_name,
+          keyword_text: text,
+          match_type: addKwMatchType,
+          cpc_bid_micros: 0,
+        }),
+      });
+      alert(`✓ Added [${addKwMatchType}] "${text}" to ${addKwPopover.ad_group_name || 'ad group'}`);
+      setAddKwPopover(null);
+      setAddKwText('');
+      setAddKwMatchType('EXACT');
+    } catch(e) {
+      alert('Add keyword failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setAddKwLoading(false);
+    }
+  }
+
+  // PR 3: Save geographic targeting to Google Ads
+  async function saveLocations(campId) {
+    const cd = campDetail;
+    const campResource = cd?.campaign?.gads_campaign_resource;
+    if (!campResource) { alert('No campaign resource found'); return; }
+    let parsed;
+    try { parsed = JSON.parse(geoEditDraft); } catch(e) { alert('Invalid geo data'); return; }
+    const locs = parsed?.locations || [];
+    if (!locs.length) { alert('Add at least one location before saving'); return; }
+    setGeoSaving(true);
+    try {
+      const res = await api(`/api/admin/campaigns/${campId}/set-locations`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({campaign_resource: campResource, geo_json: geoEditDraft}),
+      });
+      const warn = res.errors?.length ? `\n⚠️ Soft errors: ${res.errors.join(', ')}` : '';
+      alert(`✓ Locations updated (removed ${res.removed}, added ${res.added})${warn}`);
+      setGeoEditOpen(false);
+      setGeoEditDraft('');
+      openCampaignDetail(campId, campDetailDays);
+    } catch(e) {
+      alert('Location update failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setGeoSaving(false);
+    }
+  }
+
+  async function syncCampaignPerf(campId) {
+    setSyncPerfLoading(true);
+    setSyncPerfResult(null);
+    try {
+      const res = await api(`/api/admin/campaigns/${campId}/sync-perf`, {method:'POST'});
+      setSyncPerfResult(res);
+      // Reload detail data so tables update
+      await openCampaignDetail(campId, campDetailDays);
+    } catch(e) {
+      setSyncPerfResult({ok:false, errors:[e?.detail || e?.message || 'Unknown error']});
+    } finally {
+      setSyncPerfLoading(false);
+    }
+  }
+
   async function openGadsImport() {
     setGadsImportOpen(true);
     setGadsImportList([]);
     setGadsImportSelected(new Set());
+    setGadsLinkMap({});
+    setGadsUnlinkedLocal([]);
     setGadsImportLoading(true);
     try {
       const data = await api('/api/admin/gads/list-campaigns');
       setGadsImportList(data.campaigns || []);
+      setGadsUnlinkedLocal(data.unlinked_local_campaigns || []);
     } catch(e) {
       alert('Could not fetch Google Ads campaigns: ' + (e?.detail || e?.message));
       setGadsImportOpen(false);
@@ -3138,18 +3316,43 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     if (gadsImportSelected.size === 0) return;
     setGadsImporting(true);
     try {
-      const result = await api('/api/admin/gads/import-campaigns', {
-        method: 'POST',
-        body: JSON.stringify({ campaign_ids: [...gadsImportSelected] }),
-      });
+      // Split selected rows: those with a link target → /link-campaign; rest → /import-campaigns
+      const linkPairs = [];
+      const createIds = [];
+      for (const gid of gadsImportSelected) {
+        if (gadsLinkMap[gid]) linkPairs.push({ gads_campaign_id: gid, local_campaign_id: gadsLinkMap[gid] });
+        else createIds.push(gid);
+      }
+
+      let linked = 0;
+      const linkErrors = [];
+      for (const pair of linkPairs) {
+        try {
+          await api('/api/admin/gads/link-campaign', { method: 'POST', body: JSON.stringify(pair) });
+          linked++;
+        } catch(e) {
+          linkErrors.push(e?.detail || e?.message || 'Unknown error');
+        }
+      }
+
+      let importResult = { imported: [], skipped: [], errors: [] };
+      if (createIds.length > 0) {
+        importResult = await api('/api/admin/gads/import-campaigns', {
+          method: 'POST',
+          body: JSON.stringify({ campaign_ids: createIds }),
+        });
+      }
+
       const msg = [
-        result.imported?.length ? `✅ Imported ${result.imported.length} campaign(s)` : null,
-        result.skipped?.length  ? `⏭ ${result.skipped.length} already imported` : null,
-        result.errors?.length   ? `❌ ${result.errors.length} error(s)` : null,
+        linked                          ? `🔗 Linked ${linked}` : null,
+        importResult.imported?.length   ? `✅ Imported ${importResult.imported.length}` : null,
+        importResult.skipped?.length    ? `⏭ ${importResult.skipped.length} already imported` : null,
+        importResult.errors?.length     ? `❌ ${importResult.errors.length} import error(s)` : null,
+        linkErrors.length               ? `❌ ${linkErrors.length} link error(s): ${linkErrors[0]}` : null,
       ].filter(Boolean).join(' · ');
       alert(msg || 'Done');
       setGadsImportOpen(false);
-      await loadManagedCamps();
+      await loadUnifiedCamps();
     } catch(e) {
       alert('Import failed: ' + (e?.detail || e?.message));
     } finally {
@@ -3672,7 +3875,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       {gadsImportOpen && (
         <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.45)',
           zIndex:280,display:'flex',alignItems:'center',justifyContent:'center'}}
-          onClick={()=>{ if (!gadsImporting) setGadsImportOpen(false); }}>
+          onClick={()=>{ if (!gadsImporting) { setGadsImportOpen(false); setGadsLinkMap({}); setGadsUnlinkedLocal([]); } }}>
           <div style={{background:'#fff',borderRadius:12,width:620,maxWidth:'96vw',maxHeight:'88vh',
             display:'flex',flexDirection:'column',boxShadow:'0 8px 40px rgba(0,0,0,.25)'}}
             onClick={e=>e.stopPropagation()}>
@@ -3734,7 +3937,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                         <th>Type</th>
                         <th className="num">Daily Budget</th>
                         <th className="num">~Monthly</th>
-                        <th></th>
+                        <th style={{fontSize:10,color:'var(--text-muted)'}}>Link to existing</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -3776,10 +3979,35 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             <td style={{fontSize:10,color:'var(--text-muted)'}}>{camp.channel_type}</td>
                             <td className="num" style={{fontSize:11}}>${camp.daily_budget_usd}/d</td>
                             <td className="num" style={{fontSize:11}}>${camp.monthly_budget_usd}</td>
-                            <td style={{fontSize:10}}>
-                              {isImported && (
+                            <td onClick={e=>e.stopPropagation()} style={{fontSize:10,minWidth:150}}>
+                              {isImported ? (
                                 <span style={{color:'#059669',fontWeight:600}}>✓ Imported</span>
-                              )}
+                              ) : gadsUnlinkedLocal.length > 0 ? (
+                                <select
+                                  value={gadsLinkMap[camp.campaign_id] || ''}
+                                  onChange={e => {
+                                    const v = e.target.value;
+                                    setGadsLinkMap(m => {
+                                      const next = {...m};
+                                      if (v) next[camp.campaign_id] = v;
+                                      else delete next[camp.campaign_id];
+                                      return next;
+                                    });
+                                    // Auto-select the row when a link target is picked
+                                    if (v) {
+                                      const s = new Set(gadsImportSelected);
+                                      s.add(camp.campaign_id);
+                                      setGadsImportSelected(s);
+                                    }
+                                  }}
+                                  style={{fontSize:10,padding:'2px 4px',maxWidth:180,borderRadius:4,
+                                    border:'1px solid var(--border)',background:'#fff'}}>
+                                  <option value="">— Link to existing… —</option>
+                                  {gadsUnlinkedLocal.map(lc => (
+                                    <option key={lc.campaign_id} value={lc.campaign_id}>{lc.campaign_name}</option>
+                                  ))}
+                                </select>
+                              ) : null}
                             </td>
                           </tr>
                         );
@@ -4435,7 +4663,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
                                             {ad.headlines.map((h,j)=>(
                                               <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',
-                                                fontSize:10,padding:'3px 8px',borderRadius:4,border:'1px solid #bae6fd'}}>{h}</span>
+                                                fontSize:10,padding:'3px 8px',borderRadius:4,border:'1px solid #bae6fd'}}>{typeof h==='object'?h.text||'':h}</span>
                                             ))}
                                           </div>
                                         </div>
@@ -4447,7 +4675,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           </div>
                                           {ad.descriptions.map((d,j)=>(
                                             <div key={j} style={{fontSize:11,padding:'5px 10px',background:'#fff',
-                                              border:'1px solid var(--border)',borderRadius:5,marginBottom:4,lineHeight:1.5}}>{d}</div>
+                                              border:'1px solid var(--border)',borderRadius:5,marginBottom:4,lineHeight:1.5}}>{typeof d==='object'?d.text||'':d}</div>
                                           ))}
                                         </div>
                                       )}
@@ -4500,7 +4728,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
                                             {(ag.headlines||[]).map((h,j)=>(
                                               <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',
-                                                fontSize:10,padding:'3px 8px',borderRadius:4,border:'1px solid #bae6fd'}}>{h}</span>
+                                                fontSize:10,padding:'3px 8px',borderRadius:4,border:'1px solid #bae6fd'}}>{typeof h==='object'?h.text||'':h}</span>
                                             ))}
                                           </div>
                                         </div>
@@ -4511,7 +4739,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           {(ag.descriptions||[]).map((d,j)=>(
                                             <div key={j} style={{fontSize:11,padding:'5px 10px',background:'#fff',
                                               border:'1px solid var(--border)',borderRadius:5,marginBottom:4,
-                                              lineHeight:1.5,color:'var(--text)'}}>{d}</div>
+                                              lineHeight:1.5,color:'var(--text)'}}>{typeof d==='object'?d.text||'':d}</div>
                                           ))}
                                         </div>
                                       </div>
@@ -5138,6 +5366,176 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           {/* ── Performance tab ── */}
                           {detailTab==='performance' && (
                             <div>
+                              {/* Sync button row + Budget editor */}
+                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+                                gap:8,marginBottom:12,flexWrap:'wrap'}}>
+                                {/* Left: budget display + edit */}
+                                <div style={{display:'flex',alignItems:'center',gap:6}}>
+                                  {cd.campaign.gads_campaign_resource && (
+                                    <>
+                                      <span style={{fontSize:11,color:'var(--text-muted)'}}>Daily budget:</span>
+                                      {budgetEdit?.campaign_id === cd.campaign.campaign_id ? (
+                                        <span style={{display:'flex',gap:4,alignItems:'center'}}>
+                                          <span style={{fontSize:11,color:'var(--text-muted)'}}>$</span>
+                                          <input
+                                            type="number" min="1" max="9999" step="1"
+                                            value={budgetEditValue}
+                                            onChange={e=>setBudgetEditValue(e.target.value)}
+                                            onKeyDown={e=>{
+                                              if(e.key==='Enter') saveBudget(cd.campaign.campaign_id);
+                                              if(e.key==='Escape'){setBudgetEdit(null);setBudgetEditValue('');}
+                                            }}
+                                            autoFocus
+                                            style={{width:64,fontSize:12,padding:'2px 5px',
+                                              border:'1px solid var(--border)',borderRadius:4}}
+                                          />
+                                          <span style={{fontSize:11,color:'var(--text-muted)'}}>/day</span>
+                                          <button disabled={budgetSaving}
+                                            onClick={()=>saveBudget(cd.campaign.campaign_id)}
+                                            style={{fontSize:10,padding:'2px 8px',background:'var(--teal)',
+                                              color:'#fff',border:'none',borderRadius:4,cursor:'pointer',
+                                              opacity:budgetSaving?0.6:1}}>
+                                            {budgetSaving ? '…' : 'Save'}
+                                          </button>
+                                          <button onClick={()=>{setBudgetEdit(null);setBudgetEditValue('');}}
+                                            style={{fontSize:10,padding:'2px 6px',background:'#f3f4f6',
+                                              color:'var(--text)',border:'none',borderRadius:4,cursor:'pointer'}}>
+                                            ✕
+                                          </button>
+                                        </span>
+                                      ) : (
+                                        <span style={{display:'flex',alignItems:'center',gap:4}}>
+                                          <span style={{fontSize:12,fontWeight:600}}>
+                                            ${(cd.campaign.daily_budget_usd||0).toFixed(2)}/day
+                                          </span>
+                                          <button
+                                            title="Edit daily budget in Google Ads"
+                                            onClick={()=>{
+                                              setBudgetEdit({
+                                                campaign_id: cd.campaign.campaign_id,
+                                                campaign_resource: cd.campaign.gads_campaign_resource,
+                                                current_usd: cd.campaign.daily_budget_usd || 0,
+                                              });
+                                              setBudgetEditValue(String(cd.campaign.daily_budget_usd || ''));
+                                            }}
+                                            style={{fontSize:12,background:'none',border:'none',
+                                              cursor:'pointer',color:'var(--teal)',padding:'0 2px',lineHeight:1}}>
+                                            ✏️
+                                          </button>
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                                {/* Right: sync result + sync button */}
+                                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                                  {syncPerfResult && (
+                                    <span style={{fontSize:10,
+                                      color: syncPerfResult.ok ? '#065f46' : '#991b1b',
+                                      background: syncPerfResult.ok ? '#d1fae5' : '#fee2e2',
+                                      border: `1px solid ${syncPerfResult.ok ? '#6ee7b7':'#fca5a5'}`,
+                                      borderRadius:4,padding:'2px 8px'}}>
+                                      {syncPerfResult.ok
+                                        ? `✓ Synced — ${syncPerfResult.search_terms_updated} search terms, ${syncPerfResult.daily_stats_updated} daily rows`
+                                        : `✗ ${syncPerfResult.errors?.join('; ')}`}
+                                    </span>
+                                  )}
+                                  <button className="btn btn-sm btn-ghost"
+                                    style={{fontSize:11,display:'flex',alignItems:'center',gap:4}}
+                                    disabled={syncPerfLoading || !cd.has_gads_data}
+                                    onClick={()=>syncCampaignPerf(campDetail?.campaign?.campaign_id)}>
+                                    {syncPerfLoading
+                                      ? <><span style={{animation:'spin 1s linear infinite',display:'inline-block'}}>↻</span> Syncing…</>
+                                      : '↻ Sync Performance'}
+                                  </button>
+                                </div>
+                              </div>
+
+                              {/* ── PR 3: Geographic targeting editor ── */}
+                              {cd.campaign.gads_campaign_resource && (
+                                <div style={{marginBottom:12}}>
+                                  {!geoEditOpen ? (
+                                    <div style={{display:'flex',alignItems:'center',gap:6,
+                                      background:'#f9fafb',border:'1px solid var(--border)',
+                                      borderRadius:6,padding:'7px 10px'}}>
+                                      <span style={{fontSize:11,color:'var(--text-muted)',flexShrink:0}}>📍 Locations:</span>
+                                      <span style={{fontSize:12,flex:1,color:'var(--text)'}}>
+                                        {cd.campaign.geographic_targeting
+                                          ? (formatGeoSummary(cd.campaign.geographic_targeting) || cd.campaign.geographic_targeting)
+                                          : <span style={{color:'#9ca3af'}}>Not set</span>}
+                                      </span>
+                                      <button
+                                        title="Edit geographic targeting in Google Ads"
+                                        onClick={()=>{
+                                          // M5: Guard against non-JSON legacy values (prose text, empty string)
+                                          const rawGeo = cd.campaign.geographic_targeting || '';
+                                          let seedGeo = '{"unit":"miles","locations":[]}';
+                                          try {
+                                            const p = JSON.parse(rawGeo);
+                                            if (p && Array.isArray(p.locations)) seedGeo = rawGeo;
+                                          } catch(_) { /* keep default seed */ }
+                                          setGeoEditDraft(seedGeo);
+                                          setGeoEditOpen(true);
+                                        }}
+                                        style={{fontSize:12,background:'none',border:'none',
+                                          cursor:'pointer',color:'var(--teal)',padding:'0 4px',lineHeight:1}}>
+                                        ✏️ Edit
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <div style={{background:'#fff',border:'1px solid var(--teal)',
+                                      borderRadius:7,padding:'10px 12px'}}>
+                                      <div style={{display:'flex',justifyContent:'space-between',
+                                        alignItems:'center',marginBottom:8}}>
+                                        <span style={{fontSize:12,fontWeight:600,color:'var(--teal)'}}>
+                                          📍 Edit Geographic Targeting
+                                        </span>
+                                        <button onClick={()=>{setGeoEditOpen(false);setGeoEditDraft('');}}
+                                          style={{fontSize:11,background:'none',border:'none',
+                                            cursor:'pointer',color:'var(--text-muted)'}}>✕ Cancel</button>
+                                      </div>
+                                      {/* Smart radius hint based on campaign type */}
+                                      {(() => {
+                                        const name = (cd.campaign.campaign_name || '').toLowerCase();
+                                        const isSpecialized = /implant|nxtsmile|ortho|invisalign|sleep|tmj|cosmetic|veneer/i.test(name);
+                                        const suggestRadius = isSpecialized ? 40 : 15;
+                                        return (
+                                          <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:8,
+                                            background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:4,padding:'4px 8px'}}>
+                                            💡 Suggested radius for <strong>{isSpecialized ? 'specialized' : 'general'}</strong> campaign:
+                                            <strong> {suggestRadius} miles</strong>
+                                            {isSpecialized ? ' (patients travel farther for specialty care)' : ' (local general dentistry)'}
+                                          </div>
+                                        );
+                                      })()}
+                                      <GeoTargetingBuilder
+                                        value={geoEditDraft}
+                                        onChange={setGeoEditDraft}
+                                        practiceAddress={practiceSettings?.practice_address}
+                                        defaultRadius={(() => {
+                                          const name = (cd.campaign.campaign_name || '').toLowerCase();
+                                          return /implant|nxtsmile|ortho|invisalign|sleep|tmj|cosmetic|veneer/i.test(name) ? 40 : 15;
+                                        })()}
+                                      />
+                                      <div style={{display:'flex',gap:8,marginTop:10,justifyContent:'flex-end'}}>
+                                        <button onClick={()=>{setGeoEditOpen(false);setGeoEditDraft('');}}
+                                          style={{fontSize:11,padding:'4px 12px',background:'#f3f4f6',
+                                            color:'var(--text)',border:'none',borderRadius:5,cursor:'pointer'}}>
+                                          Cancel
+                                        </button>
+                                        <button disabled={geoSaving}
+                                          onClick={()=>saveLocations(cd.campaign.campaign_id)}
+                                          style={{fontSize:11,padding:'4px 14px',background:'var(--teal)',
+                                            color:'#fff',border:'none',borderRadius:5,cursor:'pointer',
+                                            opacity:geoSaving?0.6:1}}>
+                                          {geoSaving ? 'Saving…' : '💾 Save to Google Ads'}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+
                               {/* Performance KPIs */}
                               {!cd.has_gads_data ? (
                                 <div style={{background:'#fefce8',border:'1px solid #fde68a',borderRadius:7,
@@ -5172,6 +5570,62 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               {cd.ad_groups && cd.ad_groups.length > 0 && (
                                 <div style={{marginBottom:20}}>
                                   <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>📊 Ad Groups ({cd.ad_groups.length})</div>
+
+                                  {/* Add Keyword popover */}
+                                  {addKwPopover && (
+                                    <div style={{background:'#fff',border:'1px solid var(--border)',
+                                      borderRadius:8,padding:'12px',marginBottom:10,
+                                      boxShadow:'0 4px 12px rgba(0,0,0,.08)'}}>
+                                      <div style={{fontSize:11,fontWeight:700,marginBottom:8}}>
+                                        ➕ Add Keyword to: <span style={{color:'var(--teal)'}}>{addKwPopover.ad_group_name}</span>
+                                      </div>
+                                      <input
+                                        autoFocus
+                                        placeholder="keyword text"
+                                        value={addKwText}
+                                        onChange={e=>setAddKwText(e.target.value)}
+                                        onKeyDown={e=>{
+                                          if(e.key==='Enter') addKeyword(campDetail?.campaign?.campaign_id);
+                                          if(e.key==='Escape') setAddKwPopover(null);
+                                        }}
+                                        style={{width:'100%',fontSize:12,padding:'5px 8px',
+                                          border:'1px solid var(--border)',borderRadius:5,
+                                          marginBottom:8,boxSizing:'border-box'}}
+                                      />
+                                      <div style={{display:'flex',gap:6,marginBottom:8}}>
+                                        {['EXACT','PHRASE','BROAD'].map(mt=>(
+                                          <label key={mt} style={{display:'flex',alignItems:'center',gap:3,
+                                            fontSize:11,cursor:'pointer',padding:'3px 8px',borderRadius:6,
+                                            fontWeight:600,
+                                            background: addKwMatchType===mt?'#d1fae5':'#f9fafb',
+                                            border:`1px solid ${addKwMatchType===mt?'#6ee7b7':'var(--border)'}`,
+                                            color: addKwMatchType===mt?'#065f46':'var(--text)'}}>
+                                            <input type="radio" name="addKwMatchType" value={mt}
+                                              checked={addKwMatchType===mt}
+                                              onChange={()=>setAddKwMatchType(mt)}
+                                              style={{display:'none'}}/>
+                                            {mt}
+                                          </label>
+                                        ))}
+                                      </div>
+                                      <div style={{display:'flex',gap:6}}>
+                                        <button
+                                          disabled={addKwLoading || !addKwText.trim()}
+                                          onClick={()=>addKeyword(campDetail?.campaign?.campaign_id)}
+                                          style={{fontSize:11,padding:'4px 12px',background:'#059669',
+                                            color:'#fff',border:'none',borderRadius:5,cursor:'pointer',
+                                            opacity:addKwLoading||!addKwText.trim()?0.5:1}}>
+                                          {addKwLoading ? '⏳ Adding…' : '➕ Add Keyword'}
+                                        </button>
+                                        <button onClick={()=>{setAddKwPopover(null);setAddKwText('');}}
+                                          style={{fontSize:11,padding:'4px 10px',background:'#f3f4f6',
+                                            border:'none',borderRadius:5,cursor:'pointer'}}>
+                                          Cancel
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+
                                   <table className="report-table">
                                     <thead>
                                       <tr>
@@ -5181,6 +5635,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         <th className="num">CTR</th>
                                         <th className="num">Cost</th>
                                         <th className="num">Leads</th>
+                                        <th style={{textAlign:'center'}}>Status</th>
+                                        <th style={{textAlign:'center'}}>Add KW</th>
                                       </tr>
                                     </thead>
                                     <tbody>
@@ -5189,14 +5645,63 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         const clk = ag.clicks||0;
                                         const cost = (ag.cost_micros||0)/1e6;
                                         const ctr = impr>0?((clk/impr)*100).toFixed(1)+'%':'—';
+                                        const rn = ag.resource_name||'';
+                                        const effectiveStatus = agStatusOverride[rn] || ag.gads_status || 'ENABLED';
+                                        const isPaused = effectiveStatus === 'PAUSED';
+                                        const isLoading = agStatusLoading[rn];
+                                        const isKwTarget = addKwPopover?.ad_group_resource === rn;
                                         return (
-                                          <tr key={i}>
+                                          <tr key={i} style={{opacity: isPaused ? 0.6 : 1,
+                                            background: isKwTarget ? '#f0fdf4' : 'transparent'}}>
                                             <td style={{fontWeight:500}}>{ag.ad_group_name||ag.ad_group_id||'—'}</td>
                                             <td className="num">{impr.toLocaleString()}</td>
                                             <td className="num">{clk.toLocaleString()}</td>
                                             <td className="num">{ctr}</td>
                                             <td className="num">${cost.toFixed(2)}</td>
                                             <td className="num">{ag.lead_count||0}</td>
+                                            <td style={{textAlign:'center'}}>
+                                              {rn ? (
+                                                <button
+                                                  disabled={!!isLoading}
+                                                  onClick={()=>toggleAdGroupStatus(
+                                                    campDetail?.campaign?.campaign_id, rn,
+                                                    ag.ad_group_name||'', effectiveStatus
+                                                  )}
+                                                  style={{
+                                                    fontSize:10, fontWeight:600, padding:'2px 8px',
+                                                    borderRadius:10, border:'none', cursor:'pointer',
+                                                    background: isLoading ? '#e5e7eb'
+                                                      : isPaused ? '#fef3c7' : '#d1fae5',
+                                                    color: isLoading ? '#9ca3af'
+                                                      : isPaused ? '#92400e' : '#065f46',
+                                                  }}>
+                                                  {isLoading ? '…' : isPaused ? '⏸ Paused' : '▶ Active'}
+                                                </button>
+                                              ) : (
+                                                <span style={{fontSize:10,color:'var(--text-muted)'}}>—</span>
+                                              )}
+                                            </td>
+                                            <td style={{textAlign:'center'}}>
+                                              {rn ? (
+                                                <button
+                                                  title="Add positive keyword to this ad group"
+                                                  onClick={()=>{
+                                                    setAddKwPopover({
+                                                      ad_group_resource: rn,
+                                                      ad_group_name: ag.ad_group_name||''
+                                                    });
+                                                    setAddKwText('');
+                                                    setAddKwMatchType('EXACT');
+                                                  }}
+                                                  style={{fontSize:13,background:'none',border:'none',
+                                                    cursor:'pointer',color:'#059669',padding:'0 4px',
+                                                    lineHeight:1}}>
+                                                  ➕
+                                                </button>
+                                              ) : (
+                                                <span style={{fontSize:10,color:'var(--text-muted)'}}>—</span>
+                                              )}
+                                            </td>
                                           </tr>
                                         );
                                       })}
@@ -5240,7 +5745,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                             <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
                                               {headlines.map((h,j)=>(
                                                 <span key={j} style={{background:'#e0f2fe',color:'#0c4a6e',fontSize:10,
-                                                  padding:'2px 7px',borderRadius:3}}>{h}</span>
+                                                  padding:'2px 7px',borderRadius:3}}>{typeof h==='object'?h.text||'':h}</span>
                                               ))}
                                             </div>
                                           </div>
@@ -5250,13 +5755,138 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                             <div style={{fontSize:9,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',marginBottom:3}}>Descriptions</div>
                                             {descs.map((d,j)=>(
                                               <div key={j} style={{fontSize:11,padding:'3px 8px',background:'#fff',
-                                                border:'1px solid var(--border)',borderRadius:4,marginBottom:2,lineHeight:1.4}}>{d}</div>
+                                                border:'1px solid var(--border)',borderRadius:4,marginBottom:2,lineHeight:1.4}}>{typeof d==='object'?d.text||'':d}</div>
                                             ))}
                                           </div>
                                         )}
                                       </div>
                                     );
                                   })}
+                                </div>
+                              )}
+
+                              {/* Search Terms */}
+                              {cd.search_terms && cd.search_terms.length > 0 && (
+                                <div style={{marginBottom:20}}>
+                                  <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>
+                                    🔍 Search Terms ({cd.search_terms.length})
+                                  </div>
+                                  {/* Negate popover */}
+                                  {negatePopover && (
+                                    <div style={{background:'#fff',border:'1px solid var(--border)',
+                                      borderRadius:8,padding:'12px 14px',marginBottom:10,
+                                      boxShadow:'0 4px 16px rgba(0,0,0,.12)'}}>
+                                      <div style={{fontSize:11,fontWeight:700,marginBottom:8,color:'var(--text)'}}>
+                                        🚫 Negate: <span style={{fontFamily:'monospace',color:'#dc2626'}}>{negatePopover.term}</span>
+                                      </div>
+                                      <div style={{fontSize:11,marginBottom:10,color:'var(--text-muted)'}}>
+                                        Match type determines how strictly this term is blocked:
+                                      </div>
+                                      <div style={{display:'flex',gap:8,marginBottom:12}}>
+                                        {['EXACT','PHRASE','BROAD'].map(mt=>(
+                                          <label key={mt} style={{display:'flex',alignItems:'center',gap:5,
+                                            fontSize:11,cursor:'pointer',
+                                            padding:'4px 10px',borderRadius:4,
+                                            background: negatePopover.matchType===mt?'#fee2e2':'#f9fafb',
+                                            border:`1px solid ${negatePopover.matchType===mt?'#fca5a5':'var(--border)'}`,
+                                            color: negatePopover.matchType===mt?'#991b1b':'var(--text)'}}>
+                                            <input type="radio" name="matchType" value={mt}
+                                              checked={negatePopover.matchType===mt}
+                                              onChange={()=>setNegatePopover(p=>({...p,matchType:mt}))}
+                                              style={{margin:0}} />
+                                            {mt}
+                                          </label>
+                                        ))}
+                                      </div>
+                                      <div style={{display:'flex',gap:8}}>
+                                        <button className="btn btn-sm"
+                                          style={{fontSize:11,background:'#dc2626',color:'#fff',border:'none'}}
+                                          disabled={negateLoading}
+                                          onClick={()=>negateSearchTerm(
+                                            campDetail.campaign.campaign_id,
+                                            negatePopover.term,
+                                            negatePopover.matchType
+                                          )}>
+                                          {negateLoading ? '⏳ Negating…' : '🚫 Confirm Negate'}
+                                        </button>
+                                        <button className="btn btn-ghost btn-sm" style={{fontSize:11}}
+                                          onClick={()=>setNegatePopover(null)}>
+                                          Cancel
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  <div style={{maxHeight:320,overflowY:'auto',border:'1px solid var(--border)',borderRadius:7}}>
+                                    <table className="report-table" style={{margin:0,borderRadius:0}}>
+                                      <thead style={{position:'sticky',top:0,background:'#f9fafb',zIndex:1}}>
+                                        <tr>
+                                          <th>Search Term</th>
+                                          <th className="num">Impr</th>
+                                          <th className="num">Clicks</th>
+                                          <th className="num">CTR</th>
+                                          <th className="num">Cost</th>
+                                          <th className="num">Conv</th>
+                                          <th>Status</th>
+                                          <th style={{textAlign:'center'}}>Action</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {cd.search_terms.slice(0,100).map((st,i)=>{
+                                          const impr = st.impressions||0;
+                                          const clk  = st.clicks||0;
+                                          const cost = st.cost||0;          // stored as dollars by save_gads_search_terms_cache
+                                          const ctr  = impr>0 ? ((clk/impr)*100).toFixed(1)+'%' : '—';
+                                          const isAdded = st.status==='ADDED';
+                                          const isExcluded = st.status==='EXCLUDED';
+                                          const isNegated = negatedTerms.has(st.search_term) || isExcluded;
+                                          return (
+                                            <tr key={i} style={{opacity: isNegated?0.5:1,
+                                              textDecoration: isNegated?'line-through':'none'}}>
+                                              <td style={{fontFamily:'monospace',fontSize:11,maxWidth:200,
+                                                overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                                                {st.search_term}
+                                              </td>
+                                              <td className="num">{impr.toLocaleString()}</td>
+                                              <td className="num">{clk.toLocaleString()}</td>
+                                              <td className="num">{ctr}</td>
+                                              <td className="num">${cost.toFixed(2)}</td>
+                                              <td className="num">{st.conversions||0}</td>
+                                              <td>
+                                                <span style={{fontSize:9,padding:'1px 5px',borderRadius:3,fontWeight:600,
+                                                  background: isNegated?'#fee2e2': isAdded?'#d1fae5':'#f3f4f6',
+                                                  color: isNegated?'#991b1b': isAdded?'#065f46':'#6b7280'}}>
+                                                  {isNegated?'NEGATED': st.status||'—'}
+                                                </span>
+                                              </td>
+                                              <td style={{textAlign:'center'}}>
+                                                {!isNegated && (
+                                                  <button
+                                                    title="Add as negative keyword to campaign"
+                                                    onClick={()=>setNegatePopover({
+                                                      term: st.search_term, matchType:'EXACT'
+                                                    })}
+                                                    style={{fontSize:13,background:'none',border:'none',
+                                                      cursor:'pointer',color:'#dc2626',padding:'0 4px',
+                                                      lineHeight:1}}>
+                                                    🚫
+                                                  </button>
+                                                )}
+                                              </td>
+                                            </tr>
+                                          );
+                                        })}
+                                        {cd.search_terms.length > 100 && (
+                                          <tr>
+                                            <td colSpan={7} style={{textAlign:'center',fontSize:11,
+                                              color:'var(--text-muted)',fontStyle:'italic',padding:'8px'}}>
+                                              Showing top 100 of {cd.search_terms.length} terms. Click ↻ Sync to refresh.
+                                            </td>
+                                          </tr>
+                                        )}
+                                      </tbody>
+                                    </table>
+                                  </div>
                                 </div>
                               )}
 
@@ -7219,13 +7849,13 @@ function WorkflowsSection() {
 
 
 // ── Geo Targeting Builder ──────────────────────────────────────────────────
-function GeoTargetingBuilder({value, onChange, practiceAddress}) {
+function GeoTargetingBuilder({value, onChange, practiceAddress, defaultRadius}) {
   const geo = React.useMemo(() => parseGeoTargeting(value), [value]);
   const [unit, setUnit] = React.useState(geo.unit || 'miles');
   const [locations, setLocations] = React.useState(geo.locations || []);
-  const [locType, setLocType] = React.useState('postal');
+  const [locType, setLocType] = React.useState('city');
   const [searchVal, setSearchVal] = React.useState('');
-  const [radius, setRadius] = React.useState(15);
+  const [radius, setRadius] = React.useState(defaultRadius || 15);
 
   // Sync state back up whenever locations or unit change
   React.useEffect(() => {
@@ -7235,7 +7865,10 @@ function GeoTargetingBuilder({value, onChange, practiceAddress}) {
   function addLocation() {
     const trimmed = searchVal.trim();
     if (!trimmed) return;
-    const needsRadius = !['state','country'].includes(locType);
+    // Only city+radius creates a proximity criterion (radius circle).
+    // postal/address → GeoTargetConstant (zip boundary, no radius).
+    // state/country → GeoTargetConstant, no radius.
+    const needsRadius = locType === 'city';
     setLocations(prev => [...prev, {
       type: locType,
       value: trimmed,
@@ -7265,11 +7898,21 @@ function GeoTargetingBuilder({value, onChange, practiceAddress}) {
     setUnit(newUnit);
   }
 
-  const typeLabels = {postal:'Postal Code', city:'City/County', address:'Address', state:'State', country:'Country'};
-  const showRadius = !['state','country'].includes(locType);
+  // City first — it's the primary radius-targeting option.
+  // Postal/address = zip boundary (no radius circle). State/country = broad exclusions.
+  const typeLabels = {city:'City + Radius ◎', postal:'Postal Code', address:'Address', state:'State', country:'Country'};
+  // Only city+radius creates a proximity circle in Google Ads.
+  // postal/address → GeoTargetConstant (zip boundary or address area, no radius).
+  const showRadius = locType === 'city';
 
   return (
     <div style={{fontSize:13}}>
+      {/* Tip banner */}
+      <div style={{fontSize:11, color:'#92400e', background:'#fffbeb', border:'1px solid #fde68a',
+                   borderRadius:6, padding:'6px 10px', marginBottom:10, lineHeight:1.5}}>
+        💡 <strong>Radius targeting:</strong> Use <strong>City + Radius ◎</strong> to draw a circle around a city (e.g. "Grafton" + 15 mi).
+        Postal Code targets the full zip boundary only — no radius circle.
+      </div>
       {/* Unit toggle */}
       <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:10}}>
         <span style={{color:'var(--text-muted)', fontSize:12}}>Distance unit:</span>
@@ -7284,34 +7927,45 @@ function GeoTargetingBuilder({value, onChange, practiceAddress}) {
         ))}
       </div>
 
-      {/* Add row */}
-      <div style={{display:'flex', gap:6, marginBottom:8, flexWrap:'wrap'}}>
-        <select value={locType} onChange={e=>setLocType(e.target.value)}
-          style={{fontSize:12, padding:'5px 8px', border:'0.5px solid var(--border)',
-                  borderRadius:6, background:'var(--surface)'}}>
-          {Object.entries(typeLabels).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
-        </select>
-        <input value={searchVal} onChange={e=>setSearchVal(e.target.value)}
-          onKeyDown={e=>e.key==='Enter'&&addLocation()}
-          placeholder={locType==='postal'?'e.g. 01536':locType==='city'?'e.g. Grafton, MA':'Search…'}
-          style={{flex:1, minWidth:120, fontSize:12, padding:'5px 8px',
-                  border:'0.5px solid var(--border)', borderRadius:6}} />
-        {showRadius && (
-          <>
-            <input type="number" value={radius} onChange={e=>setRadius(e.target.value)}
-              min={1} max={500}
-              style={{width:52, fontSize:12, padding:'5px 6px',
-                      border:'0.5px solid var(--border)', borderRadius:6, textAlign:'center'}} />
-            <span style={{alignSelf:'center', fontSize:12, color:'var(--text-muted)'}}>
-              {unit==='miles'?'mi':'km'}
+      {/* Add row — two lines to avoid wrapping that hides the Add button */}
+      <div style={{marginBottom:8}}>
+        <div style={{display:'flex', gap:6, marginBottom:4}}>
+          <select value={locType} onChange={e=>setLocType(e.target.value)}
+            style={{fontSize:12, padding:'5px 8px', border:'0.5px solid var(--border)',
+                    borderRadius:6, background:'var(--surface)', flexShrink:0}}>
+            {Object.entries(typeLabels).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+          <input value={searchVal} onChange={e=>setSearchVal(e.target.value)}
+            onKeyDown={e=>e.key==='Enter'&&addLocation()}
+            placeholder={locType==='city'?'e.g. Grafton':locType==='postal'?'e.g. 01536':locType==='state'?'e.g. Massachusetts':'Search…'}
+            style={{flex:1, fontSize:12, padding:'5px 8px',
+                    border:'0.5px solid var(--border)', borderRadius:6}} />
+        </div>
+        <div style={{display:'flex', gap:6, alignItems:'center'}}>
+          {showRadius && (
+            <>
+              <span style={{fontSize:11, color:'var(--text-muted)', flexShrink:0}}>Radius:</span>
+              <input type="number" value={radius} onChange={e=>setRadius(e.target.value)}
+                min={1} max={500}
+                style={{width:56, fontSize:12, padding:'4px 6px',
+                        border:'0.5px solid var(--border)', borderRadius:6, textAlign:'center'}} />
+              <span style={{fontSize:12, color:'var(--text-muted)', flexShrink:0}}>
+                {unit==='miles'?'mi':'km'}
+              </span>
+            </>
+          )}
+          {(locType === 'postal' || locType === 'address') && (
+            <span style={{fontSize:11, color:'var(--text-muted)', fontStyle:'italic', flexShrink:0}}>
+              {locType === 'postal' ? 'Targets full zip boundary (no radius)' : 'Targets address area (no radius)'}
             </span>
-          </>
-        )}
-        <button onClick={addLocation}
-          style={{padding:'5px 12px', background:'var(--accent)', color:'#fff',
-                  border:'none', borderRadius:6, cursor:'pointer', fontSize:12, fontWeight:500}}>
-          + Add
-        </button>
+          )}
+          <button onClick={addLocation}
+            style={{padding:'5px 18px', background:'var(--teal)', color:'#fff',
+                    border:'none', borderRadius:6, cursor:'pointer', fontSize:12,
+                    fontWeight:600, marginLeft:'auto', flexShrink:0}}>
+            + Add Location
+          </button>
+        </div>
       </div>
 
       {/* Locations list */}
@@ -7337,7 +7991,7 @@ function GeoTargetingBuilder({value, onChange, practiceAddress}) {
                 {typeLabels[loc.type] || loc.type}
               </span>
               <span style={{flex:1, color:'var(--text)'}}>{loc.value}</span>
-              {loc.radius != null && (
+              {loc.type === 'city' && loc.radius != null && (
                 <>
                   <input type="number" value={loc.radius} min={1} max={500}
                     onChange={e=>updateRadius(idx, e.target.value)}
@@ -7345,6 +7999,9 @@ function GeoTargetingBuilder({value, onChange, practiceAddress}) {
                             border:'0.5px solid var(--border)', borderRadius:4}} />
                   <span style={{fontSize:11, color:'var(--text-muted)'}}>{unit==='miles'?'mi':'km'}</span>
                 </>
+              )}
+              {(loc.type === 'postal' || loc.type === 'address') && (
+                <span style={{fontSize:10, color:'var(--text-muted)', fontStyle:'italic'}}>zip boundary</span>
               )}
               <button onClick={()=>toggleInclude(idx)}
                 style={{padding:'2px 8px', borderRadius:10, fontSize:11, cursor:'pointer', border:'none',

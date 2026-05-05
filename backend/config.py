@@ -88,8 +88,13 @@ class Settings(BaseSettings):
     ga4_api_secret: str = ""  # Create in GA4 Admin → Data Streams → Measurement Protocol API Secrets
 
     # GA4 Data API (for pulling analytics reports)
+    # Single-property fallback (used by Measurement Protocol sender only)
     ga4_property_id: str = ""  # Numeric property ID (not G-xxx), e.g. "123456789"
     ga4_service_account_json: str = ""  # Path to service account JSON file
+    # Multi-property map: JSON string keyed by domain → GA4 numeric property ID
+    # e.g. '{"nxtsmile.com": "531016678", "graftondentalcare.com": "536128204"}'
+    # Add new domains here as new landing pages are created.
+    ga4_properties: str = "{}"
 
     # Google Ads API
     google_ads_client_id: str = ""

@@ -2004,6 +2004,7 @@ def get_unified_campaigns(days: int = 30) -> list:
         window_rows = conn.execute("""
             SELECT
                 LOWER(TRIM(campaign_name)) AS k,
+                campaign_id                AS gads_numeric_id,
                 campaign_name              AS gads_name,
                 SUM(impressions)           AS impressions,
                 SUM(clicks)                AS clicks,
@@ -2015,11 +2016,19 @@ def get_unified_campaigns(days: int = 30) -> list:
             GROUP BY LOWER(TRIM(campaign_name))
         """, (f"-{days} day",)).fetchall()
         window_by_key = {r["k"]: dict(r) for r in window_rows}
+        # Secondary lookup by GAds numeric campaign_id — handles name mismatches
+        # (e.g. when dashboard name differs from the timestamped GAds display name)
+        window_by_numeric_id = {
+            str(r["gads_numeric_id"]): dict(r)
+            for r in window_rows
+            if r["gads_numeric_id"]
+        }
 
         # ── Lifetime last-activity date (for 90-day rule) ────────────────
         lifetime_rows = conn.execute("""
             SELECT
                 LOWER(TRIM(campaign_name)) AS k,
+                campaign_id                AS gads_numeric_id,
                 MAX(date)                  AS last_activity_date
             FROM gads_daily_stats
             WHERE campaign_name != ''
@@ -2027,6 +2036,10 @@ def get_unified_campaigns(days: int = 30) -> list:
             GROUP BY LOWER(TRIM(campaign_name))
         """).fetchall()
         last_activity_by_key = {r["k"]: r["last_activity_date"] for r in lifetime_rows}
+        last_activity_by_numeric_id = {
+            str(r["gads_numeric_id"]): r["last_activity_date"]
+            for r in lifetime_rows if r["gads_numeric_id"]
+        }
 
         # ── Lead counts per campaign in the window ───────────────────────
         lead_rows = conn.execute("""
@@ -2064,7 +2077,13 @@ def get_unified_campaigns(days: int = 30) -> list:
             name_key = (row.get("campaign_name") or "").strip().lower()
             managed_keys.add(name_key)
 
-            wm = window_by_key.get(name_key, {})
+            # Match stats by name first; fall back to GAds numeric ID for
+            # campaigns whose display name was timestamped (name mismatch)
+            numeric_id = str(row.get("gads_campaign_numeric_id") or "")
+            wm = window_by_key.get(name_key) or window_by_numeric_id.get(numeric_id) or {}
+            if wm and name_key not in window_by_key and numeric_id:
+                # Also register the GAds name key as managed so it won't create a synthetic row
+                managed_keys.add((wm.get("gads_name") or "").strip().lower())
             lm = leads_by_key.get(name_key, {})
             cost = (wm.get("cost_micros") or 0) / 1_000_000.0
             leads = lm.get("lead_count") or 0
@@ -2072,8 +2091,12 @@ def get_unified_campaigns(days: int = 30) -> list:
             cpl = round(cost / leads, 2) if leads > 0 else None
             roi = round((revenue - cost) / cost * 100, 1) if cost > 0 else None
 
-            is_gads_linked = bool(row.get("gads_campaign_resource") or row.get("gads_campaign_numeric_id"))
-            last = last_activity_by_key.get(name_key)
+            # UNMANAGED rows are orphaned imports — treat as unlinked so the UI shows 🗑 not ⏹ Stop
+            is_gads_linked = bool(
+                (row.get("gads_campaign_resource") or row.get("gads_campaign_numeric_id"))
+                and row.get("status") != "UNMANAGED"
+            )
+            last = last_activity_by_key.get(name_key) or last_activity_by_numeric_id.get(numeric_id)
             if is_gads_linked:
                 if last:
                     is_inactive_90d = last < cutoff_90d
@@ -3426,6 +3449,38 @@ def set_audit_approval(action_id: str, approver: str) -> None:
                SET approval_by=?, approved_at=?, updated_at=?
              WHERE action_id=?
         """, (approver, now, now, action_id))
+
+
+def log_admin_manual_action(
+    operation: str,
+    entity_type: str,
+    entity_id: str,
+    entity_name: str,
+    before: dict,
+    after: dict,
+    reason: str = "manual_edit_via_dashboard",
+) -> str:
+    """
+    Convenience wrapper for manual admin edits.
+    Inserts a pending audit row with actor='admin_manual'.
+    Returns the generated action_id UUID string.
+    """
+    import uuid as _uuid, json as _json
+    action_id = str(_uuid.uuid4())
+    log_gads_action(
+        action_id=action_id,
+        operation=operation,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name,
+        before_state_json=_json.dumps(before),
+        after_state_json=_json.dumps(after),
+        executed=False,
+        execution_result="pending_approval",
+        actor="admin_manual",
+        reason=reason,
+    )
+    return action_id
 
 
 def get_audit_row(action_id: str) -> Optional[dict]:

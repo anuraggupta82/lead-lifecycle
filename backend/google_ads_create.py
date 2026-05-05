@@ -450,6 +450,7 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
             "ok":                     True,
             "campaign_resource_name": camp_resource,
             "campaign_numeric_id":    camp_numeric,
+            "gads_campaign_name":     gads_campaign_name,   # timestamped name as stored in Google Ads
             "ad_group_resources":     ad_group_resources,
             "keywords_added":         keywords_added,
             "ads_created":            ads_created,

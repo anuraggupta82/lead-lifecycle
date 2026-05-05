@@ -8,26 +8,115 @@ Fetches website engagement metrics that help optimize ad spend:
   - Smile tool engagement funnel
   - Traffic by source/medium
   - Daily/weekly trends
+  - Lead events (generate_lead) broken down by campaign/ad group/keyword
 
-Setup:
-  1. Create a GCP service account with "Analytics Viewer" role
-  2. Add the service account email to GA4 property access (Viewer)
-  3. Download the JSON key and set GA4_SERVICE_ACCOUNT_JSON path in .env
-  4. Set GA4_PROPERTY_ID to the numeric property ID (Admin → Property Settings)
-     Note: This is NOT the G-XXXX measurement ID — it's a numeric ID like "123456789"
+Multi-property setup:
+  Each landing page domain has its own GA4 property. Configure in .env:
+    GA4_PROPERTIES={"nxtsmile.com": "531016678", "graftondentalcare.com": "536128204"}
+  Add new domains here as new landing pages/domains are created.
+  GA4_SERVICE_ACCOUNT_JSON must be a service account with Viewer access
+  on ALL configured properties.
+
+Single-property setup (legacy fallback):
+  GA4_PROPERTY_ID=531016678
+  GA4_SERVICE_ACCOUNT_JSON=/path/to/key.json
 """
 
 import logging
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import urlparse
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
+def _get_credentials():
+    """Load GA4 service account credentials object, or None if not configured."""
+    settings = get_settings()
+    if not settings.ga4_service_account_json:
+        return None
+    try:
+        from google.oauth2 import service_account
+        return service_account.Credentials.from_service_account_file(
+            settings.ga4_service_account_json,
+            scopes=["https://www.googleapis.com/auth/analytics.readonly"],
+        )
+    except FileNotFoundError:
+        logger.warning(f"GA4 service account JSON not found: {settings.ga4_service_account_json}")
+        return None
+    except Exception as e:
+        logger.warning(f"GA4 credentials load failed: {e}")
+        return None
+
+
+def _get_property_map() -> dict:
+    """
+    Return {domain: property_id} from GA4_PROPERTIES env var.
+    Falls back to {None: GA4_PROPERTY_ID} for single-property legacy mode.
+    Example: {"nxtsmile.com": "531016678", "graftondentalcare.com": "536128204"}
+    """
+    settings = get_settings()
+    try:
+        props = json.loads(settings.ga4_properties) if settings.ga4_properties else {}
+        if props:
+            return props
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    # Legacy single-property fallback
+    if settings.ga4_property_id:
+        return {"_default": settings.ga4_property_id}
+    return {}
+
+
+def _domain_for_url(url: str) -> str:
+    """Extract bare domain from a URL string, e.g. 'https://nxtsmile.com/page' → 'nxtsmile.com'.
+    Uses explicit prefix strip (not lstrip) to avoid character-set mangling."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        netloc = parsed.netloc
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+
+def _property_id_for_url(url: str) -> Optional[str]:
+    """
+    Given a landing page URL, return the GA4 numeric property ID for its domain.
+    Returns None if the domain isn't in GA4_PROPERTIES.
+    Suffix match only goes one direction (domain ends with key), never reverse,
+    to avoid wrong-property matches (e.g. 'dental.com' matching 'graftondental.com').
+    """
+    domain = _domain_for_url(url)
+    prop_map = _get_property_map()
+    # Exact match first
+    if domain in prop_map:
+        return prop_map[domain]
+    # Suffix match — handles subdomains like sub.nxtsmile.com → nxtsmile.com
+    for d, pid in prop_map.items():
+        if d != "_default" and domain.endswith("." + d):
+            return pid
+    # Default fallback
+    return prop_map.get("_default")
+
+
+def _make_client(credentials):
+    """Create a BetaAnalyticsDataClient from credentials."""
+    try:
+        from google.analytics.data_v1beta import BetaAnalyticsDataClient
+        return BetaAnalyticsDataClient(credentials=credentials)
+    except ImportError:
+        logger.warning("google-analytics-data not installed — pip install google-analytics-data")
+        return None
+
+
 def _get_client():
-    """Create GA4 Data API client from service account credentials."""
+    """Create GA4 Data API client from service account credentials (legacy single-property)."""
     settings = get_settings()
     if not settings.ga4_property_id or not settings.ga4_service_account_json:
         logger.debug("GA4 Data API not configured — skipping")
@@ -405,6 +494,114 @@ def fetch_campaign_ga4_metrics(days: int = 30) -> list:
         return []
 
 
+def fetch_leads_by_campaign(days: int = 30) -> list:
+    """
+    Returns generate_lead event counts broken down by Google Ads campaign,
+    ad group, keyword, and landing page — pulled across ALL configured GA4
+    properties (one per landing page domain).
+
+    Each property is queried independently and results are merged. The
+    'property_domain' field tells you which site the lead came from.
+
+    Returns a list of dicts like:
+      {
+        "property_domain": "nxtsmile.com",
+        "campaign": "nXtSmile All-on-X Implants",
+        "ad_group": "All on X",
+        "keyword": "all on 4 implants near me",
+        "landing_page": "/",
+        "leads": 3,
+        "sessions": 47,
+        "lead_rate": 6.4   # leads / sessions %
+      }
+    Only rows where at least one generate_lead event fired are returned.
+    Results are sorted by leads descending across all properties combined.
+    """
+    prop_map = _get_property_map()
+    if not prop_map:
+        logger.debug("GA4 multi-property: no properties configured — skipping fetch_leads_by_campaign")
+        return []
+
+    credentials = _get_credentials()
+    if not credentials:
+        return []
+
+    client = _make_client(credentials)
+    if not client:
+        return []
+
+    try:
+        from google.analytics.data_v1beta.types import (
+            RunReportRequest, DateRange, Dimension, Metric,
+            FilterExpression, Filter,
+        )
+    except ImportError:
+        logger.warning("google-analytics-data not installed")
+        return []
+
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    all_results = []
+
+    for domain, prop_id in prop_map.items():
+        property_path = f"properties/{prop_id}"
+        display_domain = domain if domain != "_default" else "default"
+        try:
+            lead_request = RunReportRequest(
+                property=property_path,
+                date_ranges=[DateRange(start_date=start_date, end_date="today")],
+                dimensions=[
+                    Dimension(name="sessionGoogleAdsCampaignName"),
+                    Dimension(name="sessionGoogleAdsAdGroupName"),
+                    Dimension(name="sessionGoogleAdsKeyword"),
+                    Dimension(name="landingPagePlusQueryString"),
+                ],
+                metrics=[
+                    Metric(name="eventCount"),
+                    Metric(name="sessions"),
+                ],
+                dimension_filter=FilterExpression(
+                    filter=Filter(
+                        field_name="eventName",
+                        string_filter=Filter.StringFilter(value="generate_lead"),
+                    )
+                ),
+                limit=200,
+            )
+
+            response = client.run_report(lead_request)
+
+            for row in response.rows:
+                dims = [d.value for d in row.dimension_values]
+                campaign, ad_group, keyword, landing = dims[0], dims[1], dims[2], dims[3]
+
+                # Skip fully unattributed rows
+                if not campaign or campaign in ("(not set)", ""):
+                    continue
+
+                lead_count = int(row.metric_values[0].value or 0)
+                sessions = int(row.metric_values[1].value or 0)
+
+                all_results.append({
+                    "property_domain": display_domain,
+                    "campaign": campaign,
+                    "ad_group": ad_group if ad_group not in ("(not set)", "") else "",
+                    "keyword": keyword if keyword not in ("(not set)", "") else "",
+                    "landing_page": landing if landing not in ("(not set)", "") else "/",
+                    "leads": lead_count,
+                    "sessions": sessions,
+                    "lead_rate": round((lead_count / sessions * 100) if sessions > 0 else 0, 1),
+                })
+
+            logger.debug(f"GA4 [{display_domain}] lead query OK — {len(response.rows)} rows")
+
+        except Exception as e:
+            logger.error(f"GA4 fetch_leads_by_campaign failed for {display_domain} (property {prop_id}): {e}")
+
+    # Sort combined results by lead count descending
+    all_results.sort(key=lambda r: r["leads"], reverse=True)
+    return all_results
+
+
 def fetch_all_ga4_data(days: int = 30) -> dict:
     """
     Master function — pulls all GA4 reports and returns combined result.
@@ -422,6 +619,7 @@ def fetch_all_ga4_data(days: int = 30) -> dict:
         "events": fetch_event_counts(days),
         "daily_trend": fetch_daily_trend(days),
         "campaign_metrics": fetch_campaign_ga4_metrics(days),
+        "leads_by_campaign": fetch_leads_by_campaign(days),
     }
 
     configured = result["overview"].get("configured", False)
