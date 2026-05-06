@@ -3723,6 +3723,373 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
   );
 }
 
+// ── CallPerformanceSubView — team member scoreboard ───────────────────────────
+
+function CallPerformanceSubView() {
+  const [days, setDays]         = useState(30);
+  const [data, setData]         = useState(null);  // {period_days, members:[]}
+  const [criteria, setCriteria] = useState([]);    // [{name, sort_order}] for column ordering
+  const [loading, setLoading]   = useState(false);
+  const reqId = React.useRef(0);
+
+  useEffect(() => {
+    let myId = ++reqId.current;
+    setLoading(true);
+    Promise.all([
+      api(`/api/admin/calls/analysis/performance?days=${days}`),
+      api('/api/admin/calls/analysis/criteria'),
+    ]).then(([perf, crit]) => {
+      if (reqId.current !== myId) return;
+      setData(perf);
+      setCriteria((crit.criteria || []).sort((a,b) => (a.sort_order||0) - (b.sort_order||0)));
+    }).catch(e => {
+      if (reqId.current !== myId) return;
+      console.error('Performance load error', e);
+    }).finally(() => {
+      if (reqId.current === myId) setLoading(false);
+    });
+  }, [days]);
+
+  function scoreColor(s) {
+    if (s == null) return 'var(--text-muted)';
+    return s >= 80 ? 'var(--green)' : s >= 60 ? 'var(--yellow)' : 'var(--red)';
+  }
+
+  // Build ordered column list from criteria (only those present in any member's data)
+  const members = data?.members || [];
+  const allMemberCriteria = new Set(members.flatMap(m => Object.keys(m.criteria || {})));
+  // Use criteria sort_order if available; fallback to alphabetical
+  const orderedCriteria = criteria.filter(c => allMemberCriteria.has(c.name));
+  const orderedCriteriaNames = orderedCriteria.map(c => c.name);
+  // Add any that didn't appear in the criteria list (alphabetical fallback)
+  [...allMemberCriteria].sort().forEach(n => {
+    if (!orderedCriteriaNames.includes(n)) orderedCriteriaNames.push(n);
+  });
+
+  return (
+    <div>
+      {/* Days filter */}
+      <div style={{display:'flex',gap:4,marginBottom:16,alignItems:'center'}}>
+        <span style={{fontSize:11,color:'var(--text-muted)',marginRight:4}}>Period:</span>
+        {[7,14,30,90].map(d => (
+          <button key={d} onClick={() => setDays(d)}
+            style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+              background:days===d?'var(--teal)':'#fff',color:days===d?'#fff':'var(--text-muted)'}}>
+            {d}d
+          </button>
+        ))}
+        {loading && <span style={{fontSize:11,color:'var(--text-muted)',marginLeft:8}}>Loading…</span>}
+      </div>
+
+      {!loading && members.length === 0 && (
+        <div style={{padding:'40px 0',textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
+          No graded calls in this period — analyze some calls first.
+        </div>
+      )}
+
+      {members.length > 0 && (
+        <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,overflow:'auto'}}>
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+            <thead>
+              <tr style={{background:'var(--bg-card)',borderBottom:'1px solid var(--border)'}}>
+                <th style={{padding:'8px 12px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap'}}>Team Member</th>
+                <th style={{padding:'8px 12px',textAlign:'center',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap'}}>Graded Calls</th>
+                <th style={{padding:'8px 12px',textAlign:'center',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap'}}>Overall Score</th>
+                {orderedCriteriaNames.map(name => (
+                  <th key={name} style={{padding:'8px 12px',textAlign:'center',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap',maxWidth:120}}>
+                    {name}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {members.map((m, i) => (
+                <tr key={m.name} style={{borderBottom:'1px solid var(--border)',background:i%2===0?'#fff':'#fafafa'}}>
+                  <td style={{padding:'8px 12px',fontWeight:600}}>{m.name}</td>
+                  <td style={{padding:'8px 12px',textAlign:'center',color:'var(--text-muted)'}}>{m.calls}</td>
+                  <td style={{padding:'8px 12px',textAlign:'center'}}>
+                    <span style={{fontWeight:700,fontSize:14,color:scoreColor(m.avg_score)}}>
+                      {m.avg_score != null ? m.avg_score + '%' : '—'}
+                    </span>
+                  </td>
+                  {orderedCriteriaNames.map(name => {
+                    const val = m.criteria?.[name];
+                    return (
+                      <td key={name} style={{padding:'8px 12px',textAlign:'center'}}>
+                        {val != null
+                          ? <span style={{fontWeight:600,color:scoreColor(val)}}>{val}%</span>
+                          : <span style={{color:'var(--text-muted)'}}>—</span>}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{marginTop:8,fontSize:10,color:'var(--text-muted)'}}>
+        {data ? `${members.length} team member${members.length!==1?'s':''} · Last ${data.period_days} days` : ''}
+      </div>
+    </div>
+  );
+}
+
+// ── CallSettingsSubView — criteria editor + team members ──────────────────────
+
+function CallSettingsSubView() {
+  // ── Criteria state ──────────────────────────────────────────────────────────
+  const [criteria, setCriteria]     = useState([]);
+  const [critLoading, setCritLoading] = useState(true);
+  const [critSaving, setCritSaving] = useState(false);
+  const [critMsg, setCritMsg]       = useState('');
+
+  // ── Team members state ──────────────────────────────────────────────────────
+  const [members, setMembers]       = useState([]);
+  const [tmLoading, setTmLoading]   = useState(true);
+  const [tmSaving, setTmSaving]     = useState(false);
+  const [tmMsg, setTmMsg]           = useState('');
+  const [newName, setNewName]       = useState('');
+  const [newExt, setNewExt]         = useState('');
+
+  useEffect(() => {
+    // Load both on mount
+    setCritLoading(true);
+    api('/api/admin/calls/analysis/criteria')
+      .then(d => setCriteria(d.criteria || []))
+      .catch(e => setCritMsg('✗ Failed to load criteria'))
+      .finally(() => setCritLoading(false));
+
+    setTmLoading(true);
+    api('/api/admin/calls/analysis/team-members')
+      .then(d => setMembers(d.members || []))
+      .catch(e => setTmMsg('✗ Failed to load team members'))
+      .finally(() => setTmLoading(false));
+  }, []);
+
+  // ── Criteria helpers ────────────────────────────────────────────────────────
+  const weightTotal = criteria.reduce((s, c) => s + (Number(c.weight) || 0), 0);
+  const weightOk    = Math.abs(weightTotal - 100) < 0.5;
+
+  function updateCriterion(idx, field, val) {
+    setCriteria(cs => cs.map((c, i) => i === idx ? {...c, [field]: val} : c));
+    setCritMsg('');
+  }
+
+  async function saveCriteria(force = false) {
+    if (!force && !weightOk) return;
+    setCritSaving(true); setCritMsg('');
+    try {
+      const payload = criteria.map(c => ({
+        name: c.name, description: c.description || '',
+        weight: Number(c.weight) || 0,
+        enabled: c.enabled !== false && c.enabled !== 0,
+      }));
+      const d = await api('/api/admin/calls/analysis/criteria', { method: 'PUT', body: JSON.stringify({criteria: payload}) });
+      if (d.ok) { setCriteria(d.criteria || criteria); setCritMsg('✓ Saved'); }
+      else setCritMsg('✗ Save failed');
+    } catch(e) { setCritMsg('✗ ' + e.message); }
+    finally { setCritSaving(false); }
+  }
+
+  async function resetCriteria() {
+    if (!window.confirm('Reset all grading criteria to factory defaults? This cannot be undone.')) return;
+    setCritSaving(true); setCritMsg('');
+    try {
+      const d = await api('/api/admin/calls/analysis/criteria/reset', { method: 'POST' });
+      if (d.ok) { setCriteria(d.criteria || []); setCritMsg('✓ Reset to defaults'); }
+      else setCritMsg('✗ Reset failed');
+    } catch(e) { setCritMsg('✗ ' + e.message); }
+    finally { setCritSaving(false); }
+  }
+
+  // ── Team member helpers ─────────────────────────────────────────────────────
+  function addMember() {
+    const n = newName.trim();
+    const e = newExt.trim();
+    if (!n || !e) { setTmMsg('✗ Name and extension are required'); return; }
+    if (members.some(m => String(m.extension) === e)) { setTmMsg('✗ Extension already exists'); return; }
+    setMembers(ms => [...ms, {name: n, extension: e, active: true}]);
+    setNewName(''); setNewExt(''); setTmMsg('');
+  }
+
+  function updateMember(idx, field, val) {
+    setMembers(ms => ms.map((m, i) => i === idx ? {...m, [field]: val} : m));
+    setTmMsg('');
+  }
+
+  function removeMember(idx) {
+    setMembers(ms => ms.filter((_, i) => i !== idx));
+    setTmMsg('');
+  }
+
+  async function saveMembers() {
+    setTmSaving(true); setTmMsg('');
+    try {
+      const payload = members.map(m => ({
+        name: m.name, extension: m.extension,
+        active: m.active !== false && m.active !== 0,
+      }));
+      const d = await api('/api/admin/calls/analysis/team-members', { method: 'PUT', body: JSON.stringify({members: payload}) });
+      if (d.ok) { setMembers(d.members || members); setTmMsg('✓ Saved'); }
+      else setTmMsg('✗ Save failed');
+    } catch(e) { setTmMsg('✗ ' + e.message); }
+    finally { setTmSaving(false); }
+  }
+
+  const sectionHead = (title) => (
+    <div style={{fontSize:12,fontWeight:700,color:'var(--text)',marginBottom:12,textTransform:'uppercase',letterSpacing:'0.04em',borderBottom:'1px solid var(--border)',paddingBottom:6}}>
+      {title}
+    </div>
+  );
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:24}}>
+
+      {/* ── Grading Criteria Editor ─────────────────────────────────────── */}
+      <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'16px 20px'}}>
+        {sectionHead('Grading Criteria')}
+        {critLoading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading…</div>}
+        {!critLoading && (
+          <>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:12,marginBottom:12}}>
+              <thead>
+                <tr style={{background:'var(--bg-card)'}}>
+                  {['Criterion','Description','Weight (%)','Enabled'].map(h => (
+                    <th key={h} style={{padding:'6px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {criteria.map((c, i) => (
+                  <tr key={c.id || i} style={{borderBottom:'1px solid var(--border)'}}>
+                    <td style={{padding:'6px 10px',fontWeight:600,whiteSpace:'nowrap'}}>{c.name}</td>
+                    <td style={{padding:'6px 10px',color:'var(--text-muted)',fontSize:11,maxWidth:280}}>
+                      <input value={c.description || ''}
+                        onChange={e => updateCriterion(i, 'description', e.target.value)}
+                        style={{width:'100%',border:'1px solid var(--border)',borderRadius:4,padding:'2px 6px',fontSize:11,color:'var(--text)'}} />
+                    </td>
+                    <td style={{padding:'6px 10px'}}>
+                      <input type="number" min="1" max="100" value={c.weight ?? ''}
+                        onChange={e => updateCriterion(i, 'weight', e.target.value)}
+                        style={{width:60,border:'1px solid var(--border)',borderRadius:4,padding:'2px 6px',fontSize:11,
+                          color: weightOk ? 'var(--text)' : 'var(--red)'}} />
+                    </td>
+                    <td style={{padding:'6px 10px'}}>
+                      <input type="checkbox" checked={c.enabled !== false && c.enabled !== 0}
+                        onChange={e => updateCriterion(i, 'enabled', e.target.checked)} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            {/* Weight total */}
+            <div style={{fontSize:11,marginBottom:12,display:'flex',alignItems:'center',gap:8}}>
+              <span style={{color: weightOk ? 'var(--green)' : 'var(--red)', fontWeight:600}}>
+                Weight total: {weightTotal}%{!weightOk ? ` (must equal 100)` : ' ✓'}
+              </span>
+            </div>
+
+            <div style={{display:'flex',gap:8,alignItems:'center'}}>
+              <button onClick={() => saveCriteria(false)} disabled={critSaving || !weightOk}
+                title={!weightOk ? 'Weights must sum to 100' : 'Save criteria'}
+                style={{padding:'6px 16px',background:(!weightOk||critSaving)?'var(--bg-card)':'var(--teal)',
+                  color:(!weightOk||critSaving)?'var(--text-muted)':'#fff',border:'1px solid var(--teal)',
+                  borderRadius:6,cursor:(!weightOk||critSaving)?'not-allowed':'pointer',fontSize:12,fontWeight:600}}>
+                {critSaving ? 'Saving…' : 'Save Criteria'}
+              </button>
+              {!weightOk && (
+                <button onClick={() => saveCriteria(true)} disabled={critSaving}
+                  style={{padding:'6px 12px',background:'none',color:'var(--red)',border:'1px solid var(--red)',
+                    borderRadius:6,cursor:'pointer',fontSize:11}}>
+                  Save anyway
+                </button>
+              )}
+              <button onClick={resetCriteria} disabled={critSaving}
+                style={{padding:'6px 12px',background:'none',color:'var(--text-muted)',border:'1px solid var(--border)',
+                  borderRadius:6,cursor:'pointer',fontSize:11}}>
+                Reset to Defaults
+              </button>
+              {critMsg && <span style={{fontSize:11,color:critMsg.startsWith('✓')?'var(--green)':'var(--red)'}}>{critMsg}</span>}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* ── Team Members ───────────────────────────────────────────────────── */}
+      <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'16px 20px'}}>
+        {sectionHead('Team Members')}
+        <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+          Extensions are matched from Mango Voice call data to resolve team member names.
+        </div>
+        {tmLoading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading…</div>}
+        {!tmLoading && (
+          <>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:12,marginBottom:12}}>
+              <thead>
+                <tr style={{background:'var(--bg-card)'}}>
+                  {['Name','Extension','Active',''].map(h => (
+                    <th key={h} style={{padding:'6px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {members.map((m, i) => (
+                  <tr key={i} style={{borderBottom:'1px solid var(--border)'}}>
+                    <td style={{padding:'6px 10px',fontWeight:600}}>{m.name}</td>
+                    <td style={{padding:'6px 10px',fontFamily:'monospace'}}>{m.extension}</td>
+                    <td style={{padding:'6px 10px'}}>
+                      <input type="checkbox" checked={m.active !== false && m.active !== 0}
+                        onChange={e => updateMember(i, 'active', e.target.checked)} />
+                    </td>
+                    <td style={{padding:'6px 10px'}}>
+                      <button onClick={() => removeMember(i)}
+                        style={{background:'none',border:'none',cursor:'pointer',color:'var(--red)',fontSize:13,padding:'0 4px'}}
+                        title="Remove">✕</button>
+                    </td>
+                  </tr>
+                ))}
+                {/* Add row */}
+                <tr style={{background:'#f8fafc'}}>
+                  <td style={{padding:'6px 10px'}}>
+                    <input placeholder="Name" value={newName} onChange={e => setNewName(e.target.value)}
+                      style={{width:'100%',border:'1px solid var(--border)',borderRadius:4,padding:'3px 6px',fontSize:11}} />
+                  </td>
+                  <td style={{padding:'6px 10px'}}>
+                    <input placeholder="Extension" value={newExt} onChange={e => setNewExt(e.target.value)}
+                      style={{width:80,border:'1px solid var(--border)',borderRadius:4,padding:'3px 6px',fontSize:11,fontFamily:'monospace'}}
+                      onKeyDown={e => e.key==='Enter' && addMember()} />
+                  </td>
+                  <td style={{padding:'6px 10px'}}>
+                    <input type="checkbox" checked disabled />
+                  </td>
+                  <td style={{padding:'6px 10px'}}>
+                    <button onClick={addMember}
+                      style={{padding:'3px 10px',background:'var(--teal)',color:'#fff',border:'none',borderRadius:4,cursor:'pointer',fontSize:11}}>
+                      + Add
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div style={{display:'flex',gap:8,alignItems:'center'}}>
+              <button onClick={saveMembers} disabled={tmSaving}
+                style={{padding:'6px 16px',background:tmSaving?'var(--bg-card)':'var(--teal)',
+                  color:tmSaving?'var(--text-muted)':'#fff',border:'1px solid var(--teal)',
+                  borderRadius:6,cursor:tmSaving?'not-allowed':'pointer',fontSize:12,fontWeight:600}}>
+                {tmSaving ? 'Saving…' : 'Save Team Members'}
+              </button>
+              {tmMsg && <span style={{fontSize:11,color:tmMsg.startsWith('✓')?'var(--green)':'var(--red)'}}>{tmMsg}</span>}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── CallAnalysisView — top-level wrapper with sub-nav ─────────────────────────
 
 function CallAnalysisView() {
@@ -3746,16 +4113,8 @@ function CallAnalysisView() {
       </div>
 
       {subView === 'calls'       && <CallsSubView />}
-      {subView === 'performance' && (
-        <div style={{padding:'40px 0',textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
-          📊 Performance analytics coming in next update
-        </div>
-      )}
-      {subView === 'settings' && (
-        <div style={{padding:'40px 0',textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
-          ⚙ Analysis settings coming in next update
-        </div>
-      )}
+      {subView === 'performance' && <CallPerformanceSubView />}
+      {subView === 'settings'    && <CallSettingsSubView />}
     </div>
   );
 }
@@ -9779,6 +10138,155 @@ function AISettingsCard() {
   );
 }
 
+// ── AISpendCard — AI cost summary in Admin panel ──────────────────────────────
+
+function AISpendCard() {
+  const [days, setDays]         = useState(30);
+  const [data, setData]         = useState(null);  // full cost_summary response
+  const [loading, setLoading]   = useState(false);
+  const [view, setView]         = useState('window'); // 'window' | 'lifetime'
+
+  function loadData(d) {
+    setLoading(true);
+    api(`/api/admin/calls/analysis/ai-costs?days=${d}`)
+      .then(r => setData(r))
+      .catch(e => console.error('AI costs error', e))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => { loadData(days); }, [days]);
+
+  const bucket = data ? (view === 'window' ? data.window : data.lifetime) : null;
+
+  function fmtCost(v) {
+    if (v == null || !Number.isFinite(v)) return '$0.00';
+    return '$' + v.toFixed(v < 0.01 ? 4 : 2);
+  }
+
+  // Build per-API summary
+  const APIs = [
+    {key:'openai', label:'Whisper', icon:'🎙'},
+    {key:'gemini', label:'Gemini',  icon:'✨'},
+    {key:'claude', label:'Claude',  icon:'🤖'},
+  ];
+
+  // Top purposes for bar chart (top 5 by cost)
+  const purposes = bucket?.by_purpose || [];
+  const topPurposes = [...purposes].sort((a,b)=>(b.cost||0)-(a.cost||0)).slice(0, 5);
+  const maxPurposeCost = topPurposes.reduce((m,p) => Math.max(m, p.cost||0), 0);
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+        <div className="report-title" style={{margin:0}}>AI Spend</div>
+        <div style={{display:'flex',gap:6,alignItems:'center'}}>
+          {/* Window/Lifetime toggle */}
+          {['window','lifetime'].map(v => (
+            <button key={v} onClick={() => setView(v)}
+              style={{padding:'2px 10px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                background:view===v?'var(--teal)':'#fff',color:view===v?'#fff':'var(--text-muted)'}}>
+              {v==='window' ? `Last ${days}d` : 'Lifetime'}
+            </button>
+          ))}
+          {/* Days picker — only relevant for window view */}
+          {view==='window' && [30,90].map(d => (
+            <button key={d} onClick={() => setDays(d)}
+              style={{padding:'2px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                background:days===d?'#6b7280':'#fff',color:days===d?'#fff':'var(--text-muted)'}}>
+              {d}d
+            </button>
+          ))}
+          <button onClick={() => loadData(days)} disabled={loading}
+            style={{padding:'2px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',background:'#fff',color:'var(--text-muted)'}}>
+            {loading ? '…' : '↻'}
+          </button>
+        </div>
+      </div>
+
+      {loading && !data && <div style={{color:'var(--text-muted)',fontSize:12,padding:'12px 0'}}>Loading…</div>}
+
+      {bucket && (
+        <>
+          {/* Summary tiles */}
+          {bucket.total_cost === 0 && bucket.total_tokens === 0 ? (
+            <div style={{fontSize:12,color:'var(--text-muted)',fontStyle:'italic',marginBottom:12}}>
+              No AI activity in this period.
+            </div>
+          ) : (
+            <>
+              <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:10,marginBottom:16}}>
+                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>Total Spend</div>
+                  <div style={{fontSize:20,fontWeight:700,color:'var(--teal)'}}>{fmtCost(bucket.total_cost)}</div>
+                </div>
+                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>Whisper Audio</div>
+                  <div style={{fontSize:16,fontWeight:700,color:'#0369a1'}}>
+                    {fmtCost(bucket.by_api?.openai?.cost)}
+                  </div>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                    {(bucket.by_api?.openai?.mins||0).toFixed(1)} min
+                  </div>
+                </div>
+                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>Claude + Gemini</div>
+                  <div style={{fontSize:16,fontWeight:700,color:'#7c3aed'}}>
+                    {fmtCost((bucket.by_api?.claude?.cost||0) + (bucket.by_api?.gemini?.cost||0))}
+                  </div>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                    {((bucket.by_api?.claude?.tokens||0)+(bucket.by_api?.gemini?.tokens||0)).toLocaleString()} tokens
+                  </div>
+                </div>
+              </div>
+
+              {/* Per-API breakdown */}
+              <div style={{display:'flex',gap:12,marginBottom:16,flexWrap:'wrap'}}>
+                {APIs.map(({key, label, icon}) => {
+                  const a = bucket.by_api?.[key];
+                  if (!a) return null;
+                  return (
+                    <div key={key} style={{flex:'1 1 100px',background:'#f8fafc',border:'1px solid var(--border)',
+                      borderRadius:6,padding:'8px 12px',fontSize:11}}>
+                      <div style={{fontWeight:600,marginBottom:4}}>{icon} {label}</div>
+                      <div style={{color:'var(--text-muted)'}}>{fmtCost(a.cost)}</div>
+                      <div style={{color:'var(--text-muted)',fontSize:10}}>{a.calls || 0} calls</div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* By-purpose bar chart */}
+              {topPurposes.length > 0 && (
+                <div>
+                  <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:8}}>
+                    By Purpose
+                  </div>
+                  {topPurposes.map((p,i) => (
+                    <div key={p.purpose || i} style={{marginBottom:6}}>
+                      <div style={{display:'flex',justifyContent:'space-between',fontSize:10,marginBottom:2}}>
+                        <span style={{color:'var(--text)',fontWeight:500}}>{p.purpose || '—'}</span>
+                        <span style={{color:'var(--text-muted)'}}>{fmtCost(p.cost)} · {p.calls} calls</span>
+                      </div>
+                      <div style={{background:'#e2e8f0',borderRadius:3,height:6,overflow:'hidden'}}>
+                        <div style={{
+                          background:'var(--teal)',height:'100%',borderRadius:3,
+                          width: maxPurposeCost > 0 ? `${Math.max(((p.cost||0)/maxPurposeCost)*100, p.cost>0?1:0)}%` : '0%',
+                          minWidth: p.cost > 0 ? 2 : 0,
+                          transition:'width 0.4s ease',
+                        }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function ODConnectionCard() {
   const [form, setForm] = React.useState({
     od_db_host: '', od_db_port: 3306, od_db_user: '', od_db_password: '',
@@ -10184,6 +10692,8 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
       <PracticeSettingsCard />
 
       <AISettingsCard />
+
+      <AISpendCard />
 
       <ODConnectionCard />
 
