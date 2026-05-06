@@ -2986,7 +2986,51 @@ function _AICampaignView_REMOVED() {
 }
 
 
-function CallsView() {
+// ── Call Analysis — shared formatters ────────────────────────────────────────
+
+function _fmtDur(sec) {
+  if (!sec) return '—';
+  const m = Math.floor(sec/60), s = sec%60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+function _fmtTime(iso) {
+  if (!iso) return '—';
+  try { return new Date(iso).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}); }
+  catch { return iso; }
+}
+function _statusBadge(status) {
+  const colors = { answered:'#16a34a', missed:'#dc2626', voicemail:'#d97706', busy:'#6b7280', unknown:'#94a3b8' };
+  const color = colors[status] || '#94a3b8';
+  return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,background:color+'22',color,border:`1px solid ${color}44`}}>{status||'unknown'}</span>;
+}
+function _attrBadge(call) {
+  if (!call.attribution_label) return null;
+  const isAd = call.attribution_label.includes('Ad call');
+  return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
+    background:isAd?'#0369a133':'#71513033',color:isAd?'#0369a1':'#92400e',
+    border:`1px solid ${isAd?'#0369a144':'#92400e44'}`}}>{call.attribution_label}</span>;
+}
+function _transcriptBadge(status) {
+  if (!status) return <span style={{color:'var(--text-muted)'}}>—</span>;
+  const map = {
+    pending:    {label:'⏳ Pending',  color:'#d97706'},
+    in_progress:{label:'⚙ Working',  color:'#0369a1'},
+    done:       {label:'✓ Done',     color:'#16a34a'},
+    failed:     {label:'✗ Failed',   color:'#dc2626'},
+  };
+  const m = map[status] || {label:status, color:'#94a3b8'};
+  return <span style={{fontSize:10,fontWeight:700,color:m.color}}>{m.label}</span>;
+}
+function _gradeBadge(score) {
+  if (score == null) return <span style={{color:'var(--text-muted)'}}>—</span>;
+  const color = score >= 80 ? '#16a34a' : score >= 60 ? '#d97706' : '#dc2626';
+  return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
+    background:color+'22',color,border:`1px solid ${color}44`}}>{score}%</span>;
+}
+
+// ── CallsSubView — enhanced call list with analysis columns ───────────────────
+
+function CallsSubView() {
   const [calls, setCalls] = useState([]);
   const [total, setTotal] = useState(0);
   const [adCallCount, setAdCallCount] = useState(0);
@@ -2996,7 +3040,23 @@ function CallsView() {
   const [statusFilter, setStatusFilter] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState('');
-  const [expanded, setExpanded] = useState(null);
+  const [drawerCall, setDrawerCall] = useState(null); // call object shown in detail drawer
+  // Per-call analyze state: { uuid: 'idle'|'processing'|'polling'|'done'|'error' }
+  const [analyzeState, setAnalyzeState] = useState({});
+  const [analyzeError, setAnalyzeError] = useState({});
+  // Bulk job state
+  const [bulkJob, setBulkJob] = useState(null); // {id, status, total, done, errors, current_label}
+  const [bulkStarting, setBulkStarting] = useState(false);
+  const [bulkMsg, setBulkMsg] = useState('');
+  const bulkPollInFlight = React.useRef(false);
+  const activePolls = React.useRef({}); // uuid → intervalId, for cleanup on unmount
+
+  // Cleanup all per-call polls on unmount
+  useEffect(() => {
+    return () => {
+      Object.values(activePolls.current).forEach(id => clearInterval(id));
+    };
+  }, []);
 
   async function loadCalls() {
     setLoading(true);
@@ -3005,7 +3065,8 @@ function CallsView() {
       if (dirFilter) params.set('direction', dirFilter);
       if (statusFilter) params.set('status', statusFilter);
       const d = await api(`/api/admin/calls?${params}`);
-      setCalls(d.calls || []);
+      const list = d.calls || [];
+      setCalls(list);
       setTotal(d.total || 0);
       setAdCallCount(d.ad_calls_from_gads || 0);
     } catch(e) { console.error('Calls load error', e); }
@@ -3024,52 +3085,195 @@ function CallsView() {
     finally { setSyncing(false); }
   }
 
-  function fmtDur(sec) {
-    if (!sec) return '—';
-    const m = Math.floor(sec/60), s = sec%60;
-    return m > 0 ? `${m}m ${s}s` : `${s}s`;
-  }
-  function fmtTime(iso) {
-    if (!iso) return '—';
-    try { return new Date(iso).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}); }
-    catch { return iso; }
-  }
-  function statusBadge(status) {
-    const colors = { answered:'#16a34a', missed:'#dc2626', voicemail:'#d97706', busy:'#6b7280', unknown:'#94a3b8' };
-    const color = colors[status] || '#94a3b8';
-    return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,background:color+'22',color,border:`1px solid ${color}44`}}>{status||'unknown'}</span>;
-  }
-  function attrBadge(call) {
-    if (!call.attribution_label) return null;
-    const isAd = call.attribution_label.includes('Ad call');
-    return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
-      background:isAd?'#0369a133':'#71513033',color:isAd?'#0369a1':'#92400e',
-      border:`1px solid ${isAd?'#0369a144':'#92400e44'}`}}>{call.attribution_label}</span>;
+  // ── Per-call analyze ──────────────────────────────────────────────────────
+  async function handleAnalyze(uuid) {
+    setAnalyzeState(s => ({...s, [uuid]: 'processing'}));
+    setAnalyzeError(e => ({...e, [uuid]: null}));
+    // Optimistic: mark row as pending immediately
+    setCalls(cs => cs.map(c => c.uuid === uuid ? {...c, transcription_status: 'pending'} : c));
+    try {
+      await api(`/api/admin/calls/${uuid}/process`, { method: 'POST' });
+      setAnalyzeState(s => ({...s, [uuid]: 'polling'}));
+      // Poll this single call until done/failed or 2-min timeout
+      let attempts = 0;
+      const MAX = 24; // 24 × 5s = 120s
+      const poll = setInterval(async () => {
+        attempts++;
+        try {
+          const updated = await api(`/api/admin/calls/${uuid}`);
+          const st = updated.transcription_status;
+          setCalls(cs => cs.map(c => c.uuid === uuid ? {...c, ...updated} : c));
+          if (st === 'done' || st === 'failed' || attempts >= MAX) {
+            clearInterval(poll);
+            delete activePolls.current[uuid];
+            setAnalyzeState(s => ({...s, [uuid]: st === 'done' ? 'done' : 'error'}));
+            if (st === 'failed') setAnalyzeError(e => ({...e, [uuid]: 'Analysis failed — check pipeline logs'}));
+            if (attempts >= MAX && st !== 'done' && st !== 'failed') {
+              setAnalyzeError(e => ({...e, [uuid]: 'Timed out — still processing. Refresh to check.'}));
+            }
+          }
+        } catch(err) {
+          clearInterval(poll);
+          delete activePolls.current[uuid];
+          setAnalyzeState(s => ({...s, [uuid]: 'error'}));
+          setAnalyzeError(e => ({...e, [uuid]: 'Polling error: ' + (err.message||'unknown')}));
+        }
+      }, 5000);
+      activePolls.current[uuid] = poll; // register for cleanup on unmount
+    } catch(e) {
+      setAnalyzeState(s => ({...s, [uuid]: 'error'}));
+      setAnalyzeError(err => ({...err, [uuid]: 'Failed to start: ' + (e.message||'error')}));
+      setCalls(cs => cs.map(c => c.uuid === uuid ? {...c, transcription_status: null} : c));
+    }
   }
 
-  const missed = calls.filter(c=>c.status==='missed').length;
-  const answered = calls.filter(c=>c.status==='answered').length;
+  function analyzeButton(call) {
+    const st = call.transcription_status;
+    const aState = analyzeState[call.uuid] || 'idle';
+    const err = analyzeError[call.uuid];
+    if (st === 'done') return <span style={{fontSize:10,color:'#16a34a',fontWeight:700}}>✓ Done</span>;
+    if (aState === 'processing' || aState === 'polling' || st === 'pending' || st === 'in_progress') {
+      return <span style={{fontSize:10,color:'#d97706'}}>⚙ Working…</span>;
+    }
+    if (aState === 'error') return (
+      <span>
+        <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
+          style={{fontSize:9,padding:'1px 5px',border:'1px solid #dc2626',borderRadius:3,cursor:'pointer',color:'#dc2626',background:'#fef2f2'}}>
+          ↺ Retry
+        </button>
+        {err && <span style={{fontSize:9,color:'#dc2626',marginLeft:4}} title={err}>⚠</span>}
+      </span>
+    );
+    // Only show Analyze for calls with a recording (otherwise nothing to transcribe)
+    if (!call.recording_url) return <span style={{fontSize:10,color:'var(--text-muted)'}}>—</span>;
+    return (
+      <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
+        style={{fontSize:9,padding:'2px 7px',border:'1px solid #0369a1',borderRadius:3,cursor:'pointer',
+          color:'#0369a1',background:'#e0f2fe',whiteSpace:'nowrap'}}>
+        ▶ Analyze
+      </button>
+    );
+  }
+
+  // ── Bulk job ──────────────────────────────────────────────────────────────
+  async function loadBulkStatus() {
+    if (bulkPollInFlight.current) return; // prevent overlapping requests
+    bulkPollInFlight.current = true;
+    try {
+      const d = await api('/api/admin/calls/bulk-process/status');
+      setBulkJob(d.job || null);
+    } catch(e) { console.error('Bulk status error', e); }
+    finally { bulkPollInFlight.current = false; }
+  }
+
+  const bulkActive = bulkJob && (bulkJob.status === 'queued' || bulkJob.status === 'running');
+
+  useEffect(() => {
+    if (!bulkActive) return;
+    const id = setInterval(() => loadBulkStatus(), 3000);
+    return () => clearInterval(id);
+  }, [bulkActive]);
+
+  // Stop polling when job reaches terminal state and reload calls
+  useEffect(() => {
+    if (bulkJob && (bulkJob.status === 'done' || bulkJob.status === 'failed')) {
+      loadCalls(); // refresh list to show updated analysis columns
+    }
+  }, [bulkJob?.status]);
+
+  async function handleBulkProcess() {
+    setBulkStarting(true); setBulkMsg('');
+    try {
+      const d = await api('/api/admin/calls/bulk-process', { method: 'POST', body: JSON.stringify({days_back:days}) });
+      if (!d.ok) { setBulkMsg('✗ ' + (d.error || 'Could not start bulk job')); return; }
+      setBulkMsg('');
+      await loadBulkStatus();
+    } catch(e) { setBulkMsg('✗ ' + (e.message||'error')); }
+    finally { setBulkStarting(false); }
+  }
+
+  // ── Drawer helpers ────────────────────────────────────────────────────────
+  async function openDrawer(call) {
+    setDrawerCall(call); // show immediately with row data
+    try {
+      const fresh = await api(`/api/admin/calls/${call.uuid}`);
+      // Merge fresh data into both drawer and the row in the list
+      setDrawerCall(prev => prev && prev.uuid === call.uuid ? {...prev, ...fresh} : prev);
+      setCalls(cs => cs.map(c => c.uuid === call.uuid ? {...c, ...fresh} : c));
+    } catch(e) { /* silently keep stale row data */ }
+  }
+
+  function updateCallInState(uuid, updates) {
+    setCalls(cs => cs.map(c => c.uuid === uuid ? {...c, ...updates} : c));
+    setDrawerCall(prev => prev && prev.uuid === uuid ? {...prev, ...updates} : prev);
+  }
+
+  async function handleGrade(uuid) {
+    try {
+      const d = await api(`/api/admin/calls/${uuid}/grade`, { method: 'POST' });
+      if (d.ok && d.call) updateCallInState(uuid, d.call);
+      return d;
+    } catch(e) { return {ok: false, error: e.message}; }
+  }
+
+  // ── Derived stats ─────────────────────────────────────────────────────────
+  const missed      = calls.filter(c=>c.status==='missed').length;
+  const answered    = calls.filter(c=>c.status==='answered').length;
+  const transcribed = calls.filter(c=>c.transcription_status==='done').length;
+  const graded      = calls.filter(c=>c.grade_overall_score != null).length;
   const avgDur = calls.filter(c=>c.duration_sec>0).length
     ? Math.round(calls.filter(c=>c.duration_sec>0).reduce((a,c)=>a+(c.duration_sec||0),0)/calls.filter(c=>c.duration_sec>0).length)
     : 0;
+
+  const bulkPct = bulkJob && bulkJob.total > 0 ? Math.round(100 * (bulkJob.done||0) / bulkJob.total) : 0;
 
   return (
     <div>
       {/* Summary tiles */}
       <div style={{display:'flex',gap:10,marginBottom:14,flexWrap:'wrap'}}>
         {[
-          {label:'Total Calls',val:total,color:'#0f172a'},
-          {label:'Answered',val:answered,color:'#16a34a'},
-          {label:'Missed',val:missed,color:'#dc2626'},
-          {label:'From Google Ads',val:adCallCount,color:'#0369a1'},
-          {label:'Avg Duration',val:avgDur?fmtDur(avgDur):'—',color:'#7c3aed'},
+          {label:'Total Calls',   val:total,                              color:'#0f172a'},
+          {label:'Answered',      val:answered,                           color:'#16a34a'},
+          {label:'Missed',        val:missed,                             color:'#dc2626'},
+          {label:'From Google Ads',val:adCallCount,                       color:'#0369a1'},
+          {label:'Avg Duration',  val:avgDur?_fmtDur(avgDur):'—',        color:'#7c3aed'},
+          {label:'Transcribed',   val:transcribed,                        color:'#0891b2'},
+          {label:'Graded',        val:graded,                             color:'#b45309'},
         ].map(t=>(
-          <div key={t.label} style={{flex:'1 1 120px',minWidth:100,background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
-            <div style={{fontSize:22,fontWeight:700,color:t.color}}>{t.val}</div>
-            <div style={{fontSize:11,color:'var(--text-muted)',marginTop:2}}>{t.label}</div>
+          <div key={t.label} style={{flex:'1 1 100px',minWidth:90,background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
+            <div style={{fontSize:20,fontWeight:700,color:t.color}}>{t.val}</div>
+            <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>{t.label}</div>
           </div>
         ))}
       </div>
+
+      {/* Bulk job progress bar */}
+      {bulkActive && bulkJob && (
+        <div style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:8,padding:'10px 14px',marginBottom:12}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+            <span style={{fontSize:12,fontWeight:600,color:'#0369a1'}}>
+              ⚙ Bulk Processing — {bulkJob.current_label || `${bulkJob.done||0} / ${bulkJob.total||'?'} calls`}
+            </span>
+            <span style={{fontSize:11,color:'#0369a1'}}>{bulkPct}%</span>
+          </div>
+          <div style={{background:'#e0f2fe',borderRadius:4,height:8,overflow:'hidden'}}>
+            <div style={{background:'#0369a1',height:'100%',width:`${bulkPct}%`,transition:'width 0.4s ease'}} />
+          </div>
+          {bulkJob.errors > 0 && <div style={{marginTop:4,fontSize:10,color:'#dc2626'}}>{bulkJob.errors} errors</div>}
+        </div>
+      )}
+      {bulkJob && bulkJob.status === 'done' && (
+        <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,padding:'8px 14px',marginBottom:12,fontSize:12,color:'#16a34a'}}>
+          ✓ Bulk job complete — {bulkJob.done||0} processed, {bulkJob.errors||0} errors.{' '}
+          <button onClick={()=>setBulkJob(null)} style={{background:'none',border:'none',cursor:'pointer',color:'#16a34a',textDecoration:'underline',fontSize:11}}>Dismiss</button>
+        </div>
+      )}
+      {bulkJob && bulkJob.status === 'failed' && (
+        <div style={{background:'#fef2f2',border:'1px solid #fecaca',borderRadius:8,padding:'8px 14px',marginBottom:12,fontSize:12,color:'#dc2626'}}>
+          ✗ Bulk job failed: {bulkJob.error_msg || 'unknown error'}.{' '}
+          <button onClick={()=>setBulkJob(null)} style={{background:'none',border:'none',cursor:'pointer',color:'#dc2626',textDecoration:'underline',fontSize:11}}>Dismiss</button>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10,flexWrap:'wrap'}}>
@@ -3099,7 +3303,19 @@ function CallsView() {
             background:syncing?'var(--bg-card)':'var(--teal)',color:syncing?'var(--text-muted)':'#fff'}}>
           {syncing?'Syncing…':'⟳ Sync Now'}
         </button>
+        <button onClick={handleBulkProcess} disabled={bulkStarting || bulkActive}
+          style={{padding:'4px 12px',fontSize:11,border:'1px solid #7c3aed',borderRadius:4,cursor:'pointer',
+            background:(bulkStarting||bulkActive)?'var(--bg-card)':'#7c3aed',
+            color:(bulkStarting||bulkActive)?'var(--text-muted)':'#fff'}}>
+          {bulkStarting?'Starting…':bulkActive?'Processing…':'⚡ Bulk Analyze'}
+        </button>
+        <button onClick={loadCalls} disabled={loading}
+          style={{padding:'4px 10px',fontSize:11,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+            background:'#fff',color:'var(--text-muted)'}}>
+          ↻ Refresh
+        </button>
         {syncMsg && <span style={{fontSize:11,color:syncMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{syncMsg}</span>}
+        {bulkMsg && <span style={{fontSize:11,color:bulkMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{bulkMsg}</span>}
         {loading && <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>}
       </div>
 
@@ -3108,50 +3324,38 @@ function CallsView() {
         <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
           <thead>
             <tr style={{background:'var(--bg-card)',borderBottom:'1px solid var(--border)'}}>
-              {['Time','Dir','From (area)','To','Answered By','Duration','Status','Attribution'].map(h=>(
+              {['Time','Dir','From','To','Answered By','Duration','Status','Attribution','Transcript','Grade','Analyze'].map(h=>(
                 <th key={h} style={{padding:'8px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap'}}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {calls.length===0 && !loading && (
-              <tr><td colSpan={8} style={{padding:'24px',textAlign:'center',color:'var(--text-muted)'}}>
+              <tr><td colSpan={11} style={{padding:'24px',textAlign:'center',color:'var(--text-muted)'}}>
                 No calls found. Click "Sync Now" to pull latest data.
               </td></tr>
             )}
             {calls.map(call=>(
               <React.Fragment key={call.uuid}>
-                <tr onClick={()=>setExpanded(expanded===call.uuid?null:call.uuid)}
+                <tr onClick={()=>openDrawer(call)}
                   style={{borderBottom:'1px solid var(--border)',cursor:'pointer',
-                    background:call.status==='missed'?'#fef2f2':expanded===call.uuid?'#f0f9ff':'#fff'}}>
-                  <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>{fmtTime(call.started_at)}</td>
+                    background:drawerCall&&drawerCall.uuid===call.uuid?'#dbeafe':call.status==='missed'?'#fef2f2':'#fff'}}>
+                  <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>{_fmtTime(call.started_at)}</td>
                   <td style={{padding:'8px 10px'}}>
                     <span style={{fontSize:10,fontWeight:600,color:call.direction==='inbound'?'#0369a1':'#7c3aed'}}>
                       {call.direction==='inbound'?'↙ IN':'↗ OUT'}
                     </span>
                   </td>
-                  <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>{call.from_number||('area:'+call.caller_id_number)||'—'}</td>
+                  <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>{call.from_number||(call.caller_id_number?'area:'+call.caller_id_number:null)||'—'}</td>
                   <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>{call.to_number||'—'}</td>
                   <td style={{padding:'8px 10px',fontWeight:600}}>{call.answered_by||'—'}</td>
-                  <td style={{padding:'8px 10px'}}>{fmtDur(call.duration_sec)}</td>
-                  <td style={{padding:'8px 10px'}}>{statusBadge(call.status)}</td>
-                  <td style={{padding:'8px 10px'}}>{attrBadge(call)}</td>
+                  <td style={{padding:'8px 10px'}}>{_fmtDur(call.duration_sec)}</td>
+                  <td style={{padding:'8px 10px'}}>{_statusBadge(call.status)}</td>
+                  <td style={{padding:'8px 10px'}}>{_attrBadge(call)}</td>
+                  <td style={{padding:'8px 10px'}}>{_transcriptBadge(call.transcription_status)}</td>
+                  <td style={{padding:'8px 10px'}}>{_gradeBadge(call.grade_overall_score)}</td>
+                  <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}>{analyzeButton(call)}</td>
                 </tr>
-                {expanded===call.uuid && (
-                  <tr style={{background:'#f8fafc'}}>
-                    <td colSpan={8} style={{padding:'12px 16px',borderBottom:'1px solid var(--border)'}}>
-                      <div style={{display:'flex',gap:24,flexWrap:'wrap',fontSize:12}}>
-                        <div><span style={{color:'var(--text-muted)'}}>UUID:</span> <code style={{fontSize:10}}>{call.uuid}</code></div>
-                        <div><span style={{color:'var(--text-muted)'}}>Caller ID Name:</span> {call.caller_id_name||'—'}</div>
-                        <div><span style={{color:'var(--text-muted)'}}>Extension:</span> {call.extension_number||'—'}</div>
-                        <div><span style={{color:'var(--text-muted)'}}>Recording:</span> {call.recording_url?'✓ Available':'—'}</div>
-                        {call.gads_call_id && <div><span style={{color:'var(--text-muted)'}}>GAds Call ID:</span> <code style={{fontSize:10}}>{call.gads_call_id}</code></div>}
-                        {call.match_method && <div><span style={{color:'var(--text-muted)'}}>Match:</span> {call.match_method} ({Math.round((call.match_confidence||0)*100)}%)</div>}
-                        {call.lead_id && <div><span style={{color:'var(--text-muted)'}}>Lead ID:</span> <code style={{fontSize:10}}>{call.lead_id}</code></div>}
-                      </div>
-                    </td>
-                  </tr>
-                )}
               </React.Fragment>
             ))}
           </tbody>
@@ -3160,6 +3364,398 @@ function CallsView() {
       <div style={{marginTop:8,fontSize:11,color:'var(--text-muted)'}}>
         Showing {calls.length} of {total} calls · Syncs automatically every 5 min
       </div>
+
+      {/* Detail drawer */}
+      {drawerCall && (
+        <CallDetailDrawer
+          call={drawerCall}
+          onClose={()=>setDrawerCall(null)}
+          onGrade={handleGrade}
+          onAnalyze={handleAnalyze}
+          updateCallInState={updateCallInState}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── CallDetailDrawer — slide-in right panel with 4 tabs ───────────────────────
+
+function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState }) {
+  const [drawerTab, setDrawerTab] = useState('overview'); // 'overview'|'transcript'|'grade'|'attribution'
+  const [grading, setGrading]     = useState(false);
+  const [gradeMsg, setGradeMsg]   = useState('');
+
+  // Body scroll lock + Escape to close
+  useEffect(() => {
+    document.body.style.overflow = 'hidden';
+    function onKey(e) { if (e.key === 'Escape') onClose(); }
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = '';
+      document.removeEventListener('keydown', onKey);
+    };
+  }, []);
+
+  // Safe JSON parse helper
+  function safeJson(str, fallback=[]) {
+    try { return str ? JSON.parse(str) : fallback; }
+    catch { return fallback; }
+  }
+
+  const scores       = safeJson(call.grade_scores_json, []);
+  const recs         = safeJson(call.grade_recommendations_json, []);
+
+  async function doGrade() {
+    setGrading(true); setGradeMsg('');
+    const result = await onGrade(call.uuid);
+    setGrading(false);
+    if (result && result.ok) setGradeMsg('✓ Re-graded');
+    else setGradeMsg('✗ ' + ((result && result.error) || 'Grade failed'));
+  }
+
+  // Label maps
+  const lqLabels = {
+    new_patient_inquiry:'New Patient Inquiry', existing_patient:'Existing Patient',
+    emergency:'Emergency', provider_referral:'Provider Referral',
+    spam:'Spam', wrong_number:'Wrong Number', other_admin:'Other/Admin',
+  };
+  const hgLabels = { excellent:'Excellent ✓', good:'Good', needs_coaching:'Needs Coaching ⚠', poor:'Poor ✗' };
+  const hgColors = { excellent:'#16a34a', good:'#0369a1', needs_coaching:'#d97706', poor:'#dc2626' };
+  const boLabels = { booked:'Booked 📅', quoted_callback:'Quoted/Callback', declined:'Declined', no_action_needed:'No Action Needed', abandoned:'Abandoned' };
+  const boColors = { booked:'#16a34a', quoted_callback:'#0369a1', declined:'#dc2626', no_action_needed:'#6b7280', abandoned:'#6b7280' };
+
+  const tabBtn = (k, label) => (
+    <button key={k} onClick={()=>setDrawerTab(k)}
+      style={{padding:'6px 14px',fontSize:12,border:'none',borderBottom:'2px solid',cursor:'pointer',
+        background:'transparent',
+        borderBottomColor: drawerTab===k ? 'var(--teal)' : 'transparent',
+        color: drawerTab===k ? 'var(--teal)' : 'var(--text-muted)',
+        fontWeight: drawerTab===k ? 700 : 400}}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div>
+      {/* Backdrop */}
+      <div onClick={onClose}
+        style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.35)',zIndex:10000}} />
+
+      {/* Drawer panel */}
+      <div style={{position:'fixed',top:0,right:0,bottom:0,width:'min(520px,90vw)',
+        background:'#fff',zIndex:10001,display:'flex',flexDirection:'column',
+        boxShadow:'-4px 0 24px rgba(0,0,0,0.15)'}}>
+
+        {/* Header */}
+        <div style={{padding:'16px 20px',borderBottom:'1px solid var(--border)',flexShrink:0}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+            <div>
+              <div style={{fontSize:14,fontWeight:700,color:'var(--text)'}}>
+                {call.caller_id_name || call.from_number || 'Unknown Caller'}
+              </div>
+              <div style={{fontSize:11,color:'var(--text-muted)',marginTop:2,display:'flex',gap:10,flexWrap:'wrap'}}>
+                <span>{_fmtTime(call.started_at)}</span>
+                <span>·</span>
+                <span>{_fmtDur(call.duration_sec)}</span>
+                <span>·</span>
+                {_statusBadge(call.status)}
+              </div>
+            </div>
+            <button onClick={onClose}
+              style={{background:'none',border:'none',fontSize:20,cursor:'pointer',color:'var(--text-muted)',lineHeight:1,padding:'0 4px'}}>
+              ×
+            </button>
+          </div>
+        </div>
+
+        {/* Tab bar */}
+        <div style={{display:'flex',borderBottom:'1px solid var(--border)',flexShrink:0}}>
+          {tabBtn('overview','Overview')}
+          {tabBtn('transcript','Transcript')}
+          {tabBtn('grade','Grade')}
+          {tabBtn('attribution','Attribution')}
+        </div>
+
+        {/* Tab content — scrollable */}
+        <div style={{flex:1,overflowY:'auto',padding:'16px 20px'}}>
+
+          {/* ── Overview ── */}
+          {drawerTab==='overview' && (
+            <div>
+              {/* Key metadata */}
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'8px 16px',marginBottom:16,fontSize:12}}>
+                {[
+                  ['Direction',  call.direction==='inbound'?'↙ Inbound':'↗ Outbound'],
+                  ['Answered By', call.answered_by||'—'],
+                  ['Team Member', call.team_member||'—'],
+                  ['Extension',  call.extension_number||'—'],
+                  ['Recording',  call.recording_url?'✓ Available':'—'],
+                  ['Attempts',   call.pipeline_attempts||0],
+                ].map(([k,v])=>(
+                  <div key={k}>
+                    <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:2}}>{k}</div>
+                    <div style={{fontWeight:500}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Outcome badges */}
+              <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:16}}>
+                {call.lead_quality && (
+                  <span style={{padding:'3px 10px',borderRadius:12,fontSize:11,fontWeight:700,
+                    background:'#f0f9ff',color:'#0369a1',border:'1px solid #bae6fd'}}>
+                    {lqLabels[call.lead_quality]||call.lead_quality}
+                  </span>
+                )}
+                {call.handling_grade && (
+                  <span style={{padding:'3px 10px',borderRadius:12,fontSize:11,fontWeight:700,
+                    background:(hgColors[call.handling_grade]||'#6b7280')+'18',
+                    color:hgColors[call.handling_grade]||'#6b7280',
+                    border:`1px solid ${(hgColors[call.handling_grade]||'#6b7280')}44`}}>
+                    {hgLabels[call.handling_grade]||call.handling_grade}
+                  </span>
+                )}
+                {call.booked_outcome && (
+                  <span style={{padding:'3px 10px',borderRadius:12,fontSize:11,fontWeight:700,
+                    background:(boColors[call.booked_outcome]||'#6b7280')+'18',
+                    color:boColors[call.booked_outcome]||'#6b7280',
+                    border:`1px solid ${(boColors[call.booked_outcome]||'#6b7280')}44`}}>
+                    {boLabels[call.booked_outcome]||call.booked_outcome}
+                  </span>
+                )}
+                {call.is_empty ? (
+                  <span style={{padding:'3px 10px',borderRadius:12,fontSize:11,fontWeight:700,
+                    background:'#fef9c3',color:'#854d0e',border:'1px solid #fde68a'}}>
+                    ⚠ Empty call
+                  </span>
+                ) : null}
+              </div>
+
+              {/* Summary */}
+              {call.summary ? (
+                <div style={{background:'#f8fafc',border:'1px solid var(--border)',borderRadius:8,padding:'12px 14px',fontSize:12}}>
+                  <div style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',marginBottom:6,textTransform:'uppercase',letterSpacing:'0.05em'}}>AI Summary</div>
+                  <div style={{color:'var(--text)',lineHeight:1.6}}>{call.summary}</div>
+                  {call.summarized_at && <div style={{fontSize:10,color:'var(--text-muted)',marginTop:6}}>Summarized {_fmtTime(call.summarized_at)}</div>}
+                </div>
+              ) : (
+                <div style={{color:'var(--text-muted)',fontSize:12,fontStyle:'italic'}}>No summary yet — analyze this call to generate one.</div>
+              )}
+
+              {/* Pipeline error */}
+              {call.pipeline_error && (
+                <div style={{marginTop:12,background:'#fef2f2',border:'1px solid #fecaca',borderRadius:6,padding:'8px 12px',fontSize:11,color:'#dc2626'}}>
+                  ⚠ Pipeline error: {call.pipeline_error}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Transcript ── */}
+          {drawerTab==='transcript' && (
+            <div>
+              {call.is_empty && (
+                <div style={{background:'#fef9c3',border:'1px solid #fde68a',borderRadius:6,padding:'8px 12px',marginBottom:12,fontSize:11,color:'#854d0e'}}>
+                  ⚠ Empty call — voicemail or greeting only
+                </div>
+              )}
+              {call.call_transcript ? (
+                <pre style={{background:'#f8fafc',border:'1px solid var(--border)',borderRadius:8,padding:'14px',
+                  fontSize:11,lineHeight:1.7,whiteSpace:'pre-wrap',wordBreak:'break-word',
+                  maxHeight:'60vh',overflowY:'auto',margin:0,color:'var(--text)'}}>
+                  {call.call_transcript}
+                </pre>
+              ) : (
+                <div style={{textAlign:'center',padding:'40px 0',color:'var(--text-muted)'}}>
+                  <div style={{fontSize:32,marginBottom:12}}>🎙</div>
+                  <div style={{fontSize:13,marginBottom:16}}>
+                    {call.transcription_status==='pending' ? '⏳ Transcription queued…' :
+                     call.transcription_status==='in_progress' ? '⚙ Transcribing…' :
+                     call.transcription_status==='failed' ? '✗ Transcription failed' :
+                     'No transcript available'}
+                  </div>
+                  {(!call.transcription_status || call.transcription_status==='failed') && call.recording_url && (
+                    <button onClick={()=>onAnalyze(call.uuid)}
+                      style={{padding:'8px 20px',background:'var(--teal)',color:'#fff',border:'none',
+                        borderRadius:6,cursor:'pointer',fontSize:12,fontWeight:600}}>
+                      ▶ Analyze This Call
+                    </button>
+                  )}
+                  {call.transcription_status==='failed' && call.pipeline_error && (
+                    <div style={{marginTop:10,fontSize:11,color:'#dc2626'}}>{call.pipeline_error}</div>
+                  )}
+                </div>
+              )}
+              {call.transcript_model && (
+                <div style={{marginTop:8,fontSize:10,color:'var(--text-muted)'}}>Model: {call.transcript_model}</div>
+              )}
+            </div>
+          )}
+
+          {/* ── Grade ── */}
+          {drawerTab==='grade' && (
+            <div>
+              {call.grade_gradeable === 0 ? (
+                <div style={{background:'#f8fafc',border:'1px solid var(--border)',borderRadius:8,padding:'16px',marginBottom:16}}>
+                  <div style={{fontWeight:600,color:'var(--text-muted)',marginBottom:6}}>Not Gradeable</div>
+                  <div style={{fontSize:12,color:'var(--text-muted)'}}>{call.grade_reason || 'This call type does not require grading.'}</div>
+                </div>
+              ) : (
+                <>
+                  {/* Overall score */}
+                  {call.grade_overall_score != null && (
+                    <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+                      <div style={{fontSize:36,fontWeight:800,color:call.grade_overall_score>=80?'#16a34a':call.grade_overall_score>=60?'#d97706':'#dc2626'}}>
+                        {call.grade_overall_score}%
+                      </div>
+                      {call.grade_overall_notes && (
+                        <div style={{fontSize:12,color:'var(--text)',lineHeight:1.5,flex:1}}>{call.grade_overall_notes}</div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Criteria scores table */}
+                  {scores.length > 0 && (
+                    <div style={{marginBottom:16}}>
+                      <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',marginBottom:8,textTransform:'uppercase',letterSpacing:'0.05em'}}>Criteria Scores</div>
+                      <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+                        <thead>
+                          <tr style={{background:'var(--bg-card)'}}>
+                            {['Criterion','Score','Notes'].map(h=>(
+                              <th key={h} style={{padding:'6px 8px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)'}}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {scores.map((s,i)=>(
+                            <tr key={i} style={{borderBottom:'1px solid var(--border)'}}>
+                              <td style={{padding:'6px 8px',fontWeight:500}}>{s.criterion||s.name||'—'}</td>
+                              <td style={{padding:'6px 8px'}}>{_gradeBadge(s.score)}</td>
+                              <td style={{padding:'6px 8px',color:'var(--text-muted)',fontSize:11}}>{s.notes||'—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* Recommendations */}
+                  {recs.length > 0 && (
+                    <div style={{marginBottom:16}}>
+                      <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',marginBottom:8,textTransform:'uppercase',letterSpacing:'0.05em'}}>Recommendations</div>
+                      <ul style={{margin:0,paddingLeft:16,fontSize:12,lineHeight:1.8,color:'var(--text)'}}>
+                        {recs.map((r,i)=><li key={i}>{r}</li>)}
+                      </ul>
+                    </div>
+                  )}
+
+                  {!call.grade_overall_score && !scores.length && (
+                    <div style={{color:'var(--text-muted)',fontSize:12,fontStyle:'italic',marginBottom:16}}>
+                      No grade yet — transcribe the call first, then re-grade.
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* Re-grade button */}
+              <div style={{borderTop:'1px solid var(--border)',paddingTop:14,display:'flex',alignItems:'center',gap:10}}>
+                <button onClick={doGrade} disabled={grading || !call.call_transcript}
+                  title={!call.call_transcript?'Transcribe first':'Re-run grading with current criteria'}
+                  style={{padding:'7px 18px',background:grading?'var(--bg-card)':'var(--teal)',color:grading?'var(--text-muted)':'#fff',
+                    border:'1px solid var(--teal)',borderRadius:6,cursor:(!call.call_transcript||grading)?'not-allowed':'pointer',fontSize:12,fontWeight:600}}>
+                  {grading ? '⚙ Grading…' : '↺ Re-grade'}
+                </button>
+                {gradeMsg && <span style={{fontSize:11,color:gradeMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{gradeMsg}</span>}
+                {call.graded_at && <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>Graded {_fmtTime(call.graded_at)}</span>}
+              </div>
+            </div>
+          )}
+
+          {/* ── Attribution ── */}
+          {drawerTab==='attribution' && (
+            <div style={{fontSize:12}}>
+              <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'10px 16px',alignItems:'start'}}>
+                {[
+                  ['Attribution', call.attribution_label || '—'],
+                  ['From Number', call.from_number || '—'],
+                  ['Caller ID',   call.caller_id_name || '—'],
+                  ['To Number',   call.to_number || '—'],
+                ].map(([k,v])=>(
+                  <React.Fragment key={k}>
+                    <div style={{color:'var(--text-muted)',fontWeight:500,whiteSpace:'nowrap'}}>{k}</div>
+                    <div>{v}</div>
+                  </React.Fragment>
+                ))}
+
+                {call.gads_call_id && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500}}>GAds Call ID</div>
+                  <code style={{fontSize:10}}>{call.gads_call_id}</code>
+                </React.Fragment>)}
+
+                {call.match_method && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Match Method</div>
+                  <div>{call.match_method} ({Math.round((call.match_confidence||0)*100)}% confidence)</div>
+                </React.Fragment>)}
+
+                {call.lead_id && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Lead ID</div>
+                  <div>
+                    <code style={{fontSize:10}}>{call.lead_id}</code>
+                  </div>
+                </React.Fragment>)}
+
+                <div style={{color:'var(--text-muted)',fontWeight:500}}>UUID</div>
+                <code style={{fontSize:10,wordBreak:'break-all'}}>{call.uuid}</code>
+              </div>
+
+              {!call.gads_call_id && !call.match_method && !call.lead_id && (
+                <div style={{marginTop:16,color:'var(--text-muted)',fontStyle:'italic'}}>
+                  No Google Ads or lead attribution for this call.
+                </div>
+              )}
+            </div>
+          )}
+
+        </div>{/* end scrollable content */}
+      </div>{/* end drawer panel */}
+    </div>
+  );
+}
+
+// ── CallAnalysisView — top-level wrapper with sub-nav ─────────────────────────
+
+function CallAnalysisView() {
+  const [subView, setSubView] = useState('calls'); // 'calls' | 'performance' | 'settings'
+
+  const subNavStyle = (k) => ({
+    padding:'5px 14px', fontSize:12, border:'none', borderBottom:'2px solid',
+    cursor:'pointer', background:'transparent',
+    borderBottomColor: subView===k ? 'var(--teal)' : 'transparent',
+    color: subView===k ? 'var(--teal)' : 'var(--text-muted)',
+    fontWeight: subView===k ? 700 : 400,
+  });
+
+  return (
+    <div>
+      {/* Sub-navigation */}
+      <div style={{display:'flex',gap:2,borderBottom:'1px solid var(--border)',marginBottom:16}}>
+        <button style={subNavStyle('calls')}       onClick={()=>setSubView('calls')}>📋 Calls</button>
+        <button style={subNavStyle('performance')} onClick={()=>setSubView('performance')}>📊 Performance</button>
+        <button style={subNavStyle('settings')}    onClick={()=>setSubView('settings')}>⚙ Settings</button>
+      </div>
+
+      {subView === 'calls'       && <CallsSubView />}
+      {subView === 'performance' && (
+        <div style={{padding:'40px 0',textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
+          📊 Performance analytics coming in next update
+        </div>
+      )}
+      {subView === 'settings' && (
+        <div style={{padding:'40px 0',textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
+          ⚙ Analysis settings coming in next update
+        </div>
+      )}
     </div>
   );
 }
@@ -3757,7 +4353,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['calls','📞 Calls']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['calls','🎙 Call Analysis']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -3787,8 +4383,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         </div>
       )}
 
-      {/* ── Calls view ── */}
-      {view==='calls' && <CallsView />}
+      {/* ── Call Analysis view ── */}
+      {view==='calls' && <CallAnalysisView />}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>
