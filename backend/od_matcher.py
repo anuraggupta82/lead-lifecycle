@@ -120,16 +120,27 @@ def match_leads_to_od() -> dict:
     """
     Match unmatched leads to OpenDental patients using phone/email hashes.
     Pulls production attributed to implant CDT codes.
+
+    M3 fix: also refreshes production for already-matched leads that have a gclid,
+    so cumulative OD production (crown work added 60 days post-consult) is captured.
+    Uses INSERT OR REPLACE in append_keyword_production_log so re-runs are idempotent.
     """
     conn = _get_db()
     if not conn:
         return {"matched": 0, "errors": 1, "error": "OpenDental MySQL unavailable (office network required)"}
 
+    all_leads = get_all_leads()
     unmatched = [
-        l for l in get_all_leads()
+        l for l in all_leads
         if not l.get("od_patient_num") and (l.get("phone_hash") or l.get("email_hash"))
     ]
-    logger.info(f"OD matcher: {len(unmatched)} leads to check")
+    # Already-matched leads with gclid — refresh production amounts nightly
+    already_matched_with_gclid = [
+        l for l in all_leads
+        if l.get("od_patient_num") and l.get("gclid") and l.get("keyword_text")
+    ]
+    logger.info(f"OD matcher: {len(unmatched)} leads to match, "
+                f"{len(already_matched_with_gclid)} existing matches to refresh")
 
     matched = errors = 0
 
@@ -202,6 +213,49 @@ def match_leads_to_od() -> dict:
                               "od_relationship": od_rel,
                           }))
 
+                # Phase A: append to keyword_production_log when lead has a gclid + keyword
+                if lead.get("gclid") and lead.get("keyword_text"):
+                    try:
+                        from database import append_keyword_production_log
+                        # Look up match_type from gads_keywords_cache for this keyword+campaign
+                        _match_type = ""
+                        try:
+                            _lconn2 = _get_sqlite()
+                            _kw_row = _lconn2.execute(
+                                "SELECT match_type FROM gads_keywords_cache "
+                                "WHERE LOWER(keyword_text)=? AND campaign_name=? LIMIT 1",
+                                (lead["keyword_text"].lower(), lead.get("campaign_name", ""))
+                            ).fetchone()
+                            _lconn2.close()
+                            if _kw_row:
+                                _match_type = dict(_kw_row).get("match_type", "")
+                        except Exception:
+                            pass
+                        # Determine appointment date from apt_info
+                        _apt_date = apt_info.get("next_apt_date", "")
+                        if not _apt_date and apt_info.get("last_complete_date"):
+                            _apt_date = str(apt_info["last_complete_date"])[:10]
+                        append_keyword_production_log(
+                            lead_id=lead["id"],
+                            keyword_text=lead["keyword_text"],
+                            match_type=_match_type,
+                            campaign_id=lead.get("campaign_id", ""),
+                            campaign_name=lead.get("campaign_name", ""),
+                            ad_group_name=lead.get("ad_group_name", ""),
+                            gclid=lead["gclid"],
+                            od_patient_num=pat_num,
+                            production_amount=production["total"],
+                            procedure_codes=production.get("codes", []),
+                            match_method=match_method,
+                            appointment_date=_apt_date,
+                        )
+                        logger.info(
+                            f"[phase_a] keyword_production_log: lead={lead['id'][:8]} "
+                            f"kw='{lead['keyword_text']}' prod=${production['total']:.2f}"
+                        )
+                    except Exception as _kpl_err:
+                        logger.warning(f"[phase_a] keyword_production_log append failed (non-fatal): {_kpl_err}")
+
                 logger.info(f"Lead {lead['id']} matched to OD PatNum {pat_num} via {match_method}, "
                             f"production=${production['total']:.2f}, relationship={od_rel}")
                 matched += 1
@@ -213,7 +267,64 @@ def match_leads_to_od() -> dict:
     finally:
         conn.close()
 
-    return {"matched": matched, "unmatched": len(unmatched) - matched, "errors": errors}
+    # ── M3 fix: refresh production for already-matched leads with gclid ───────
+    # Opens a fresh OD connection for the production refresh pass.
+    production_refreshed = 0
+    if already_matched_with_gclid:
+        refresh_conn = _get_db()
+        if refresh_conn:
+            try:
+                for lead in already_matched_with_gclid:
+                    try:
+                        pat_num = lead["od_patient_num"]
+                        production = _get_patient_production(refresh_conn, pat_num)
+                        apt_info = _get_appointment_info(refresh_conn, pat_num)
+                        # Look up match_type from cache
+                        _match_type = ""
+                        try:
+                            _lconn = _get_sqlite()
+                            _kw_row = _lconn.execute(
+                                "SELECT match_type FROM gads_keywords_cache "
+                                "WHERE LOWER(keyword_text)=? AND campaign_name=? LIMIT 1",
+                                (lead["keyword_text"].lower(), lead.get("campaign_name", ""))
+                            ).fetchone()
+                            _lconn.close()
+                            if _kw_row:
+                                _match_type = dict(_kw_row).get("match_type", "")
+                        except Exception:
+                            pass
+                        _apt_date = apt_info.get("next_apt_date", "")
+                        if not _apt_date and apt_info.get("last_complete_date"):
+                            _apt_date = str(apt_info["last_complete_date"])[:10]
+                        from database import append_keyword_production_log
+                        append_keyword_production_log(
+                            lead_id=lead["id"],
+                            keyword_text=lead["keyword_text"],
+                            match_type=_match_type,
+                            campaign_id=lead.get("campaign_id", ""),
+                            campaign_name=lead.get("campaign_name", ""),
+                            ad_group_name=lead.get("ad_group_name", ""),
+                            gclid=lead["gclid"],
+                            od_patient_num=pat_num,
+                            production_amount=production["total"],
+                            procedure_codes=production.get("codes", []),
+                            match_method=lead.get("od_matched_at", "refresh"),
+                            appointment_date=_apt_date,
+                        )
+                        production_refreshed += 1
+                    except Exception as _ref_err:
+                        logger.warning(f"[phase_a] Production refresh failed for lead {lead['id'][:8]}: {_ref_err}")
+            finally:
+                refresh_conn.close()
+            if production_refreshed:
+                logger.info(f"[phase_a] Refreshed production for {production_refreshed} already-matched leads")
+
+    return {
+        "matched": matched,
+        "unmatched": len(unmatched) - matched,
+        "errors": errors,
+        "production_refreshed": production_refreshed,
+    }
 
 
 # ── Part 2: Sync treatment stages for already-matched leads ─────────────────

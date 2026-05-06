@@ -2986,8 +2986,186 @@ function _AICampaignView_REMOVED() {
 }
 
 
+function CallsView() {
+  const [calls, setCalls] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [adCallCount, setAdCallCount] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [days, setDays] = useState(30);
+  const [dirFilter, setDirFilter] = useState('inbound');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState('');
+  const [expanded, setExpanded] = useState(null);
+
+  async function loadCalls() {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ days, limit: 200, offset: 0 });
+      if (dirFilter) params.set('direction', dirFilter);
+      if (statusFilter) params.set('status', statusFilter);
+      const d = await api(`/api/admin/calls?${params}`);
+      setCalls(d.calls || []);
+      setTotal(d.total || 0);
+      setAdCallCount(d.ad_calls_from_gads || 0);
+    } catch(e) { console.error('Calls load error', e); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => { loadCalls(); }, [days, dirFilter, statusFilter]);
+
+  async function handleSync() {
+    setSyncing(true); setSyncMsg('');
+    try {
+      const d = await api('/api/admin/calls/sync', { method: 'POST' });
+      setSyncMsg(`✓ Synced ${d.synced} calls`);
+      await loadCalls();
+    } catch(e) { setSyncMsg('✗ Sync failed: ' + (e.message||'error')); }
+    finally { setSyncing(false); }
+  }
+
+  function fmtDur(sec) {
+    if (!sec) return '—';
+    const m = Math.floor(sec/60), s = sec%60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    try { return new Date(iso).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}); }
+    catch { return iso; }
+  }
+  function statusBadge(status) {
+    const colors = { answered:'#16a34a', missed:'#dc2626', voicemail:'#d97706', busy:'#6b7280', unknown:'#94a3b8' };
+    const color = colors[status] || '#94a3b8';
+    return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,background:color+'22',color,border:`1px solid ${color}44`}}>{status||'unknown'}</span>;
+  }
+  function attrBadge(call) {
+    if (!call.attribution_label) return null;
+    const isAd = call.attribution_label.includes('Ad call');
+    return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
+      background:isAd?'#0369a133':'#71513033',color:isAd?'#0369a1':'#92400e',
+      border:`1px solid ${isAd?'#0369a144':'#92400e44'}`}}>{call.attribution_label}</span>;
+  }
+
+  const missed = calls.filter(c=>c.status==='missed').length;
+  const answered = calls.filter(c=>c.status==='answered').length;
+  const avgDur = calls.filter(c=>c.duration_sec>0).length
+    ? Math.round(calls.filter(c=>c.duration_sec>0).reduce((a,c)=>a+(c.duration_sec||0),0)/calls.filter(c=>c.duration_sec>0).length)
+    : 0;
+
+  return (
+    <div>
+      {/* Summary tiles */}
+      <div style={{display:'flex',gap:10,marginBottom:14,flexWrap:'wrap'}}>
+        {[
+          {label:'Total Calls',val:total,color:'#0f172a'},
+          {label:'Answered',val:answered,color:'#16a34a'},
+          {label:'Missed',val:missed,color:'#dc2626'},
+          {label:'From Google Ads',val:adCallCount,color:'#0369a1'},
+          {label:'Avg Duration',val:avgDur?fmtDur(avgDur):'—',color:'#7c3aed'},
+        ].map(t=>(
+          <div key={t.label} style={{flex:'1 1 120px',minWidth:100,background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
+            <div style={{fontSize:22,fontWeight:700,color:t.color}}>{t.val}</div>
+            <div style={{fontSize:11,color:'var(--text-muted)',marginTop:2}}>{t.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Toolbar */}
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10,flexWrap:'wrap'}}>
+        <div style={{display:'flex',gap:4}}>
+          {[7,14,30,90].map(d=>(
+            <button key={d} onClick={()=>setDays(d)}
+              style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                background:days===d?'var(--teal)':'#fff',color:days===d?'#fff':'var(--text-muted)'}}>
+              {d}d</button>
+          ))}
+        </div>
+        <select value={dirFilter} onChange={e=>setDirFilter(e.target.value)}
+          style={{padding:'3px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}>
+          <option value="">All directions</option>
+          <option value="inbound">Inbound</option>
+          <option value="outbound">Outbound</option>
+        </select>
+        <select value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}
+          style={{padding:'3px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}>
+          <option value="">All statuses</option>
+          <option value="answered">Answered</option>
+          <option value="missed">Missed</option>
+          <option value="voicemail">Voicemail</option>
+        </select>
+        <button onClick={handleSync} disabled={syncing}
+          style={{padding:'4px 12px',fontSize:11,border:'1px solid var(--teal)',borderRadius:4,cursor:'pointer',
+            background:syncing?'var(--bg-card)':'var(--teal)',color:syncing?'var(--text-muted)':'#fff'}}>
+          {syncing?'Syncing…':'⟳ Sync Now'}
+        </button>
+        {syncMsg && <span style={{fontSize:11,color:syncMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{syncMsg}</span>}
+        {loading && <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>}
+      </div>
+
+      {/* Calls table */}
+      <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,overflow:'hidden'}}>
+        <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+          <thead>
+            <tr style={{background:'var(--bg-card)',borderBottom:'1px solid var(--border)'}}>
+              {['Time','Dir','From (area)','To','Answered By','Duration','Status','Attribution'].map(h=>(
+                <th key={h} style={{padding:'8px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap'}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {calls.length===0 && !loading && (
+              <tr><td colSpan={8} style={{padding:'24px',textAlign:'center',color:'var(--text-muted)'}}>
+                No calls found. Click "Sync Now" to pull latest data.
+              </td></tr>
+            )}
+            {calls.map(call=>(
+              <React.Fragment key={call.uuid}>
+                <tr onClick={()=>setExpanded(expanded===call.uuid?null:call.uuid)}
+                  style={{borderBottom:'1px solid var(--border)',cursor:'pointer',
+                    background:call.status==='missed'?'#fef2f2':expanded===call.uuid?'#f0f9ff':'#fff'}}>
+                  <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>{fmtTime(call.started_at)}</td>
+                  <td style={{padding:'8px 10px'}}>
+                    <span style={{fontSize:10,fontWeight:600,color:call.direction==='inbound'?'#0369a1':'#7c3aed'}}>
+                      {call.direction==='inbound'?'↙ IN':'↗ OUT'}
+                    </span>
+                  </td>
+                  <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>{call.from_number||('area:'+call.caller_id_number)||'—'}</td>
+                  <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>{call.to_number||'—'}</td>
+                  <td style={{padding:'8px 10px',fontWeight:600}}>{call.answered_by||'—'}</td>
+                  <td style={{padding:'8px 10px'}}>{fmtDur(call.duration_sec)}</td>
+                  <td style={{padding:'8px 10px'}}>{statusBadge(call.status)}</td>
+                  <td style={{padding:'8px 10px'}}>{attrBadge(call)}</td>
+                </tr>
+                {expanded===call.uuid && (
+                  <tr style={{background:'#f8fafc'}}>
+                    <td colSpan={8} style={{padding:'12px 16px',borderBottom:'1px solid var(--border)'}}>
+                      <div style={{display:'flex',gap:24,flexWrap:'wrap',fontSize:12}}>
+                        <div><span style={{color:'var(--text-muted)'}}>UUID:</span> <code style={{fontSize:10}}>{call.uuid}</code></div>
+                        <div><span style={{color:'var(--text-muted)'}}>Caller ID Name:</span> {call.caller_id_name||'—'}</div>
+                        <div><span style={{color:'var(--text-muted)'}}>Extension:</span> {call.extension_number||'—'}</div>
+                        <div><span style={{color:'var(--text-muted)'}}>Recording:</span> {call.recording_url?'✓ Available':'—'}</div>
+                        {call.gads_call_id && <div><span style={{color:'var(--text-muted)'}}>GAds Call ID:</span> <code style={{fontSize:10}}>{call.gads_call_id}</code></div>}
+                        {call.match_method && <div><span style={{color:'var(--text-muted)'}}>Match:</span> {call.match_method} ({Math.round((call.match_confidence||0)*100)}%)</div>}
+                        {call.lead_id && <div><span style={{color:'var(--text-muted)'}}>Lead ID:</span> <code style={{fontSize:10}}>{call.lead_id}</code></div>}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{marginTop:8,fontSize:11,color:'var(--text-muted)'}}>
+        Showing {calls.length} of {total} calls · Syncs automatically every 5 min
+      </div>
+    </div>
+  );
+}
+
 function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
-  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives'
+  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'calls'
   const [dateRange, setDateRange] = useState(() => defaultDateRange(30));
   const [adCreativesDays, setAdCreativesDays] = useState(30);
   const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
@@ -3019,6 +3197,15 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [adPreviewMode, setAdPreviewMode] = useState('search');
   // Custom values card expand state
   const [customValsOpen, setCustomValsOpen] = useState(false);
+  const [sitelinkEditorOpen, setSitelinkEditorOpen] = useState(false);
+  const [sitelinkDraft, setSitelinkDraft] = useState([]); // [{title,url}]
+  const [sitelinkSaving, setSitelinkSaving] = useState(false);
+  const [sitelinkResult, setSitelinkResult] = useState(null); // {ok,gads_applied,count,gads_errors}
+  const [sitelinkSuggestions, setSitelinkSuggestions] = useState([]); // [{title,url,reason}]
+  const [sitelinkSuggestLoading, setSitelinkSuggestLoading] = useState(false);
+  const [sitelinkSuggestInstruction, setSitelinkSuggestInstruction] = useState('');
+  const [sitelinkSuggestError, setSitelinkSuggestError] = useState(null);
+  const [sitelinkRetryCount, setSitelinkRetryCount] = useState(0); // cap AI Fix & Retry at 2
 
   const [stopConfirm, setStopConfirm] = useState(null);
   const [gadsImportOpen, setGadsImportOpen] = useState(false);
@@ -3395,6 +3582,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [wizardCopyFrom, setWizardCopyFrom] = useState(''); // campaign_id to copy settings from
   const [wizardStrategy, setWizardStrategy] = useState(null);
   const [wizardStrategyLoading, setWizardStrategyLoading] = useState(false);
+  const [wizardRefineInput, setWizardRefineInput] = useState('');
+  const [wizardRefineLoading, setWizardRefineLoading] = useState(false);
+  const [wizardRefinedPreview, setWizardRefinedPreview] = useState(null); // refined strategy object
+  const [wizardCreatedCampId, setWizardCreatedCampId] = useState(null); // campaign_id once saved
   const EMPTY_CAMP = {
     campaign_name:'', campaign_type:'MANUAL', campaign_id:'',
     service_focus:'', promo_offer:'', target_audience:'',
@@ -3443,6 +3634,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     setWizardStepError('');
     setWizardStrategy(null);
     setWizardStrategyLoading(false);
+    setWizardRefineInput('');
+    setWizardRefineLoading(false);
+    setWizardRefinedPreview(null);
+    setWizardCreatedCampId(null);
     loadManagedCamps(); // refresh so new campaign + strategy appear immediately
   }
 
@@ -3474,6 +3669,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       };
       const createRes = await api('/api/admin/campaigns/create', { method: 'POST', body: JSON.stringify(savedCamp) });
       const createdCampId = createRes?.campaign?.campaign_id || null;
+      setWizardCreatedCampId(createdCampId);
       // Campaign saved — move to Step 4: Opus Strategy Review
       setWizardStep(4);
       setWizardStrategy(null);
@@ -3561,7 +3757,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['calls','📞 Calls']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -3590,6 +3786,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
           <AdCreativesView days={adCreativesDays} />
         </div>
       )}
+
+      {/* ── Calls view ── */}
+      {view==='calls' && <CallsView />}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>
@@ -3680,6 +3879,18 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       {c.is_inactive_90d && (
                         <span style={{fontSize:9,marginLeft:5,color:'var(--text-muted)'}}>· 90d inactive</span>
                       )}
+                      {(() => {
+                        let slCount = 0;
+                        try { slCount = c.sitelinks ? JSON.parse(c.sitelinks).length : 0; } catch(e) {}
+                        return slCount > 0 ? (
+                          <span title={`${slCount} sitelink${slCount!==1?'s':''} configured`}
+                            style={{display:'inline-block',fontSize:9,marginLeft:5,
+                              background:'#eff6ff',color:'#1d4ed8',border:'1px solid #bfdbfe',
+                              borderRadius:8,padding:'0px 5px',fontWeight:600,lineHeight:'16px'}}>
+                            🔗{slCount}
+                          </span>
+                        ) : null;
+                      })()}
                     </td>
 
                     {/* Status */}
@@ -4985,7 +5196,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         <button className="btn btn-teal btn-sm" style={{fontSize:11}}
                                           disabled={launchCardEdit.saving}
                                           onClick={()=>saveCardField('campaign_name', launchCardEdit.draft)}>
-                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                          {launchCardEdit.saving ? '…' : isLinkedAlready ? 'Save Changes' : 'Save'}
                                         </button>
                                         <button className="btn btn-sm" style={{fontSize:11,
                                           background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
@@ -5030,7 +5241,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         <button className="btn btn-teal btn-sm" style={{fontSize:11}}
                                           disabled={launchCardEdit.saving}
                                           onClick={()=>saveCardField('monthly_budget', dailyToMonthly(parseFloat(launchCardEdit.draft)||0))}>
-                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                          {launchCardEdit.saving ? '…' : isLinkedAlready ? 'Save Changes' : 'Save'}
                                         </button>
                                         <button className="btn btn-sm" style={{fontSize:11,
                                           background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
@@ -5088,7 +5299,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               const val = geoEditValue;
                                               await saveCardField('geographic_targeting', val);
                                             }}>
-                                            {launchCardEdit.saving ? '…' : 'Save'}
+                                            {launchCardEdit.saving ? '…' : isLinkedAlready ? 'Save Changes' : 'Save'}
                                           </button>
                                           <button className="btn btn-sm" style={{fontSize:11,
                                             background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
@@ -5127,7 +5338,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         <button className="btn btn-teal btn-sm" style={{fontSize:11}}
                                           disabled={launchCardEdit.saving}
                                           onClick={()=>saveCardField('landing_page', launchCardEdit.draft)}>
-                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                          {launchCardEdit.saving ? '…' : isLinkedAlready ? 'Save Changes' : 'Save'}
                                         </button>
                                         <button className="btn btn-sm" style={{fontSize:11,
                                           background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
@@ -5168,7 +5379,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         <button className="btn btn-teal btn-sm" style={{fontSize:11}}
                                           disabled={launchCardEdit.saving}
                                           onClick={()=>saveCardField('call_extension_phone', launchCardEdit.draft)}>
-                                          {launchCardEdit.saving ? '…' : 'Save'}
+                                          {launchCardEdit.saving ? '…' : isLinkedAlready ? 'Save Changes' : 'Save'}
                                         </button>
                                         <button className="btn btn-sm" style={{fontSize:11,
                                           background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
@@ -5181,6 +5392,430 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     )}
                                   </div>
                                 </div>
+
+                                {/* Card 5b — Sitelink Extensions */}
+                                {(() => {
+                                  // Parse existing sitelinks from campaign
+                                  let existingSitelinks = [];
+                                  try {
+                                    const raw = camp.sitelinks || '';
+                                    existingSitelinks = raw ? JSON.parse(raw) : [];
+                                  } catch(e) {}
+                                  const slCount = existingSitelinks.length;
+
+                                  // Default blank sitelinks for the editor
+                                  const DEFAULT_SITELINKS = [
+                                    {title:'Book Online',    url: (camp.landing_page || practiceSettings.website || 'https://graftondentalcare.com') + '/book'},
+                                    {title:'New Patients',   url: (camp.landing_page || practiceSettings.website || 'https://graftondentalcare.com') + '/new-patients'},
+                                    {title:'About Us',       url: (camp.landing_page || practiceSettings.website || 'https://graftondentalcare.com') + '/about'},
+                                    {title:'Patient Forms',  url: (camp.landing_page || practiceSettings.website || 'https://graftondentalcare.com') + '/forms'},
+                                  ];
+
+                                  function openEditor() {
+                                    setSitelinkDraft(existingSitelinks.length > 0
+                                      ? existingSitelinks.map(sl => ({title: sl.title||'', url: sl.url||''}))
+                                      : DEFAULT_SITELINKS.map(sl => ({...sl}))
+                                    );
+                                    setSitelinkResult(null);
+                                    setSitelinkSuggestions([]);
+                                    setSitelinkSuggestInstruction('');
+                                    setSitelinkSuggestError(null);
+                                    setSitelinkRetryCount(0);
+                                    setSitelinkEditorOpen(true);
+                                  }
+
+                                  // AI suggest — accepts optional overrides for error-retry loop
+                                  async function aiSuggest(overrideInstruction, previousErrors, previousSuggestions) {
+                                    setSitelinkSuggestLoading(true);
+                                    setSitelinkSuggestError(null);
+                                    try {
+                                      const body = { instruction: overrideInstruction !== undefined ? overrideInstruction : (sitelinkSuggestInstruction || null) };
+                                      if (previousErrors && previousErrors.length > 0) {
+                                        body.previous_errors = previousErrors;
+                                        body.previous_suggestions = previousSuggestions || sitelinkDraft;
+                                      }
+                                      const r = await api(`/api/admin/campaigns/${camp.campaign_id}/sitelinks/suggest`, {
+                                        method: 'POST',
+                                        body: JSON.stringify(body)
+                                      });
+                                      const sugs = r.suggestions || [];
+                                      setSitelinkSuggestions(sugs);
+                                      if (sugs.length === 0) {
+                                        setSitelinkSuggestError('AI returned no suggestions — try a more specific instruction (e.g. "focus on insurance and financing").');
+                                      }
+                                    } catch(e) {
+                                      setSitelinkSuggestError(e.message || 'AI suggest failed');
+                                    }
+                                    setSitelinkSuggestLoading(false);
+                                  }
+
+                                  // Add a suggestion to the draft (replace if title already exists, else append)
+                                  function addSuggestionToDraft(sg) {
+                                    setSitelinkDraft(d => {
+                                      const existing = d.findIndex(x => x.title.toLowerCase() === sg.title.toLowerCase());
+                                      const entry = {title: sg.title, url: sg.url};
+                                      if (existing >= 0) return d.map((x,i) => i===existing ? entry : x);
+                                      if (d.length >= 10) return d; // max 10
+                                      return [...d, entry];
+                                    });
+                                  }
+
+                                  // Replace entire draft with all suggestions (max 10)
+                                  function useAllSuggestions() {
+                                    setSitelinkDraft(sitelinkSuggestions.slice(0,10).map(sg => ({title:sg.title, url:sg.url})));
+                                  }
+
+                                  async function saveSitelinks() {
+                                    const valid = sitelinkDraft.filter(sl => sl.title.trim() && sl.url.trim().startsWith('https://'));
+                                    if (valid.length === 0) {
+                                      setSitelinkResult({ok:false, msg:'At least one sitelink with a title and https:// URL is required.'});
+                                      return;
+                                    }
+                                    setSitelinkSaving(true);
+                                    setSitelinkResult(null);
+                                    try {
+                                      const r = await api(`/api/admin/campaigns/${camp.campaign_id}/sitelinks`, {
+                                        method: 'POST',
+                                        body: JSON.stringify({sitelinks: valid})
+                                      });
+                                      const gadsErrors = r.gads_errors || [];
+                                      if (r.gads_applied && gadsErrors.length === 0) {
+                                        // Clean success
+                                        setSitelinkResult({ok:true, count:r.saved, gads_applied:true, gads_errors:[]});
+                                        setCampDetail(prev => prev ? {
+                                          ...prev,
+                                          campaign: {...prev.campaign, sitelinks: JSON.stringify(valid)}
+                                        } : prev);
+                                        setSitelinkEditorOpen(false);
+                                      } else if (r.gads_applied && gadsErrors.length > 0) {
+                                        // Partial success — GAds had errors, show AI retry prompt
+                                        setCampDetail(prev => prev ? {
+                                          ...prev,
+                                          campaign: {...prev.campaign, sitelinks: JSON.stringify(valid)}
+                                        } : prev);
+                                        setSitelinkResult({ok:'partial', count:r.saved, gads_count:r.gads_count,
+                                          gads_errors: gadsErrors, draft_at_save: valid});
+                                      } else {
+                                        // Saved to DB but not live (no gads resource), or not applied
+                                        setSitelinkResult({ok:true, count:r.saved, gads_applied:false, gads_errors:[]});
+                                        setCampDetail(prev => prev ? {
+                                          ...prev,
+                                          campaign: {...prev.campaign, sitelinks: JSON.stringify(valid)}
+                                        } : prev);
+                                        setSitelinkEditorOpen(false);
+                                      }
+                                    } catch(e) {
+                                      setSitelinkResult({ok:false, msg: e.message || 'Save failed'});
+                                    }
+                                    setSitelinkSaving(false);
+                                  }
+
+                                  const MAX_AI_RETRIES = 2;
+
+                                  // AI Fix & Retry — feed GAds errors back to AI, get improved sitelinks, auto-save
+                                  async function aiFixAndRetry(gadsErrors, draftAtSave) {
+                                    // Iteration cap — prevent infinite loop if AI can't fix
+                                    if (sitelinkRetryCount >= MAX_AI_RETRIES) {
+                                      setSitelinkResult({ok:false, msg:`AI could not fix the errors after ${MAX_AI_RETRIES} attempts. Please edit the sitelinks manually to resolve the Google Ads issues above.`});
+                                      return;
+                                    }
+                                    setSitelinkRetryCount(c => c + 1);
+                                    setSitelinkResult(null);
+                                    // 1. Get AI-improved suggestions
+                                    setSitelinkSuggestLoading(true);
+                                    setSitelinkSuggestError(null);
+                                    let improved = [];
+                                    try {
+                                      const r = await api(`/api/admin/campaigns/${camp.campaign_id}/sitelinks/suggest`, {
+                                        method: 'POST',
+                                        body: JSON.stringify({
+                                          previous_errors: gadsErrors,
+                                          previous_suggestions: draftAtSave,
+                                          instruction: 'Fix the Google Ads errors. Make all titles strictly under 25 characters.'
+                                        })
+                                      });
+                                      improved = r.suggestions || [];
+                                      setSitelinkSuggestions(improved);
+                                    } catch(e) {
+                                      setSitelinkSuggestError(e.message || 'AI fix failed');
+                                      setSitelinkSuggestLoading(false);
+                                      return;
+                                    }
+                                    setSitelinkSuggestLoading(false);
+                                    if (improved.length === 0) {
+                                      setSitelinkSuggestError('AI could not generate improved sitelinks. Please edit manually.');
+                                      return;
+                                    }
+                                    // 2. Replace draft with improved suggestions and validate before save
+                                    const rawDraft = improved.slice(0,10).map(sg => ({title:sg.title, url:sg.url}));
+                                    const newDraft = rawDraft.filter(sl => sl.title.trim() && sl.url.trim().startsWith('https://'));
+                                    setSitelinkDraft(newDraft);
+                                    if (newDraft.length === 0) {
+                                      setSitelinkSuggestError('AI returned no valid sitelinks (missing titles or https:// URLs). Please edit manually.');
+                                      return;
+                                    }
+                                    // 3. Auto-save the improved sitelinks
+                                    setSitelinkSaving(true);
+                                    try {
+                                      const r2 = await api(`/api/admin/campaigns/${camp.campaign_id}/sitelinks`, {
+                                        method: 'POST',
+                                        body: JSON.stringify({sitelinks: newDraft})
+                                      });
+                                      const errs2 = r2.gads_errors || [];
+                                      if (r2.gads_applied && errs2.length === 0) {
+                                        setSitelinkResult({ok:true, count:r2.saved, gads_applied:true, gads_errors:[], ai_fixed:true});
+                                        setCampDetail(prev => prev ? {
+                                          ...prev, campaign: {...prev.campaign, sitelinks: JSON.stringify(newDraft)}
+                                        } : prev);
+                                        setSitelinkEditorOpen(false);
+                                      } else if (errs2.length > 0) {
+                                        // Still failing — show partial panel again (user can retry or give up)
+                                        setSitelinkResult({ok:'partial', count:r2.saved, gads_count:r2.gads_count,
+                                          gads_errors:errs2, draft_at_save:newDraft});
+                                      } else {
+                                        setSitelinkResult({ok:true, count:r2.saved, gads_applied:false, gads_errors:[], ai_fixed:true});
+                                        setCampDetail(prev => prev ? {
+                                          ...prev, campaign: {...prev.campaign, sitelinks: JSON.stringify(newDraft)}
+                                        } : prev);
+                                        setSitelinkEditorOpen(false);
+                                      }
+                                    } catch(e2) {
+                                      setSitelinkResult({ok:false, msg: e2.message || 'Auto-save after AI fix failed'});
+                                    }
+                                    setSitelinkSaving(false);
+                                  }
+
+                                  return (
+                                    <div style={cardStyle}>
+                                      <div style={cardHeaderStyle}>
+                                        <span style={{fontSize:12,fontWeight:700}}>🔗 Sitelink Extensions</span>
+                                        <div style={{display:'flex',alignItems:'center',gap:8}}>
+                                          {slCount > 0 && (
+                                            <span style={{fontSize:10,background:'#dcfce7',color:'#166534',
+                                              border:'1px solid #86efac',borderRadius:10,padding:'1px 8px',fontWeight:600}}>
+                                              ✓ {slCount} sitelink{slCount!==1?'s':''} saved
+                                            </span>
+                                          )}
+                                          <button style={{fontSize:11,background:'none',border:'1px solid var(--border)',
+                                            borderRadius:5,padding:'3px 10px',cursor:'pointer',color:'var(--teal)',fontWeight:600}}
+                                            onClick={openEditor}>
+                                            {slCount > 0 ? 'Edit' : '+ Add Sitelinks'}
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      {/* Saved sitelinks summary */}
+                                      {slCount > 0 && !sitelinkEditorOpen && (
+                                        <div style={{padding:'8px 14px 12px'}}>
+                                          {existingSitelinks.map((sl,i) => (
+                                            <div key={i} style={{display:'flex',gap:8,alignItems:'baseline',
+                                              padding:'4px 0',borderBottom:'1px solid var(--border)'}}>
+                                              <span style={{fontSize:12,color:'#1a0dab',fontWeight:600,minWidth:120,flexShrink:0}}>
+                                                {sl.title}
+                                              </span>
+                                              <span style={{fontSize:11,color:'#6b7280',wordBreak:'break-all'}}>
+                                                {sl.url}
+                                              </span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      )}
+
+                                      {/* Empty state */}
+                                      {slCount === 0 && !sitelinkEditorOpen && (
+                                        <div style={{padding:'10px 14px',fontSize:11,color:'#9ca3af',fontStyle:'italic'}}>
+                                          No sitelinks configured. Add 4+ for best ad performance.
+                                        </div>
+                                      )}
+
+                                      {/* Editor */}
+                                      {sitelinkEditorOpen && (
+                                        <div style={{padding:'10px 14px 14px'}}>
+
+                                          {/* AI Suggest row */}
+                                          <div style={{display:'flex',gap:6,alignItems:'center',marginBottom:10,
+                                            padding:'8px 10px',background:'#f8f4ff',border:'1px solid #ddd6fe',borderRadius:6}}>
+                                            <span style={{fontSize:11,fontWeight:600,color:'#7c3aed',flexShrink:0}}>✨ AI Suggest</span>
+                                            <input
+                                              value={sitelinkSuggestInstruction}
+                                              onChange={e => setSitelinkSuggestInstruction(e.target.value)}
+                                              placeholder="Refinement hint… (e.g. focus on insurance, financing, Invisalign)"
+                                              onKeyDown={e => { if(e.key==='Enter') aiSuggest(); }}
+                                              style={{flex:1,fontSize:11,padding:'4px 8px',border:'1px solid #ddd6fe',
+                                                borderRadius:5,outline:'none',background:'white'}}
+                                            />
+                                            <button
+                                              onClick={() => aiSuggest()}
+                                              disabled={sitelinkSuggestLoading}
+                                              style={{fontSize:11,padding:'4px 12px',borderRadius:5,cursor:'pointer',
+                                                background:'#7c3aed',color:'white',border:'none',fontWeight:600,flexShrink:0}}>
+                                              {sitelinkSuggestLoading ? '…' : sitelinkSuggestions.length > 0 ? 'Suggest Again →' : 'Suggest'}
+                                            </button>
+                                          </div>
+
+                                          {/* AI Suggest error */}
+                                          {sitelinkSuggestError && (
+                                            <div style={{fontSize:11,color:'#dc2626',marginBottom:8,padding:'5px 8px',
+                                              background:'#fef2f2',borderRadius:5,border:'1px solid #fecaca'}}>
+                                              ✗ {sitelinkSuggestError}
+                                            </div>
+                                          )}
+
+                                          {/* Suggestion chips */}
+                                          {sitelinkSuggestions.length > 0 && (
+                                            <div style={{marginBottom:12,padding:'8px 10px',background:'#fdf4ff',
+                                              border:'1px solid #e9d5ff',borderRadius:6}}>
+                                              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
+                                                <span style={{fontSize:10,color:'#7c3aed',fontWeight:700}}>
+                                                  AI SUGGESTIONS — click to add to draft
+                                                </span>
+                                                <button onClick={useAllSuggestions}
+                                                  style={{fontSize:10,color:'#7c3aed',background:'none',border:'1px solid #ddd6fe',
+                                                    borderRadius:4,padding:'2px 8px',cursor:'pointer',fontWeight:600}}>
+                                                  Use All
+                                                </button>
+                                              </div>
+                                              <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                                                {sitelinkSuggestions.map((sg,i) => {
+                                                  const alreadyInDraft = sitelinkDraft.some(d => d.title.toLowerCase()===sg.title.toLowerCase());
+                                                  return (
+                                                    <button key={i}
+                                                      title={sg.reason || sg.url}
+                                                      onClick={() => addSuggestionToDraft(sg)}
+                                                      style={{fontSize:11,padding:'4px 10px',borderRadius:12,cursor:'pointer',
+                                                        border: alreadyInDraft ? '1px solid #a855f7' : '1px solid #c4b5fd',
+                                                        background: alreadyInDraft ? '#a855f7' : 'white',
+                                                        color: alreadyInDraft ? 'white' : '#6d28d9',
+                                                        fontWeight: alreadyInDraft ? 700 : 400}}>
+                                                      {alreadyInDraft ? '✓ ' : ''}{sg.title}
+                                                    </button>
+                                                  );
+                                                })}
+                                              </div>
+                                              <div style={{fontSize:10,color:'#9ca3af',marginTop:6}}>
+                                                Hover a chip for rationale · Click to add · Click again to update
+                                              </div>
+                                            </div>
+                                          )}
+
+                                          {/* Draft rows */}
+                                          <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:8}}>
+                                            Title ≤ 25 chars · URL must start with https:// · Google recommends 4+
+                                          </div>
+                                          {sitelinkDraft.map((sl,i) => (
+                                            <div key={i} style={{display:'flex',gap:6,alignItems:'center',marginBottom:6}}>
+                                              <div style={{position:'relative',width:160}}>
+                                                <input
+                                                  value={sl.title}
+                                                  maxLength={25}
+                                                  placeholder="Title (25 chars max)"
+                                                  onChange={e => {
+                                                    setSitelinkDraft(d => d.map((x,j)=> j===i ? {...x,title:e.target.value} : x));
+                                                    // Clear stale partial GAds error panel when user manually edits
+                                                    setSitelinkResult(r => (r && r.ok === 'partial') ? null : r);
+                                                  }}
+                                                  style={{width:'100%',fontSize:12,padding:'4px 28px 4px 7px',
+                                                    border: `1px solid ${sl.title.length > 22 ? '#f59e0b' : 'var(--border)'}`,
+                                                    borderRadius:5,outline:'none',boxSizing:'border-box'}}
+                                                />
+                                                <span style={{position:'absolute',right:5,top:'50%',transform:'translateY(-50%)',
+                                                  fontSize:9,color: sl.title.length > 22 ? '#f59e0b' : '#9ca3af',pointerEvents:'none'}}>
+                                                  {sl.title.length}/25
+                                                </span>
+                                              </div>
+                                              <input
+                                                value={sl.url}
+                                                placeholder="https://..."
+                                                onChange={e => {
+                                                  setSitelinkDraft(d => d.map((x,j)=> j===i ? {...x,url:e.target.value} : x));
+                                                  setSitelinkResult(r => (r && r.ok === 'partial') ? null : r);
+                                                }}
+                                                style={{flex:1,fontSize:12,padding:'4px 7px',
+                                                  border:`1px solid ${sl.url && !sl.url.startsWith('https://') ? '#ef4444' : 'var(--border)'}`,
+                                                  borderRadius:5,outline:'none'}}
+                                              />
+                                              <button
+                                                title="Remove"
+                                                onClick={()=> setSitelinkDraft(d => d.filter((_,j)=>j!==i))}
+                                                style={{fontSize:13,background:'none',border:'none',cursor:'pointer',
+                                                  color:'#9ca3af',padding:'0 4px',lineHeight:1}}>✕</button>
+                                            </div>
+                                          ))}
+                                          {sitelinkDraft.length < 10 && (
+                                            <button
+                                              onClick={()=> setSitelinkDraft(d => [...d, {title:'',url:'https://'}])}
+                                              style={{fontSize:11,color:'var(--teal)',background:'none',border:'none',
+                                                cursor:'pointer',padding:'4px 0',textDecoration:'underline'}}>
+                                              + Add another sitelink
+                                            </button>
+                                          )}
+
+                                          {/* Save result / GAds error panel */}
+                                          {sitelinkResult && (
+                                            <div style={{marginTop:8,fontSize:11,
+                                              color: sitelinkResult.ok === true ? '#166534' : sitelinkResult.ok === 'partial' ? '#92400e' : '#dc2626',
+                                              background: sitelinkResult.ok === true ? '#f0fdf4' : sitelinkResult.ok === 'partial' ? '#fffbeb' : '#fef2f2',
+                                              border: `1px solid ${sitelinkResult.ok === true ? '#86efac' : sitelinkResult.ok === 'partial' ? '#fcd34d' : '#fecaca'}`,
+                                              borderRadius:5,padding:'8px 10px'}}>
+                                              {sitelinkResult.ok === true && (
+                                                <>
+                                                  {sitelinkResult.ai_fixed && <span>🤖 AI fixed &amp; </span>}
+                                                  ✓ {sitelinkResult.count} sitelink(s) saved
+                                                  {sitelinkResult.gads_applied ? ' and pushed to Google Ads' : ''}
+                                                </>
+                                              )}
+                                              {sitelinkResult.ok === 'partial' && (
+                                                <div>
+                                                  <div style={{fontWeight:600,marginBottom:4}}>
+                                                    ⚠ Saved to DB ({sitelinkResult.count}) but Google Ads returned {sitelinkResult.gads_errors.length} error(s):
+                                                  </div>
+                                                  {sitelinkResult.gads_errors.slice(0,5).map((e,i) => (
+                                                    <div key={i} style={{fontSize:10,color:'#78350f',marginBottom:2}}>• {e}</div>
+                                                  ))}
+                                                  <div style={{marginTop:8}}>
+                                                    {sitelinkRetryCount < MAX_AI_RETRIES ? (
+                                                      <>
+                                                        <button
+                                                          disabled={sitelinkSuggestLoading || sitelinkSaving}
+                                                          onClick={() => aiFixAndRetry(sitelinkResult.gads_errors, sitelinkResult.draft_at_save)}
+                                                          style={{fontSize:11,padding:'5px 12px',borderRadius:5,cursor:'pointer',
+                                                            background:'#d97706',color:'white',border:'none',fontWeight:600}}>
+                                                          {(sitelinkSuggestLoading || sitelinkSaving) ? '🤖 AI fixing…' : '🤖 AI Fix & Retry →'}
+                                                        </button>
+                                                        <span style={{fontSize:10,color:'#92400e',marginLeft:8}}>
+                                                          AI will evaluate errors and push improved sitelinks automatically
+                                                          {sitelinkRetryCount > 0 && ` (attempt ${sitelinkRetryCount + 1}/${MAX_AI_RETRIES})`}
+                                                        </span>
+                                                      </>
+                                                    ) : (
+                                                      <span style={{fontSize:10,color:'#78350f',fontStyle:'italic'}}>
+                                                        AI has reached its retry limit. Please edit the sitelinks manually to fix the issues above.
+                                                      </span>
+                                                    )}
+                                                  </div>
+                                                </div>
+                                              )}
+                                              {sitelinkResult.ok === false && `✗ ${sitelinkResult.msg}`}
+                                            </div>
+                                          )}
+
+                                          <div style={{display:'flex',gap:8,marginTop:10}}>
+                                            <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                              disabled={sitelinkSaving}
+                                              onClick={saveSitelinks}>
+                                              {sitelinkSaving ? '…' : isLinkedAlready ? 'Save & Push to Google Ads' : 'Save Sitelinks'}
+                                            </button>
+                                            <button className="btn btn-sm" style={{fontSize:11,background:'var(--surface)',
+                                              border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                              onClick={()=>{ setSitelinkEditorOpen(false); setSitelinkResult(null); setSitelinkSuggestions([]); }}>
+                                              Cancel
+                                            </button>
+                                          </div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })()}
 
                                 {/* Card 6 — Custom Values (collapsed accordion) */}
                                 <div style={cardStyle}>
@@ -5195,7 +5830,6 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     <div style={cardBodyStyle}>
                                       {[
                                         {label:'Bidding Strategy', val: adGroups.bidding_strategy || camp.bidding_strategy || ''},
-                                        {label:'Sitelinks',        val: camp.sitelinks || ''},
                                         {label:'Callouts',         val: camp.callouts || ''},
                                         {label:'Ad Schedule',      val: camp.ad_schedule || ''},
                                         {label:'UTM Parameters',   val: camp.utm_params || ''},
@@ -5247,16 +5881,39 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
                                 {/* Launch controls */}
                                 <div style={{marginTop:6,borderTop:'1px solid var(--border)',paddingTop:16}}>
-                                  {isLinkedAlready ? (
-                                    <div style={{display:'flex',alignItems:'center',gap:8,padding:'10px 14px',
-                                      background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8}}>
-                                      <span style={{fontSize:16}}>✅</span>
-                                      <div>
-                                        <div style={{fontSize:12,fontWeight:700,color:'#166534'}}>Launched to Google Ads</div>
-                                        <div style={{fontSize:10,color:'#166534',marginTop:1}}>Campaign is live in Google Ads. Manage status with the controls above.</div>
+                                  {isLinkedAlready ? (() => {
+                                    const liveStatus = camp.status || '';
+                                    const isRunning  = liveStatus === 'ACTIVE';
+                                    const isPaused   = liveStatus === 'PAUSED';
+                                    const statusColor  = isRunning ? '#166534' : isPaused ? '#92400e' : '#374151';
+                                    const statusBg     = isRunning ? '#f0fdf4' : isPaused ? '#fffbeb' : '#f9fafb';
+                                    const statusBorder = isRunning ? '#86efac' : isPaused ? '#fde68a' : '#e5e7eb';
+                                    const statusIcon   = isRunning ? '🟢' : isPaused ? '⏸' : '✅';
+                                    const statusLabel  = isRunning ? 'Running' : isPaused ? 'Paused' : 'Launched';
+                                    return (
+                                      <div style={{background:statusBg, border:`1px solid ${statusBorder}`,
+                                        borderRadius:8, padding:'12px 14px'}}>
+                                        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
+                                          <span style={{fontSize:18}}>{statusIcon}</span>
+                                          <div>
+                                            <div style={{fontSize:13,fontWeight:700,color:statusColor}}>{statusLabel} in Google Ads</div>
+                                            {camp.launch_date && (
+                                              <div style={{fontSize:10,color:statusColor,opacity:.8,marginTop:1}}>
+                                                Launched {new Date(camp.launch_date).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}
+                                              </div>
+                                            )}
+                                          </div>
+                                        </div>
+                                        <div style={{fontSize:10,color:statusColor,opacity:.75}}>
+                                          {isRunning
+                                            ? 'Campaign is live and serving ads. Use Pause / Stop controls above to manage.'
+                                            : isPaused
+                                              ? 'Campaign is paused in Google Ads. Use Resume above to re-enable.'
+                                              : 'Campaign linked to Google Ads. Manage status with the controls above.'}
+                                        </div>
                                       </div>
-                                    </div>
-                                  ) : (
+                                    );
+                                  })() : (
                                     <>
                                       {!readyToLaunch && (
                                         <div style={{fontSize:11,color:'#dc2626',marginBottom:8,lineHeight:1.5,
@@ -5282,7 +5939,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         }}
                                       />
                                       <div style={{fontSize:10,color:'var(--text-muted)',textAlign:'center',marginTop:6}}>
-                                        Launch now, schedule, or save as queued. Google Ads API push pipeline coming soon.
+                                        Launch now, schedule, or save as queued.
                                       </div>
                                     </>
                                   )}
@@ -6269,7 +6926,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                 )}
 
                 {!wizardStrategyLoading && wizardStrategy && !wizardStrategy._error && (() => {
-                  const s = wizardStrategy;
+                  const s = wizardRefinedPreview || wizardStrategy;
                   const Section = ({title, children}) => (
                     <div style={{marginBottom:14}}>
                       <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.6px',marginBottom:5}}>{title}</div>
@@ -6350,6 +7007,85 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                     </div>
                   );
                 })()}
+
+                {/* ── Refine chat box — only when strategy is loaded ── */}
+                {!wizardStrategyLoading && wizardStrategy && !wizardStrategy._error && (
+                  <div style={{marginTop:14,borderTop:'1px solid var(--border)',paddingTop:12}}>
+                    <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.6px',marginBottom:6}}>
+                      ✨ Refine Strategy
+                    </div>
+                    <div style={{display:'flex',gap:6}}>
+                      <input
+                        value={wizardRefineInput}
+                        onChange={e=>setWizardRefineInput(e.target.value)}
+                        onKeyDown={e=>{
+                          if(e.key==='Enter'&&!e.shiftKey&&!wizardRefineLoading&&wizardRefineInput.trim()){
+                            e.preventDefault();
+                            (async()=>{
+                              setWizardRefineLoading(true);
+                              try {
+                                const base = wizardRefinedPreview || wizardStrategy;
+                                const res = await api(`/api/admin/campaigns/${wizardCreatedCampId}/build-step-refine`,{
+                                  method:'POST',
+                                  body:JSON.stringify({step:'strategy',instruction:wizardRefineInput,current_override:base}),
+                                });
+                                setWizardRefinedPreview(res.data);
+                                setWizardRefineInput('');
+                              } catch(e){ alert('Refine failed: '+e.message); }
+                              finally { setWizardRefineLoading(false); }
+                            })();
+                          }
+                        }}
+                        placeholder='e.g. "Add more focus on insurance, remove implant mentions"'
+                        style={{flex:1,fontSize:11,padding:'5px 8px',border:'1px solid var(--border)',borderRadius:5,background:'var(--bg)',color:'var(--text)'}}
+                        disabled={wizardRefineLoading||!wizardCreatedCampId}
+                      />
+                      <button
+                        className="btn btn-sm"
+                        disabled={wizardRefineLoading||!wizardRefineInput.trim()||!wizardCreatedCampId}
+                        onClick={async()=>{
+                          setWizardRefineLoading(true);
+                          try {
+                            const base = wizardRefinedPreview || wizardStrategy;
+                            const res = await api(`/api/admin/campaigns/${wizardCreatedCampId}/build-step-refine`,{
+                              method:'POST',
+                              body:JSON.stringify({step:'strategy',instruction:wizardRefineInput,current_override:base}),
+                            });
+                            setWizardRefinedPreview(res.data);
+                            setWizardRefineInput('');
+                          } catch(e){ alert('Refine failed: '+e.message); }
+                          finally { setWizardRefineLoading(false); }
+                        }}
+                        style={{whiteSpace:'nowrap'}}
+                      >
+                        {wizardRefineLoading ? '⏳…' : '✨ Refine'}
+                      </button>
+                    </div>
+                    {wizardRefinedPreview && (
+                      <div style={{display:'flex',gap:6,marginTop:6,alignItems:'center'}}>
+                        <span style={{fontSize:10,color:'#16a34a',fontWeight:600}}>✓ Strategy updated</span>
+                        <button className="btn btn-sm" style={{fontSize:10,padding:'2px 8px',background:'#dcfce7',color:'#15803d',border:'1px solid #86efac'}}
+                          onClick={async()=>{
+                            if(!wizardCreatedCampId) return;
+                            try {
+                              await api(`/api/admin/campaigns/${wizardCreatedCampId}/strategy`,{
+                                method:'PATCH',
+                                body:JSON.stringify({strategy:wizardRefinedPreview}),
+                              });
+                              setWizardStrategy(wizardRefinedPreview);
+                              setWizardRefinedPreview(null);
+                            } catch(e){ alert('Save failed: '+e.message); }
+                          }}>
+                          💾 Save to campaign
+                        </button>
+                        <button className="btn btn-sm" style={{fontSize:10,padding:'2px 8px'}}
+                          onClick={()=>setWizardRefinedPreview(null)}>
+                          ✕ Discard
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -7857,45 +8593,60 @@ function GeoTargetingBuilder({value, onChange, practiceAddress, defaultRadius}) 
   const [searchVal, setSearchVal] = React.useState('');
   const [radius, setRadius] = React.useState(defaultRadius || 15);
 
-  // Sync state back up whenever locations or unit change
+  // Track whether we've made a local edit — prevents external value prop from overwriting local state
+  const locallyEdited = React.useRef(false);
+
+  // Re-init internal state if parent provides a new non-empty value and we haven't locally edited yet
   React.useEffect(() => {
-    onChange(serializeGeoTargeting({unit, locations}));
-  }, [unit, locations]);
+    if (!locallyEdited.current && value) {
+      const parsed = parseGeoTargeting(value);
+      setUnit(parsed.unit || 'miles');
+      setLocations(parsed.locations || []);
+    }
+  }, [value]);
+
+  // Push local changes up to parent — only after a local edit, not on mount
+  function notifyParent(newUnit, newLocations) {
+    locallyEdited.current = true;
+    onChange(serializeGeoTargeting({unit: newUnit, locations: newLocations}));
+  }
 
   function addLocation() {
     const trimmed = searchVal.trim();
     if (!trimmed) return;
-    // Only city+radius creates a proximity criterion (radius circle).
-    // postal/address → GeoTargetConstant (zip boundary, no radius).
-    // state/country → GeoTargetConstant, no radius.
     const needsRadius = locType === 'city';
-    setLocations(prev => [...prev, {
-      type: locType,
-      value: trimmed,
-      radius: needsRadius ? Number(radius) : null,
-      include: true
-    }]);
+    const newLoc = { type: locType, value: trimmed, radius: needsRadius ? Number(radius) : null, include: true };
+    const newLocations = [...locations, newLoc];
+    setLocations(newLocations);
     setSearchVal('');
+    notifyParent(unit, newLocations);
   }
 
   function removeLocation(idx) {
-    setLocations(prev => prev.filter((_,i) => i !== idx));
+    const newLocations = locations.filter((_,i) => i !== idx);
+    setLocations(newLocations);
+    notifyParent(unit, newLocations);
   }
 
   function toggleInclude(idx) {
-    setLocations(prev => prev.map((l,i) => i===idx ? {...l, include:!l.include} : l));
+    const newLocations = locations.map((l,i) => i===idx ? {...l, include:!l.include} : l);
+    setLocations(newLocations);
+    notifyParent(unit, newLocations);
   }
 
   function updateRadius(idx, val) {
-    setLocations(prev => prev.map((l,i) => i===idx ? {...l, radius:Number(val)} : l));
+    const newLocations = locations.map((l,i) => i===idx ? {...l, radius:Number(val)} : l);
+    setLocations(newLocations);
+    notifyParent(unit, newLocations);
   }
 
   function switchUnit(newUnit) {
     if (newUnit === unit) return;
-    // Convert radii
     const factor = newUnit === 'miles' ? 0.621371 : 1.60934;
-    setLocations(prev => prev.map(l => l.radius ? {...l, radius: Math.round(l.radius * factor)} : l));
+    const newLocations = locations.map(l => l.radius ? {...l, radius: Math.round(l.radius * factor)} : l);
+    setLocations(newLocations);
     setUnit(newUnit);
+    notifyParent(newUnit, newLocations);
   }
 
   // City first — it's the primary radius-targeting option.
@@ -8147,15 +8898,27 @@ function AdPreviewPanel({campDetail, practiceSettings, adPreviewMode, setAdPrevi
             {phone && (
               <div style={{fontSize: 12, color: '#4d5156', marginBottom: 10}}>📞 {phone}</div>
             )}
-            {/* Sitelink chips */}
-            <div style={{display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6}}>
-              {['Book Now', 'Our Services', 'About Us', 'Contact'].map(sl => (
-                <span key={sl} style={{fontSize: 12, color: '#1a0dab', textDecoration: 'underline',
-                  cursor: 'pointer'}}>
-                  {sl}
-                </span>
-              ))}
-            </div>
+            {/* Sitelink chips — use actual configured sitelinks, fall back to defaults */}
+            {(() => {
+              let slItems = [];
+              try {
+                const raw = camp.sitelinks || '';
+                slItems = raw ? JSON.parse(raw) : [];
+              } catch(e) {}
+              const displayLinks = slItems.length > 0
+                ? slItems.slice(0, 4).map(sl => sl.title)
+                : ['Book Now', 'Our Services', 'About Us', 'Contact'];
+              return (
+                <div style={{display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6}}>
+                  {displayLinks.map((sl, i) => (
+                    <span key={i} style={{fontSize: 12, color: '#1a0dab', textDecoration: 'underline',
+                      cursor: 'pointer'}}>
+                      {sl}
+                    </span>
+                  ))}
+                </div>
+              );
+            })()}
           </div>
         )}
       </div>

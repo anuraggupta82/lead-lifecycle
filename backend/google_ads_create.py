@@ -11,9 +11,157 @@ New campaigns are always created as PAUSED first, then ENABLED at the end.
 """
 import logging
 import json
+import re
 from config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Google Ads prohibits phone numbers in ad text (PHONE_NUMBER_IN_AD_TEXT policy).
+# This regex catches common US formats: 508-318-4477, (508) 318-4477, 508.318.4477, 5083184477
+_PHONE_RE = re.compile(r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}|\b\d{10}\b')
+
+def _strip_phone_numbers(text: str) -> str:
+    """Remove phone numbers from ad text to avoid PHONE_NUMBER_IN_AD_TEXT policy rejection."""
+    return _PHONE_RE.sub('', text).strip()
+
+
+# ── AI self-healing for ad-copy policy violations ────────────────────────────
+_MAX_AI_FIXES = 2  # per ad group — caps total AI retry attempts
+
+def _extract_policy_topics(gads_exc) -> list:
+    """
+    Walk a GoogleAdsException and pull out the policy topic strings
+    (e.g. 'PHONE_NUMBER_IN_AD_TEXT', 'TRADEMARK', 'COPYRIGHTED_CONTENT').
+
+    Returns [] if the exception is not a policy error — caller should
+    treat an empty list as "non-policy failure, do not attempt AI fix".
+    Handles both modern policy_finding_error and legacy policy_violation_error.
+    """
+    topics = []
+    failure = getattr(gads_exc, "failure", None)
+    if failure is None:
+        return topics
+    for err in getattr(failure, "errors", []) or []:
+        ec = getattr(err, "error_code", None)
+        if ec is None:
+            continue
+        # Modern shape: POLICY_FINDING
+        pfe = getattr(ec, "policy_finding_error", 0)
+        if pfe:
+            details = getattr(err, "details", None)
+            pfd = getattr(details, "policy_finding_details", None) if details else None
+            for entry in getattr(pfd, "policy_topic_entries", []) or []:
+                t = getattr(entry, "topic", None)
+                if t:
+                    topics.append(str(t))
+        # Legacy shape: POLICY_VIOLATION
+        pve = getattr(ec, "policy_violation_error", 0)
+        if pve:
+            details = getattr(err, "details", None)
+            pvd = getattr(details, "policy_violation_details", None) if details else None
+            key = getattr(pvd, "key", None) if pvd else None
+            name = getattr(key, "policy_name", None) if key else None
+            if name:
+                topics.append(str(name))
+    # Dedupe, preserve order
+    seen = set()
+    return [t for t in topics if not (t in seen or seen.add(t))]
+
+
+def _ai_fix_ad_copy(headlines, descriptions, policy_topics, ad_group_name, ai_client):
+    """
+    Ask Claude Sonnet to rewrite headlines/descriptions that violated Google Ads policy.
+
+    Args:
+        headlines:      list of str — the rejected headlines
+        descriptions:   list of str — the rejected descriptions
+        policy_topics:  list of str — e.g. ['PHONE_NUMBER_IN_AD_TEXT']
+        ad_group_name:  str — for context in the prompt
+        ai_client:      anthropic.Anthropic() instance
+
+    Returns:
+        (fixed_headlines, fixed_descriptions) — both truncated, deduped, ready for AdTextAsset
+
+    Raises:
+        ValueError on malformed JSON, insufficient assets, or empty AI output
+        RuntimeError if ai_client is None
+    """
+    if ai_client is None:
+        raise RuntimeError("AI client not available for ad-copy self-heal")
+
+    topics_str = ", ".join(policy_topics) if policy_topics else "POLICY_FINDING (topic unspecified)"
+
+    system_msg = (
+        "You are a Google Ads copywriter. You rewrite ad copy to pass Google's "
+        "policy review while preserving the original intent and call-to-action."
+    )
+
+    user_msg = f"""Google Ads rejected the following ad for ad group "{ad_group_name}".
+
+Violated policy topics: {topics_str}
+
+Current headlines (max 30 chars each, need at least 3):
+{json.dumps(headlines, indent=2)}
+
+Current descriptions (max 90 chars each, need at least 2):
+{json.dumps(descriptions, indent=2)}
+
+Rewrite the offending lines so they comply with these rules:
+- No phone numbers anywhere
+- No trademarks, brand names you do not own, or competitor names
+- No copyrighted slogans
+- No sexually suggestive, shocking, or unsubstantiated medical claims
+- No ALL-CAPS gimmicks, excessive punctuation (!!!, ???), or emoji
+- Headlines must be <= 30 characters, descriptions <= 90 characters
+- Keep headlines unique (no duplicates after truncation)
+- Preserve the original offer/intent — this is a dental practice ad
+
+Return ONLY a JSON object, no markdown, no commentary:
+{{"headlines": ["...", "...", ...], "descriptions": ["...", "...", ...]}}
+
+Provide at least 5 headlines and 3 descriptions so we have room after dedup/filter."""
+
+    response = ai_client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=1500,
+        system=system_msg,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    raw = response.content[0].text.strip()
+
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if not match:
+        raise ValueError(f"AI fix returned no JSON object: {raw[:200]!r}")
+    try:
+        parsed = json.loads(match.group())
+    except json.JSONDecodeError as je:
+        raise ValueError(f"AI fix JSON decode failed: {je}; raw={raw[:200]!r}")
+
+    fixed_h = parsed.get("headlines") or []
+    fixed_d = parsed.get("descriptions") or []
+    if not isinstance(fixed_h, list) or not isinstance(fixed_d, list):
+        raise ValueError("AI fix returned non-list headlines or descriptions")
+
+    def _clean(items, cap):
+        out, seen = [], set()
+        for it in items:
+            s = it if isinstance(it, str) else str(it or "")
+            s = _strip_phone_numbers(s).strip()[:cap]
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    fixed_h = _clean(fixed_h, 30)[:15]
+    fixed_d = _clean(fixed_d, 90)[:4]
+
+    if len(fixed_h) < 3:
+        raise ValueError(f"AI fix produced only {len(fixed_h)} valid headlines (need 3+)")
+    if len(fixed_d) < 2:
+        raise ValueError(f"AI fix produced only {len(fixed_d)} valid descriptions (need 2+)")
+
+    return fixed_h, fixed_d
+
 
 # GAds sentinel dates that mean "not set" — strip these when importing
 _GADS_DATE_SENTINELS = {"2037-12-30", "1970-01-01", "0001-01-01", ""}
@@ -329,16 +477,54 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         else:
             log.append("  (no negative keywords)")
 
-        # ── Step 7: RSA ads ───────────────────────────────────────────────────
+        # ── Step 7: RSA ads (with AI self-heal on policy rejection) ─────────────
         log.append("Step 7: Creating RSA ads")
         ad_service  = client.get_service("AdGroupAdService")
         ads_created = 0
+        ads_failed  = 0
+        ads_fixed   = 0  # ad groups that needed at least one AI fix
+
+        # Lazy-init Anthropic client for self-heal. Gracefully disabled if
+        # anthropic isn't installed or ANTHROPIC_API_KEY isn't set.
+        _heal_ai_client = None
+        try:
+            import anthropic as _anthropic
+            _heal_ai_client = _anthropic.Anthropic()
+        except Exception as _ai_init_err:
+            logger.info(f"AI self-heal disabled (init failed): {_ai_init_err}")
+
+        # Import exception class here so it's available in the inner loop
+        from google.ads.googleads.errors import GoogleAdsException as _GadsExc
 
         ac_groups = ac_data.get("ad_groups", [])
 
+        # Helper: build a fresh AdGroupAdOperation proto each attempt.
+        # Proto messages are not safely mutable after a failed RPC — always rebuild.
+        def _build_rsa_op(ag_res, hdls, descs):
+            from urllib.parse import urlparse as _urlparse
+            op  = client.get_type("AdGroupAdOperation")
+            ad  = op.create
+            ad.ad_group = ag_res
+            ad.status   = client.enums.AdGroupAdStatusEnum.ENABLED
+            rsa = ad.ad.responsive_search_ad
+            pp  = [p for p in _urlparse(landing_page).path.strip("/").split("/") if p]
+            if pp:
+                rsa.path1 = pp[0][:15]
+            if len(pp) > 1:
+                rsa.path2 = pp[1][:15]
+            for h in hdls:
+                a = client.get_type("AdTextAsset"); a.text = h[:30]
+                rsa.headlines.append(a)
+            for d in descs:
+                a = client.get_type("AdTextAsset"); a.text = d[:90]
+                rsa.descriptions.append(a)
+            ad.ad.final_urls.append(landing_page)
+            return op
+
         for i, ag_resource in enumerate(ad_group_resources):
-            # Match ad copy group by index (or use first if only one)
+            ag_label = f"ad group {i+1}"
             ac_group = ac_groups[i] if i < len(ac_groups) else (ac_groups[0] if ac_groups else {})
+            ag_name  = ac_group.get("name") or ag_label
 
             headlines_raw    = ac_group.get("headlines", [])
             descriptions_raw = ac_group.get("descriptions", [])
@@ -347,57 +533,99 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
             headlines    = [h if isinstance(h, str) else h.get("text","") for h in headlines_raw]
             descriptions = [d if isinstance(d, str) else d.get("text","") for d in descriptions_raw]
 
+            # Sanitize: strip phone numbers (PHONE_NUMBER_IN_AD_TEXT policy)
+            headlines    = [_strip_phone_numbers(h) for h in headlines]
+            descriptions = [_strip_phone_numbers(d) for d in descriptions]
+
             # Filter empty, cap at 15 headlines / 4 descriptions (API limits)
             headlines    = [h.strip() for h in headlines    if h.strip()][:15]
             descriptions = [d.strip() for d in descriptions if d.strip()][:4]
 
-            if not headlines:
-                log.append(f"  ⚠ Ad group {i+1}: no headlines — skipping RSA creation")
-                continue
-            if not descriptions:
-                log.append(f"  ⚠ Ad group {i+1}: no descriptions — skipping RSA creation")
-                continue
-
-            # Need at least 3 headlines
             if len(headlines) < 3:
-                log.append(f"  ⚠ Ad group {i+1}: only {len(headlines)} headline(s) — need 3+ for RSA")
+                log.append(f"  ⚠ {ag_label}: only {len(headlines)} headline(s) — need 3+, skipping RSA")
+                ads_failed += 1
+                continue
+            if len(descriptions) < 2:
+                log.append(f"  ⚠ {ag_label}: only {len(descriptions)} description(s) — need 2+, skipping RSA")
+                ads_failed += 1
                 continue
 
-            ad_op = client.get_type("AdGroupAdOperation")
-            ad    = ad_op.create
-            ad.ad_group = ag_resource
-            ad.status   = client.enums.AdGroupAdStatusEnum.ENABLED
+            ai_attempts = 0
+            ad_created  = False
 
-            rsa = ad.ad.responsive_search_ad
-            # Parse display path from landing page
-            from urllib.parse import urlparse
-            parsed_url = urlparse(landing_page)
-            path_parts = [p for p in parsed_url.path.strip("/").split("/") if p]
-            # Only assign path1/path2 when non-empty — Google rejects empty string
-            if path_parts:
-                rsa.path1 = path_parts[0][:15]
-            if len(path_parts) > 1:
-                rsa.path2 = path_parts[1][:15]
+            while True:
+                try:
+                    ad_op = _build_rsa_op(ag_resource, headlines, descriptions)
+                    ad_service.mutate_ad_group_ads(
+                        customer_id=customer_id, operations=[ad_op]
+                    )
+                    ads_created += 1
+                    if ai_attempts > 0:
+                        ads_fixed += 1
+                        log.append(
+                            f"  ✓ RSA created for {ag_label} after {ai_attempts} AI fix(es): "
+                            f"{len(headlines)} headlines, {len(descriptions)} descriptions"
+                        )
+                    else:
+                        log.append(
+                            f"  ✓ RSA created for {ag_label}: "
+                            f"{len(headlines)} headlines, {len(descriptions)} descriptions"
+                        )
+                    ad_created = True
+                    break
 
-            # Add headlines
-            for h_text in headlines:
-                asset = client.get_type("AdTextAsset")
-                asset.text = h_text[:30]  # Google max 30 chars
-                rsa.headlines.append(asset)
+                except _GadsExc as gae:
+                    topics = _extract_policy_topics(gae)
 
-            # Add descriptions
-            for d_text in descriptions:
-                asset = client.get_type("AdTextAsset")
-                asset.text = d_text[:90]  # Google max 90 chars
-                rsa.descriptions.append(asset)
+                    if not topics:
+                        # Non-policy failure (auth, quota, schema) — don't burn AI
+                        # retries; propagate so the outer rollback runs.
+                        logger.error(f"{ag_label} RSA failed (non-policy): {gae}")
+                        log.append(f"  ✗ {ag_label} RSA failed (non-policy error) — aborting")
+                        raise
 
-            ad.ad.final_urls.append(landing_page)
+                    # Policy violation — try AI fix if budget remains
+                    if ai_attempts >= _MAX_AI_FIXES or _heal_ai_client is None:
+                        log.append(
+                            f"  ✗ {ag_label} RSA failed after {ai_attempts} AI fix(es) — "
+                            f"skipping. Policy topics: {topics}"
+                        )
+                        logger.warning(
+                            f"create_campaign_in_gads: {ag_label} RSA permanently failed. "
+                            f"topics={topics} ai={'present' if _heal_ai_client else 'missing'}"
+                        )
+                        ads_failed += 1
+                        break
 
-            ad_response = ad_service.mutate_ad_group_ads(
-                customer_id=customer_id, operations=[ad_op]
+                    ai_attempts += 1
+                    log.append(
+                        f"  ⚠ {ag_label} RSA rejected — policy topics: {topics}. "
+                        f"Attempting AI fix ({ai_attempts}/{_MAX_AI_FIXES})…"
+                    )
+                    try:
+                        headlines, descriptions = _ai_fix_ad_copy(
+                            headlines, descriptions, topics, ag_name, _heal_ai_client
+                        )
+                        log.append(f"  ↻ AI returned fixed copy for {ag_label} — retrying submission")
+                    except Exception as fix_err:
+                        log.append(f"  ✗ AI fix attempt {ai_attempts} failed: {fix_err}")
+                        logger.warning(f"create_campaign_in_gads AI fix failed ({ag_label}): {fix_err}")
+                        if ai_attempts >= _MAX_AI_FIXES:
+                            log.append(f"  ✗ {ag_label} RSA giving up — AI fixes exhausted. Topics: {topics}")
+                            ads_failed += 1
+                            break
+                        # else: loop again — mutate will fail again, bump counter, then exit
+
+        log.append(
+            f"Step 7 complete: {ads_created}/{len(ad_group_resources)} ad groups got an RSA"
+            + (f" ({ads_fixed} via AI self-heal)" if ads_fixed else "")
+            + (f"; {ads_failed} failed" if ads_failed else "")
+        )
+        if ads_created == 0 and ad_group_resources:
+            log.append("  ⚠ No RSA ads were created — campaign will not serve until ads are added manually")
+            logger.warning(
+                f"create_campaign_in_gads: '{campaign_name}' has 0 RSAs after Step 7"
             )
-            ads_created += 1
-            log.append(f"  ✓ RSA created for ad group {i+1}: {len(headlines)} headlines, {len(descriptions)} descriptions")
 
         # ── Step 8: Call extension ────────────────────────────────────────────
         if call_phone:
@@ -433,6 +661,30 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         else:
             log.append("Step 8: No phone configured — skipping call extension")
 
+        # ── Step 8b: Sitelinks ────────────────────────────────────────────────
+        sitelinks_raw = campaign.get("sitelinks") or ""
+        sitelinks_list = []
+        if sitelinks_raw:
+            try:
+                sitelinks_list = json.loads(sitelinks_raw) if isinstance(sitelinks_raw, str) else sitelinks_raw
+            except Exception:
+                pass
+        if sitelinks_list:
+            log.append(f"Step 8b: Adding {len(sitelinks_list)} sitelink(s)")
+            try:
+                sl_result = add_sitelinks_to_campaign(camp_resource, sitelinks_list, customer_id)
+                if sl_result["ok"]:
+                    log.append(f"  ✓ {sl_result['count']} sitelink(s) linked to campaign")
+                else:
+                    log.append(f"  ⚠ Sitelinks Step 8b failed (non-fatal)")
+                for err in sl_result.get("errors") or []:
+                    log.append(f"    • {err}")
+            except Exception as sle:
+                log.append(f"  ⚠ Sitelinks Step 8b exception (non-fatal): {sle}")
+                logger.warning(f"create_campaign_in_gads Step 8b sitelinks failed: {sle}")
+        else:
+            log.append("Step 8b: No sitelinks configured — skipping")
+
         # ── Step 9: Enable campaign ───────────────────────────────────────────
         log.append("Step 9: Enabling campaign (PAUSED → ENABLED)")
         enable_result = set_campaign_status(camp_resource, "ENABLED")
@@ -462,6 +714,29 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
     except Exception as e:
         logger.error(f"create_campaign_in_gads failed: {e}", exc_info=True)
         log.append(f"FATAL ERROR: {e}")
+        # ── Rollback: remove partial campaign from Google Ads ─────────────────
+        # camp_resource is set after Step 2 succeeds. If we get here after that,
+        # there is an orphaned PAUSED campaign (with budget/ad groups/keywords but
+        # no ads) sitting in Google Ads. Remove it automatically.
+        try:
+            if 'camp_resource' in dir() or 'camp_resource' in locals():
+                pass  # handled below
+        except Exception:
+            pass
+        _camp_resource = locals().get('camp_resource')
+        if _camp_resource:
+            try:
+                log.append(f"Rollback: removing partial campaign {_camp_resource} from Google Ads…")
+                rb_client = _build_client()
+                rb_service = rb_client.get_service("CampaignService")
+                rb_op = rb_client.get_type("CampaignOperation")
+                rb_op.remove = _camp_resource
+                rb_service.mutate_campaigns(customer_id=customer_id, operations=[rb_op])
+                log.append(f"  ✓ Partial campaign removed from Google Ads")
+                logger.info(f"create_campaign_in_gads rollback: removed {_camp_resource}")
+            except Exception as rb_err:
+                log.append(f"  ⚠ Rollback failed: {rb_err} — remove {_camp_resource} manually in Google Ads")
+                logger.warning(f"create_campaign_in_gads rollback failed for {_camp_resource}: {rb_err}")
         return {"ok": False, "error": str(e), "log": log}
 
 
@@ -481,6 +756,189 @@ def _build_client():
         "login_customer_id":  settings.google_ads_login_customer_id,
         "use_proto_plus":     True,
     })
+
+
+def _remove_existing_campaign_sitelinks(campaign_resource_name: str, client, customer_id: str) -> int:
+    """
+    Remove all SITELINK-type CampaignAsset links from an existing campaign.
+    Does NOT delete the underlying Asset resources (orphaned assets are harmless
+    and Google Ads dedupes them account-wide on future creates).
+
+    Returns the number of CampaignAsset links removed (0 if none).
+    """
+    service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT campaign_asset.resource_name
+        FROM campaign_asset
+        WHERE campaign_asset.campaign = '{campaign_resource_name}'
+          AND campaign_asset.field_type = SITELINK
+          AND campaign_asset.status != REMOVED
+    """
+    try:
+        rows = list(service.search(customer_id=customer_id, query=query))
+    except Exception as qe:
+        logger.warning(f"_remove_existing_campaign_sitelinks: query failed: {qe}")
+        return 0
+
+    if not rows:
+        return 0
+
+    camp_asset_service = client.get_service("CampaignAssetService")
+    remove_ops = []
+    for row in rows:
+        op = client.get_type("CampaignAssetOperation")
+        op.remove = row.campaign_asset.resource_name
+        remove_ops.append(op)
+
+    try:
+        camp_asset_service.mutate_campaign_assets(
+            customer_id=customer_id,
+            operations=remove_ops,
+        )
+        logger.info(f"_remove_existing_campaign_sitelinks: removed {len(remove_ops)} sitelink links from {campaign_resource_name}")
+        return len(remove_ops)
+    except Exception as re_err:
+        logger.warning(f"_remove_existing_campaign_sitelinks: remove failed: {re_err}")
+        return 0
+
+
+def add_sitelinks_to_campaign(campaign_resource_name: str, sitelinks: list, customer_id: str = None, replace: bool = False) -> dict:
+    """
+    Create SitelinkAsset assets and link them to an existing campaign.
+
+    Batches all asset creates into one mutate call, then all campaign links
+    into a second mutate call (matches keyword/geo batching pattern).
+    Non-fatal — designed to be called from Step 8b inside create_campaign_in_gads
+    and from the /sitelinks endpoint for existing live campaigns.
+
+    Args:
+        campaign_resource_name: Full resource name e.g. "customers/.../campaigns/..."
+        sitelinks: list of dicts with keys: title (required), url (required),
+                   description1 (optional, max 35 chars), description2 (optional, max 35 chars)
+        customer_id: Digits-only customer ID. If None, loaded from settings.
+        replace: If True, remove existing SITELINK campaign_asset links first (edit workflow).
+                 If False (default), append — safe for new campaigns that have no sitelinks yet.
+
+    Returns:
+        { "ok": bool, "count": int, "errors": [str, ...] }
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        logger.warning(f"add_sitelinks_to_campaign blocked by kill switch: {e}")
+        return {"ok": False, "count": 0, "errors": [str(e)]}
+
+    settings = get_settings()
+    if not customer_id:
+        customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    if not customer_id:
+        return {"ok": False, "count": 0, "errors": ["google_ads_customer_id not configured"]}
+
+    # Derive campaign name for asset naming from resource name (e.g. ".../campaigns/12345")
+    camp_id_suffix = campaign_resource_name.split("/campaigns/")[-1]
+
+    errors = []
+    try:
+        client = _build_client()
+        asset_service = client.get_service("AssetService")
+        camp_asset_service = client.get_service("CampaignAssetService")
+
+        # ── Pass 0 (edit mode): remove existing sitelink links before re-adding ──
+        if replace:
+            removed = _remove_existing_campaign_sitelinks(campaign_resource_name, client, customer_id)
+            if removed:
+                logger.info(f"add_sitelinks_to_campaign: removed {removed} existing sitelinks (replace=True)")
+
+        # ── Pass 1: Create all sitelink assets in one batch ───────────────────
+        asset_ops = []
+        valid_sitelinks = []  # parallel list — only items that pass validation
+        for sl in sitelinks:
+            title = _strip_phone_numbers((sl.get("title") or "").strip())[:25]
+            url   = (sl.get("url") or "").strip()
+            desc1 = _strip_phone_numbers((sl.get("description1") or "").strip())[:35]
+            desc2 = _strip_phone_numbers((sl.get("description2") or "").strip())[:35]
+
+            if not title:
+                errors.append(f"Sitelink skipped — empty title after sanitization: {sl!r}")
+                continue
+            if not url.startswith("https://"):
+                errors.append(f"Sitelink '{title}' skipped — URL must start with https://: {url!r}")
+                continue
+
+            asset_op = client.get_type("AssetOperation")
+            asset    = asset_op.create
+            asset.name = f"Camp {camp_id_suffix} Sitelink — {title}"
+            asset.sitelink_asset.link_text = title
+            asset.sitelink_asset.final_urls.append(url)
+
+            # descriptions: must be both-present or both-absent (Google policy)
+            if desc1 and desc2:
+                asset.sitelink_asset.description1 = desc1
+                asset.sitelink_asset.description2 = desc2
+            elif desc1 or desc2:
+                # One provided, one missing — skip both to avoid SITELINK_HAS_ONLY_DESCRIPTION1/2
+                logger.warning(f"Sitelink '{title}': both description1 and description2 required; omitting descriptions")
+
+            asset_ops.append(asset_op)
+            valid_sitelinks.append({"title": title, "url": url})
+
+        if not asset_ops:
+            return {"ok": False, "count": 0, "errors": errors or ["No valid sitelinks to add"]}
+
+        asset_response = asset_service.mutate_assets(
+            customer_id=customer_id,
+            operations=asset_ops,
+            partial_failure=True,
+        )
+
+        # Collect successfully created asset resource names, log partial failures
+        asset_resources = []
+        if hasattr(asset_response, "partial_failure_error") and asset_response.partial_failure_error.code:
+            pf_error = asset_response.partial_failure_error
+            logger.warning(f"add_sitelinks_to_campaign: partial_failure during asset create: {pf_error}")
+            errors.append(f"Some assets failed: {pf_error.message}")
+
+        for i, result in enumerate(asset_response.results):
+            rn = result.resource_name
+            if rn:  # empty resource_name indicates that slot failed in partial-failure mode
+                asset_resources.append(rn)
+            else:
+                label = valid_sitelinks[i]["title"] if i < len(valid_sitelinks) else f"index {i}"
+                errors.append(f"Asset create returned empty resource for sitelink '{label}'")
+
+        if not asset_resources:
+            return {"ok": False, "count": 0, "errors": errors}
+
+        # ── Pass 2: Link all assets to the campaign in one batch ──────────────
+        link_ops = []
+        for asset_rn in asset_resources:
+            link_op     = client.get_type("CampaignAssetOperation")
+            link        = link_op.create
+            link.campaign   = campaign_resource_name
+            link.asset      = asset_rn
+            link.field_type = client.enums.AssetFieldTypeEnum.SITELINK
+            link_ops.append(link_op)
+
+        link_response = camp_asset_service.mutate_campaign_assets(
+            customer_id=customer_id,
+            operations=link_ops,
+            partial_failure=True,
+        )
+
+        # Count actually linked (non-empty resource_name) and surface link-level partial failures
+        linked_count = sum(1 for r in link_response.results if r.resource_name)
+        if hasattr(link_response, "partial_failure_error") and link_response.partial_failure_error.code:
+            pf_link_error = link_response.partial_failure_error
+            logger.warning(f"add_sitelinks_to_campaign: partial_failure during link: {pf_link_error}")
+            errors.append(f"Some links failed: {pf_link_error.message}")
+
+        logger.info(f"add_sitelinks_to_campaign: {linked_count} sitelink(s) linked to {campaign_resource_name}")
+        return {"ok": True, "count": linked_count, "errors": errors}
+
+    except Exception as e:
+        logger.error(f"add_sitelinks_to_campaign failed: {e}")
+        return {"ok": False, "count": 0, "errors": [str(e)]}
 
 
 def fetch_campaigns_from_gads() -> list:
@@ -609,31 +1067,31 @@ def set_campaign_status(campaign_resource_name: str, target_status: str) -> dict
         client = _build_client()
         campaign_service = client.get_service("CampaignService")
 
-        # Build the update operation
         campaign_operation = client.get_type("CampaignOperation")
-        campaign = campaign_operation.update
-        campaign.resource_name = campaign_resource_name
 
-        # Set status using the enum
-        status_enum = client.enums.CampaignStatusEnum
-        status_map = {
-            "PAUSED":  status_enum.PAUSED,
-            "ENABLED": status_enum.ENABLED,
-            "REMOVED": status_enum.REMOVED,
-        }
-        campaign.status = status_map[target_status]
+        if target_status == "REMOVED":
+            # Google Ads API v24 requires the `remove` field for deletion —
+            # setting status=REMOVED via an update operation returns INVALID_ENUM_VALUE.
+            campaign_operation.remove = campaign_resource_name
+        else:
+            # PAUSED / ENABLED — standard update + field mask
+            campaign = campaign_operation.update
+            campaign.resource_name = campaign_resource_name
+            status_enum = client.enums.CampaignStatusEnum
+            status_map = {
+                "PAUSED":  status_enum.PAUSED,
+                "ENABLED": status_enum.ENABLED,
+            }
+            campaign.status = status_map[target_status]
 
-        # Explicit field mask — only update `status`, never touch other fields.
-        # FieldMask is a protobuf well-known type, NOT a Google Ads API type;
-        # client.get_type("FieldMask") doesn't exist in v24.
-        from google.protobuf import field_mask_pb2
-        client.copy_from(
-            campaign_operation.update_mask,
-            field_mask_pb2.FieldMask(paths=["status"]),
-        )
+            # Explicit field mask — only update `status`, never touch other fields.
+            from google.protobuf import field_mask_pb2
+            client.copy_from(
+                campaign_operation.update_mask,
+                field_mask_pb2.FieldMask(paths=["status"]),
+            )
 
-        # Single-operation mutate — no partial_failure needed for one op
-        # Errors surface as GoogleAdsException (caught below)
+        # Single-operation mutate
         response = campaign_service.mutate_campaigns(
             customer_id=customer_id,
             operations=[campaign_operation],

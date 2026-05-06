@@ -778,6 +778,57 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     logger.info("Analyzing and generating recommendations...")
     actions = _analyze_keywords(keyword_perf, attribution, search_terms, campaign=primary_campaign)
 
+    # ── Phase A: Suppress recently-rejected recommendations ───────────────────
+    # M6 fix: key suppression by (entity_name_lower, operation) tuple — NOT entity_name
+    # alone. A rejected "decrease_bid" on keyword X should NOT suppress "pause_keyword"
+    # on the same keyword X. Each action type maps to a distinct operation string.
+    try:
+        from database import get_recent_rejections
+        recent_rejections = get_recent_rejections(days=30)
+        suppressed_count = 0
+
+        # Build (entity_name_lower, operation) and (entity_id, operation) sets
+        rejected_op_pairs = set()
+        rejected_id_op_pairs = set()
+        for r in recent_rejections:
+            ename = (r.get("entity_name") or "").lower()
+            op = r.get("operation") or ""
+            eid = r.get("entity_id") or ""
+            if ename and op:
+                rejected_op_pairs.add((ename, op))
+            if eid and op:
+                rejected_id_op_pairs.add((eid, op))
+
+        # Map each action_type to the exact operation string stored in gads_audit_log
+        ACTION_TO_OPERATION = {
+            "pause":         "pause_keyword",
+            "increase_bid":  "increase_bid",
+            "decrease_bid":  "decrease_bid",
+            "new_exact":     "add_exact_keyword",
+            "new_negative":  "add_negative_keyword",
+        }
+
+        def _is_rejected(item: dict, operation: str) -> bool:
+            """Return True if this exact (entity, operation) was recently rejected."""
+            eid = item.get("resource_name") or item.get("ad_group_resource") or item.get("campaign_resource") or ""
+            ename = (item.get("keyword") or item.get("search_term") or "").lower()
+            if eid and (eid, operation) in rejected_id_op_pairs:
+                return True
+            if ename and (ename, operation) in rejected_op_pairs:
+                return True
+            return False
+
+        for action_type, operation in ACTION_TO_OPERATION.items():
+            before = len(actions.get(action_type, []))
+            actions[action_type] = [a for a in actions.get(action_type, []) if not _is_rejected(a, operation)]
+            after = len(actions[action_type])
+            suppressed_count += (before - after)
+
+        if suppressed_count > 0:
+            logger.info(f"[phase_a] Suppressed {suppressed_count} recommendation(s) recently rejected by admin")
+    except Exception as _rej_err:
+        logger.warning(f"[phase_a] Rejection suppression check failed (non-fatal): {_rej_err}")
+
     # ── Create pending_approval audit rows for each recommendation ────────────
     actions_pending = 0
 

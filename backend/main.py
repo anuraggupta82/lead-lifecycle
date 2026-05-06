@@ -190,6 +190,109 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"IMAP poll failed: {e}")
 
+    # ── Mango Voice — initialize token manager and schedule jobs ──────────────
+    settings = get_settings()
+    if settings.mango_enabled and settings.mango_username and settings.mango_password:
+        try:
+            from mango_service import MangoTokenManager, sync_mango_calls, reconcile_attribution
+            _mango_token_mgr = MangoTokenManager(
+                username=settings.mango_username,
+                password=settings.mango_password,
+                api_base=settings.mango_api_base,
+            )
+            app.state.mango_token_mgr = _mango_token_mgr
+            logger.info("Mango Voice token manager initialized")
+
+            def _mango_sync_job():
+                _stamp("mango_sync")
+                try:
+                    n = sync_mango_calls(
+                        _mango_token_mgr,
+                        pbx_id=settings.mango_pbx_id,
+                        api_base=settings.mango_api_base,
+                    )
+                    if n > 0:
+                        logger.info(f"Mango sync: {n} calls upserted")
+                except Exception as e:
+                    logger.error(f"Mango sync failed: {e}")
+
+            def _mango_reconcile_job():
+                _stamp("mango_reconcile")
+                try:
+                    n = reconcile_attribution(days=7)
+                    if n > 0:
+                        logger.info(f"Mango reconcile: {n} calls attributed")
+                except Exception as e:
+                    logger.error(f"Mango reconcile failed: {e}")
+
+            def _mango_gads_call_view_job():
+                _stamp("mango_call_view")
+                try:
+                    from google_ads_sync import sync_call_view
+                    n = sync_call_view(days_back=14)
+                    logger.info(f"GAds call_view sync: {n} rows")
+                except Exception as e:
+                    logger.error(f"GAds call_view sync failed: {e}")
+
+            ads_scheduler.add_job(
+                _mango_sync_job,
+                CronTrigger(minute="0,5,10,15,20,25,30,35,40,45,50,55"),
+                id="mango_sync", name="Mango Voice Call Sync",
+                max_instances=1, coalesce=True, replace_existing=True,
+            )
+            ads_scheduler.add_job(
+                _mango_reconcile_job,
+                CronTrigger(minute="3,33"),
+                id="mango_reconcile", name="Mango Attribution Reconciler",
+                max_instances=1, coalesce=True, replace_existing=True,
+            )
+            ads_scheduler.add_job(
+                _mango_gads_call_view_job,
+                CronTrigger(hour=6, minute=5),
+                id="mango_call_view", name="GAds Call View Sync",
+                replace_existing=True,
+            )
+
+            # Pipeline tick — runs every N minutes (offset from sync to avoid contention)
+            _pipeline_interval = max(5, settings.mango_pipeline_interval_min)
+
+            def _mango_pipeline_tick():
+                _stamp("mango_pipeline")
+                try:
+                    from mango_pipeline import run_pipeline_tick
+                    tok = None
+                    if app.state.mango_token_mgr:
+                        tok = app.state.mango_token_mgr.get_token()
+                    run_pipeline_tick(mango_token=tok)
+                except Exception as e:
+                    logger.error(f"Mango pipeline tick failed: {e}")
+
+            ads_scheduler.add_job(
+                _mango_pipeline_tick,
+                "interval",
+                minutes=_pipeline_interval,
+                id="mango_pipeline", name="Mango Call Analysis Pipeline",
+                max_instances=1, coalesce=True, replace_existing=True,
+            )
+
+        except Exception as e:
+            logger.warning(f"Mango Voice initialization failed (non-fatal): {e}")
+            app.state.mango_token_mgr = None
+    else:
+        app.state.mango_token_mgr = None
+        logger.info("Mango Voice disabled (MANGO_ENABLED=false or credentials missing)")
+
+    # 6:30 AM — Rebuild keyword_intelligence join table (Phase A)
+    # Runs after GA4 pull (5:30) and GAds sync (6:00) so all source data is fresh.
+    def _keyword_intelligence_job():
+        _stamp("keyword_intelligence")
+        try:
+            from intelligence_builder import rebuild_keyword_intelligence
+            result = rebuild_keyword_intelligence()
+            logger.info(f"Keyword intelligence rebuilt: {result}")
+        except Exception as e:
+            logger.error(f"Keyword intelligence rebuild failed: {e}")
+
     # 11 PM — Upload offline conversions
     def _conversion_upload_job():
         _stamp("conversion_upload")
@@ -210,6 +313,8 @@ async def lifespan(app: FastAPI):
                           id="ga4_pull", name="GA4 Analytics Data Pull", replace_existing=True)
     ads_scheduler.add_job(_gads_sync_job, CronTrigger(hour=6, minute=0),
                           id="gads_sync", name="Google Ads GCLID Sync", replace_existing=True)
+    ads_scheduler.add_job(_keyword_intelligence_job, CronTrigger(hour=6, minute=30),
+                          id="keyword_intelligence", name="Keyword Intelligence Rebuild", replace_existing=True)
     ads_scheduler.add_job(_optimizer_job, CronTrigger(hour=7, minute=0),
                           id="ai_optimizer", name="AI Campaign Optimizer", replace_existing=True)
     ads_scheduler.add_job(_od_sync_job, CronTrigger(hour=22, minute=0),
@@ -218,7 +323,7 @@ async def lifespan(app: FastAPI):
                           id="conversion_upload", name="Google Ads Conversion Upload", replace_existing=True)
 
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (5:30AM GA4, 6AM gads sync, 7AM optimizer, 10PM OD, 11PM conversions)")
+    logger.info("Scheduled jobs started (5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 11PM conversions)")
 
     yield
 
@@ -799,13 +904,64 @@ async def gads_approve_action(action_id: str, request: Request):
         logger.error(f"Approve action failed for {action_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+    # Phase A: snapshot for outcome tracking (T+7/T+30/T+90)
+    try:
+        from database import snapshot_applied_outcome, _conn as _db_conn
+        before = json.loads(row.get("before_state_json") or "{}")
+        entity_type = row.get("entity_type", "")
+        entity_name = row.get("entity_name", "")
+
+        # M2 fix: resolve campaign_id for keyword/ad_group/ad entity types
+        # For campaign actions it's the entity_id itself; for keyword actions
+        # we look up the campaign from gads_keywords_cache by keyword name.
+        snap_campaign_id = ""
+        snap_campaign_name = ""
+        if entity_type == "campaign":
+            snap_campaign_id = row.get("entity_id", "")
+            snap_campaign_name = entity_name
+        else:
+            # Try to find campaign context for keyword/ad_group actions
+            try:
+                with _db_conn() as _c:
+                    _kw_camp = _c.execute(
+                        "SELECT campaign_name FROM gads_keywords_cache "
+                        "WHERE LOWER(keyword_text)=? LIMIT 1",
+                        (entity_name.lower(),)
+                    ).fetchone()
+                    if _kw_camp:
+                        snap_campaign_name = _kw_camp["campaign_name"]
+                        # Look up campaign_id from campaigns table
+                        _camp_row = _c.execute(
+                            "SELECT campaign_id FROM campaigns WHERE campaign_name=? LIMIT 1",
+                            (snap_campaign_name,)
+                        ).fetchone()
+                        if _camp_row:
+                            snap_campaign_id = _camp_row["campaign_id"]
+            except Exception:
+                pass
+
+        snapshot_applied_outcome(
+            action_id=action_id,
+            operation=operation,
+            entity_type=entity_type,
+            entity_id=row.get("entity_id", ""),
+            entity_name=entity_name,
+            campaign_id=snap_campaign_id,
+            campaign_name=snap_campaign_name,
+            before_state=before,
+            ai_reason=row.get("reason", ""),
+            optimizer_run_id=row.get("optimizer_run_id", ""),
+        )
+    except Exception as _snap_err:
+        logger.warning(f"[phase_a] snapshot_applied_outcome failed (non-fatal): {_snap_err}")
+
     return {"status": "ok", "action_id": action_id, "operation": operation}
 
 
 @app.post("/api/admin/gads/reject/{action_id}", dependencies=[Depends(_require_admin)])
 async def gads_reject_action(action_id: str, request: Request):
-    """Dismiss a recommendation without executing it."""
-    from database import get_audit_row, update_gads_action_result, set_audit_approval
+    """Dismiss a recommendation without executing it. Optionally capture reject_reason."""
+    from database import get_audit_row, update_gads_action_result, set_audit_approval, record_reject_reason
     row = get_audit_row(action_id)
     if not row:
         raise HTTPException(status_code=404, detail="Action not found")
@@ -814,9 +970,19 @@ async def gads_reject_action(action_id: str, request: Request):
             status_code=409,
             detail=f"Action already in state '{row['execution_result']}'"
         )
+    # Phase A: capture optional reject reason from request body
+    reject_reason = ""
+    try:
+        body = await request.json()
+        reject_reason = str(body.get("reason", ""))[:300]
+    except Exception:
+        pass
     update_gads_action_result(action_id, executed=False, execution_result="rejected")
     set_audit_approval(action_id, approver="admin")
-    return {"status": "ok", "action_id": action_id}
+    if reject_reason:
+        record_reject_reason(action_id, reject_reason)
+        logger.info(f"[phase_a] Rejection recorded for {action_id[:8]}: {reject_reason[:80]}")
+    return {"status": "ok", "action_id": action_id, "reject_reason": reject_reason}
 
 
 @app.get("/api/admin/gads/writes-status", dependencies=[Depends(_require_admin)])
@@ -1985,6 +2151,345 @@ def admin_campaign_set_ai_max(campaign_id: str, body: CampaignAiMaxRequest):
     return {"ok": True, "campaign_id": campaign_id, "ai_max_enabled": body.enabled}
 
 
+class CampaignSitelinksRequest(BaseModel):
+    sitelinks: list  # [{title, url, description1?, description2?}]
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/sitelinks", dependencies=[Depends(_require_admin)])
+def admin_campaign_sitelinks(campaign_id: str, body: CampaignSitelinksRequest):
+    """
+    Save sitelinks for a campaign and, if the campaign is already live in Google Ads,
+    immediately push them via the API.
+
+    Validates each sitelink:
+      - title: required, max 25 chars (trimmed), no phone numbers
+      - url: required, must start with https://
+      - description1 / description2: optional, max 35 chars each; both or neither required
+
+    Stores as JSON in campaigns.sitelinks.
+    If gads_campaign_resource is set → calls add_sitelinks_to_campaign() and returns gads_applied=True.
+    """
+    from database import get_campaign_by_id, update_campaign_fields
+    from google_ads_create import add_sitelinks_to_campaign, _strip_phone_numbers
+    from urllib.parse import urlparse
+    import json as _json
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    raw = body.sitelinks
+    if not isinstance(raw, list) or len(raw) == 0:
+        raise HTTPException(status_code=400, detail="sitelinks must be a non-empty list")
+    if len(raw) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 sitelinks per campaign")
+
+    validated = []
+    errors = []
+    for i, sl in enumerate(raw):
+        if not isinstance(sl, dict):
+            errors.append(f"Item {i}: must be an object with title and url")
+            continue
+        title = _strip_phone_numbers((sl.get("title") or "").strip())[:25]
+        url   = (sl.get("url") or "").strip()
+        desc1 = _strip_phone_numbers((sl.get("description1") or "").strip())[:35]
+        desc2 = _strip_phone_numbers((sl.get("description2") or "").strip())[:35]
+
+        if not title:
+            errors.append(f"Item {i}: title is required")
+            continue
+        if not url.startswith("https://"):
+            errors.append(f"Item {i} '{title}': URL must start with https://")
+            continue
+        try:
+            parsed = urlparse(url)
+            if not parsed.netloc:
+                errors.append(f"Item {i} '{title}': URL is not valid")
+                continue
+        except Exception:
+            errors.append(f"Item {i} '{title}': URL could not be parsed")
+            continue
+
+        entry = {"title": title, "url": url}
+        if desc1 and desc2:
+            entry["description1"] = desc1
+            entry["description2"] = desc2
+        elif desc1 or desc2:
+            errors.append(f"Item {i} '{title}': both description1 and description2 required if either is set; descriptions omitted")
+        validated.append(entry)
+
+    if not validated:
+        raise HTTPException(status_code=400, detail=f"No valid sitelinks: {errors}")
+
+    # Save to DB
+    update_campaign_fields(campaign_id, {"sitelinks": _json.dumps(validated)})
+
+    # If campaign is live in Google Ads → push immediately
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    gads_applied = False
+    gads_count   = 0
+    gads_errors  = []
+
+    if gads_resource:
+        result = add_sitelinks_to_campaign(gads_resource, validated, replace=True)
+        gads_applied = result["ok"]
+        gads_count   = result.get("count", 0)
+        gads_errors  = result.get("errors", [])
+        logger.info(
+            f"admin_campaign_sitelinks: pushed {gads_count} sitelinks to GAds "
+            f"for campaign {campaign_id} ({gads_resource})"
+        )
+
+    return {
+        "ok":          True,
+        "campaign_id": campaign_id,
+        "saved":       len(validated),
+        "gads_applied": gads_applied,
+        "gads_count":  gads_count,
+        "gads_errors": gads_errors,
+        "validation_warnings": errors,
+    }
+
+
+class SitelinkSuggestRequest(BaseModel):
+    instruction: Optional[str] = None          # refinement hint, e.g. "focus on insurance"
+    previous_errors: Optional[list] = None     # GAds error strings from a prior attempt
+    previous_suggestions: Optional[list] = None  # [{title,url}] that had errors — for AI to improve
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/sitelinks/suggest", dependencies=[Depends(_require_admin)])
+def admin_campaign_sitelinks_suggest(campaign_id: str, body: SitelinkSuggestRequest):
+    """
+    AI-powered sitelink suggestions for a campaign.
+
+    Reads campaign context (name, service_focus, landing_page, strategy excerpt, phone).
+    Calls Claude Sonnet and returns [{title, url, reason}] — 4-8 suggestions.
+
+    If `instruction` is provided, the AI refines suggestions accordingly.
+    If `previous_errors` + `previous_suggestions` are provided (from a failed GAds push),
+    the AI evaluates the error messages and returns improved suggestions that avoid them.
+    This enables an automatic retry loop when Google Ads rejects sitelinks.
+    """
+    from database import get_campaign_by_id
+    import json as _json
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # --- Build campaign context block ---
+    campaign_name    = camp.get("campaign_name") or "Unnamed Campaign"
+    service_focus    = camp.get("service_focus") or ""
+    landing_page     = camp.get("landing_page") or ""
+    phone            = camp.get("call_extension_phone") or ""
+    website          = landing_page or ""
+
+    # Derive base website from landing page if possible
+    from urllib.parse import urlparse as _urlparse
+    try:
+        _parsed = _urlparse(landing_page)
+        base_url = f"{_parsed.scheme}://{_parsed.netloc}" if _parsed.netloc else landing_page
+    except Exception:
+        base_url = landing_page
+
+    # Strategy snippet (first 600 chars is enough for context)
+    strategy_raw = camp.get("strategy_json") or {}
+    if isinstance(strategy_raw, str):
+        try:
+            strategy_raw = _json.loads(strategy_raw)
+        except Exception:
+            strategy_raw = {}
+    strategy_snippet = ""
+    if isinstance(strategy_raw, dict):
+        overview = strategy_raw.get("campaign_overview") or strategy_raw.get("summary") or ""
+        if overview:
+            strategy_snippet = str(overview)[:600]
+
+    # Practice context — use practice_website as fallback when landing_page not set
+    practice_name    = get_setting("practice_name") or "our dental practice"
+    practice_city    = get_setting("practice_city") or ""
+    practice_website = get_setting("practice_website") or ""
+
+    # Determine best base URL: landing page domain > practice website > none
+    if not base_url and practice_website:
+        try:
+            _pw = _urlparse(practice_website)
+            base_url = f"{_pw.scheme}://{_pw.netloc}" if _pw.netloc else practice_website
+        except Exception:
+            base_url = practice_website
+
+    if not base_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Campaign has no landing page and no practice website is configured. "
+                   "Add a landing page on the campaign or set your practice website in Admin → Practice Info."
+        )
+
+    context_block = f"""Campaign: {campaign_name}
+Practice: {practice_name}{f', {practice_city}' if practice_city else ''}
+Service focus: {service_focus or 'General dentistry'}
+Base website / landing page: {base_url}
+Phone: {phone or '(not set)'}"""
+    if strategy_snippet:
+        context_block += f"\nStrategy overview: {strategy_snippet}"
+
+    # Sanitize instruction — cap length, wrap in delimiters for injection safety
+    safe_instruction = ""
+    if body.instruction:
+        safe_instruction = str(body.instruction).strip()[:300]
+
+    # --- Build the prompt ---
+    error_section = ""
+    if body.previous_errors and body.previous_suggestions:
+        prev_sl_text = _json.dumps(body.previous_suggestions, indent=2)
+        err_text = "\n".join(f"  - {e}" for e in body.previous_errors[:10])
+        error_section = f"""
+IMPORTANT — A previous set of sitelinks was REJECTED by Google Ads with these errors:
+{err_text}
+
+Previous sitelinks that had issues:
+{prev_sl_text}
+
+Analyze these errors carefully. Common causes:
+- Title over 25 characters (count exactly — must be ≤25, aim for ≤20 to be safe)
+- URL not starting with https://
+- URL domain does not match the practice's base website domain ({base_url})
+- Phone numbers in title or descriptions
+- Special characters or trademark symbols
+- Descriptions: must BOTH be present or BOTH absent (never just one)
+
+Produce improved sitelinks that avoid ALL of these issues.
+"""
+
+    instruction_section = ""
+    if safe_instruction:
+        instruction_section = f"\n<user_instruction>{safe_instruction}</user_instruction>\n"
+
+    system_prompt = f"""You are a Google Ads specialist generating sitelink extensions for a dental practice.
+
+STRICT RULES — Google will reject violations:
+1. title: MAXIMUM 25 characters (count every single character including spaces). Aim for ≤20. NEVER exceed 25.
+2. url: Must start with https:// and use the same domain as the practice base website ({base_url}). Do NOT use a different domain. If you are unsure what page exists, use the base URL itself.
+3. descriptions: OPTIONAL. If you include descriptions, BOTH description1 AND description2 are required (max 35 chars each). NEVER include just one description.
+4. No phone numbers anywhere in title or descriptions.
+5. No special characters, trademark symbols, or ALL CAPS words.
+6. Focus on high-value dental pages: booking, services, about, insurance, new patients, financing, emergency, etc.
+
+Return ONLY valid JSON — an array of 4 to 8 sitelink objects. No markdown code fences, no explanation outside the JSON.
+JSON schema (do NOT include description1/description2 unless you have valid content for BOTH):
+[
+  {{"title": "Book a Visit", "url": "https://example.com/book", "reason": "Direct path to scheduling"}},
+  {{"title": "New Patients", "url": "https://example.com/new-patients", "reason": "Captures new patient searches"}}
+]"""
+
+    user_prompt = f"""Generate the best Google Ads sitelinks for this campaign:
+
+{context_block}
+{error_section}
+Guidelines:
+- Prioritize high-conversion pages: Book Appointment, New Patients, specific service pages, Insurance/Financing
+- All URLs must use {base_url} as the domain
+- If you are unsure what sub-pages exist, use {base_url}/book, {base_url}/contact, {base_url}/about, {base_url}/new-patients — these are standard paths
+- If landing_page is the main destination, sitelinks should complement it with OTHER sections of the site
+- Titles should be action-oriented and specific to the service focus
+- Keep titles SHORT — aim for ≤20 characters, NEVER over 25
+{instruction_section}
+Return ONLY the JSON array."""
+
+    client = _get_anthropic_client()
+    try:
+        response = client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw_text = response.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"sitelinks/suggest: Anthropic call failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI call failed: {e}")
+
+    # Parse JSON from response
+    import re as _re
+    suggestions = []
+    parse_error = None
+    try:
+        # Strip outermost markdown code fences only (not inner content)
+        clean = raw_text
+        if clean.startswith("```"):
+            clean = _re.sub(r"^```(?:json)?\s*\n?", "", clean)
+            clean = _re.sub(r"\n?```\s*$", "", clean)
+        clean = clean.strip()
+        # Try to extract a JSON array first
+        arr_match = _re.search(r"\[.*\]", clean, _re.DOTALL)
+        if arr_match:
+            parsed = _json.loads(arr_match.group(0))
+        else:
+            parsed = _json.loads(clean)
+        # Handle single-object response (AI returned a dict instead of array)
+        if isinstance(parsed, dict):
+            suggestions = [parsed]
+        elif isinstance(parsed, list):
+            suggestions = parsed
+        else:
+            suggestions = []
+    except Exception as e:
+        parse_error = str(e)
+        logger.error(f"sitelinks/suggest: JSON parse failed: {e}\nRaw: {raw_text[:500]}")
+
+    # Validate and sanitize suggestions
+    validated = []
+    warnings = []
+    for i, sl in enumerate(suggestions or []):
+        if not isinstance(sl, dict):
+            continue
+        title = (sl.get("title") or "").strip()
+        url   = (sl.get("url") or "").strip()
+        reason = (sl.get("reason") or "").strip()[:120]
+
+        if not title:
+            warnings.append(f"Item {i}: missing title, skipped")
+            continue
+        if len(title) > 25:
+            warnings.append(f"Item {i} '{title}': title {len(title)} chars > 25, truncated")
+            title = title[:25]
+        if not url.startswith("https://"):
+            warnings.append(f"Item {i} '{title}': URL doesn't start with https://, skipped")
+            continue
+
+        entry = {"title": title, "url": url, "reason": reason}
+        # Pass through optional descriptions only if BOTH provided (both-or-neither rule)
+        d1 = (sl.get("description1") or "").strip()[:35]
+        d2 = (sl.get("description2") or "").strip()[:35]
+        if d1 and d2:
+            entry["description1"] = d1
+            entry["description2"] = d2
+        elif d1 or d2:
+            warnings.append(f"Item {i} '{title}': only one description provided — descriptions omitted")
+
+        validated.append(entry)
+
+    if parse_error and not validated:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI returned unparseable response. Parse error: {parse_error}. Raw: {raw_text[:300]}"
+        )
+    if not validated:
+        # AI returned valid JSON but all items were filtered out
+        raise HTTPException(
+            status_code=422,
+            detail=f"AI returned no usable sitelinks. Warnings: {warnings[:5]}. Try a different refinement instruction."
+        )
+
+    return {
+        "ok":          True,
+        "campaign_id": campaign_id,
+        "suggestions": validated,
+        "warnings":    warnings,
+        "model":       SONNET_MODEL,
+    }
+
+
 @app.get("/api/admin/campaigns/{campaign_id}/search-term-types", dependencies=[Depends(_require_admin)])
 def admin_campaign_search_term_types(campaign_id: str, days: int = 30):
     """
@@ -2135,6 +2640,18 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         # Practice info for extension defaults
         practice_hours = get_setting("practice_hours") or ""
 
+        # Sitelinks — read from campaign row
+        _sitelinks_raw = camp.get("sitelinks") or ""
+        _sitelinks_list = []
+        if _sitelinks_raw:
+            try:
+                import json as _json
+                _sitelinks_list = _json.loads(_sitelinks_raw)
+            except Exception:
+                pass
+        _sitelinks_done  = len(_sitelinks_list) > 0
+        _sitelinks_value = f"{len(_sitelinks_list)} sitelink(s) configured" if _sitelinks_done else ""
+
         checklist = [
             # ── REQUIRED ────────────────────────────────────────────────────────
             {
@@ -2231,12 +2748,12 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
             {
                 "key":      "sitelinks",
                 "item":     "Sitelink extensions",
-                "value":    "",
-                "done":     False,
+                "value":    _sitelinks_value,
+                "done":     _sitelinks_done,
                 "skippable": True,
                 "category": "recommended",
                 "action":   "manual",
-                "note":     "Add 4 quick links below your ad (e.g. Book Appointment, Patient Forms, Financing).",
+                "note":     "Add quick links below your ad (e.g. Book Online, New Patients, About Us). Saved here and pushed to Google Ads automatically.",
             },
             {
                 "key":      "callouts",
@@ -2386,6 +2903,7 @@ Rules:
 - Descriptions: exactly 4 per ad group, max 90 characters each
 - Include the practice service, urgency, differentiators, and CTAs
 - No punctuation at end of headlines
+- NEVER include phone numbers (e.g. 508-318-4477) in any headline or description — Google Ads prohibits phone numbers in ad text; use call extensions for phone numbers
 - Return ONLY the JSON object, no explanation."""
 
     elif step == "ad_groups":
@@ -3559,6 +4077,368 @@ def admin_gads_ad_metrics(ad_id: str, days: int = 30):
     for row in rows:
         row["cost"] = round((row.get("cost_micros") or 0) / 1_000_000.0, 2)
     return {"ad_id": ad_id, "days": days, "metrics": rows}
+
+
+# ─── Mango Voice call endpoints ──────────────────────────────────────────────
+
+@app.get("/api/admin/calls", dependencies=[Depends(_require_admin)])
+def admin_get_calls(
+    direction: str = "",
+    status: str = "",
+    days: int = 30,
+    limit: int = 100,
+    offset: int = 0,
+):
+    """List Mango Voice calls. Filter by direction (inbound/outbound), status, days back."""
+    from database import get_mango_calls, get_gads_call_view
+    calls, total = get_mango_calls(
+        limit=limit, offset=offset,
+        direction=direction, status=status, days=days,
+    )
+    # Also return gads call_view counts for summary
+    gads_calls = get_gads_call_view(days=days)
+    ad_call_count = len(gads_calls)
+    ad_call_total_duration = sum(c.get("call_duration_sec", 0) for c in gads_calls)
+    # Enrich each call with matched status label
+    for c in calls:
+        if c.get("gads_call_id"):
+            conf = c.get("match_confidence", 0) or 0
+            c["attribution_label"] = "Ad call ✓" if conf >= 0.90 else "Ad call (~)"
+        elif c.get("lead_id"):
+            c["attribution_label"] = "Known lead"
+        else:
+            c["attribution_label"] = ""
+    return {
+        "calls": calls,
+        "total": total,
+        "ad_calls_from_gads": ad_call_count,
+        "ad_call_total_duration_sec": ad_call_total_duration,
+    }
+
+
+@app.get("/api/admin/calls/{uuid}", dependencies=[Depends(_require_admin)])
+def admin_get_call(uuid: str):
+    """Return a single Mango call record by UUID."""
+    from database import get_mango_call
+    call = get_mango_call(uuid)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return call
+
+
+@app.post("/api/admin/calls/sync", dependencies=[Depends(_require_admin)])
+def admin_mango_sync_now(request: Request):
+    """Manually trigger a Mango call sync right now."""
+    token_mgr = getattr(request.app.state, "mango_token_mgr", None)
+    if not token_mgr:
+        raise HTTPException(status_code=503, detail="Mango not configured or disabled")
+    try:
+        from mango_service import sync_mango_calls
+        settings = get_settings()
+        n = sync_mango_calls(token_mgr, pbx_id=settings.mango_pbx_id, api_base=settings.mango_api_base)
+        return {"synced": n}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/reconcile", dependencies=[Depends(_require_admin)])
+def admin_mango_reconcile_now():
+    """Manually trigger attribution reconciliation."""
+    try:
+        from mango_service import reconcile_attribution
+        n = reconcile_attribution(days=14)
+        return {"attributed": n}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/gads/call-view", dependencies=[Depends(_require_admin)])
+def admin_gads_call_view(days: int = 30):
+    """Return Google Ads call_view rows (calls directly from ads)."""
+    from database import get_gads_call_view
+    rows = get_gads_call_view(days=days)
+    return {"calls": rows, "total": len(rows)}
+
+
+# ─── Call Analysis endpoints ──────────────────────────────────────────────────
+
+@app.post("/api/admin/calls/{uuid}/process", dependencies=[Depends(_require_admin)])
+def admin_process_call(uuid: str, request: Request, background_tasks: BackgroundTasks):
+    """
+    Manually trigger pipeline processing for a single call.
+    Non-blocking — queues work as a background task and returns immediately.
+    Poll GET /api/admin/calls/{uuid} to see updated transcription_status.
+    """
+    from database import get_mango_call
+    call = get_mango_call(uuid)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    from mango_pipeline import process_call
+    token_mgr = getattr(request.app.state, "mango_token_mgr", None)
+    tok = token_mgr.get_token() if token_mgr else None
+    background_tasks.add_task(process_call, call, mango_token=tok)
+    return {"ok": True, "status": "queued", "uuid": uuid}
+
+
+@app.post("/api/admin/calls/bulk-process", dependencies=[Depends(_require_admin)])
+def admin_bulk_process_calls(request: Request, body: dict = Body(default={})):
+    """
+    Start a bulk analysis job for all unprocessed calls.
+    Non-blocking — returns job_id immediately, processing runs in background.
+    Options: min_seconds (int), batch_size (int), days_back (int)
+    """
+    from database import get_active_call_bulk_job, insert_call_bulk_job
+    from mango_pipeline import start_bulk_job_async
+
+    # Reject if a job is already running
+    active = get_active_call_bulk_job()
+    if active:
+        return {"ok": False, "error": "A bulk job is already running", "job": active}
+
+    options = {
+        "min_seconds": int(body.get("min_seconds", 30)),
+        "batch_size":  int(body.get("batch_size", 50)),
+        "days_back":   int(body.get("days_back", 90)),
+    }
+    do_grade = bool(body.get("do_grade", True))
+    job_id = insert_call_bulk_job(date_from="", date_to="", do_grade=do_grade, options=options)
+
+    token_mgr = getattr(request.app.state, "mango_token_mgr", None)
+    tok = token_mgr.get_token() if token_mgr else None
+    start_bulk_job_async(job_id, mango_token=tok)
+
+    return {"ok": True, "job_id": job_id}
+
+
+@app.get("/api/admin/calls/bulk-process/status", dependencies=[Depends(_require_admin)])
+def admin_bulk_process_status():
+    """Return the status of the most recent bulk job."""
+    from database import get_active_call_bulk_job
+    job = get_active_call_bulk_job()
+    if not job:
+        # Return last completed job from DB
+        from database import _conn
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM call_bulk_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row:
+            job = dict(row)
+    return {"job": job}
+
+
+@app.post("/api/admin/calls/{uuid}/grade", dependencies=[Depends(_require_admin)])
+def admin_grade_call(uuid: str):
+    """
+    Re-grade a single call that already has a transcript.
+    Useful after changing grading criteria.
+    """
+    from database import get_mango_call, update_mango_call_analysis
+    call = get_mango_call(uuid)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    transcript = call.get("transcript") or ""
+    if not transcript.strip():
+        raise HTTPException(status_code=400, detail="No transcript available — transcribe first")
+
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
+
+    try:
+        from mango_pipeline import _grade
+        caller_name = call.get("caller_id_name") or ""
+        grade = _grade(transcript, settings.gemini_api_key, settings.gemini_model, uuid, caller_name)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        import json as _json
+        if grade.get("gradeable"):
+            update_mango_call_analysis(
+                uuid,
+                grade_scores_json=_json.dumps(grade.get("scores", [])),
+                grade_overall_score=float(grade.get("overall_score") or 0),
+                grade_overall_notes=grade.get("overall_notes", ""),
+                grade_recommendations_json=_json.dumps(grade.get("recommendations", [])),
+                grade_gradeable=1,
+                grade_reason="",
+                graded_at=now_iso,
+            )
+        else:
+            update_mango_call_analysis(
+                uuid,
+                grade_gradeable=0,
+                grade_reason=grade.get("reason", "Not gradeable"),
+                graded_at=now_iso,
+            )
+        updated = get_mango_call(uuid)
+        return {"ok": True, "grade": grade, "call": updated}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/calls/analysis/criteria", dependencies=[Depends(_require_admin)])
+def admin_get_criteria():
+    """Return current grading criteria."""
+    from database import get_call_grading_criteria
+    return {"criteria": get_call_grading_criteria()}
+
+
+@app.put("/api/admin/calls/analysis/criteria", dependencies=[Depends(_require_admin)])
+def admin_set_criteria(body: dict = Body(...)):
+    """
+    Replace all grading criteria.
+    Body: { "criteria": [ {name, description, weight, enabled}, ... ] }
+    Total weight should sum to 100.
+    """
+    from database import set_call_grading_criteria
+    criteria = body.get("criteria")
+    if not isinstance(criteria, list) or not criteria:
+        raise HTTPException(status_code=400, detail="criteria must be a non-empty list")
+    # Validate fields
+    for item in criteria:
+        if not item.get("name") or item.get("weight") is None:
+            raise HTTPException(status_code=400, detail="Each criterion needs name and weight")
+    try:
+        set_call_grading_criteria(criteria)
+        from database import get_call_grading_criteria
+        return {"ok": True, "criteria": get_call_grading_criteria()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/analysis/criteria/reset", dependencies=[Depends(_require_admin)])
+def admin_reset_criteria():
+    """Reset grading criteria to factory defaults."""
+    from database import reset_call_grading_criteria, get_call_grading_criteria
+    reset_call_grading_criteria()
+    return {"ok": True, "criteria": get_call_grading_criteria()}
+
+
+@app.get("/api/admin/calls/analysis/team-members", dependencies=[Depends(_require_admin)])
+def admin_get_team_members():
+    """Return configured team members."""
+    from database import get_call_team_members
+    return {"members": get_call_team_members()}
+
+
+@app.put("/api/admin/calls/analysis/team-members", dependencies=[Depends(_require_admin)])
+def admin_set_team_members(body: dict = Body(...)):
+    """
+    Replace all team members.
+    Body: { "members": [ {name, extension, active}, ... ] }
+    """
+    from database import set_call_team_members
+    members = body.get("members")
+    if not isinstance(members, list):
+        raise HTTPException(status_code=400, detail="members must be a list")
+    for m in members:
+        if not m.get("name") or not m.get("extension"):
+            raise HTTPException(status_code=400, detail="Each member needs name and extension")
+    try:
+        set_call_team_members(members)
+        from database import get_call_team_members
+        return {"ok": True, "members": get_call_team_members()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/calls/analysis/ai-costs", dependencies=[Depends(_require_admin)])
+def admin_ai_costs(days: int = 30):
+    """Return AI spend summary for Whisper, Gemini, and Claude."""
+    from ai_costs import cost_summary
+    return cost_summary(days=days)
+
+
+@app.get("/api/admin/calls/analysis/performance", dependencies=[Depends(_require_admin)])
+def admin_call_performance(days: int = 30):
+    """
+    Return per-team-member call performance stats.
+    Aggregates graded calls by team member, averaged scores per criterion.
+    """
+    from database import _conn
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT team_member, grade_overall_score, grade_scores_json, graded_at
+               FROM mango_calls
+               WHERE grade_gradeable = 1
+                 AND team_member IS NOT NULL AND team_member != ''
+                 AND graded_at >= ?
+               ORDER BY graded_at DESC""",
+            (cutoff,),
+        ).fetchall()
+
+    import json as _json
+    from collections import defaultdict
+
+    member_data: dict = defaultdict(lambda: {"calls": 0, "total_score": 0.0, "criteria_sums": defaultdict(float), "criteria_counts": defaultdict(int)})
+
+    for row in rows:
+        name = row["team_member"]
+        score = row["grade_overall_score"] or 0
+        d = member_data[name]
+        d["calls"] += 1
+        d["total_score"] += score
+        try:
+            scores = _json.loads(row["grade_scores_json"] or "[]")
+            for s in scores:
+                criterion = s.get("criterion", "")
+                val = s.get("score")
+                if criterion and val is not None:
+                    d["criteria_sums"][criterion] += float(val)
+                    d["criteria_counts"][criterion] += 1
+        except (ValueError, TypeError):
+            pass
+
+    result = []
+    for name, d in member_data.items():
+        calls = d["calls"]
+        avg_score = round(d["total_score"] / calls, 2) if calls else 0
+        criteria_avg = {
+            c: round(d["criteria_sums"][c] / d["criteria_counts"][c], 2)
+            for c in d["criteria_sums"]
+        }
+        result.append({
+            "name": name,
+            "calls": calls,
+            "avg_score": avg_score,
+            "criteria": criteria_avg,
+        })
+
+    result.sort(key=lambda x: x["avg_score"], reverse=True)
+    return {"period_days": days, "members": result}
+
+
+@app.get("/api/admin/calls/analysis/revenue", dependencies=[Depends(_require_admin)])
+def admin_call_revenue(days: int = 90):
+    """
+    Return rows from the call_to_revenue view — call attribution chain.
+    Links calls → leads → Google Ads campaigns.
+    """
+    from database import _conn
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM call_to_revenue WHERE call_started_at >= ? ORDER BY call_started_at DESC LIMIT 500",
+            (cutoff,),
+        ).fetchall()
+    return {"rows": [dict(r) for r in rows], "total": len(rows)}
+
+
+@app.post("/api/admin/pipeline/trigger", dependencies=[Depends(_require_admin)])
+def admin_trigger_pipeline(request: Request):
+    """Manually trigger one pipeline tick right now."""
+    from mango_pipeline import run_pipeline_tick
+    token_mgr = getattr(request.app.state, "mango_token_mgr", None)
+    tok = token_mgr.get_token() if token_mgr else None
+    try:
+        run_pipeline_tick(mango_token=tok)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Pipeline with enrichment ────────────────────────────────────────────────

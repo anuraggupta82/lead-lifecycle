@@ -109,6 +109,39 @@ class Settings(BaseSettings):
     # Find IDs at: https://developers.google.com/google-ads/api/data/geotargets
     google_ads_geo_target_ids: str = ""
 
+    # Mango Voice (PBX call tracking)
+    mango_username: str = ""
+    mango_password: str = ""
+    mango_pbx_id: str = "9021"
+    mango_api_base: str = "https://api.mangovoice.com"
+    # Set to false to disable Mango sync (e.g. if credentials not yet configured)
+    mango_enabled: bool = False
+
+    # OpenAI (Whisper transcription — BAA covered)
+    openai_api_key: str = ""
+    # Max recording duration to transcribe (seconds). Calls shorter than this skip transcription.
+    call_transcription_min_sec: int = 30
+    # Max calls to auto-transcribe per scheduler run (cost guard)
+    call_transcription_batch_size: int = 10
+
+    # ── Gemini (call summarization + grading) ────────────────────────────────
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+
+    # ── Call Analysis pipeline ───────────────────────────────────────────────
+    mango_pipeline_enabled: bool = False       # Master on/off switch
+    mango_pipeline_auto_grade: bool = True     # Run Gemini grading after each summary
+    mango_pipeline_only_inbound: bool = True   # Skip outbound calls
+    mango_pipeline_min_seconds: int = 30       # Skip calls shorter than this
+    mango_pipeline_max_per_run: int = 20       # Cost guard: max calls per scheduler tick
+    mango_pipeline_interval_min: int = 10      # Minutes between pipeline runs
+    mango_pipeline_recording_ttl_min: int = 30 # Delete cached recordings older than this
+    mango_recording_dir: str = "/tmp/gdc_recordings"
+
+    # Whisper backend: 'api' = OpenAI cloud (default), 'local' = on-device GPU
+    mango_whisper_mode: str = "api"
+    mango_whisper_local_model: str = "large-v2"
+
     class Config:
         env_file = ".env"
         case_sensitive = False

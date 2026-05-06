@@ -20,6 +20,7 @@ from database import (
     get_all_leads, upsert_lead, save_gads_keywords_cache,
     save_gads_geo_cache, save_gads_schedule_cache,
     save_gads_daily_stats, save_gads_ads, save_gads_ad_metrics,
+    upsert_gads_call_view,
 )
 
 logger = logging.getLogger(__name__)
@@ -626,6 +627,71 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result
+
+
+def sync_call_view(days_back: int = 14) -> int:
+    """
+    Pull Google Ads call_view data (calls made directly from ads) and upsert
+    into the gads_call_view table for attribution matching.
+    Returns count of rows upserted.
+    """
+    try:
+        client = _build_client()
+    except Exception as e:
+        logger.error(f"sync_call_view: failed to build client: {e}")
+        return 0
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id.replace("-", "")
+    ga_service = client.get_service("GoogleAdsService")
+
+    query = """
+        SELECT
+            call_view.resource_name,
+            call_view.caller_area_code,
+            call_view.caller_country_code,
+            call_view.call_duration_seconds,
+            call_view.call_status,
+            call_view.type,
+            call_view.start_call_date_time,
+            call_view.end_call_date_time,
+            campaign.id,
+            campaign.name
+        FROM call_view
+        ORDER BY call_view.start_call_date_time DESC
+        LIMIT 500
+    """
+
+    count = 0
+    try:
+        response = ga_service.search(customer_id=customer_id, query=query)
+        for row in response:
+            cv = row.call_view
+            # Build a stable call_id from the resource_name tail segment
+            resource_name = cv.resource_name or ""
+            call_id = resource_name.split("/")[-1] if resource_name else ""
+            if not call_id:
+                continue
+
+            record = {
+                "call_id": call_id,
+                "customer_id": customer_id,
+                "campaign_id": str(row.campaign.id),
+                "campaign_name": row.campaign.name,
+                "caller_country_code": cv.caller_country_code or "",
+                "caller_area_code": cv.caller_area_code or "",
+                "call_duration_sec": int(cv.call_duration_seconds or 0),
+                "call_status": cv.call_status.name if cv.call_status else "",
+                "call_type": cv.type_.name if cv.type_ else "",
+                "start_call_date_time": str(cv.start_call_date_time or ""),
+            }
+            upsert_gads_call_view(record)
+            count += 1
+    except Exception as e:
+        logger.error(f"sync_call_view: API error: {e}")
+
+    logger.info(f"sync_call_view: upserted {count} call_view rows")
+    return count
 
 
 if __name__ == "__main__":

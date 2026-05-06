@@ -215,7 +215,10 @@ CREATE TABLE IF NOT EXISTS gads_keywords_cache (
     synced_at               TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key ON gads_keywords_cache(keyword_text, days);
+-- M5 fix: UNIQUE across (keyword_text, match_type, ad_group_name, campaign_name, days)
+-- so the same keyword in different ad groups / match types gets separate rows.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key
+    ON gads_keywords_cache(keyword_text, match_type, ad_group_name, campaign_name, days);
 
 CREATE TABLE IF NOT EXISTS gads_search_terms_cache (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -505,6 +508,184 @@ CREATE TABLE IF NOT EXISTS campaigns (
 
 CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
 CREATE INDEX IF NOT EXISTS idx_campaigns_type   ON campaigns(campaign_type);
+
+-- ── Phase A: Feedback Loop Foundation ────────────────────────────────────────
+
+-- Append-only log: every OD appointment that can be attributed to a keyword click.
+-- Written by od_matcher.py when it finds a patient match for a lead that has a gclid.
+CREATE TABLE IF NOT EXISTS keyword_production_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at           TEXT NOT NULL,                  -- ISO timestamp (UTC)
+    lead_id             TEXT NOT NULL,                  -- FK leads.id
+    keyword_text        TEXT NOT NULL DEFAULT '',       -- matched keyword (lowercase)
+    match_type          TEXT NOT NULL DEFAULT '',       -- BROAD, PHRASE, EXACT
+    campaign_id         TEXT NOT NULL DEFAULT '',       -- GAds campaign ID
+    campaign_name       TEXT NOT NULL DEFAULT '',
+    ad_group_name       TEXT NOT NULL DEFAULT '',
+    gclid               TEXT NOT NULL DEFAULT '',       -- Google click ID from lead
+    od_patient_num      TEXT NOT NULL DEFAULT '',       -- OD patient number matched
+    production_amount   REAL NOT NULL DEFAULT 0.0,      -- $ production from OD
+    procedure_codes     TEXT NOT NULL DEFAULT '[]',     -- JSON array of procedure codes
+    match_method        TEXT NOT NULL DEFAULT '',       -- 'email','phone','manual'
+    appointment_date    TEXT NOT NULL DEFAULT '',       -- YYYY-MM-DD of OD appointment
+    FOREIGN KEY (lead_id) REFERENCES leads(id),
+    -- M4 fix: dedup guard — one row per (lead, patient); INSERT OR REPLACE updates production
+    UNIQUE(lead_id, od_patient_num)
+);
+
+CREATE INDEX IF NOT EXISTS idx_kpl_keyword   ON keyword_production_log(keyword_text, campaign_id);
+CREATE INDEX IF NOT EXISTS idx_kpl_lead      ON keyword_production_log(lead_id);
+CREATE INDEX IF NOT EXISTS idx_kpl_logged    ON keyword_production_log(logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_kpl_gclid     ON keyword_production_log(gclid);
+
+-- Snapshot table: captured when admin clicks Apply on an optimizer recommendation.
+-- Updated at T+7, T+30, T+90 to track whether the action improved performance.
+CREATE TABLE IF NOT EXISTS applied_outcomes (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_id           TEXT NOT NULL UNIQUE,           -- FK gads_audit_log.action_id
+    applied_at          TEXT NOT NULL,                  -- when Apply was clicked (UTC)
+    operation           TEXT NOT NULL,                  -- pause_keyword, set_budget, add_keyword, etc.
+    entity_type         TEXT NOT NULL,                  -- keyword, campaign, ad_group, ad
+    entity_id           TEXT NOT NULL,                  -- resource_name or id
+    entity_name         TEXT NOT NULL,                  -- human-readable
+    campaign_id         TEXT NOT NULL DEFAULT '',
+    campaign_name       TEXT NOT NULL DEFAULT '',
+    -- Pre-action snapshot (from before_state_json at apply time)
+    pre_impressions_7d  INTEGER DEFAULT 0,
+    pre_clicks_7d       INTEGER DEFAULT 0,
+    pre_cost_7d         REAL DEFAULT 0.0,
+    pre_conversions_7d  REAL DEFAULT 0.0,
+    pre_cpc             REAL DEFAULT 0.0,
+    -- Outcome snapshots (filled by nightly job at T+7, T+30, T+90)
+    post_7d_json        TEXT DEFAULT '{}',              -- {impressions, clicks, cost, conversions}
+    post_30d_json       TEXT DEFAULT '{}',
+    post_90d_json       TEXT DEFAULT '{}',
+    -- Status tracking
+    outcome_7d_at       TEXT DEFAULT '',                -- when post_7d_json was filled
+    outcome_30d_at      TEXT DEFAULT '',
+    outcome_90d_at      TEXT DEFAULT '',
+    verdict             TEXT DEFAULT 'pending',         -- pending, improved, neutral, degraded
+    verdict_reason      TEXT DEFAULT '',
+    -- AI recommendation context
+    ai_reason           TEXT DEFAULT '',                -- why AI recommended this action
+    optimizer_run_id    TEXT DEFAULT ''                 -- FK gads_optimizer_runs.run_id
+);
+
+CREATE INDEX IF NOT EXISTS idx_ao_applied    ON applied_outcomes(applied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ao_campaign   ON applied_outcomes(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_ao_verdict    ON applied_outcomes(verdict);
+CREATE INDEX IF NOT EXISTS idx_ao_entity     ON applied_outcomes(entity_id);
+
+-- Denormalized intelligence table: one row per (keyword, date), joining GAds stats +
+-- OD production + GA4 session quality. Rebuilt nightly by the intelligence job.
+CREATE TABLE IF NOT EXISTS keyword_intelligence (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    date                    TEXT NOT NULL,              -- YYYY-MM-DD (stats period end date)
+    keyword_text            TEXT NOT NULL,
+    match_type              TEXT NOT NULL DEFAULT '',
+    campaign_id             TEXT NOT NULL DEFAULT '',
+    campaign_name           TEXT NOT NULL DEFAULT '',
+    ad_group_name           TEXT NOT NULL DEFAULT '',
+    -- GAds performance (from gads_keywords_cache)
+    impressions             INTEGER DEFAULT 0,
+    clicks                  INTEGER DEFAULT 0,
+    cost_usd                REAL DEFAULT 0.0,
+    avg_cpc                 REAL DEFAULT 0.0,
+    conversions             REAL DEFAULT 0.0,
+    quality_score           INTEGER DEFAULT 0,
+    impression_share        REAL DEFAULT 0.0,
+    -- OD production (from keyword_production_log, rolling 90d)
+    od_appointments         INTEGER DEFAULT 0,          -- count of OD matches
+    od_production_total     REAL DEFAULT 0.0,           -- sum of production_amount
+    od_production_per_click REAL DEFAULT 0.0,           -- od_production_total / clicks (0 if no clicks)
+    -- GA4 session quality (from ga4_cache, rolling 30d)
+    ga4_sessions            INTEGER DEFAULT 0,
+    ga4_avg_duration_sec    REAL DEFAULT 0.0,
+    ga4_bounce_rate         REAL DEFAULT 0.0,           -- 0.0–1.0
+    ga4_lead_events         INTEGER DEFAULT 0,          -- generate_lead events
+    session_quality_score   REAL DEFAULT 0.0,           -- composite SQS (0–100)
+    -- Decision history (from gads_audit_log, last 90d)
+    times_recommended       INTEGER DEFAULT 0,          -- how many times AI recommended an action
+    times_applied           INTEGER DEFAULT 0,          -- how many times admin applied
+    times_rejected          INTEGER DEFAULT 0,          -- how many times admin rejected
+    last_decision_at        TEXT DEFAULT '',            -- most recent Apply/Reject timestamp
+    last_decision           TEXT DEFAULT '',            -- 'applied' or 'rejected'
+    -- Computed signals
+    true_roas               REAL DEFAULT 0.0,           -- od_production_total / cost_usd (0 if no cost)
+    data_age_days           INTEGER DEFAULT 0,          -- days since keyword first seen
+    confidence_tier         TEXT DEFAULT 'low',         -- low (<14d) | medium (14-90d) | high (90d+)
+    rebuilt_at              TEXT NOT NULL               -- when this row was last rebuilt
+    ,UNIQUE(keyword_text, match_type, campaign_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ki_keyword    ON keyword_intelligence(keyword_text, campaign_id);
+CREATE INDEX IF NOT EXISTS idx_ki_date       ON keyword_intelligence(date DESC);
+CREATE INDEX IF NOT EXISTS idx_ki_campaign   ON keyword_intelligence(campaign_id, date DESC);
+CREATE INDEX IF NOT EXISTS idx_ki_roas       ON keyword_intelligence(true_roas DESC);
+CREATE INDEX IF NOT EXISTS idx_ki_sqs        ON keyword_intelligence(session_quality_score DESC);
+
+-- ── Mango Voice call records (PBX metadata, synced every 5 min) ──────────────
+CREATE TABLE IF NOT EXISTS mango_calls (
+    uuid                 TEXT PRIMARY KEY,
+    started_at           TEXT NOT NULL,
+    ended_at             TEXT,
+    direction            TEXT NOT NULL DEFAULT 'inbound',
+    from_number          TEXT,
+    to_number            TEXT,
+    caller_id_name       TEXT,
+    caller_id_number     TEXT,
+    destination_number   TEXT,
+    extension_number     TEXT,
+    answered_by          TEXT,
+    duration_sec         INTEGER DEFAULT 0,
+    status               TEXT,
+    recording_url        TEXT,
+    recording_local_path TEXT,
+    lead_id              TEXT,
+    gads_call_id         TEXT,
+    match_confidence     REAL,
+    match_method         TEXT,
+    -- Call analysis (Phase 2)
+    call_transcript      TEXT,
+    call_summary         TEXT,
+    lead_quality         TEXT,   -- new_patient_inquiry|existing_patient|emergency|provider_referral|spam|wrong_number|other_admin
+    handling_grade       TEXT,   -- excellent|good|needs_coaching|poor (only for new_patient/emergency)
+    booked_outcome       TEXT,   -- booked|quoted_callback|declined|no_action_needed|abandoned
+    call_category        TEXT,   -- free-form AI category label
+    transcription_status TEXT DEFAULT 'pending',  -- pending|in_progress|done|failed|skipped_too_short|skipped_no_audio
+    transcript_model     TEXT,
+    transcribed_at       TEXT,
+    od_appointment_id    TEXT,
+    grade_overridden_by  TEXT,
+    grade_overridden_at  TEXT,
+    grade_override_reason TEXT,
+    raw_payload          TEXT,   -- JSON blob of original Mango API response (for debugging field names)
+    synced_at            TEXT NOT NULL,
+    updated_at           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mango_calls_started    ON mango_calls(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mango_calls_lead       ON mango_calls(lead_id);
+CREATE INDEX IF NOT EXISTS idx_mango_calls_from       ON mango_calls(from_number);
+CREATE INDEX IF NOT EXISTS idx_mango_calls_status     ON mango_calls(status);
+CREATE INDEX IF NOT EXISTS idx_mango_calls_direction  ON mango_calls(direction);
+
+-- ── Google Ads call_view — calls placed directly from the ad ─────────────────
+CREATE TABLE IF NOT EXISTS gads_call_view (
+    call_id                      TEXT PRIMARY KEY,
+    customer_id                  TEXT,
+    campaign_id                  TEXT,
+    campaign_name                TEXT,
+    caller_country_code          TEXT,
+    caller_area_code             TEXT,
+    call_duration_sec            INTEGER DEFAULT 0,
+    call_status                  TEXT,
+    call_type                    TEXT,
+    start_call_date_time         TEXT,
+    synced_at                    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gads_cv_started  ON gads_call_view(start_call_date_time DESC);
+CREATE INDEX IF NOT EXISTS idx_gads_cv_area     ON gads_call_view(caller_area_code);
+CREATE INDEX IF NOT EXISTS idx_gads_cv_campaign ON gads_call_view(campaign_id);
 """
 
 LIFECYCLE_STAGES = [
@@ -745,7 +926,29 @@ def _migrate(conn):
             synced_at       TEXT NOT NULL
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key ON gads_keywords_cache(keyword_text, days)")
+    # M5 fix: migrate the narrow UNIQUE index to include match_type, ad_group_name, campaign_name
+    # so same keyword in different ad groups / match types gets separate rows.
+    try:
+        # Check if old narrow index exists and current index is still narrow
+        existing_indexes = {row[1] for row in conn.execute(
+            "SELECT * FROM sqlite_master WHERE type='index' AND tbl_name='gads_keywords_cache'"
+        ).fetchall()}
+        # Drop the old narrow index if present (may not exist in fresh DBs using new schema)
+        conn.execute("DROP INDEX IF EXISTS idx_gads_kw_cache_key")
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key
+            ON gads_keywords_cache(keyword_text, match_type, ad_group_name, campaign_name, days)
+        """)
+    except Exception as _kw_idx_err:
+        print(f"[db] gads_keywords_cache UNIQUE index migration (non-fatal): {_kw_idx_err}")
+        # Fallback: just ensure the new index exists
+        try:
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key
+                ON gads_keywords_cache(keyword_text, match_type, ad_group_name, campaign_name, days)
+            """)
+        except Exception:
+            pass
 
     # Add quality score and impression share columns to keywords cache (migration)
     kw_cache_cols = {row[1] for row in conn.execute("PRAGMA table_info(gads_keywords_cache)").fetchall()}
@@ -916,12 +1119,203 @@ def _migrate(conn):
     if "skip_workflow" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN skip_workflow INTEGER NOT NULL DEFAULT 0")
 
+    # Sitelinks column — stores JSON list of {title, url, description1, description2}
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "sitelinks" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN sitelinks TEXT DEFAULT ''")
+
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_follow_up_queue_lead_template
         ON follow_up_queue(lead_id, template)
     """)
+
+    # ── Mango calls analysis columns (Call Analysis Phase 1 — May 2026) ──────────
+    mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
+    mango_new_cols = [
+        ("call_transcript",      "TEXT"),
+        ("call_summary",         "TEXT"),
+        ("lead_quality",         "TEXT"),
+        ("handling_grade",       "TEXT"),
+        ("booked_outcome",       "TEXT"),
+        ("call_category",        "TEXT"),
+        ("transcription_status", "TEXT DEFAULT 'pending'"),
+        ("transcript_model",     "TEXT"),
+        ("transcribed_at",       "TEXT"),
+        ("od_appointment_id",    "TEXT"),
+        ("grade_overridden_by",  "TEXT"),
+        ("grade_overridden_at",  "TEXT"),
+        ("grade_override_reason","TEXT"),
+        ("raw_payload",          "TEXT"),
+    ]
+    for col_name, col_type in mango_new_cols:
+        if col_name not in mango_cols:
+            try:
+                conn.execute(f"ALTER TABLE mango_calls ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+    # Composite index for dashboard filters
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_dir_status ON mango_calls(direction, status, started_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_transcript ON mango_calls(transcription_status)")
+
+    # ── Mango calls analysis columns Phase 2 (Call Analysis — May 2026) ─────────
+    mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
+    mango_phase2_cols = [
+        ("team_member",                "TEXT DEFAULT ''"),
+        ("grade_scores_json",          "TEXT DEFAULT ''"),
+        ("grade_overall_score",        "REAL"),
+        ("grade_overall_notes",        "TEXT DEFAULT ''"),
+        ("grade_recommendations_json", "TEXT DEFAULT ''"),
+        ("grade_gradeable",            "INTEGER"),   # 1=gradeable, 0=not, NULL=ungraded
+        ("grade_reason",               "TEXT DEFAULT ''"),  # reason if not gradeable
+        ("graded_at",                  "TEXT DEFAULT ''"),
+        ("summarized_at",              "TEXT DEFAULT ''"),
+        ("is_empty",                   "INTEGER DEFAULT 0"),  # 1=greeting/voicemail only
+        ("pipeline_error",             "TEXT DEFAULT ''"),
+        ("pipeline_attempts",          "INTEGER DEFAULT 0"),
+    ]
+    for col_name, col_type in mango_phase2_cols:
+        if col_name not in mango_cols:
+            try:
+                conn.execute(f"ALTER TABLE mango_calls ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_team_member    ON mango_calls(team_member)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_graded_at      ON mango_calls(graded_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_overall_score  ON mango_calls(grade_overall_score)")
+
+    # ── AI usage cost ledger ──────────────────────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_usage (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts                  TEXT NOT NULL,
+            api                 TEXT NOT NULL,
+            model               TEXT DEFAULT '',
+            purpose             TEXT DEFAULT '',
+            call_id             TEXT DEFAULT '',
+            campaign_id         TEXT DEFAULT '',
+            lead_id             TEXT DEFAULT '',
+            optimizer_run_id    TEXT DEFAULT '',
+            minutes             REAL DEFAULT 0.0,
+            input_tokens        INTEGER DEFAULT 0,
+            output_tokens       INTEGER DEFAULT 0,
+            cache_read_tokens   INTEGER DEFAULT 0,
+            cache_write_tokens  INTEGER DEFAULT 0,
+            cost_usd            REAL DEFAULT 0.0,
+            request_ms          INTEGER DEFAULT 0,
+            error               TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_ts       ON ai_usage(ts DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_api      ON ai_usage(api, ts DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_purpose  ON ai_usage(purpose, ts DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_call     ON ai_usage(call_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_campaign ON ai_usage(campaign_id)")
+
+    # ── Call grading rubric (editable via UI) ─────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS call_grading_criteria (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            weight      INTEGER NOT NULL DEFAULT 0,
+            description TEXT NOT NULL DEFAULT '',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            active      INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        )
+    """)
+
+    # ── Call team members (editable via UI) ───────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS call_team_members (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            extension   TEXT DEFAULT '',
+            active      INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            UNIQUE(name)
+        )
+    """)
+
+    # ── Bulk processing job state ─────────────────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS call_bulk_jobs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            status          TEXT NOT NULL DEFAULT 'queued',
+            date_from       TEXT NOT NULL,
+            date_to         TEXT NOT NULL,
+            do_grade        INTEGER NOT NULL DEFAULT 0,
+            options_json    TEXT DEFAULT '{}',
+            total           INTEGER NOT NULL DEFAULT 0,
+            done            INTEGER NOT NULL DEFAULT 0,
+            graded          INTEGER NOT NULL DEFAULT 0,
+            skipped         INTEGER NOT NULL DEFAULT 0,
+            errors          INTEGER NOT NULL DEFAULT 0,
+            current_label   TEXT DEFAULT '',
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT DEFAULT '',
+            error_msg       TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_call_bulk_jobs_status ON call_bulk_jobs(status, started_at DESC)")
+    # Migration: add options_json column if this is an existing DB without it
+    try:
+        conn.execute("ALTER TABLE call_bulk_jobs ADD COLUMN options_json TEXT DEFAULT '{}'")
+    except Exception:
+        pass  # column already exists
+
+    # ── call_to_revenue view ──────────────────────────────────────────────────────
+    conn.execute("DROP VIEW IF EXISTS call_to_revenue")
+    conn.execute("""
+        CREATE VIEW call_to_revenue AS
+        SELECT
+            mc.uuid                     AS call_uuid,
+            mc.started_at               AS call_started_at,
+            mc.direction,
+            mc.from_number,
+            mc.duration_sec,
+            mc.team_member,
+            mc.lead_quality,
+            mc.handling_grade,
+            mc.booked_outcome,
+            mc.grade_overall_score,
+            mc.is_empty,
+            mc.lead_id,
+            l.first_name                AS lead_first_name,
+            l.last_name                 AS lead_last_name,
+            l.email                     AS lead_email,
+            l.stage                     AS lead_stage,
+            l.campaign_name             AS lead_campaign_name,
+            l.campaign_id               AS lead_campaign_id,
+            l.gclid                     AS lead_gclid,
+            l.attributed_production     AS lead_production,
+            l.attributed_income         AS lead_income,
+            l.treatment_plan_value      AS lead_tx_plan_value,
+            l.appointment_date          AS lead_appt_date,
+            l.appointment_status        AS lead_appt_status,
+            mc.gads_call_id,
+            gcv.campaign_name           AS gads_campaign_name,
+            gcv.campaign_id             AS gads_campaign_id,
+            gcv.call_duration_sec       AS gads_call_duration_sec
+        FROM mango_calls mc
+        LEFT JOIN leads          l   ON l.id = mc.lead_id
+                                     AND mc.lead_id IS NOT NULL
+                                     AND mc.lead_id != ''
+        LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+    """)
+
+    # Seed grading rubric on first run
+    n_crit = conn.execute("SELECT COUNT(*) FROM call_grading_criteria").fetchone()[0]
+    if n_crit == 0:
+        _seed_call_grading_criteria(conn)
+
+    # Seed team members from extension map on first run
+    n_tm = conn.execute("SELECT COUNT(*) FROM call_team_members").fetchone()[0]
+    if n_tm == 0:
+        _seed_call_team_members(conn)
 
     # Seed default workflow if no workflows exist
     existing_workflows = conn.execute("SELECT COUNT(*) FROM workflows").fetchone()[0]
@@ -1089,6 +1483,122 @@ def _migrate(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ad_metrics_date ON gads_ad_metrics(date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ad_metrics_ad   ON gads_ad_metrics(ad_id, date)")
 
+    # ── Phase A: Feedback Loop Foundation ─────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS keyword_production_log (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at           TEXT NOT NULL,
+            lead_id             TEXT NOT NULL,
+            keyword_text        TEXT NOT NULL DEFAULT '',
+            match_type          TEXT NOT NULL DEFAULT '',
+            campaign_id         TEXT NOT NULL DEFAULT '',
+            campaign_name       TEXT NOT NULL DEFAULT '',
+            ad_group_name       TEXT NOT NULL DEFAULT '',
+            gclid               TEXT NOT NULL DEFAULT '',
+            od_patient_num      TEXT NOT NULL DEFAULT '',
+            production_amount   REAL NOT NULL DEFAULT 0.0,
+            procedure_codes     TEXT NOT NULL DEFAULT '[]',
+            match_method        TEXT NOT NULL DEFAULT '',
+            appointment_date    TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (lead_id) REFERENCES leads(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kpl_keyword ON keyword_production_log(keyword_text, campaign_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kpl_lead    ON keyword_production_log(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kpl_logged  ON keyword_production_log(logged_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kpl_gclid   ON keyword_production_log(gclid)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS applied_outcomes (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id           TEXT NOT NULL UNIQUE,
+            applied_at          TEXT NOT NULL,
+            operation           TEXT NOT NULL,
+            entity_type         TEXT NOT NULL,
+            entity_id           TEXT NOT NULL,
+            entity_name         TEXT NOT NULL,
+            campaign_id         TEXT NOT NULL DEFAULT '',
+            campaign_name       TEXT NOT NULL DEFAULT '',
+            pre_impressions_7d  INTEGER DEFAULT 0,
+            pre_clicks_7d       INTEGER DEFAULT 0,
+            pre_cost_7d         REAL DEFAULT 0.0,
+            pre_conversions_7d  REAL DEFAULT 0.0,
+            pre_cpc             REAL DEFAULT 0.0,
+            post_7d_json        TEXT DEFAULT '{}',
+            post_30d_json       TEXT DEFAULT '{}',
+            post_90d_json       TEXT DEFAULT '{}',
+            outcome_7d_at       TEXT DEFAULT '',
+            outcome_30d_at      TEXT DEFAULT '',
+            outcome_90d_at      TEXT DEFAULT '',
+            verdict             TEXT DEFAULT 'pending',
+            verdict_reason      TEXT DEFAULT '',
+            ai_reason           TEXT DEFAULT '',
+            optimizer_run_id    TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ao_applied  ON applied_outcomes(applied_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ao_campaign ON applied_outcomes(campaign_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ao_verdict  ON applied_outcomes(verdict)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ao_entity   ON applied_outcomes(entity_id)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS keyword_intelligence (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            date                    TEXT NOT NULL,
+            keyword_text            TEXT NOT NULL,
+            match_type              TEXT NOT NULL DEFAULT '',
+            campaign_id             TEXT NOT NULL DEFAULT '',
+            campaign_name           TEXT NOT NULL DEFAULT '',
+            ad_group_name           TEXT NOT NULL DEFAULT '',
+            impressions             INTEGER DEFAULT 0,
+            clicks                  INTEGER DEFAULT 0,
+            cost_usd                REAL DEFAULT 0.0,
+            avg_cpc                 REAL DEFAULT 0.0,
+            conversions             REAL DEFAULT 0.0,
+            quality_score           INTEGER DEFAULT 0,
+            impression_share        REAL DEFAULT 0.0,
+            od_appointments         INTEGER DEFAULT 0,
+            od_production_total     REAL DEFAULT 0.0,
+            od_production_per_click REAL DEFAULT 0.0,
+            ga4_sessions            INTEGER DEFAULT 0,
+            ga4_avg_duration_sec    REAL DEFAULT 0.0,
+            ga4_bounce_rate         REAL DEFAULT 0.0,
+            ga4_lead_events         INTEGER DEFAULT 0,
+            session_quality_score   REAL DEFAULT 0.0,
+            times_recommended       INTEGER DEFAULT 0,
+            times_applied           INTEGER DEFAULT 0,
+            times_rejected          INTEGER DEFAULT 0,
+            last_decision_at        TEXT DEFAULT '',
+            last_decision           TEXT DEFAULT '',
+            true_roas               REAL DEFAULT 0.0,
+            data_age_days           INTEGER DEFAULT 0,
+            confidence_tier         TEXT DEFAULT 'low',
+            rebuilt_at              TEXT NOT NULL,
+            UNIQUE(keyword_text, match_type, campaign_id, date)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ki_keyword  ON keyword_intelligence(keyword_text, campaign_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ki_date     ON keyword_intelligence(date DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ki_campaign ON keyword_intelligence(campaign_id, date DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ki_roas     ON keyword_intelligence(true_roas DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ki_sqs      ON keyword_intelligence(session_quality_score DESC)")
+
+    # Add reject_reason column to gads_audit_log (migration for existing DBs)
+    audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(gads_audit_log)").fetchall()}
+    if "reject_reason" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN reject_reason TEXT DEFAULT ''")
+
+    # M4 fix: add UNIQUE(lead_id, od_patient_num) to keyword_production_log for existing DBs.
+    # SQLite doesn't support ALTER TABLE ADD CONSTRAINT, so we use CREATE UNIQUE INDEX.
+    # ON CONFLICT REPLACE semantics are handled at insert time via INSERT OR REPLACE.
+    try:
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_kpl_lead_patient
+            ON keyword_production_log(lead_id, od_patient_num)
+        """)
+    except Exception as _kpl_idx_err:
+        print(f"[db] keyword_production_log UNIQUE index (non-fatal, may already exist): {_kpl_idx_err}")
+
     # ── Step 10b: Phone hash normalization backfill ────────────────────────────
     # Re-hash all leads using _hash_phone() (last-10-digits) so Twilio E.164
     # lookups resolve correctly. Safe: 10-digit stored phones produce the same
@@ -1184,6 +1694,55 @@ def _migrate(conn):
         )
         if cur.rowcount:
             print(f"[db] Cleared tombstone for test email: {_te} ({cur.rowcount} row(s))")
+
+
+def _seed_call_grading_criteria(conn):
+    """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
+    now = datetime.now(timezone.utc).isoformat()
+    criteria = [
+        (1,  "Enthusiasm & Warmth", 15,
+         "Did the team member sound enthusiastic, upbeat, and genuinely welcoming throughout the call? "
+         "People can feel your emotions over the phone — the goal is to sound bubbly and excited, not flat or rushed."),
+        (2,  "Proper Greeting", 10,
+         "Did the team member answer with the correct greeting: 'Thank you for calling [Practice], this is [Name], "
+         "how can I help you?' Was the call answered promptly (within 3 rings)?"),
+        (3,  "Call Control & Follow-Up Questions", 20,
+         "Did the team member take control of the call — answering the patient's question quickly and immediately "
+         "following up with their own question? Did they keep asking questions rather than letting the call go flat? "
+         "Did they ask 'How did you hear about us?'"),
+        (4,  "Information Collection", 20,
+         "For new patients, did the team member collect all 6 required pieces of information: "
+         "(1) Name, (2) Date of birth, (3) Email, (4) Cell phone, "
+         "(5) How they heard about the office, (6) Whether other family members need an appointment?"),
+        (5,  "Appointment Scheduling Technique", 15,
+         "Did the team member offer two specific appointment time options (prioritizing today and tomorrow)? "
+         "Did they ask about scheduling other family members? Did they repeat and confirm the appointment time? "
+         "Did they ask the patient to call ASAP if anything changes?"),
+        (6,  "Empathy & Concern Handling", 10,
+         "Did the team member show genuine empathy for patients in pain or distress? Did they handle cost and "
+         "insurance questions correctly — giving a price range then redirecting with a question — without "
+         "proactively asking about insurance unless the patient raised it?"),
+        (7,  "Active Listening & Clear Communication", 10,
+         "Did the team member practice 'silence is golden' — stop talking after asking a question and wait for "
+         "the patient to speak? Did they avoid TMI (too much information), keeping answers concise and not over-explaining?"),
+    ]
+    for sort_order, name, weight, description in criteria:
+        conn.execute(
+            "INSERT OR IGNORE INTO call_grading_criteria "
+            "(name, weight, description, sort_order, active, created_at, updated_at) VALUES (?,?,?,?,1,?,?)",
+            (name, weight, description, sort_order, now, now)
+        )
+
+
+def _seed_call_team_members(conn):
+    """Seed default team members from mango_service EXTENSION_MAP."""
+    now = datetime.now(timezone.utc).isoformat()
+    defaults = [("Olivia", "101"), ("Ivette", "103")]
+    for name, extension in defaults:
+        conn.execute(
+            "INSERT OR IGNORE INTO call_team_members (name, extension, active, created_at, updated_at) VALUES (?,?,1,?,?)",
+            (name, extension, now, now)
+        )
 
 
 def _seed_default_workflow(conn):
@@ -2373,7 +2932,7 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
         "campaign_name", "service_focus", "monthly_budget", "start_date",
         "end_date", "notes", "promo_offer", "landing_page", "objective",
         "target_audience", "expected_cpl", "geographic_targeting",
-        "launch_date", "call_extension_phone", "skip_workflow",
+        "launch_date", "call_extension_phone", "skip_workflow", "sitelinks",
     }
     safe = {k: v for k, v in fields.items() if k in ALLOWED}
     if not safe:
@@ -2587,7 +3146,7 @@ def save_gads_keywords_cache(keywords: list, days: int = 30):
                      abs_top_impression_pct, budget_lost_is, rank_lost_is,
                      days, synced_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(keyword_text, days) DO UPDATE SET
+                ON CONFLICT(keyword_text, match_type, ad_group_name, campaign_name, days) DO UPDATE SET
                     match_type=excluded.match_type,
                     ad_group_name=excluded.ad_group_name,
                     campaign_name=excluded.campaign_name,
@@ -4072,3 +4631,721 @@ def clear_next_action(lead_id: str) -> None:
             "UPDATE leads SET next_action_at='', next_action_note='' WHERE id=?",
             (lead_id,)
         )
+
+
+# ─── Phase A: Feedback Loop — Keyword Production Log ─────────────────────────
+
+def append_keyword_production_log(
+    lead_id: str,
+    keyword_text: str,
+    match_type: str,
+    campaign_id: str,
+    campaign_name: str,
+    ad_group_name: str,
+    gclid: str,
+    od_patient_num: str,
+    production_amount: float,
+    procedure_codes: list,
+    match_method: str,
+    appointment_date: str,
+) -> dict:
+    """Upsert one OD-attributed production event for a keyword click.
+
+    M3+M4 fix: uses INSERT OR REPLACE on UNIQUE(lead_id, od_patient_num) so:
+    - First call creates the row (new match)
+    - Subsequent calls for the same (lead, patient) update production_amount
+      to reflect cumulative OD production (crown work added 60 days later, etc.)
+    - Prevents double-counting if OD sync runs multiple times
+    """
+    import json as _json
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute(
+            """INSERT OR REPLACE INTO keyword_production_log
+               (logged_at, lead_id, keyword_text, match_type, campaign_id, campaign_name,
+                ad_group_name, gclid, od_patient_num, production_amount, procedure_codes,
+                match_method, appointment_date)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now, lead_id, keyword_text.lower().strip(), match_type, campaign_id,
+             campaign_name, ad_group_name, gclid, od_patient_num, production_amount,
+             _json.dumps(procedure_codes), match_method, appointment_date),
+        )
+        row = conn.execute(
+            "SELECT * FROM keyword_production_log WHERE rowid=?", (cur.lastrowid,)
+        ).fetchone()
+        return dict(row) if row else {}
+
+
+def get_keyword_production_log(
+    keyword_text: str = "",
+    campaign_id: str = "",
+    days: int = 90,
+) -> list:
+    """Return production log rows, optionally filtered by keyword and/or campaign."""
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        if keyword_text and campaign_id:
+            rows = conn.execute(
+                "SELECT * FROM keyword_production_log "
+                "WHERE keyword_text=? AND campaign_id=? AND logged_at>=? ORDER BY logged_at DESC",
+                (keyword_text.lower(), campaign_id, cutoff),
+            ).fetchall()
+        elif keyword_text:
+            rows = conn.execute(
+                "SELECT * FROM keyword_production_log "
+                "WHERE keyword_text=? AND logged_at>=? ORDER BY logged_at DESC",
+                (keyword_text.lower(), cutoff),
+            ).fetchall()
+        elif campaign_id:
+            rows = conn.execute(
+                "SELECT * FROM keyword_production_log "
+                "WHERE campaign_id=? AND logged_at>=? ORDER BY logged_at DESC",
+                (campaign_id, cutoff),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM keyword_production_log "
+                "WHERE logged_at>=? ORDER BY logged_at DESC",
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ─── Phase A: Feedback Loop — Applied Outcomes ───────────────────────────────
+
+def snapshot_applied_outcome(
+    action_id: str,
+    operation: str,
+    entity_type: str,
+    entity_id: str,
+    entity_name: str,
+    campaign_id: str,
+    campaign_name: str,
+    before_state: dict,
+    ai_reason: str = "",
+    optimizer_run_id: str = "",
+) -> None:
+    """Snapshot an applied action for T+7/T+30/T+90 outcome tracking."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO applied_outcomes
+               (action_id, applied_at, operation, entity_type, entity_id, entity_name,
+                campaign_id, campaign_name, pre_impressions_7d, pre_clicks_7d,
+                pre_cost_7d, pre_conversions_7d, pre_cpc, ai_reason, optimizer_run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (action_id, now, operation, entity_type, entity_id, entity_name,
+             campaign_id, campaign_name,
+             int(before_state.get("impressions", 0)),
+             int(before_state.get("clicks", 0)),
+             float(before_state.get("cost_micros", 0)) / 1_000_000,
+             float(before_state.get("conversions", 0)),
+             float(before_state.get("avg_cpc", 0)),
+             ai_reason, optimizer_run_id),
+        )
+
+
+def get_pending_outcome_snapshots(window_days: int = 7) -> list:
+    """Return applied_outcomes rows whose post_{window_days}d_json hasn't been filled yet."""
+    col = f"post_{window_days}d_json"
+    filled_col = f"outcome_{window_days}d_at"
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM applied_outcomes WHERE {filled_col}='' ORDER BY applied_at ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_outcome_snapshot(action_id: str, window_days: int, stats: dict) -> None:
+    """Fill in post-action stats at T+N window."""
+    import json as _json
+    now = datetime.now(timezone.utc).isoformat()
+    col_json = f"post_{window_days}d_json"
+    col_at = f"outcome_{window_days}d_at"
+    with _conn() as conn:
+        conn.execute(
+            f"UPDATE applied_outcomes SET {col_json}=?, {col_at}=? WHERE action_id=?",
+            (_json.dumps(stats), now, action_id),
+        )
+
+
+# ─── Phase A: Feedback Loop — Keyword Intelligence ───────────────────────────
+
+def upsert_keyword_intelligence(rows: list) -> int:
+    """Bulk upsert keyword_intelligence rows (from nightly rebuild job).
+    Each row is a dict matching the table columns.
+    Returns count of rows written."""
+    import json as _json
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    with _conn() as conn:
+        for r in rows:
+            conn.execute(
+                """INSERT INTO keyword_intelligence
+                   (date, keyword_text, match_type, campaign_id, campaign_name,
+                    ad_group_name, impressions, clicks, cost_usd, avg_cpc, conversions,
+                    quality_score, impression_share, od_appointments, od_production_total,
+                    od_production_per_click, ga4_sessions, ga4_avg_duration_sec,
+                    ga4_bounce_rate, ga4_lead_events, session_quality_score,
+                    times_recommended, times_applied, times_rejected,
+                    last_decision_at, last_decision, true_roas,
+                    data_age_days, confidence_tier, rebuilt_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(keyword_text, match_type, campaign_id, date)
+                   DO UPDATE SET
+                     impressions=excluded.impressions, clicks=excluded.clicks,
+                     cost_usd=excluded.cost_usd, avg_cpc=excluded.avg_cpc,
+                     conversions=excluded.conversions, quality_score=excluded.quality_score,
+                     impression_share=excluded.impression_share,
+                     od_appointments=excluded.od_appointments,
+                     od_production_total=excluded.od_production_total,
+                     od_production_per_click=excluded.od_production_per_click,
+                     ga4_sessions=excluded.ga4_sessions,
+                     ga4_avg_duration_sec=excluded.ga4_avg_duration_sec,
+                     ga4_bounce_rate=excluded.ga4_bounce_rate,
+                     ga4_lead_events=excluded.ga4_lead_events,
+                     session_quality_score=excluded.session_quality_score,
+                     times_recommended=excluded.times_recommended,
+                     times_applied=excluded.times_applied,
+                     times_rejected=excluded.times_rejected,
+                     last_decision_at=excluded.last_decision_at,
+                     last_decision=excluded.last_decision,
+                     true_roas=excluded.true_roas, data_age_days=excluded.data_age_days,
+                     confidence_tier=excluded.confidence_tier, rebuilt_at=excluded.rebuilt_at
+                """,
+                (
+                    r.get("date", now[:10]),
+                    r.get("keyword_text", "").lower().strip(),
+                    r.get("match_type", ""),
+                    r.get("campaign_id", ""),
+                    r.get("campaign_name", ""),
+                    r.get("ad_group_name", ""),
+                    int(r.get("impressions", 0)),
+                    int(r.get("clicks", 0)),
+                    float(r.get("cost_usd", 0.0)),
+                    float(r.get("avg_cpc", 0.0)),
+                    float(r.get("conversions", 0.0)),
+                    int(r.get("quality_score", 0)),
+                    float(r.get("impression_share", 0.0)),
+                    int(r.get("od_appointments", 0)),
+                    float(r.get("od_production_total", 0.0)),
+                    float(r.get("od_production_per_click", 0.0)),
+                    int(r.get("ga4_sessions", 0)),
+                    float(r.get("ga4_avg_duration_sec", 0.0)),
+                    float(r.get("ga4_bounce_rate", 0.0)),
+                    int(r.get("ga4_lead_events", 0)),
+                    float(r.get("session_quality_score", 0.0)),
+                    int(r.get("times_recommended", 0)),
+                    int(r.get("times_applied", 0)),
+                    int(r.get("times_rejected", 0)),
+                    r.get("last_decision_at", ""),
+                    r.get("last_decision", ""),
+                    float(r.get("true_roas", 0.0)),
+                    int(r.get("data_age_days", 0)),
+                    r.get("confidence_tier", "low"),
+                    now,
+                ),
+            )
+            written += 1
+    return written
+
+
+def get_keyword_intelligence(
+    campaign_id: str = "",
+    min_clicks: int = 0,
+    days: int = 30,
+) -> list:
+    """Return keyword intelligence rows for the optimizer to read."""
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()[:10]
+    with _conn() as conn:
+        if campaign_id:
+            rows = conn.execute(
+                "SELECT * FROM keyword_intelligence "
+                "WHERE campaign_id=? AND date>=? AND clicks>=? "
+                "ORDER BY date DESC, true_roas DESC",
+                (campaign_id, cutoff, min_clicks),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM keyword_intelligence "
+                "WHERE date>=? AND clicks>=? ORDER BY date DESC, true_roas DESC",
+                (cutoff, min_clicks),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ─── Phase A: Feedback Loop — Decision History helpers ───────────────────────
+
+def get_recent_rejections(entity_id: str = "", days: int = 30) -> list:
+    """Return audit log rows where execution_result='rejected', optionally filtered by entity."""
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        if entity_id:
+            rows = conn.execute(
+                "SELECT * FROM gads_audit_log "
+                "WHERE execution_result='rejected' AND entity_id=? AND created_at>=? "
+                "ORDER BY created_at DESC",
+                (entity_id, cutoff),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM gads_audit_log "
+                "WHERE execution_result='rejected' AND created_at>=? ORDER BY created_at DESC",
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def record_reject_reason(action_id: str, reject_reason: str) -> None:
+    """Store the reject_reason when admin rejects an optimizer recommendation."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE gads_audit_log SET reject_reason=?, updated_at=? WHERE action_id=?",
+            (reject_reason, now, action_id),
+        )
+
+
+# ─── Mango Voice helpers ──────────────────────────────────────────────────────
+
+def upsert_mango_call(call: dict) -> None:
+    """Insert or update a Mango call record. call must have 'uuid' key."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO mango_calls
+               (uuid, started_at, ended_at, direction, from_number, to_number,
+                caller_id_name, caller_id_number, destination_number,
+                extension_number, answered_by, duration_sec, status,
+                recording_url, recording_local_path,
+                lead_id, gads_call_id, match_confidence, match_method,
+                raw_payload, synced_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(uuid) DO UPDATE SET
+                 ended_at=excluded.ended_at,
+                 direction=excluded.direction,
+                 from_number=excluded.from_number,
+                 to_number=excluded.to_number,
+                 caller_id_name=excluded.caller_id_name,
+                 caller_id_number=excluded.caller_id_number,
+                 destination_number=excluded.destination_number,
+                 extension_number=excluded.extension_number,
+                 answered_by=excluded.answered_by,
+                 duration_sec=excluded.duration_sec,
+                 status=excluded.status,
+                 recording_url=COALESCE(excluded.recording_url, mango_calls.recording_url),
+                 recording_local_path=COALESCE(excluded.recording_local_path, mango_calls.recording_local_path),
+                 lead_id=COALESCE(excluded.lead_id, mango_calls.lead_id),
+                 gads_call_id=COALESCE(excluded.gads_call_id, mango_calls.gads_call_id),
+                 match_confidence=COALESCE(excluded.match_confidence, mango_calls.match_confidence),
+                 match_method=COALESCE(excluded.match_method, mango_calls.match_method),
+                 raw_payload=excluded.raw_payload,
+                 updated_at=excluded.updated_at
+            """,
+            (
+                call["uuid"],
+                call.get("started_at", ""),
+                call.get("ended_at"),
+                call.get("direction", "inbound"),
+                call.get("from_number"),
+                call.get("to_number"),
+                call.get("caller_id_name"),
+                call.get("caller_id_number"),
+                call.get("destination_number"),
+                call.get("extension_number"),
+                call.get("answered_by"),
+                int(call.get("duration_sec", 0)),
+                call.get("status"),
+                call.get("recording_url"),
+                call.get("recording_local_path"),
+                call.get("lead_id"),
+                call.get("gads_call_id"),
+                call.get("match_confidence"),
+                call.get("match_method"),
+                call.get("raw_payload"),
+                now,
+                now,
+            ),
+        )
+
+
+def get_mango_calls(
+    limit: int = 100,
+    offset: int = 0,
+    direction: str = "",
+    status: str = "",
+    days: int = 30,
+) -> list:
+    """Return mango_calls rows, newest first."""
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()
+    clauses = ["started_at >= ?"]
+    params: list = [cutoff]
+    if direction:
+        clauses.append("direction = ?")
+        params.append(direction)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    where = " AND ".join(clauses)
+    params.extend([limit, offset])
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM mango_calls WHERE {where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            params,
+        ).fetchall()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM mango_calls WHERE {where}",
+            params[:-2],
+        ).fetchone()[0]
+    return [dict(r) for r in rows], total
+
+
+def get_mango_call(uuid: str) -> dict | None:
+    """Return a single mango_call by uuid."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM mango_calls WHERE uuid=?", (uuid,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_mango_call_attribution(
+    uuid: str,
+    lead_id: str = None,
+    gads_call_id: str = None,
+    match_confidence: float = None,
+    match_method: str = None,
+) -> None:
+    """Update attribution fields on a mango_calls row."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE mango_calls SET
+               lead_id=COALESCE(?,lead_id),
+               gads_call_id=COALESCE(?,gads_call_id),
+               match_confidence=COALESCE(?,match_confidence),
+               match_method=COALESCE(?,match_method),
+               updated_at=?
+               WHERE uuid=?""",
+            (lead_id, gads_call_id, match_confidence, match_method, now, uuid),
+        )
+
+
+def get_mango_calls_unmatched(days: int = 7) -> list:
+    """Return inbound mango_calls with no gads_call_id attribution, for the matcher."""
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM mango_calls
+               WHERE direction='inbound' AND gads_call_id IS NULL
+               AND started_at >= ? ORDER BY started_at DESC""",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_missed_mango_calls_since(since_iso: str) -> list:
+    """Return missed inbound calls since a given ISO timestamp (for Inbox alerts)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM mango_calls
+               WHERE direction='inbound' AND status='missed'
+               AND started_at >= ? ORDER BY started_at DESC""",
+            (since_iso,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ─── Google Ads call_view helpers ─────────────────────────────────────────────
+
+def upsert_gads_call_view(call: dict) -> None:
+    """Insert or ignore a Google Ads call_view record."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO gads_call_view
+               (call_id, customer_id, campaign_id, campaign_name,
+                caller_country_code, caller_area_code,
+                call_duration_sec, call_status, call_type,
+                start_call_date_time, synced_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(call_id) DO UPDATE SET
+                 call_duration_sec=excluded.call_duration_sec,
+                 call_status=excluded.call_status,
+                 synced_at=excluded.synced_at""",
+            (
+                call["call_id"],
+                call.get("customer_id", ""),
+                call.get("campaign_id", ""),
+                call.get("campaign_name", ""),
+                call.get("caller_country_code", ""),
+                call.get("caller_area_code", ""),
+                int(call.get("call_duration_sec", 0)),
+                call.get("call_status", ""),
+                call.get("call_type", ""),
+                call.get("start_call_date_time", ""),
+                now,
+            ),
+        )
+
+
+def get_gads_call_view(days: int = 30) -> list:
+    """Return recent Google Ads call_view rows for attribution matching."""
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM gads_call_view WHERE start_call_date_time >= ? ORDER BY start_call_date_time DESC",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── AI Usage helpers ───────────────────────────────────────────────────────────
+
+def insert_ai_usage(
+    api: str,
+    purpose: str,
+    cost_usd: float,
+    model: str = "",
+    call_id: str = "",
+    campaign_id: str = "",
+    lead_id: str = "",
+    optimizer_run_id: str = "",
+    minutes: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    request_ms: int = 0,
+    error: str = "",
+) -> None:
+    """Insert one AI usage row into ai_usage table."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO ai_usage
+               (ts, api, model, purpose, call_id, campaign_id, lead_id, optimizer_run_id,
+                minutes, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                cost_usd, request_ms, error)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now, api, model, purpose, call_id, campaign_id, lead_id, optimizer_run_id,
+             minutes, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             round(cost_usd, 8), request_ms, error),
+        )
+
+
+def get_ai_cost_summary(days: int = 30) -> dict:
+    """Return cost totals grouped by api, model, and purpose for the given window + lifetime."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    cutoff_window = (now - timedelta(days=days)).isoformat(timespec="seconds")
+
+    def _query(cutoff=None):
+        where = "WHERE ts >= ?" if cutoff else ""
+        params = (cutoff,) if cutoff else ()
+        with _conn() as conn:
+            total_row = conn.execute(
+                f"SELECT SUM(cost_usd) as cost, SUM(minutes) as mins, "
+                f"SUM(input_tokens+output_tokens) as tokens FROM ai_usage {where}", params
+            ).fetchone()
+            by_api = conn.execute(
+                f"SELECT api, SUM(cost_usd) as cost, SUM(minutes) as mins, "
+                f"SUM(input_tokens+output_tokens) as tokens, COUNT(*) as calls "
+                f"FROM ai_usage {where} GROUP BY api", params
+            ).fetchall()
+            by_model = conn.execute(
+                f"SELECT model, api, SUM(cost_usd) as cost, COUNT(*) as calls "
+                f"FROM ai_usage {where} GROUP BY model, api ORDER BY cost DESC", params
+            ).fetchall()
+            by_purpose = conn.execute(
+                f"SELECT purpose, api, SUM(cost_usd) as cost, COUNT(*) as calls "
+                f"FROM ai_usage {where} GROUP BY purpose ORDER BY cost DESC", params
+            ).fetchall()
+            daily = conn.execute(
+                f"SELECT substr(ts,1,10) as date, api, SUM(cost_usd) as cost "
+                f"FROM ai_usage {where} GROUP BY date, api ORDER BY date DESC LIMIT 90", params
+            ).fetchall()
+        return {
+            "total_cost": round(total_row["cost"] or 0, 4),
+            "total_minutes": round(total_row["mins"] or 0, 2),
+            "total_tokens": int(total_row["tokens"] or 0),
+            "by_api": {r["api"]: {"cost": round(r["cost"] or 0, 4), "mins": round(r["mins"] or 0, 2),
+                                   "tokens": int(r["tokens"] or 0), "calls": r["calls"]}
+                       for r in by_api},
+            "by_model": [{"model": r["model"], "api": r["api"],
+                          "cost": round(r["cost"] or 0, 4), "calls": r["calls"]} for r in by_model],
+            "by_purpose": [{"purpose": r["purpose"], "api": r["api"],
+                            "cost": round(r["cost"] or 0, 4), "calls": r["calls"]} for r in by_purpose],
+            "daily": [{"date": r["date"], "api": r["api"],
+                       "cost": round(r["cost"] or 0, 4)} for r in daily],
+        }
+
+    window = _query(cutoff_window)
+    lifetime = _query(None)
+    return {"window_days": days, "window": window, "lifetime": lifetime}
+
+
+# ── Call grading criteria helpers ──────────────────────────────────────────────
+
+def get_call_grading_criteria() -> list:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM call_grading_criteria WHERE active=1 ORDER BY sort_order"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_call_grading_criteria(criteria: list) -> None:
+    """Replace all active criteria with the supplied list (transactional)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute("DELETE FROM call_grading_criteria")
+        for i, c in enumerate(criteria):
+            conn.execute(
+                "INSERT INTO call_grading_criteria (name, weight, description, sort_order, active, created_at, updated_at) "
+                "VALUES (?,?,?,?,1,?,?)",
+                (c.get("name",""), int(c.get("weight", 0)), c.get("description",""), i, now, now)
+            )
+
+
+def reset_call_grading_criteria() -> None:
+    """Restore the 7 default Grafton criteria."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM call_grading_criteria")
+        _seed_call_grading_criteria(conn)
+
+
+# ── Call team members helpers ──────────────────────────────────────────────────
+
+def get_call_team_members() -> list:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM call_team_members ORDER BY name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_call_team_members(members: list) -> None:
+    """Replace team members list (transactional)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute("DELETE FROM call_team_members")
+        for m in members:
+            conn.execute(
+                "INSERT OR IGNORE INTO call_team_members (name, extension, active, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (m.get("name",""), m.get("extension",""), 1 if m.get("active", True) else 0, now, now)
+            )
+
+
+# ── Call bulk job helpers ──────────────────────────────────────────────────────
+
+def insert_call_bulk_job(
+    date_from: str,
+    date_to: str,
+    do_grade: bool,
+    options: Optional[dict] = None,
+) -> int:
+    """Create a new bulk job record, return its ID."""
+    now = datetime.now(timezone.utc).isoformat()
+    opts_json = json.dumps(options or {})
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO call_bulk_jobs (status, date_from, date_to, do_grade, options_json, started_at) VALUES (?,?,?,?,?,?)",
+            ("queued", date_from, date_to, 1 if do_grade else 0, opts_json, now)
+        )
+        return cur.lastrowid
+
+
+def get_call_bulk_job(job_id: int) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM call_bulk_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["options"] = json.loads(d.get("options_json") or "{}")
+    except Exception:
+        d["options"] = {}
+    return d
+
+
+def get_active_call_bulk_job() -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM call_bulk_jobs WHERE status IN ('queued','running') ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_call_bulk_job(job_id: int, **kwargs) -> None:
+    _BULK_JOB_COLS = {
+        "status", "total", "done", "graded", "skipped", "errors",
+        "current_label", "started_at", "finished_at", "error_msg",
+    }
+    fields = {k: v for k, v in kwargs.items() if k in _BULK_JOB_COLS}
+    if not fields:
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [job_id]
+    with _conn() as conn:
+        conn.execute(f"UPDATE call_bulk_jobs SET {sets} WHERE id=?", vals)
+
+
+# ── Mango pipeline helpers ─────────────────────────────────────────────────────
+
+def update_mango_call_analysis(uuid: str, **kwargs) -> None:
+    """Update any subset of analysis columns on a mango_calls row."""
+    _ALLOWED_COLS = {
+        "transcript", "summary", "team_member",
+        "grade_scores_json", "grade_overall_score", "grade_overall_notes",
+        "grade_recommendations_json", "grade_gradeable", "grade_reason",
+        "graded_at", "summarized_at", "is_empty", "pipeline_error", "pipeline_attempts",
+        "lead_id", "gads_resource_name", "transcription_status",
+    }
+    fields = {k: v for k, v in kwargs.items() if k in _ALLOWED_COLS}
+    if not fields:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    fields["updated_at"] = now
+    sets = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [uuid]
+    with _conn() as conn:
+        conn.execute(f"UPDATE mango_calls SET {sets} WHERE uuid=?", vals)
+
+
+def get_calls_needing_processing(
+    min_seconds: int = 30,
+    max_attempts: int = 3,
+    batch_size: int = 20,
+    days_back: int = 90,
+) -> list:
+    """Return mango_calls that need transcription/analysis, newest first."""
+    cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days_back)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM mango_calls
+               WHERE direction = 'inbound'
+                 AND duration_sec >= ?
+                 AND status NOT IN ('missed', 'busy')
+                 AND (transcription_status IS NULL OR transcription_status IN ('pending', 'failed'))
+                 AND (pipeline_attempts IS NULL OR pipeline_attempts < ?)
+                 AND started_at >= ?
+               ORDER BY started_at DESC
+               LIMIT ?""",
+            (min_seconds, max_attempts, cutoff, batch_size)
+        ).fetchall()
+    return [dict(r) for r in rows]
