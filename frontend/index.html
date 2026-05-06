@@ -3843,14 +3843,22 @@ function CallPerformanceSubView() {
   );
 }
 
-// ── CallSettingsSubView — criteria editor + team members ──────────────────────
+// ── CallSettingsSubView — pipeline toggles + criteria editor + team members ────
 
 function CallSettingsSubView() {
+  // ── Pipeline toggles state ──────────────────────────────────────────────────
+  const PIPE_EMPTY = { mango_enabled: false, mango_pipeline_enabled: false, mango_pipeline_auto_grade: true };
+  const [pipeForm, setPipeForm]   = useState(PIPE_EMPTY);
+  const [pipeLoading, setPipeLoading] = useState(true);
+  const [pipeSaving, setPipeSaving]   = useState(false);
+  const [pipeMsg, setPipeMsg]         = useState('');
+
   // ── Criteria state ──────────────────────────────────────────────────────────
-  const [criteria, setCriteria]     = useState([]);
+  const [criteria, setCriteria]       = useState([]);
   const [critLoading, setCritLoading] = useState(true);
-  const [critSaving, setCritSaving] = useState(false);
-  const [critMsg, setCritMsg]       = useState('');
+  const [critSaving, setCritSaving]   = useState(false);
+  const [critMsg, setCritMsg]         = useState('');
+  const [newCritName, setNewCritName] = useState('');
 
   // ── Team members state ──────────────────────────────────────────────────────
   const [members, setMembers]       = useState([]);
@@ -3861,19 +3869,54 @@ function CallSettingsSubView() {
   const [newExt, setNewExt]         = useState('');
 
   useEffect(() => {
-    // Load both on mount
+    // Load pipeline settings
+    api('/api/admin/mango-settings')
+      .then(d => setPipeForm({
+        mango_enabled:             !!d.mango_enabled,
+        mango_pipeline_enabled:    !!d.mango_pipeline_enabled,
+        mango_pipeline_auto_grade: d.mango_pipeline_auto_grade !== false,
+      }))
+      .catch(() => {})
+      .finally(() => setPipeLoading(false));
+
+    // Load criteria — normalize active→enabled
     setCritLoading(true);
     api('/api/admin/calls/analysis/criteria')
-      .then(d => setCriteria(d.criteria || []))
-      .catch(e => setCritMsg('✗ Failed to load criteria'))
+      .then(d => {
+        const rows = (d.criteria || []).map(c => ({...c, enabled: c.enabled !== undefined ? c.enabled : (c.active !== 0)}));
+        setCriteria(rows);
+        // If table is empty (never seeded), reset to defaults automatically
+        if (rows.length === 0) {
+          return api('/api/admin/calls/analysis/criteria/reset', { method: 'POST' })
+            .then(r => {
+              const seeded = (r.criteria || []).map(c => ({...c, enabled: c.active !== 0}));
+              setCriteria(seeded);
+            });
+        }
+      })
+      .catch(() => setCritMsg('✗ Failed to load criteria'))
       .finally(() => setCritLoading(false));
 
     setTmLoading(true);
     api('/api/admin/calls/analysis/team-members')
       .then(d => setMembers(d.members || []))
-      .catch(e => setTmMsg('✗ Failed to load team members'))
+      .catch(() => setTmMsg('✗ Failed to load team members'))
       .finally(() => setTmLoading(false));
   }, []);
+
+  // ── Pipeline helpers ─────────────────────────────────────────────────────────
+  async function savePipelineSettings() {
+    setPipeSaving(true); setPipeMsg('');
+    try {
+      await api('/api/admin/mango-settings', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(pipeForm),
+      });
+      setPipeMsg('✓ Saved');
+    } catch(e) { setPipeMsg('✗ ' + e.message); }
+    finally { setPipeSaving(false); }
+  }
 
   // ── Criteria helpers ────────────────────────────────────────────────────────
   const weightTotal = criteria.reduce((s, c) => s + (Number(c.weight) || 0), 0);
@@ -3881,6 +3924,19 @@ function CallSettingsSubView() {
 
   function updateCriterion(idx, field, val) {
     setCriteria(cs => cs.map((c, i) => i === idx ? {...c, [field]: val} : c));
+    setCritMsg('');
+  }
+
+  function addCriterion() {
+    const name = newCritName.trim();
+    if (!name) return;
+    setCriteria(cs => [...cs, {name, description: '', weight: 0, enabled: true}]);
+    setNewCritName('');
+    setCritMsg('');
+  }
+
+  function removeCriterion(idx) {
+    setCriteria(cs => cs.filter((_, i) => i !== idx));
     setCritMsg('');
   }
 
@@ -3894,8 +3950,11 @@ function CallSettingsSubView() {
         enabled: c.enabled !== false && c.enabled !== 0,
       }));
       const d = await api('/api/admin/calls/analysis/criteria', { method: 'PUT', body: JSON.stringify({criteria: payload}) });
-      if (d.ok) { setCriteria(d.criteria || criteria); setCritMsg('✓ Saved'); }
-      else setCritMsg('✗ Save failed');
+      if (d.ok) {
+        const rows = (d.criteria || criteria).map(c => ({...c, enabled: c.enabled !== undefined ? c.enabled : (c.active !== 0)}));
+        setCriteria(rows);
+        setCritMsg('✓ Saved');
+      } else setCritMsg('✗ Save failed');
     } catch(e) { setCritMsg('✗ ' + e.message); }
     finally { setCritSaving(false); }
   }
@@ -3905,8 +3964,11 @@ function CallSettingsSubView() {
     setCritSaving(true); setCritMsg('');
     try {
       const d = await api('/api/admin/calls/analysis/criteria/reset', { method: 'POST' });
-      if (d.ok) { setCriteria(d.criteria || []); setCritMsg('✓ Reset to defaults'); }
-      else setCritMsg('✗ Reset failed');
+      if (d.ok) {
+        const rows = (d.criteria || []).map(c => ({...c, enabled: c.active !== 0}));
+        setCriteria(rows);
+        setCritMsg('✓ Reset to defaults');
+      } else setCritMsg('✗ Reset failed');
     } catch(e) { setCritMsg('✗ ' + e.message); }
     finally { setCritSaving(false); }
   }
@@ -3954,16 +4016,57 @@ function CallSettingsSubView() {
   return (
     <div style={{display:'flex',flexDirection:'column',gap:24}}>
 
+      {/* ── Pipeline Toggles ────────────────────────────────────────────────── */}
+      <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'16px 20px'}}>
+        {sectionHead('Pipeline Settings')}
+        {pipeLoading ? (
+          <div style={{color:'var(--text-muted)',fontSize:12}}>Loading…</div>
+        ) : (
+          <>
+            <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:12,padding:'8px 12px',background:'#fff7ed',border:'1px solid #fed7aa',borderRadius:6}}>
+              ⚠️ <strong>Important:</strong> The AI pipeline only processes <strong>new calls going forward</strong> when enabled. Enabling it will not retroactively analyze existing calls — use "Bulk Analyze" on the Calls tab for that.
+            </div>
+            {[
+              ['mango_enabled', 'Enable Mango Sync', 'Sync call list from Mango Voice every 5 minutes'],
+              ['mango_pipeline_enabled', 'Enable AI Pipeline', 'Download recordings, transcribe with Whisper, and grade with Claude — for new calls only'],
+              ['mango_pipeline_auto_grade', 'Auto-grade after transcription', 'Automatically grade each call with Claude immediately after transcription completes'],
+            ].map(([key, label, desc]) => (
+              <div key={key} style={{display:'flex',alignItems:'flex-start',gap:10,marginBottom:10}}>
+                <input type="checkbox" id={`pipe_${key}`} checked={!!pipeForm[key]}
+                  onChange={e => setPipeForm(f => ({...f, [key]: e.target.checked}))}
+                  style={{marginTop:2,flexShrink:0}} />
+                <label htmlFor={`pipe_${key}`} style={{fontSize:12,cursor:'pointer'}}>
+                  <span style={{fontWeight:600}}>{label}</span>
+                  {desc && <span style={{color:'var(--text-muted)',marginLeft:6,fontSize:11}}>{desc}</span>}
+                </label>
+              </div>
+            ))}
+            <div style={{display:'flex',gap:8,alignItems:'center',marginTop:8}}>
+              <button onClick={savePipelineSettings} disabled={pipeSaving}
+                style={{padding:'6px 16px',background:pipeSaving?'var(--bg-card)':'var(--teal)',
+                  color:pipeSaving?'var(--text-muted)':'#fff',border:'1px solid var(--teal)',
+                  borderRadius:6,cursor:pipeSaving?'not-allowed':'pointer',fontSize:12,fontWeight:600}}>
+                {pipeSaving ? 'Saving…' : 'Save Pipeline Settings'}
+              </button>
+              {pipeMsg && <span style={{fontSize:11,color:pipeMsg.startsWith('✓')?'var(--green)':'var(--red)'}}>{pipeMsg}</span>}
+            </div>
+          </>
+        )}
+      </div>
+
       {/* ── Grading Criteria Editor ─────────────────────────────────────── */}
       <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'16px 20px'}}>
         {sectionHead('Grading Criteria')}
+        <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+          Each criterion is scored pass/fail during call analysis. Weights must sum to 100%.
+        </div>
         {critLoading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading…</div>}
         {!critLoading && (
           <>
             <table style={{width:'100%',borderCollapse:'collapse',fontSize:12,marginBottom:12}}>
               <thead>
                 <tr style={{background:'var(--bg-card)'}}>
-                  {['Criterion','Description','Weight (%)','Enabled'].map(h => (
+                  {['Criterion','Description','Weight (%)','Enabled',''].map(h => (
                     <th key={h} style={{padding:'6px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)'}}>{h}</th>
                   ))}
                 </tr>
@@ -3971,14 +4074,18 @@ function CallSettingsSubView() {
               <tbody>
                 {criteria.map((c, i) => (
                   <tr key={c.id || i} style={{borderBottom:'1px solid var(--border)'}}>
-                    <td style={{padding:'6px 10px',fontWeight:600,whiteSpace:'nowrap'}}>{c.name}</td>
+                    <td style={{padding:'6px 10px',fontWeight:600,whiteSpace:'nowrap'}}>
+                      <input value={c.name || ''}
+                        onChange={e => updateCriterion(i, 'name', e.target.value)}
+                        style={{width:'100%',minWidth:140,border:'1px solid var(--border)',borderRadius:4,padding:'2px 6px',fontSize:11,fontWeight:600,color:'var(--text)'}} />
+                    </td>
                     <td style={{padding:'6px 10px',color:'var(--text-muted)',fontSize:11,maxWidth:280}}>
                       <input value={c.description || ''}
                         onChange={e => updateCriterion(i, 'description', e.target.value)}
                         style={{width:'100%',border:'1px solid var(--border)',borderRadius:4,padding:'2px 6px',fontSize:11,color:'var(--text)'}} />
                     </td>
                     <td style={{padding:'6px 10px'}}>
-                      <input type="number" min="1" max="100" value={c.weight ?? ''}
+                      <input type="number" min="0" max="100" value={c.weight ?? ''}
                         onChange={e => updateCriterion(i, 'weight', e.target.value)}
                         style={{width:60,border:'1px solid var(--border)',borderRadius:4,padding:'2px 6px',fontSize:11,
                           color: weightOk ? 'var(--text)' : 'var(--red)'}} />
@@ -3987,8 +4094,28 @@ function CallSettingsSubView() {
                       <input type="checkbox" checked={c.enabled !== false && c.enabled !== 0}
                         onChange={e => updateCriterion(i, 'enabled', e.target.checked)} />
                     </td>
+                    <td style={{padding:'6px 10px'}}>
+                      <button onClick={() => removeCriterion(i)}
+                        style={{background:'none',border:'none',cursor:'pointer',color:'var(--red)',fontSize:13,padding:'0 4px'}}
+                        title="Remove">✕</button>
+                    </td>
                   </tr>
                 ))}
+                {/* Add row */}
+                <tr style={{background:'#f8fafc'}}>
+                  <td colSpan={4} style={{padding:'6px 10px'}}>
+                    <input placeholder="New criterion name…" value={newCritName}
+                      onChange={e => setNewCritName(e.target.value)}
+                      onKeyDown={e => e.key==='Enter' && addCriterion()}
+                      style={{width:'100%',border:'1px solid var(--border)',borderRadius:4,padding:'3px 6px',fontSize:11}} />
+                  </td>
+                  <td style={{padding:'6px 10px'}}>
+                    <button onClick={addCriterion}
+                      style={{padding:'3px 10px',background:'var(--teal)',color:'#fff',border:'none',borderRadius:4,cursor:'pointer',fontSize:11}}>
+                      + Add
+                    </button>
+                  </td>
+                </tr>
               </tbody>
             </table>
 
@@ -4720,7 +4847,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['calls','🎙 Call Analysis']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -4749,9 +4876,6 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
           <AdCreativesView days={adCreativesDays} />
         </div>
       )}
-
-      {/* ── Call Analysis view ── */}
-      {view==='calls' && <CallAnalysisView />}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>
@@ -10151,7 +10275,11 @@ function AISettingsCard() {
 function MangoSettingsCard() {
   const EMPTY = {
     mango_username:'', mango_password:'', mango_pbx_id:'', mango_api_base:'',
-    openai_api_key:'', gemini_api_key:'', gemini_model:'gemini-2.5-flash',
+    openai_api_key:'',
+    vertex_project_id:'marketing-landing-page-491721',
+    vertex_location:'us-central1',
+    vertex_credentials_path:'',
+    vertex_model:'gemini-2.5-flash',
     mango_whisper_mode:'api',
     mango_enabled:false, mango_pipeline_enabled:false, mango_pipeline_auto_grade:true,
   };
@@ -10223,7 +10351,7 @@ function MangoSettingsCard() {
     <div className="report-section" style={{marginBottom:12}}>
       <div className="report-title" style={{marginBottom:12}}>📞 Mango Voice & AI</div>
       <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:12}}>
-        Credentials for Mango Voice call sync, OpenAI Whisper transcription, and Gemini grading.
+        Credentials for Mango Voice call sync, OpenAI Whisper transcription, and Vertex AI call grading (HIPAA-compliant via GCP BAA).
         Changes take effect immediately — no restart required.
       </div>
 
@@ -10238,8 +10366,12 @@ function MangoSettingsCard() {
         <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
           letterSpacing:'0.05em',margin:'10px 0 6px'}}>AI Services</div>
         {inp('OpenAI API Key', 'openai_api_key', 'password', 'sk-...')}
-        {inp('Gemini API Key', 'gemini_api_key', 'password', 'AIza...')}
-        {inp('Gemini Model', 'gemini_model', 'text', 'gemini-2.5-flash')}
+        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+          letterSpacing:'0.05em',margin:'8px 0 4px'}}>Vertex AI (Gemini — HIPAA-compliant)</div>
+        {inp('GCP Project ID', 'vertex_project_id', 'text', 'marketing-landing-page-491721')}
+        {inp('Location', 'vertex_location', 'text', 'us-central1')}
+        {inp('SA Key Path', 'vertex_credentials_path', 'text', '/path/to/key.json  (blank = Cloud Run ADC)')}
+        {inp('Model', 'vertex_model', 'text', 'gemini-2.5-flash')}
 
         <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
           <label style={{fontSize:11,fontWeight:600,minWidth:150,flexShrink:0}}>Whisper Mode</label>
@@ -11290,6 +11422,7 @@ function App() {
         <button className={'tab' + (tab === 'pipeline' ? ' active' : '')} onClick={() => setTab('pipeline')}>Pipeline</button>
         <button className={'tab' + (tab === 'reports' ? ' active' : '')} onClick={() => setTab('reports')}>Reports & Campaigns</button>
         <button className={'tab' + (tab === 'workflows' ? ' active' : '')} onClick={() => setTab('workflows')}>Workflows</button>
+        <button className={'tab' + (tab === 'calls' ? ' active' : '')} onClick={() => setTab('calls')}>📋 Call Analysis</button>
         <button className={'tab' + (tab === 'admin' ? ' active' : '')} onClick={() => setTab('admin')}>Admin</button>
       </div>
       <div className="main">
@@ -11316,6 +11449,7 @@ function App() {
             )}
             {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} />}
             {tab === 'workflows' && <WorkflowsSection />}
+            {tab === 'calls' && <CallAnalysisView />}
             {tab === 'admin' && (
               <AdminTab
                 onSync={() => api('/api/admin/sync', { method: 'POST' })}

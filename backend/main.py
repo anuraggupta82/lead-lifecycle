@@ -4241,14 +4241,20 @@ def admin_grade_call(uuid: str):
     if not transcript.strip():
         raise HTTPException(status_code=400, detail="No transcript available — transcribe first")
 
-    settings = get_settings()
-    if not settings.gemini_api_key:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
+    from database import get_mango_settings as _get_mango
+    msettings = _get_mango()
+    if not msettings["vertex_project_id"]:
+        raise HTTPException(status_code=503, detail="VERTEX_PROJECT_ID not configured")
 
     try:
         from mango_pipeline import _grade
         caller_name = call.get("caller_id_name") or ""
-        grade = _grade(transcript, settings.gemini_api_key, settings.gemini_model, uuid, caller_name)
+        grade = _grade(
+            transcript,
+            msettings["vertex_project_id"], msettings["vertex_location"],
+            msettings["vertex_credentials_path"], msettings["vertex_model"],
+            uuid, caller_name,
+        )
         now_iso = datetime.now(timezone.utc).isoformat()
 
         import json as _json
@@ -5733,8 +5739,11 @@ def admin_get_mango_settings():
         "mango_pbx_id":              s["mango_pbx_id"],
         "mango_api_base":            s["mango_api_base"],
         "openai_api_key":            "••••••••" if s["openai_api_key"] else "",
-        "gemini_api_key":            "••••••••" if s["gemini_api_key"] else "",
-        "gemini_model":              s["gemini_model"],
+        # Vertex AI (HIPAA-compliant Gemini)
+        "vertex_project_id":         s["vertex_project_id"],
+        "vertex_location":           s["vertex_location"],
+        "vertex_credentials_path":   s["vertex_credentials_path"],
+        "vertex_model":              s["vertex_model"],
         "mango_whisper_mode":        s["mango_whisper_mode"],
         "mango_enabled":             s["mango_enabled"],
         "mango_pipeline_enabled":    s["mango_pipeline_enabled"],
@@ -5756,8 +5765,11 @@ def admin_save_mango_settings(body: dict, request: Request):
     _save("mango_pbx_id",              body.get("mango_pbx_id", ""))
     _save("mango_api_base",            body.get("mango_api_base", ""))
     _save("mango_openai_api_key",      body.get("openai_api_key", ""))
-    _save("mango_gemini_api_key",      body.get("gemini_api_key", ""))
-    _save("mango_gemini_model",        body.get("gemini_model", ""))
+    # Vertex AI settings (replaces direct gemini_api_key)
+    _save("vertex_project_id",        body.get("vertex_project_id", ""))
+    _save("vertex_location",          body.get("vertex_location", ""))
+    _save("vertex_credentials_path",  body.get("vertex_credentials_path", ""))
+    _save("vertex_model",             body.get("vertex_model", ""))
     _save("mango_whisper_mode",        body.get("mango_whisper_mode", ""))
 
     # Boolean toggles — always save even when False

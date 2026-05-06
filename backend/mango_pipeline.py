@@ -6,14 +6,20 @@ For each unprocessed inbound call:
   1. Download recording from Mango
   2. Transcribe with OpenAI Whisper (cloud) or local Whisper model
   3. PHI-scrub + strip greeting
-  4. Summarize with Gemini
-  5. Grade with Gemini against configured criteria
+  4. Summarize with Gemini via Vertex AI (HIPAA-compliant)
+  5. Grade with Gemini via Vertex AI against configured criteria
   6. Resolve team member from transcript / extension
   7. Persist everything to mango_calls via database.update_mango_call_analysis
   8. Log AI costs to ai_usage via ai_costs helpers
   9. Clean up temp recording file
 
-All AI keys come from settings (openai_api_key, gemini_api_key).
+AI routing:
+  - Transcription : OpenAI Whisper API (openai_api_key, covered by BAA)
+  - Summary/Grade : Gemini via Google Vertex AI SDK (HIPAA-compliant under GCP BAA)
+                    Configured via vertex_project_id / vertex_location /
+                    vertex_credentials_path / vertex_model in settings.
+                    Direct Gemini REST API (gemini_api_key) is NOT used.
+
 The pipeline is gated by settings.mango_pipeline_enabled — when False, the
 scheduler job exits immediately so no API calls are made.
 
@@ -238,11 +244,10 @@ def _transcribe_local(audio_path: Path, model_name: str) -> str:
         raise
 
 
-# ── Gemini helpers ────────────────────────────────────────────────────────────
+# ── Vertex AI helpers (HIPAA-compliant Gemini via GCP) ───────────────────────
 
-_GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-)
+# Module-level init guard — avoids redundant vertexai.init() calls across ticks
+_vertex_init_key: str = ""
 
 _SUMMARY_PROMPT_LIVE = """\
 You are a clinical assistant for Grafton Dental Care summarizing patient phone calls for the patient chart.
@@ -331,54 +336,72 @@ Transcript:
 """
 
 
-def _call_gemini(prompt: str, model: str, api_key: str, temperature: float = 0.25,
+def _call_vertex(prompt: str, model: str, project_id: str, location: str,
+                 credentials_path: str, temperature: float = 0.25,
                  max_tokens: int = 1200) -> tuple[str, int, int]:
-    """Call Gemini REST API. Returns (text, input_tokens, output_tokens)."""
-    url = _GEMINI_API_URL.format(model=model)
-    resp = requests.post(
-        url,
-        params={"key": api_key},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
-        },
-        timeout=60,
+    """Call Gemini via Vertex AI SDK (HIPAA-compliant). Returns (text, input_tokens, output_tokens).
+
+    Uses the same init-guard pattern as Pearly's vertex_client.py to avoid
+    redundant vertexai.init() calls across pipeline ticks.
+    """
+    global _vertex_init_key
+
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+    # Only re-init when config changes
+    init_key = f"{project_id}::{location}::{credentials_path}"
+    if _vertex_init_key != init_key:
+        init_kwargs: dict = {"project": project_id, "location": location}
+        if credentials_path:
+            from google.oauth2 import service_account
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            init_kwargs["credentials"] = creds
+        vertexai.init(**init_kwargs)
+        _vertex_init_key = init_key
+        log.info("[vertex] init complete (project=%s, location=%s)", project_id, location)
+
+    gen_config = GenerationConfig(
+        max_output_tokens=max_tokens,
+        temperature=temperature,
     )
-    if resp.status_code == 400:
-        detail = resp.json().get("error", {}).get("message", resp.text)
-        raise ValueError(f"Gemini API error: {detail}")
-    if resp.status_code == 403:
-        raise ValueError("Invalid Gemini API key.")
-    if resp.status_code == 404:
-        raise ValueError(f"Gemini model not found: {model}")
-    resp.raise_for_status()
+    gmodel = GenerativeModel(model, generation_config=gen_config)
+    response = gmodel.generate_content(prompt)
 
-    rj = resp.json()
-    candidates = rj.get("candidates", [])
-    if not candidates:
-        raise ValueError("Gemini returned no response.")
+    # Extract text defensively (blocked responses return empty)
+    text = ""
+    try:
+        text = response.text.strip()
+    except Exception:
+        log.warning("[vertex] response blocked or empty for model=%s", model)
+        text = ""
 
-    usage = rj.get("usageMetadata", {})
-    in_tok = int(usage.get("promptTokenCount", 0))
-    out_tok = int(usage.get("candidatesTokenCount", 0))
-    text = candidates[0]["content"]["parts"][0]["text"].strip()
+    usage = getattr(response, "usage_metadata", None)
+    in_tok  = getattr(usage, "prompt_token_count",     0) or 0
+    out_tok = getattr(usage, "candidates_token_count", 0) or 0
+
     return text, in_tok, out_tok
 
 
-def _summarize(transcript: str, gemini_api_key: str, gemini_model: str,
+def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
+               vertex_credentials_path: str, vertex_model: str,
                call_uuid: str, caller_name: str = "") -> str:
-    """PHI-scrub, strip greeting, summarize with Gemini. Logs cost."""
+    """PHI-scrub, strip greeting, summarize via Vertex AI Gemini. Logs cost."""
     cleaned, voicemail = _strip_greeting(transcript)
     scrubbed = _scrub_phi(cleaned, caller_name)
     prompt_tmpl = _SUMMARY_PROMPT_VOICEMAIL if voicemail else _SUMMARY_PROMPT_LIVE
     prompt = prompt_tmpl.format(transcript=scrubbed)
 
-    text, in_tok, out_tok = _call_gemini(
-        prompt, gemini_model, gemini_api_key, temperature=0.25, max_tokens=1200
+    text, in_tok, out_tok = _call_vertex(
+        prompt, vertex_model, vertex_project_id, vertex_location,
+        vertex_credentials_path, temperature=0.25, max_tokens=1200,
     )
     log_gemini(
         purpose="call_summary",
-        model=gemini_model,
+        model=vertex_model,
         input_tokens=in_tok,
         output_tokens=out_tok,
         call_id=call_uuid,
@@ -386,7 +409,8 @@ def _summarize(transcript: str, gemini_api_key: str, gemini_model: str,
     return text
 
 
-def _grade(transcript: str, gemini_api_key: str, gemini_model: str,
+def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
+           vertex_credentials_path: str, vertex_model: str,
            call_uuid: str, caller_name: str = "") -> dict:
     """PHI-scrub, build grading prompt, call Gemini. Logs cost. Returns grade dict."""
     cleaned, _ = _strip_greeting(transcript)
@@ -402,12 +426,13 @@ def _grade(transcript: str, gemini_api_key: str, gemini_model: str,
 
     prompt = _GRADING_PROMPT.format(criteria_text=criteria_text, transcript=scrubbed)
 
-    raw, in_tok, out_tok = _call_gemini(
-        prompt, gemini_model, gemini_api_key, temperature=0.15, max_tokens=2048
+    raw, in_tok, out_tok = _call_vertex(
+        prompt, vertex_model, vertex_project_id, vertex_location,
+        vertex_credentials_path, temperature=0.15, max_tokens=2048,
     )
     log_gemini(
         purpose="call_grade",
-        model=gemini_model,
+        model=vertex_model,
         input_tokens=in_tok,
         output_tokens=out_tok,
         call_id=call_uuid,
@@ -578,20 +603,27 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             log.info("[pipeline] Call %s is empty/voicemail-only — skipping AI analysis", uuid)
             return
 
-        # ── 4. Summarize ──────────────────────────────────────────────────────
-        gemini_key = msettings["gemini_api_key"]
-        if not gemini_key:
+        # ── 4. Summarize via Vertex AI (HIPAA-compliant Gemini) ───────────────
+        vertex_project = msettings["vertex_project_id"]
+        if not vertex_project:
             # Store transcript but skip AI analysis
             db.update_mango_call_analysis(
                 uuid,
                 transcript=transcript,
                 transcription_status="done",
                 summarized_at=datetime.now(timezone.utc).isoformat(),
-                pipeline_error="GEMINI_API_KEY not configured — summary skipped",
+                pipeline_error="VERTEX_PROJECT_ID not configured — summary skipped",
             )
             return
 
-        summary = _summarize(transcript, gemini_key, msettings["gemini_model"], uuid, caller_name)
+        vertex_location = msettings["vertex_location"]
+        vertex_creds    = msettings["vertex_credentials_path"]
+        vertex_model    = msettings["vertex_model"]
+
+        summary = _summarize(
+            transcript, vertex_project, vertex_location, vertex_creds, vertex_model,
+            uuid, caller_name,
+        )
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # Persist transcript + summary now (in case grading fails)
@@ -612,7 +644,10 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         # ── 6. Grade ─────────────────────────────────────────────────────────
         if msettings["mango_pipeline_auto_grade"]:
             try:
-                grade = _grade(transcript, gemini_key, msettings["gemini_model"], uuid, caller_name)
+                grade = _grade(
+                    transcript, vertex_project, vertex_location, vertex_creds, vertex_model,
+                    uuid, caller_name,
+                )
                 now_iso2 = datetime.now(timezone.utc).isoformat()
 
                 if grade.get("gradeable"):

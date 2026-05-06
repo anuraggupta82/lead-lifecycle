@@ -124,13 +124,17 @@ class Settings(BaseSettings):
     # Max calls to auto-transcribe per scheduler run (cost guard)
     call_transcription_batch_size: int = 10
 
-    # ── Gemini (call summarization + grading) ────────────────────────────────
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    # ── Vertex AI (call summarization + grading — HIPAA-compliant via BAA) ────
+    # Uses google-cloud-aiplatform SDK; data stays within GCP under BAA.
+    # gemini_api_key is NOT used — all Gemini calls go through Vertex.
+    vertex_project_id: str = "marketing-landing-page-491721"
+    vertex_location: str = "us-central1"
+    vertex_credentials_path: str = ""        # SA key file; blank = ADC / Cloud Run SA
+    vertex_model: str = "gemini-2.5-flash"   # model for summary + grading
 
     # ── Call Analysis pipeline ───────────────────────────────────────────────
     mango_pipeline_enabled: bool = False       # Master on/off switch
-    mango_pipeline_auto_grade: bool = True     # Run Gemini grading after each summary
+    mango_pipeline_auto_grade: bool = True     # Run Gemini/Vertex grading after each summary
     mango_pipeline_only_inbound: bool = True   # Skip outbound calls
     mango_pipeline_min_seconds: int = 30       # Skip calls shorter than this
     mango_pipeline_max_per_run: int = 20       # Cost guard: max calls per scheduler tick

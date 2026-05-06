@@ -2195,8 +2195,11 @@ def get_mango_settings() -> dict:
         "mango_pbx_id":              get_setting("mango_pbx_id")              or cfg.mango_pbx_id,
         "mango_api_base":            get_setting("mango_api_base")            or cfg.mango_api_base,
         "openai_api_key":            get_setting("mango_openai_api_key")      or cfg.openai_api_key,
-        "gemini_api_key":            get_setting("mango_gemini_api_key")      or cfg.gemini_api_key,
-        "gemini_model":              get_setting("mango_gemini_model")        or cfg.gemini_model,
+        # Vertex AI (HIPAA-compliant Gemini) — replaces direct Gemini API key
+        "vertex_project_id":         get_setting("vertex_project_id")         or cfg.vertex_project_id,
+        "vertex_location":           get_setting("vertex_location")           or cfg.vertex_location,
+        "vertex_credentials_path":   get_setting("vertex_credentials_path")   or cfg.vertex_credentials_path,
+        "vertex_model":              get_setting("vertex_model")               or cfg.vertex_model,
         "mango_whisper_mode":        get_setting("mango_whisper_mode")        or cfg.mango_whisper_mode,
         "mango_whisper_local_model": get_setting("mango_whisper_local_model") or cfg.mango_whisper_local_model,
         "mango_enabled":             (get_setting("mango_enabled")            or str(cfg.mango_enabled)).lower() == "true",
