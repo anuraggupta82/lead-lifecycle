@@ -511,7 +511,9 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
     Run the full analysis pipeline for a single mango_calls row.
     Updates the DB row in place. Raises on hard failures.
     """
-    settings = get_settings()
+    # Use DB-first settings so Admin UI saves take effect without restart.
+    msettings = db.get_mango_settings()
+    settings = get_settings()  # kept for mango_recording_dir + non-Mango fields
     uuid = call_row["uuid"]
     duration_sec = call_row.get("duration_sec") or 0
     recording_url = call_row.get("recording_url") or ""
@@ -542,7 +544,7 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         audio_path = _fetch_recording(recording_url, uuid, token=mango_token)
 
         # ── 2. Transcribe ─────────────────────────────────────────────────────
-        openai_key = settings.openai_api_key
+        openai_key = msettings["openai_api_key"]
         if not openai_key:
             db.update_mango_call_analysis(
                 uuid, transcription_status="failed",
@@ -550,15 +552,16 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             )
             return
 
-        if settings.mango_whisper_mode == "local":
-            transcript = _transcribe_local(audio_path, settings.mango_whisper_local_model)
+        whisper_mode = msettings["mango_whisper_mode"]
+        if whisper_mode == "local":
+            transcript = _transcribe_local(audio_path, msettings["mango_whisper_local_model"])
         else:
             transcript = _transcribe_openai(audio_path, openai_key)
 
         # Log Whisper cost
         log_whisper(
             duration_seconds=float(duration_sec),
-            model="whisper-1" if settings.mango_whisper_mode == "api" else settings.mango_whisper_local_model,
+            model="whisper-1" if whisper_mode == "api" else msettings["mango_whisper_local_model"],
             call_id=uuid,
         )
 
@@ -576,7 +579,7 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             return
 
         # ── 4. Summarize ──────────────────────────────────────────────────────
-        gemini_key = settings.gemini_api_key
+        gemini_key = msettings["gemini_api_key"]
         if not gemini_key:
             # Store transcript but skip AI analysis
             db.update_mango_call_analysis(
@@ -588,7 +591,7 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             )
             return
 
-        summary = _summarize(transcript, gemini_key, settings.gemini_model, uuid, caller_name)
+        summary = _summarize(transcript, gemini_key, msettings["gemini_model"], uuid, caller_name)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # Persist transcript + summary now (in case grading fails)
@@ -607,9 +610,9 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             db.update_mango_call_analysis(uuid, team_member=team_member)
 
         # ── 6. Grade ─────────────────────────────────────────────────────────
-        if settings.mango_pipeline_auto_grade:
+        if msettings["mango_pipeline_auto_grade"]:
             try:
-                grade = _grade(transcript, gemini_key, settings.gemini_model, uuid, caller_name)
+                grade = _grade(transcript, gemini_key, msettings["gemini_model"], uuid, caller_name)
                 now_iso2 = datetime.now(timezone.utc).isoformat()
 
                 if grade.get("gradeable"):
@@ -751,11 +754,12 @@ def run_pipeline_tick(mango_token: Optional[str] = None) -> None:
     """
     Called by APScheduler every mango_pipeline_interval_min minutes.
     Picks up unprocessed calls and runs the pipeline on each.
-    Gated by settings.mango_pipeline_enabled.
+    Gated by mango_pipeline_enabled (DB-first so UI toggle takes effect immediately).
     """
-    settings = get_settings()
+    msettings = db.get_mango_settings()
+    settings = get_settings()  # kept for min_seconds / max_per_run (not yet in DB)
 
-    if not settings.mango_pipeline_enabled:
+    if not msettings["mango_pipeline_enabled"]:
         return
 
     # Recover any calls left stuck in_progress from a previous crash

@@ -5721,6 +5721,142 @@ def admin_save_ai_settings(body: dict):
     return {"ok": True}
 
 
+# ─── Mango Voice + AI Settings ───────────────────────────────────────────────
+
+@app.get("/api/admin/mango-settings", dependencies=[Depends(_require_admin)])
+def admin_get_mango_settings():
+    from database import get_mango_settings
+    s = get_mango_settings()
+    return {
+        "mango_username":            s["mango_username"],
+        "mango_password":            "••••••••" if s["mango_password"] else "",
+        "mango_pbx_id":              s["mango_pbx_id"],
+        "mango_api_base":            s["mango_api_base"],
+        "openai_api_key":            "••••••••" if s["openai_api_key"] else "",
+        "gemini_api_key":            "••••••••" if s["gemini_api_key"] else "",
+        "gemini_model":              s["gemini_model"],
+        "mango_whisper_mode":        s["mango_whisper_mode"],
+        "mango_enabled":             s["mango_enabled"],
+        "mango_pipeline_enabled":    s["mango_pipeline_enabled"],
+        "mango_pipeline_auto_grade": s["mango_pipeline_auto_grade"],
+    }
+
+
+@app.post("/api/admin/mango-settings", dependencies=[Depends(_require_admin)])
+def admin_save_mango_settings(body: dict, request: Request):
+    from database import save_setting
+
+    def _save(key: str, val: str):
+        v = (val or "").strip()
+        if v and not v.startswith("•"):
+            save_setting(key, v)
+
+    _save("mango_username",            body.get("mango_username", ""))
+    _save("mango_password",            body.get("mango_password", ""))
+    _save("mango_pbx_id",              body.get("mango_pbx_id", ""))
+    _save("mango_api_base",            body.get("mango_api_base", ""))
+    _save("mango_openai_api_key",      body.get("openai_api_key", ""))
+    _save("mango_gemini_api_key",      body.get("gemini_api_key", ""))
+    _save("mango_gemini_model",        body.get("gemini_model", ""))
+    _save("mango_whisper_mode",        body.get("mango_whisper_mode", ""))
+
+    # Boolean toggles — always save even when False
+    for key, field in [
+        ("mango_enabled",             "mango_enabled"),
+        ("mango_pipeline_enabled",    "mango_pipeline_enabled"),
+        ("mango_pipeline_auto_grade", "mango_pipeline_auto_grade"),
+    ]:
+        val = body.get(field)
+        if val is not None:
+            save_setting(key, "true" if val else "false")
+
+    # If credentials changed, rebuild the token manager so it takes effect now
+    new_user = (body.get("mango_username") or "").strip()
+    new_pass = (body.get("mango_password") or "").strip()
+    if new_user and new_pass and not new_pass.startswith("•"):
+        try:
+            from mango_service import MangoTokenManager
+            from database import get_mango_settings
+            ms = get_mango_settings()
+            mgr = MangoTokenManager(
+                username=ms["mango_username"],
+                password=ms["mango_password"],
+                api_base=ms["mango_api_base"],
+            )
+            request.app.state.mango_token_mgr = mgr
+            logger.info("Mango token manager rebuilt after credential update")
+        except Exception as e:
+            logger.warning(f"Mango token manager rebuild failed: {e}")
+
+    return {"ok": True}
+
+
+# ─── Recording streaming endpoint ─────────────────────────────────────────────
+
+@app.get("/api/admin/calls/recording/{uuid}/play", dependencies=[Depends(_require_admin)])
+def admin_play_recording(uuid: str, request: Request):
+    """Stream a Mango call recording to the browser for in-page playback.
+
+    Download flow: Mango S3 → temp file → stream to browser.
+    The temp file is reused if already present (TTL sweeper cleans it later).
+    """
+    from database import get_mango_call
+    from mango_pipeline import _fetch_recording
+    from fastapi.responses import StreamingResponse
+
+    call = get_mango_call(uuid)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    recording_url = call.get("recording_url") or ""
+    if not recording_url:
+        raise HTTPException(status_code=404, detail="No recording URL for this call")
+
+    token_mgr = getattr(request.app.state, "mango_token_mgr", None)
+    tok = token_mgr.get_token() if token_mgr else None
+
+    try:
+        path = _fetch_recording(recording_url, uuid, token=tok)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch recording: {e}")
+
+    def _stream():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        # Don't delete — let the TTL sweeper handle it so re-plays reuse the cache
+
+    return StreamingResponse(
+        _stream(),
+        media_type="audio/mpeg",
+        headers={"Content-Disposition": f'inline; filename="{uuid}.mp3"'},
+    )
+
+
+# ─── Pipeline run-now endpoint ────────────────────────────────────────────────
+
+@app.post("/api/admin/calls/pipeline/run-now", dependencies=[Depends(_require_admin)])
+def admin_pipeline_run_now(request: Request):
+    """Immediately trigger a pipeline tick in a background thread."""
+    import threading
+    from mango_pipeline import run_pipeline_tick
+
+    token_mgr = getattr(request.app.state, "mango_token_mgr", None)
+    tok = token_mgr.get_token() if token_mgr else None
+
+    def _run():
+        try:
+            run_pipeline_tick(mango_token=tok)
+        except Exception as e:
+            logger.error(f"Manual pipeline run failed: {e}")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"ok": True, "started": True}
+
+
 # ─── Practice Information Settings ──────────────────────────────────────────
 
 @app.get("/api/admin/practice-settings", dependencies=[Depends(_require_admin)])

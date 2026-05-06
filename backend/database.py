@@ -2181,6 +2181,30 @@ def get_od_settings() -> dict:
     }
 
 
+def get_mango_settings() -> dict:
+    """Return Mango Voice + AI settings from DB, falling back to env/config defaults.
+
+    Call-site rule: always use this helper instead of get_settings() directly so
+    that credentials saved via the Admin UI take effect without a restart.
+    """
+    from config import get_settings
+    cfg = get_settings()
+    return {
+        "mango_username":            get_setting("mango_username")            or cfg.mango_username,
+        "mango_password":            get_setting("mango_password")            or cfg.mango_password,
+        "mango_pbx_id":              get_setting("mango_pbx_id")              or cfg.mango_pbx_id,
+        "mango_api_base":            get_setting("mango_api_base")            or cfg.mango_api_base,
+        "openai_api_key":            get_setting("mango_openai_api_key")      or cfg.openai_api_key,
+        "gemini_api_key":            get_setting("mango_gemini_api_key")      or cfg.gemini_api_key,
+        "gemini_model":              get_setting("mango_gemini_model")        or cfg.gemini_model,
+        "mango_whisper_mode":        get_setting("mango_whisper_mode")        or cfg.mango_whisper_mode,
+        "mango_whisper_local_model": get_setting("mango_whisper_local_model") or cfg.mango_whisper_local_model,
+        "mango_enabled":             (get_setting("mango_enabled")            or str(cfg.mango_enabled)).lower() == "true",
+        "mango_pipeline_enabled":    (get_setting("mango_pipeline_enabled")   or str(cfg.mango_pipeline_enabled)).lower() == "true",
+        "mango_pipeline_auto_grade": (get_setting("mango_pipeline_auto_grade") or str(cfg.mango_pipeline_auto_grade)).lower() == "true",
+    }
+
+
 def delete_workflow(workflow_id: int) -> bool:
     with _conn() as conn:
         # Null out any campaigns that reference this workflow before deleting

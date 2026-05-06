@@ -3144,14 +3144,22 @@ function CallsSubView() {
         {err && <span style={{fontSize:9,color:'#dc2626',marginLeft:4}} title={err}>⚠</span>}
       </span>
     );
-    // Only show Analyze for calls with a recording (otherwise nothing to transcribe)
+    // Only show Analyze/Play for calls with a recording (otherwise nothing to transcribe)
     if (!call.recording_url) return <span style={{fontSize:10,color:'var(--text-muted)'}}>—</span>;
     return (
-      <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
-        style={{fontSize:9,padding:'2px 7px',border:'1px solid #0369a1',borderRadius:3,cursor:'pointer',
-          color:'#0369a1',background:'#e0f2fe',whiteSpace:'nowrap'}}>
-        ▶ Analyze
-      </button>
+      <span style={{display:'flex',gap:4,alignItems:'center',flexWrap:'wrap'}}>
+        <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
+          style={{fontSize:9,padding:'2px 7px',border:'1px solid #0369a1',borderRadius:3,cursor:'pointer',
+            color:'#0369a1',background:'#e0f2fe',whiteSpace:'nowrap'}}>
+          ▶ Analyze
+        </button>
+        <button onClick={e=>{e.stopPropagation();window.open(`/api/admin/calls/recording/${call.uuid}/play`,'_blank');}}
+          title="Play recording"
+          style={{fontSize:9,padding:'2px 6px',border:'1px solid #7c3aed',borderRadius:3,cursor:'pointer',
+            color:'#7c3aed',background:'#f5f3ff',whiteSpace:'nowrap'}}>
+          🎵
+        </button>
+      </span>
     );
   }
 
@@ -10138,6 +10146,135 @@ function AISettingsCard() {
   );
 }
 
+// ── MangoSettingsCard — Mango Voice + AI credentials in Admin panel ───────────
+
+function MangoSettingsCard() {
+  const EMPTY = {
+    mango_username:'', mango_password:'', mango_pbx_id:'', mango_api_base:'',
+    openai_api_key:'', gemini_api_key:'', gemini_model:'gemini-2.5-flash',
+    mango_whisper_mode:'api',
+    mango_enabled:false, mango_pipeline_enabled:false, mango_pipeline_auto_grade:true,
+  };
+  const [form, setForm]       = React.useState(EMPTY);
+  const [loaded, setLoaded]   = React.useState(false);
+  const [saving, setSaving]   = React.useState(false);
+  const [saveMsg, setSaveMsg] = React.useState('');
+  const [running, setRunning] = React.useState(false);
+  const [runMsg, setRunMsg]   = React.useState('');
+
+  React.useEffect(() => {
+    api('/api/admin/mango-settings').then(r => {
+      setForm(f => ({...f, ...r}));
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  async function handleSave(e) {
+    e.preventDefault();
+    setSaving(true); setSaveMsg('');
+    try {
+      await api('/api/admin/mango-settings', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(form),
+      });
+      setSaveMsg('Saved ✓');
+      setTimeout(() => setSaveMsg(''), 3000);
+    } catch(err) { setSaveMsg('Error: ' + err.message); }
+    setSaving(false);
+  }
+
+  async function handleRunNow() {
+    setRunning(true); setRunMsg('');
+    try {
+      await api('/api/admin/calls/pipeline/run-now', {method:'POST'});
+      setRunMsg('Pipeline started ✓ — check Call Analysis tab for progress');
+      setTimeout(() => setRunMsg(''), 6000);
+    } catch(err) { setRunMsg('Error: ' + err.message); }
+    setRunning(false);
+  }
+
+  const inp = (label, key, type='text', ph='') => (
+    <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
+      <label style={{fontSize:11,fontWeight:600,minWidth:150,flexShrink:0}}>{label}</label>
+      <input type={type} value={form[key]||''} placeholder={ph}
+        onChange={e => setForm(f=>({...f,[key]:e.target.value}))}
+        style={{flex:1,minWidth:140,padding:'3px 7px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}
+      />
+    </div>
+  );
+
+  const tog = (label, key, desc) => (
+    <div style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:6}}>
+      <input type="checkbox" id={`mango_tog_${key}`} checked={!!form[key]}
+        onChange={e => setForm(f=>({...f,[key]:e.target.checked}))}
+        style={{marginTop:2}}
+      />
+      <label htmlFor={`mango_tog_${key}`} style={{fontSize:11,cursor:'pointer'}}>
+        <span style={{fontWeight:600}}>{label}</span>
+        {desc && <span style={{color:'var(--text-muted)',marginLeft:4}}>{desc}</span>}
+      </label>
+    </div>
+  );
+
+  if (!loaded) return null;
+
+  return (
+    <div className="report-section" style={{marginBottom:12}}>
+      <div className="report-title" style={{marginBottom:12}}>📞 Mango Voice & AI</div>
+      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:12}}>
+        Credentials for Mango Voice call sync, OpenAI Whisper transcription, and Gemini grading.
+        Changes take effect immediately — no restart required.
+      </div>
+
+      <form onSubmit={handleSave}>
+        <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+          letterSpacing:'0.05em',marginBottom:6}}>Mango Voice</div>
+        {inp('Username', 'mango_username', 'text', 'your@email.com')}
+        {inp('Password', 'mango_password', 'password', '••••••••')}
+        {inp('PBX ID', 'mango_pbx_id', 'text', '9021')}
+        {inp('API Base', 'mango_api_base', 'text', 'https://api.mangovoice.com')}
+
+        <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+          letterSpacing:'0.05em',margin:'10px 0 6px'}}>AI Services</div>
+        {inp('OpenAI API Key', 'openai_api_key', 'password', 'sk-...')}
+        {inp('Gemini API Key', 'gemini_api_key', 'password', 'AIza...')}
+        {inp('Gemini Model', 'gemini_model', 'text', 'gemini-2.5-flash')}
+
+        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
+          <label style={{fontSize:11,fontWeight:600,minWidth:150,flexShrink:0}}>Whisper Mode</label>
+          <select value={form.mango_whisper_mode||'api'}
+            onChange={e => setForm(f=>({...f,mango_whisper_mode:e.target.value}))}
+            style={{padding:'3px 7px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}>
+            <option value="api">Cloud (OpenAI API) — recommended</option>
+            <option value="local">Local GPU — requires whisper + torch installed</option>
+          </select>
+        </div>
+
+        <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+          letterSpacing:'0.05em',margin:'10px 0 6px'}}>Pipeline Toggles</div>
+        {tog('Enable Mango Sync', 'mango_enabled', '— sync call list from Mango every 5 min')}
+        {tog('Enable AI Pipeline', 'mango_pipeline_enabled', '— download + transcribe + grade calls')}
+        {tog('Auto-grade after transcription', 'mango_pipeline_auto_grade')}
+
+        <div style={{display:'flex',alignItems:'center',gap:8,marginTop:10,flexWrap:'wrap'}}>
+          <button type="submit" className="btn btn-teal btn-sm" disabled={saving}>
+            {saving ? 'Saving…' : 'Save Settings'}
+          </button>
+          <button type="button" className="btn btn-sm" disabled={running}
+            onClick={handleRunNow}
+            style={{background:'#7c3aed',color:'#fff',border:'none',borderRadius:4,padding:'4px 12px',
+              fontSize:11,cursor:'pointer',opacity:running?0.6:1}}>
+            {running ? 'Starting…' : '⚡ Sync & Analyze Now'}
+          </button>
+          {saveMsg && <span style={{fontSize:11,color:saveMsg.startsWith('Error')?'var(--red)':'var(--green)'}}>{saveMsg}</span>}
+          {runMsg && <span style={{fontSize:11,color:runMsg.startsWith('Error')?'var(--red)':'var(--green)'}}>{runMsg}</span>}
+        </div>
+      </form>
+    </div>
+  );
+}
+
 // ── AISpendCard — AI cost summary in Admin panel ──────────────────────────────
 
 function AISpendCard() {
@@ -10692,6 +10829,8 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
       <PracticeSettingsCard />
 
       <AISettingsCard />
+
+      <MangoSettingsCard />
 
       <AISpendCard />
 
