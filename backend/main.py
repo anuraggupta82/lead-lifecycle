@@ -4160,6 +4160,30 @@ def admin_gads_call_view(days: int = 30):
     return {"calls": rows, "total": len(rows)}
 
 
+@app.get("/api/admin/gads/call-conversions", dependencies=[Depends(_require_admin)])
+def admin_gads_call_conversions(days: int = 30, min_duration_sec: int = 0):
+    """Return GAds call_view rows joined to matched Mango call records.
+
+    Each row represents one call that came directly from a Google Ad.
+    When the probabilistic matcher has run, the row is enriched with the full
+    Mango call data: caller phone number, transcript, grade, team member,
+    and any matched lead.
+
+    Use min_duration_sec=60 to filter to calls that count as conversions
+    (the Google Ads 'Phone call leads' conversion threshold is typically 60s).
+    """
+    from database import get_gads_call_conversions
+    rows = get_gads_call_conversions(days=days, min_duration_sec=min_duration_sec)
+    matched   = [r for r in rows if r.get("mango_uuid")]
+    converted = [r for r in rows if r.get("gads_duration_sec", 0) >= 60]
+    return {
+        "calls": rows,
+        "total": len(rows),
+        "matched_to_mango": len(matched),
+        "conversions_60s": len(converted),
+    }
+
+
 # ─── Call Analysis endpoints ──────────────────────────────────────────────────
 
 @app.post("/api/admin/calls/{uuid}/process", dependencies=[Depends(_require_admin)])
@@ -4176,7 +4200,33 @@ def admin_process_call(uuid: str, request: Request, background_tasks: Background
     from mango_pipeline import process_call
     token_mgr = getattr(request.app.state, "mango_token_mgr", None)
     tok = token_mgr.get_token() if token_mgr else None
-    background_tasks.add_task(process_call, call, mango_token=tok)
+
+    def _safe_process_call(call_dict, mango_token=None):
+        """Wrapper that logs any unhandled exception from the pipeline.
+
+        FastAPI BackgroundTasks swallow exceptions silently — without this
+        wrapper, a top-level error in process_call (e.g. import failure,
+        DB error before the inner try-block) leaves the call stuck in
+        'in_progress' with no log line.
+        """
+        try:
+            process_call(call_dict, mango_token=mango_token)
+        except Exception as err:
+            logger.exception(
+                "[pipeline] Unhandled error in process_call(%s): %s: %s",
+                call_dict.get("uuid"), type(err).__name__, err,
+            )
+            try:
+                from database import update_mango_call_analysis
+                update_mango_call_analysis(
+                    call_dict.get("uuid", ""),
+                    transcription_status="failed",
+                    pipeline_error=f"{type(err).__name__}: {str(err)[:480]}",
+                )
+            except Exception:
+                logger.exception("[pipeline] Could not persist failure state")
+
+    background_tasks.add_task(_safe_process_call, call, mango_token=tok)
     return {"ok": True, "status": "queued", "uuid": uuid}
 
 
@@ -4237,7 +4287,7 @@ def admin_grade_call(uuid: str):
     call = get_mango_call(uuid)
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
-    transcript = call.get("transcript") or ""
+    transcript = call.get("call_transcript") or ""
     if not transcript.strip():
         raise HTTPException(status_code=400, detail="No transcript available — transcribe first")
 
@@ -4259,10 +4309,22 @@ def admin_grade_call(uuid: str):
 
         import json as _json
         if grade.get("gradeable"):
+            # Normalise 1–10 scores → 0–100 scale and rename explanation→notes
+            raw_scores = grade.get("scores", [])
+            normalised_scores = [
+                {
+                    "criterion": s.get("criterion", s.get("name", "")),
+                    "score": round(float(s.get("score", 0)) * 10),
+                    "notes": s.get("explanation", s.get("notes", "")),
+                }
+                for s in raw_scores
+            ]
+            raw_overall = float(grade.get("overall_score") or 0)
+            overall_pct = round(raw_overall * 10)
             update_mango_call_analysis(
                 uuid,
-                grade_scores_json=_json.dumps(grade.get("scores", [])),
-                grade_overall_score=float(grade.get("overall_score") or 0),
+                grade_scores_json=_json.dumps(normalised_scores),
+                grade_overall_score=overall_pct,
                 grade_overall_notes=grade.get("overall_notes", ""),
                 grade_recommendations_json=_json.dumps(grade.get("recommendations", [])),
                 grade_gradeable=1,
@@ -5738,6 +5800,7 @@ def admin_get_mango_settings():
         "mango_password":            "••••••••" if s["mango_password"] else "",
         "mango_pbx_id":              s["mango_pbx_id"],
         "mango_api_base":            s["mango_api_base"],
+        "mango_account_uuid":        s.get("mango_account_uuid", ""),
         "openai_api_key":            "••••••••" if s["openai_api_key"] else "",
         # Vertex AI (HIPAA-compliant Gemini)
         "vertex_project_id":         s["vertex_project_id"],
@@ -5764,6 +5827,7 @@ def admin_save_mango_settings(body: dict, request: Request):
     _save("mango_password",            body.get("mango_password", ""))
     _save("mango_pbx_id",              body.get("mango_pbx_id", ""))
     _save("mango_api_base",            body.get("mango_api_base", ""))
+    _save("mango_account_uuid",        body.get("mango_account_uuid", ""))
     _save("mango_openai_api_key",      body.get("openai_api_key", ""))
     # Vertex AI settings (replaces direct gemini_api_key)
     _save("vertex_project_id",        body.get("vertex_project_id", ""))

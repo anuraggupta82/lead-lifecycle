@@ -3011,12 +3011,14 @@ function _attrBadge(call) {
     border:`1px solid ${isAd?'#0369a144':'#92400e44'}`}}>{call.attribution_label}</span>;
 }
 function _transcriptBadge(status) {
-  if (!status) return <span style={{color:'var(--text-muted)'}}>—</span>;
+  // 'pending' is the DB default for every new call — treat as not-yet-transcribed (show —)
+  if (!status || status === 'pending') return <span style={{color:'var(--text-muted)'}}>—</span>;
   const map = {
-    pending:    {label:'⏳ Pending',  color:'#d97706'},
-    in_progress:{label:'⚙ Working',  color:'#0369a1'},
-    done:       {label:'✓ Done',     color:'#16a34a'},
-    failed:     {label:'✗ Failed',   color:'#dc2626'},
+    in_progress:        {label:'⚙ Working',  color:'#0369a1'},
+    done:               {label:'✓ Done',     color:'#16a34a'},
+    failed:             {label:'✗ Failed',   color:'#dc2626'},
+    skipped_too_short:  {label:'⏭ Too short', color:'#94a3b8'},
+    skipped_no_audio:   {label:'⏭ No audio', color:'#94a3b8'},
   };
   const m = map[status] || {label:status, color:'#94a3b8'};
   return <span style={{fontSize:10,fontWeight:700,color:m.color}}>{m.label}</span>;
@@ -3035,6 +3037,11 @@ function CallsSubView() {
   const [total, setTotal] = useState(0);
   const [adCallCount, setAdCallCount] = useState(0);
   const [loading, setLoading] = useState(false);
+  // GAds call conversions panel
+  const [convCalls, setConvCalls] = useState([]);
+  const [convLoading, setConvLoading] = useState(false);
+  const [convExpanded, setConvExpanded] = useState(false);
+  const [convMinDur, setConvMinDur] = useState(60); // default: show calls ≥60s (conversion threshold)
   const [days, setDays] = useState(30);
   const [dirFilter, setDirFilter] = useState('inbound');
   const [statusFilter, setStatusFilter] = useState('');
@@ -3044,6 +3051,9 @@ function CallsSubView() {
   // Per-call analyze state: { uuid: 'idle'|'processing'|'polling'|'done'|'error' }
   const [analyzeState, setAnalyzeState] = useState({});
   const [analyzeError, setAnalyzeError] = useState({});
+  // Per-call grade-only state: { uuid: 'idle'|'working'|'done'|'error' }
+  const [gradeOnlyState, setGradeOnlyState] = useState({});
+  const [gradeOnlyError, setGradeOnlyError] = useState({});
   // Bulk job state
   const [bulkJob, setBulkJob] = useState(null); // {id, status, total, done, errors, current_label}
   const [bulkStarting, setBulkStarting] = useState(false);
@@ -3074,6 +3084,17 @@ function CallsSubView() {
   }
 
   useEffect(() => { loadCalls(); }, [days, dirFilter, statusFilter]);
+
+  async function loadConversions() {
+    setConvLoading(true);
+    try {
+      const d = await api(`/api/admin/gads/call-conversions?days=${days}&min_duration_sec=${convMinDur}`);
+      setConvCalls(d.calls || []);
+    } catch(e) { console.error('Conversions load error', e); }
+    finally { setConvLoading(false); }
+  }
+
+  useEffect(() => { loadConversions(); }, [days, convMinDur]);
 
   async function handleSync() {
     setSyncing(true); setSyncMsg('');
@@ -3130,35 +3151,80 @@ function CallsSubView() {
   function analyzeButton(call) {
     const st = call.transcription_status;
     const aState = analyzeState[call.uuid] || 'idle';
-    const err = analyzeError[call.uuid];
-    if (st === 'done') return <span style={{fontSize:10,color:'#16a34a',fontWeight:700}}>✓ Done</span>;
-    if (aState === 'processing' || aState === 'polling' || st === 'pending' || st === 'in_progress') {
-      return <span style={{fontSize:10,color:'#d97706'}}>⚙ Working…</span>;
-    }
+    const aErr   = analyzeError[call.uuid];
+    const gState = gradeOnlyState[call.uuid] || 'idle';
+    const gErr   = gradeOnlyError[call.uuid];
+    const hasTranscript = st === 'done';
+    const isGraded = call.grade_overall_score != null;
+    // Only show "Transcribing…" if the UI actively triggered it (aState is set),
+    // not just because the DB default is 'pending'. 'in_progress' means the backend is actively working.
+    const transcribing = aState === 'processing' || aState === 'polling' || st === 'in_progress';
+    const grading = gState === 'working';
+
+    const playBtn = call.recording_url ? (
+      <button onClick={e=>{e.stopPropagation();window.open(`/api/admin/calls/recording/${call.uuid}/play`,'_blank');}}
+        title="Play recording"
+        style={{fontSize:9,padding:'2px 5px',border:'1px solid #7c3aed',borderRadius:3,cursor:'pointer',
+          color:'#7c3aed',background:'#f5f3ff'}}>
+        🎵
+      </button>
+    ) : null;
+
+    // Transcribing in progress
+    if (transcribing) return (
+      <span style={{display:'flex',gap:3,alignItems:'center'}}>
+        <span style={{fontSize:9,color:'#d97706'}}>⚙ Transcribing…</span>
+        {playBtn}
+      </span>
+    );
+
+    // Transcribe failed / retry
     if (aState === 'error') return (
-      <span>
+      <span style={{display:'flex',gap:3,alignItems:'center'}}>
         <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
           style={{fontSize:9,padding:'1px 5px',border:'1px solid #dc2626',borderRadius:3,cursor:'pointer',color:'#dc2626',background:'#fef2f2'}}>
           ↺ Retry
         </button>
-        {err && <span style={{fontSize:9,color:'#dc2626',marginLeft:4}} title={err}>⚠</span>}
+        {aErr && <span style={{fontSize:9,color:'#dc2626'}} title={aErr}>⚠</span>}
+        {playBtn}
       </span>
     );
-    // Only show Analyze/Play for calls with a recording (otherwise nothing to transcribe)
-    if (!call.recording_url) return <span style={{fontSize:10,color:'var(--text-muted)'}}>—</span>;
+
     return (
-      <span style={{display:'flex',gap:4,alignItems:'center',flexWrap:'wrap'}}>
-        <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
-          style={{fontSize:9,padding:'2px 7px',border:'1px solid #0369a1',borderRadius:3,cursor:'pointer',
-            color:'#0369a1',background:'#e0f2fe',whiteSpace:'nowrap'}}>
-          ▶ Analyze
-        </button>
-        <button onClick={e=>{e.stopPropagation();window.open(`/api/admin/calls/recording/${call.uuid}/play`,'_blank');}}
-          title="Play recording"
-          style={{fontSize:9,padding:'2px 6px',border:'1px solid #7c3aed',borderRadius:3,cursor:'pointer',
-            color:'#7c3aed',background:'#f5f3ff',whiteSpace:'nowrap'}}>
-          🎵
-        </button>
+      <span style={{display:'flex',gap:3,alignItems:'center',flexWrap:'wrap'}}>
+        {/* Transcribe button — show if no transcript yet. Backend fetches recording from Mango on demand,
+            so we don't require call.recording_url to be present. */}
+        {!hasTranscript && (
+          <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
+            title="Transcribe this call with Whisper"
+            style={{fontSize:9,padding:'2px 6px',border:'1px solid #0369a1',borderRadius:3,cursor:'pointer',
+              color:'#0369a1',background:'#e0f2fe',whiteSpace:'nowrap'}}>
+            🎙 Transcribe
+          </button>
+        )}
+        {/* Grade button — only available once transcript exists */}
+        {hasTranscript && (
+          grading
+            ? <span style={{fontSize:9,color:'#d97706'}}>⚙ Grading…</span>
+            : gState === 'done'
+              ? <span style={{fontSize:9,color:'#16a34a',fontWeight:700}}>✓ Graded</span>
+              : (
+                <button onClick={e=>{e.stopPropagation();handleGradeOnly(call.uuid);}}
+                  title={isGraded ? 'Re-grade this call' : 'Grade this call with Vertex AI'}
+                  style={{fontSize:9,padding:'2px 6px',
+                    border:`1px solid ${isGraded?'#b45309':'#16a34a'}`,borderRadius:3,cursor:'pointer',
+                    color:isGraded?'#b45309':'#16a34a',
+                    background:isGraded?'#fef3c7':'#dcfce7',whiteSpace:'nowrap'}}>
+                  {isGraded ? '↺ Re-grade' : '⭐ Grade'}
+                </button>
+              )
+        )}
+        {/* Transcript done badge when no grade yet */}
+        {hasTranscript && !isGraded && gState === 'idle' && (
+          <span style={{fontSize:9,color:'#0891b2'}}>✓ Transcript</span>
+        )}
+        {gErr && <span style={{fontSize:9,color:'#dc2626'}} title={gErr}>⚠</span>}
+        {playBtn}
       </span>
     );
   }
@@ -3224,6 +3290,20 @@ function CallsSubView() {
     } catch(e) { return {ok: false, error: e.message}; }
   }
 
+  async function handleGradeOnly(uuid) {
+    setGradeOnlyState(s => ({...s, [uuid]: 'working'}));
+    setGradeOnlyError(e => ({...e, [uuid]: null}));
+    try {
+      const d = await api(`/api/admin/calls/${uuid}/grade`, { method: 'POST' });
+      if (d.ok && d.call) updateCallInState(uuid, d.call);
+      setGradeOnlyState(s => ({...s, [uuid]: 'done'}));
+      setTimeout(() => setGradeOnlyState(s => ({...s, [uuid]: 'idle'})), 3000);
+    } catch(e) {
+      setGradeOnlyState(s => ({...s, [uuid]: 'error'}));
+      setGradeOnlyError(err => ({...err, [uuid]: e.message || 'Grade failed'}));
+    }
+  }
+
   // ── Derived stats ─────────────────────────────────────────────────────────
   const missed      = calls.filter(c=>c.status==='missed').length;
   const answered    = calls.filter(c=>c.status==='answered').length;
@@ -3253,6 +3333,98 @@ function CallsSubView() {
             <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>{t.label}</div>
           </div>
         ))}
+      </div>
+
+      {/* ── GAds Call Conversions panel ──────────────────────────────────── */}
+      <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,marginBottom:14,overflow:'hidden'}}>
+        {/* Header row */}
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 14px',cursor:'pointer',userSelect:'none'}}
+             onClick={()=>setConvExpanded(x=>!x)}>
+          <div style={{display:'flex',alignItems:'center',gap:10}}>
+            <span style={{fontSize:13,fontWeight:700,color:'#0369a1'}}>📞 Google Ads Call Conversions</span>
+            {convLoading
+              ? <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>
+              : <span style={{fontSize:11,color:'var(--text-muted)'}}>{convCalls.length} call{convCalls.length!==1?'s':''} • {convCalls.filter(c=>c.mango_uuid).length} matched to Mango</span>
+            }
+          </div>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <select value={convMinDur} onChange={e=>{setConvMinDur(Number(e.target.value));setConvExpanded(true);}}
+                    onClick={e=>e.stopPropagation()}
+                    style={{fontSize:11,padding:'2px 6px',border:'1px solid var(--border)',borderRadius:4,background:'#f8fafc'}}>
+              <option value={0}>All durations</option>
+              <option value={60}>≥60s (conversions)</option>
+              <option value={120}>≥2 min</option>
+              <option value={180}>≥3 min</option>
+            </select>
+            <span style={{fontSize:11,color:'var(--text-muted)'}}>{convExpanded ? '▲' : '▼'}</span>
+          </div>
+        </div>
+
+        {/* Expanded table */}
+        {convExpanded && (
+          convCalls.length === 0
+          ? <div style={{padding:'12px 14px',fontSize:12,color:'var(--text-muted)',fontStyle:'italic'}}>
+              {convLoading ? 'Loading…' : 'No Google Ads call data for this period. Run GAds Call View sync to populate.'}
+            </div>
+          : <div style={{overflowX:'auto'}}>
+              <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+                <thead>
+                  <tr style={{background:'#f8fafc',borderTop:'1px solid var(--border)'}}>
+                    {['Time (GAds)','Campaign','Area Code','Duration','Status','Caller Number','Answered By','Grade','Lead','Transcript'].map(h=>(
+                      <th key={h} style={{padding:'6px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap',borderBottom:'1px solid var(--border)'}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {convCalls.map((c,i)=>{
+                    const matched = !!c.mango_uuid;
+                    const ts = c.start_call_date_time ? new Date(c.start_call_date_time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}) : '—';
+                    const dur = c.gads_duration_sec ? _fmtDur(c.gads_duration_sec) : '—';
+                    const isConv = (c.gads_duration_sec||0) >= 60;
+                    return (
+                      <tr key={c.call_id||i} style={{borderBottom:'1px solid var(--border)',background:matched?'#f0fdf4':'#fffbeb'}}>
+                        <td style={{padding:'6px 10px',whiteSpace:'nowrap'}}>
+                          {ts}
+                          {isConv && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
+                        </td>
+                        <td style={{padding:'6px 10px',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={c.campaign_name||''}>{c.campaign_name||'—'}</td>
+                        <td style={{padding:'6px 10px',fontFamily:'monospace'}}>{c.caller_area_code ? `(${c.caller_area_code}) ***-****` : '—'}</td>
+                        <td style={{padding:'6px 10px',fontFamily:'monospace'}}>{dur}</td>
+                        <td style={{padding:'6px 10px'}}>
+                          <span style={{fontSize:10,fontWeight:700,color:c.gads_call_status==='RECEIVED'?'#16a34a':'#94a3b8'}}>{c.gads_call_status||'—'}</span>
+                        </td>
+                        {/* Mango-enriched columns */}
+                        <td style={{padding:'6px 10px',fontFamily:'monospace'}}>
+                          {matched
+                            ? <span style={{color:'#0f172a',fontWeight:600}}>{c.from_number||'—'}</span>
+                            : <span style={{color:'#94a3b8',fontStyle:'italic'}}>unmatched</span>}
+                        </td>
+                        <td style={{padding:'6px 10px'}}>{c.team_member||c.answered_by||'—'}</td>
+                        <td style={{padding:'6px 10px'}}>
+                          {c.grade_overall_score != null
+                            ? _gradeBadge(c.grade_overall_score)
+                            : <span style={{color:'var(--text-muted)',fontSize:11}}>{matched?(c.transcription_status==='done'?'Not graded':'No transcript'):'—'}</span>}
+                        </td>
+                        <td style={{padding:'6px 10px'}}>
+                          {c.lead_name
+                            ? <span style={{fontSize:11,color:'#0369a1',fontWeight:600}}>{c.lead_name}</span>
+                            : <span style={{color:'var(--text-muted)',fontSize:11}}>—</span>}
+                        </td>
+                        <td style={{padding:'6px 10px',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={c.call_summary||''}>
+                          {c.call_summary
+                            ? <span style={{fontSize:10,color:'var(--text-muted)'}}>{c.call_summary.slice(0,80)}{c.call_summary.length>80?'…':''}</span>
+                            : <span style={{color:'var(--text-muted)',fontSize:11}}>—</span>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <div style={{padding:'6px 14px',fontSize:10,color:'var(--text-muted)',borderTop:'1px solid var(--border)'}}>
+                🟢 Green rows = matched to Mango call record (full caller ID visible) · 🟡 Yellow = GAds call with no Mango match yet · CONV badge = duration ≥60s (counts as conversion)
+              </div>
+            </div>
+        )}
       </div>
 
       {/* Bulk job progress bar */}
@@ -3332,7 +3504,7 @@ function CallsSubView() {
         <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
           <thead>
             <tr style={{background:'var(--bg-card)',borderBottom:'1px solid var(--border)'}}>
-              {['Time','Dir','From','To','Answered By','Duration','Status','Attribution','Transcript','Grade','Analyze'].map(h=>(
+              {['Time','Dir','From','To','Answered By','Duration','Status','Attribution','Transcript','Grade','Actions'].map(h=>(
                 <th key={h} style={{padding:'8px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap'}}>{h}</th>
               ))}
             </tr>
@@ -3578,16 +3750,16 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                 <div style={{textAlign:'center',padding:'40px 0',color:'var(--text-muted)'}}>
                   <div style={{fontSize:32,marginBottom:12}}>🎙</div>
                   <div style={{fontSize:13,marginBottom:16}}>
-                    {call.transcription_status==='pending' ? '⏳ Transcription queued…' :
+                    {call.transcription_status==='pending' ? 'Not yet transcribed. Click Transcribe to begin.' :
                      call.transcription_status==='in_progress' ? '⚙ Transcribing…' :
                      call.transcription_status==='failed' ? '✗ Transcription failed' :
                      'No transcript available'}
                   </div>
-                  {(!call.transcription_status || call.transcription_status==='failed') && call.recording_url && (
+                  {(!call.transcription_status || call.transcription_status==='pending' || call.transcription_status==='failed') && (
                     <button onClick={()=>onAnalyze(call.uuid)}
                       style={{padding:'8px 20px',background:'var(--teal)',color:'#fff',border:'none',
                         borderRadius:6,cursor:'pointer',fontSize:12,fontWeight:600}}>
-                      ▶ Analyze This Call
+                      ▶ Transcribe This Call
                     </button>
                   )}
                   {call.transcription_status==='failed' && call.pipeline_error && (
@@ -10274,7 +10446,7 @@ function AISettingsCard() {
 
 function MangoSettingsCard() {
   const EMPTY = {
-    mango_username:'', mango_password:'', mango_pbx_id:'', mango_api_base:'',
+    mango_username:'', mango_password:'', mango_pbx_id:'', mango_api_base:'', mango_account_uuid:'',
     openai_api_key:'',
     vertex_project_id:'marketing-landing-page-491721',
     vertex_location:'us-central1',
@@ -10362,6 +10534,7 @@ function MangoSettingsCard() {
         {inp('Password', 'mango_password', 'password', '••••••••')}
         {inp('PBX ID', 'mango_pbx_id', 'text', '9021')}
         {inp('API Base', 'mango_api_base', 'text', 'https://api.mangovoice.com')}
+        {inp('Account UUID', 'mango_account_uuid', 'text', 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx')}
 
         <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
           letterSpacing:'0.05em',margin:'10px 0 6px'}}>AI Services</div>

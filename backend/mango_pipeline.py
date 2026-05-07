@@ -45,6 +45,7 @@ import requests
 import database as db
 from ai_costs import log_whisper, log_gemini, log_claude
 from config import get_settings
+from mango_service import fetch_fresh_recording_url
 
 log = logging.getLogger(__name__)
 
@@ -134,22 +135,24 @@ def _fetch_recording(recording_url: str, call_uuid: str, token: Optional[str] = 
 
     headers: dict[str, str] = {}
     url_lower = recording_url.lower()
-    is_presigned = (
-        ".amazonaws.com" in url_lower
-        or "x-amz-signature" in url_lower
-        or "awsaccesskeyid" in url_lower
-        or "x-amz-credential" in url_lower
-    )
-    if token and not is_presigned:
+    # S3 URLs (amazonaws.com) must NOT have an Authorization header — S3 rejects
+    # Bearer tokens with 400. The Mango S3 bucket is accessible without auth.
+    # Only add the Bearer token for Mango API URLs (mangovoice.com etc.).
+    is_s3 = ".amazonaws.com" in url_lower
+    if token and not is_s3:
         headers["Authorization"] = f"Bearer {token}"
 
+    log.info("[pipeline] Fetching recording: %s (auth=%s)", recording_url, "Bearer" if headers.get("Authorization") else "none")
     resp = requests.get(recording_url, headers=headers, timeout=60, stream=True)
+    if not resp.ok:
+        log.error("[pipeline] Recording fetch failed: HTTP %s — %s", resp.status_code, resp.text[:200])
     resp.raise_for_status()
 
     content_type = resp.headers.get("Content-Type", "")
-    if "text/html" in content_type or "application/json" in content_type:
+    if any(ct in content_type for ct in ("text/html", "application/json", "application/xml", "text/xml")):
         raise ValueError(
-            f"Recording download returned {content_type} — likely an auth error"
+            f"Recording download returned {content_type} instead of audio — "
+            f"likely an S3 or auth error. Body: {resp.text[:200]}"
         )
 
     total = 0
@@ -163,6 +166,33 @@ def _fetch_recording(recording_url: str, call_uuid: str, token: Optional[str] = 
         raise ValueError("Recording download returned empty file")
 
     return local
+
+
+def _rebuild_recording_url(call_row: dict, msettings: dict) -> str:
+    """Reconstruct the Mango S3 recording URL from the known pattern.
+
+    Mango's call-listing endpoint frequently omits `recording_url` even when a
+    recording exists. The standalone mango-call-analysis app builds the URL
+    from this pattern:
+        https://mango-prd.s3.amazonaws.com/recorded_calls/{account_uuid}/{MMYYYY}/{call_uuid}.mp3
+
+    Returns "" if account_uuid or started_at are unavailable.
+    """
+    # account_uuid is a separate config (NOT the same as pbx_id). The
+    # standalone app stores it as cfg["mango"]["account_uuid"]. We accept it
+    # from db settings under "mango_account_uuid" — admin must set it for the
+    # S3-pattern fallback to work.
+    account_uuid = msettings.get("mango_account_uuid") or ""
+    started_at = call_row.get("started_at") or ""
+    uuid = call_row.get("uuid") or ""
+    if not (account_uuid and started_at and uuid):
+        return ""
+    try:
+        dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        mmyyyy = dt.strftime("%m%Y")
+    except Exception:
+        return ""
+    return f"https://mango-prd.s3.amazonaws.com/recorded_calls/{account_uuid}/{mmyyyy}/{uuid}.mp3"
 
 
 def _cleanup_recording(path: Path) -> None:
@@ -298,7 +328,9 @@ Grading Criteria:
 
 IMPORTANT RULES:
 - If the call is very short, a voicemail, or has no real conversation, give N/A for all criteria and explain why.
-- Be fair but honest. Score based on what actually happened in the call.
+- Be fair and realistic. A score of 7–8 represents solid, professional performance. Reserve 9–10 for exceptional calls and 1–3 for genuinely poor performance. Most competent calls should score 6–8.
+- Judge staff only on what is within their control. If a patient requests something the office cannot offer (e.g. weekend hours when the office is Mon–Thu), credit the staff for clearly explaining the limitation and offering alternatives.
+- The pre-recorded IVR greeting ("Thank you for calling Grafton Dental Care...") is NOT staff performance — ignore it entirely.
 - Never include PHI (patient names, phone numbers, dates of birth) in your response.
 - Keep all string values on a single line — do not use line breaks inside JSON string values.
 - Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
@@ -338,7 +370,8 @@ Transcript:
 
 def _call_vertex(prompt: str, model: str, project_id: str, location: str,
                  credentials_path: str, temperature: float = 0.25,
-                 max_tokens: int = 1200) -> tuple[str, int, int]:
+                 max_tokens: int = 1200,
+                 response_mime_type: str = "") -> tuple[str, int, int]:
     """Call Gemini via Vertex AI SDK (HIPAA-compliant). Returns (text, input_tokens, output_tokens).
 
     Uses the same init-guard pattern as Pearly's vertex_client.py to avoid
@@ -364,12 +397,12 @@ def _call_vertex(prompt: str, model: str, project_id: str, location: str,
         _vertex_init_key = init_key
         log.info("[vertex] init complete (project=%s, location=%s)", project_id, location)
 
-    gen_config = GenerationConfig(
-        max_output_tokens=max_tokens,
-        temperature=temperature,
-    )
-    gmodel = GenerativeModel(model, generation_config=gen_config)
-    response = gmodel.generate_content(prompt)
+    gen_cfg_kwargs: dict = {"max_output_tokens": max_tokens, "temperature": temperature}
+    if response_mime_type:
+        gen_cfg_kwargs["response_mime_type"] = response_mime_type
+    gen_config = GenerationConfig(**gen_cfg_kwargs)
+    gmodel = GenerativeModel(model)
+    response = gmodel.generate_content(prompt, generation_config=gen_config)
 
     # Extract text defensively (blocked responses return empty)
     text = ""
@@ -429,6 +462,7 @@ def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
     raw, in_tok, out_tok = _call_vertex(
         prompt, vertex_model, vertex_project_id, vertex_location,
         vertex_credentials_path, temperature=0.15, max_tokens=2048,
+        response_mime_type="application/json",
     )
     log_gemini(
         purpose="call_grade",
@@ -453,6 +487,8 @@ def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
         pass
 
     def _sanitize(s: str) -> str:
+        """Walk character-by-character and sanitize literal control chars inside JSON string values.
+        Matches the approach proven in the standalone mango-call-analysis app (core.py)."""
         result = []
         in_str = False
         esc = False
@@ -466,15 +502,33 @@ def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
             elif ch == '"':
                 result.append(ch)
                 in_str = not in_str
-            elif in_str and ch in '\n\r':
-                result.append(' ')
+            elif in_str and ch == '\n':
+                result.append(' ')   # literal newline inside string → space
+            elif in_str and ch == '\r':
+                pass                 # strip carriage returns entirely
             elif in_str and ch == '\t':
-                result.append(' ')
+                result.append(' ')   # tab inside string → space
             else:
                 result.append(ch)
         return ''.join(result)
 
-    return json.loads(_sanitize(raw))
+    try:
+        return json.loads(_sanitize(raw))
+    except json.JSONDecodeError as e:
+        log.warning("[pipeline] Grade JSON parse failed after sanitize: %s — trying json_repair", e)
+
+    # Last resort: json_repair handles embedded unescaped quotes, newlines, etc.
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(raw, return_objects=True)
+        if isinstance(repaired, dict) and "gradeable" in repaired:
+            log.info("[pipeline] Grade JSON recovered via json_repair")
+            return repaired
+    except Exception as repair_err:
+        log.warning("[pipeline] json_repair also failed: %s — raw (first 300): %s",
+                    repair_err, raw[:300])
+
+    return {"gradeable": False, "reason": "AI returned unparseable JSON — check logs"}
 
 
 # ── Team member resolution ────────────────────────────────────────────────────
@@ -536,48 +590,75 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
     Run the full analysis pipeline for a single mango_calls row.
     Updates the DB row in place. Raises on hard failures.
     """
-    # Use DB-first settings so Admin UI saves take effect without restart.
-    msettings = db.get_mango_settings()
-    settings = get_settings()  # kept for mango_recording_dir + non-Mango fields
-    uuid = call_row["uuid"]
-    duration_sec = call_row.get("duration_sec") or 0
-    recording_url = call_row.get("recording_url") or ""
-    caller_name = call_row.get("caller_id_name") or ""
+    uuid = call_row.get("uuid") or ""
+    log.info("[pipeline] Processing call %s (duration=%ds)",
+             uuid, call_row.get("duration_sec") or 0)
 
-    log.info("[pipeline] Processing call %s (duration=%ds)", uuid, duration_sec)
-
-    # Mark in-progress and bump attempt counter
-    attempts = (call_row.get("pipeline_attempts") or 0) + 1
-    db.update_mango_call_analysis(
-        uuid,
-        transcription_status="in_progress",
-        pipeline_attempts=attempts,
-    )
-
+    # Wrap EVERYTHING — even the in_progress write — so a setup-time exception
+    # (DB error, missing settings row, etc.) is logged + persisted, not swallowed
+    # by FastAPI's BackgroundTasks runner.
     audio_path: Optional[Path] = None
-
     try:
+        # Use DB-first settings so Admin UI saves take effect without restart.
+        msettings = db.get_mango_settings()
+        settings = get_settings()  # kept for mango_recording_dir + non-Mango fields
+        duration_sec = call_row.get("duration_sec") or 0
+        caller_name = call_row.get("caller_id_name") or ""
+
+        # Mark in-progress and bump attempt counter
+        attempts = (call_row.get("pipeline_attempts") or 0) + 1
+        db.update_mango_call_analysis(
+            uuid,
+            transcription_status="in_progress",
+            pipeline_attempts=attempts,
+        )
+
         # ── 1. Download recording ─────────────────────────────────────────────
+        # Mango's S3 bucket is NOT publicly accessible. The only valid download
+        # URLs are fresh pre-signed URLs returned by the Mango /calls/ API.
+        # The recording_url stored in the DB was fetched at sync time and expires
+        # within minutes — we must re-fetch from Mango's API to get a fresh one.
+        recording_url = ""
+        if mango_token:
+            tok_mgr = getattr(process_call, "_token_mgr_cache", None)
+            # Re-fetch a fresh pre-signed URL for this call from Mango API
+            pbx_id = msettings.get("mango_pbx_id") or ""
+            api_base = msettings.get("mango_api_base") or "https://api.mangovoice.com"
+            try:
+                from mango_service import MangoTokenManager, fetch_fresh_recording_url as _ffru
+                # Build a lightweight token manager that just wraps the existing token
+                class _SingleTokenMgr:
+                    def get_token(self): return mango_token
+                recording_url = _ffru(_SingleTokenMgr(), uuid, pbx_id, api_base=api_base)
+            except Exception as e:
+                log.warning("[pipeline] %s — could not re-fetch recording URL from Mango: %s", uuid, e)
+
         if not recording_url:
+            msg = ("Could not obtain a fresh recording URL from Mango API. "
+                   "The call may not have a recording, or the Mango token is expired.")
+            log.error("[pipeline] %s — %s", uuid, msg)
             db.update_mango_call_analysis(
                 uuid, transcription_status="failed",
-                pipeline_error="No recording URL available",
-                is_empty=1,
+                pipeline_error=msg,
             )
             return
+        log.info("[pipeline] %s — downloading fresh recording URL", uuid)
 
-        audio_path = _fetch_recording(recording_url, uuid, token=mango_token)
+        audio_path = _fetch_recording(recording_url, uuid, token=None)  # pre-signed URL needs no Bearer
 
         # ── 2. Transcribe ─────────────────────────────────────────────────────
         openai_key = msettings["openai_api_key"]
-        if not openai_key:
+        whisper_mode = msettings["mango_whisper_mode"]
+        if whisper_mode != "local" and not openai_key:
+            msg = ("OPENAI_API_KEY not configured — set it in Admin → Mango "
+                   "settings or in backend/.env (OPENAI_API_KEY=...)")
+            log.error("[pipeline] %s — %s", uuid, msg)
             db.update_mango_call_analysis(
                 uuid, transcription_status="failed",
-                pipeline_error="OPENAI_API_KEY not configured",
+                pipeline_error=msg,
             )
             return
 
-        whisper_mode = msettings["mango_whisper_mode"]
         if whisper_mode == "local":
             transcript = _transcribe_local(audio_path, msettings["mango_whisper_local_model"])
         else:
@@ -594,11 +675,12 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         if _is_empty_call(transcript):
             db.update_mango_call_analysis(
                 uuid,
-                transcript=transcript,
+                call_transcript=transcript,
                 transcription_status="done",
                 summarized_at=datetime.now(timezone.utc).isoformat(),
                 is_empty=1,
                 pipeline_error="",
+                pipeline_attempts=0,
             )
             log.info("[pipeline] Call %s is empty/voicemail-only — skipping AI analysis", uuid)
             return
@@ -607,9 +689,10 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         vertex_project = msettings["vertex_project_id"]
         if not vertex_project:
             # Store transcript but skip AI analysis
+            log.warning("[pipeline] %s — VERTEX_PROJECT_ID not configured, summary skipped", uuid)
             db.update_mango_call_analysis(
                 uuid,
-                transcript=transcript,
+                call_transcript=transcript,
                 transcription_status="done",
                 summarized_at=datetime.now(timezone.utc).isoformat(),
                 pipeline_error="VERTEX_PROJECT_ID not configured — summary skipped",
@@ -629,11 +712,12 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         # Persist transcript + summary now (in case grading fails)
         db.update_mango_call_analysis(
             uuid,
-            transcript=transcript,
-            summary=summary,
+            call_transcript=transcript,
+            call_summary=summary,
             transcription_status="done",
             summarized_at=now_iso,
             pipeline_error="",
+            pipeline_attempts=0,  # reset attempt counter on success
         )
 
         # ── 5. Resolve team member ────────────────────────────────────────────
@@ -651,12 +735,24 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
                 now_iso2 = datetime.now(timezone.utc).isoformat()
 
                 if grade.get("gradeable"):
-                    scores_json = json.dumps(grade.get("scores", []))
+                    # Normalise 1–10 scores → 0–100 scale and rename explanation→notes
+                    raw_scores = grade.get("scores", [])
+                    normalised_scores = [
+                        {
+                            "criterion": s.get("criterion", s.get("name", "")),
+                            "score": round(float(s.get("score", 0)) * 10),
+                            "notes": s.get("explanation", s.get("notes", "")),
+                        }
+                        for s in raw_scores
+                    ]
+                    raw_overall = float(grade.get("overall_score") or 0)
+                    overall_pct = round(raw_overall * 10)
+                    scores_json = json.dumps(normalised_scores)
                     recs_json = json.dumps(grade.get("recommendations", []))
                     db.update_mango_call_analysis(
                         uuid,
                         grade_scores_json=scores_json,
-                        grade_overall_score=float(grade.get("overall_score") or 0),
+                        grade_overall_score=overall_pct,
                         grade_overall_notes=grade.get("overall_notes", ""),
                         grade_recommendations_json=recs_json,
                         grade_gradeable=1,
@@ -680,12 +776,18 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         log.info("[pipeline] Call %s processed successfully", uuid)
 
     except Exception as err:
-        log.error("[pipeline] Failed to process call %s: %s", uuid, err, exc_info=True)
-        db.update_mango_call_analysis(
-            uuid,
-            transcription_status="failed",
-            pipeline_error=str(err)[:500],
-        )
+        # Log with full traceback so the actual failure surfaces in stdout/log file.
+        log.exception("[pipeline] Failed to process call %s: %s: %s",
+                      uuid, type(err).__name__, err)
+        try:
+            db.update_mango_call_analysis(
+                uuid,
+                transcription_status="failed",
+                pipeline_error=f"{type(err).__name__}: {str(err)[:480]}",
+            )
+        except Exception as db_err:
+            log.exception("[pipeline] Could not even write failure state for %s: %s",
+                          uuid, db_err)
 
     finally:
         if audio_path:

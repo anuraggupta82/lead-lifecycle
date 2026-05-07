@@ -2194,6 +2194,7 @@ def get_mango_settings() -> dict:
         "mango_password":            get_setting("mango_password")            or cfg.mango_password,
         "mango_pbx_id":              get_setting("mango_pbx_id")              or cfg.mango_pbx_id,
         "mango_api_base":            get_setting("mango_api_base")            or cfg.mango_api_base,
+        "mango_account_uuid":        get_setting("mango_account_uuid")        or "",
         "openai_api_key":            get_setting("mango_openai_api_key")      or cfg.openai_api_key,
         # Vertex AI (HIPAA-compliant Gemini) — replaces direct Gemini API key
         "vertex_project_id":         get_setting("vertex_project_id")         or cfg.vertex_project_id,
@@ -5141,6 +5142,65 @@ def get_gads_call_view(days: int = 30) -> list:
     return [dict(r) for r in rows]
 
 
+def get_gads_call_conversions(days: int = 30, min_duration_sec: int = 0) -> list:
+    """Return Google Ads call_view rows joined to their matched Mango call record.
+
+    Each row = one GAds call, enriched with full Mango data (caller number,
+    transcript, grade, team member, lead match) when a match exists.
+    LEFT JOIN so GAds calls with no Mango match still appear (unmatched).
+    """
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                cv.call_id,
+                cv.campaign_id,
+                cv.campaign_name,
+                cv.caller_area_code,
+                cv.caller_country_code,
+                cv.call_duration_sec      AS gads_duration_sec,
+                cv.call_status            AS gads_call_status,
+                cv.call_type,
+                cv.start_call_date_time,
+                -- Mango match fields (NULL when unmatched)
+                mc.uuid                   AS mango_uuid,
+                mc.from_number,
+                mc.caller_id_name,
+                mc.started_at,
+                mc.duration_sec           AS mango_duration_sec,
+                mc.status                 AS mango_status,
+                mc.direction,
+                mc.answered_by,
+                mc.team_member,
+                mc.match_confidence,
+                mc.match_method,
+                mc.call_transcript,
+                mc.call_summary,
+                mc.grade_overall_score,
+                mc.grade_overall_notes,
+                mc.grade_gradeable,
+                mc.transcription_status,
+                mc.lead_id,
+                -- Lead match fields (NULL when no lead)
+                TRIM(COALESCE(l.first_name,'') || ' ' || COALESCE(l.last_name,'')) AS lead_name,
+                l.email                   AS lead_email,
+                l.stage                   AS lead_stage,
+                l.campaign_name           AS lead_campaign
+            FROM gads_call_view cv
+            LEFT JOIN mango_calls mc ON mc.gads_call_id = cv.call_id
+            LEFT JOIN leads l ON l.id = mc.lead_id
+            WHERE cv.start_call_date_time >= ?
+              AND cv.call_duration_sec >= ?
+            ORDER BY cv.start_call_date_time DESC
+            """,
+            (cutoff, min_duration_sec),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ── AI Usage helpers ───────────────────────────────────────────────────────────
 
 def insert_ai_usage(
@@ -5337,7 +5397,7 @@ def update_call_bulk_job(job_id: int, **kwargs) -> None:
 def update_mango_call_analysis(uuid: str, **kwargs) -> None:
     """Update any subset of analysis columns on a mango_calls row."""
     _ALLOWED_COLS = {
-        "transcript", "summary", "team_member",
+        "call_transcript", "call_summary", "team_member",
         "grade_scores_json", "grade_overall_score", "grade_overall_notes",
         "grade_recommendations_json", "grade_gradeable", "grade_reason",
         "graded_at", "summarized_at", "is_empty", "pipeline_error", "pipeline_attempts",

@@ -319,6 +319,67 @@ def fetch_calls_since(
     return results
 
 
+def fetch_fresh_recording_url(
+    token_manager: MangoTokenManager,
+    call_uuid: str,
+    pbx_id: str,
+    api_base: str = _API_BASE,
+) -> str:
+    """
+    Fetch a fresh pre-signed recording URL for a specific call from Mango API.
+
+    Strategy:
+    1. Try GET /calls/{uuid}/ (single-object endpoint — fastest, most accurate)
+    2. Fall back to GET /calls/?pbx_ids=...&limit=200 and scan for matching uuid
+       (Mango ignores most filter params, so uuid= filter doesn't work)
+
+    Returns the fresh recording_url string, or "" if unavailable.
+    """
+    base = api_base.rstrip("/")
+    token = token_manager.get_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # ── Strategy 1: single-object endpoint ────────────────────────────────────
+    r = requests.get(f"{base}/calls/{call_uuid}/", headers=headers, timeout=20)
+    if r.status_code == 200:
+        raw = r.json()
+        url = raw.get("recording_url") or raw.get("recording") or ""
+        if url:
+            logger.info("Mango: fresh recording URL for %s via detail endpoint: found", call_uuid)
+            return url
+        logger.info("Mango: detail endpoint returned call %s but no recording_url. Keys: %s",
+                    call_uuid, list(raw.keys()))
+        # Call exists but has no recording — return empty immediately
+        return ""
+
+    logger.info("Mango: detail endpoint returned %s for %s — falling back to list scan",
+                r.status_code, call_uuid)
+
+    # ── Strategy 2: scan recent calls list for matching uuid ─────────────────
+    # Mango ignores most filter params; fetch a large recent page and find our call
+    r2 = requests.get(
+        f"{base}/calls/",
+        headers=headers,
+        params={"pbx_ids": pbx_id, "ordering": "-started_at", "limit": 200},
+        timeout=20,
+    )
+    if not r2.ok:
+        logger.warning("Mango: list scan returned HTTP %s for call %s", r2.status_code, call_uuid)
+        return ""
+    results = r2.json().get("results", [])
+    for raw in results:
+        if str(raw.get("uuid") or raw.get("id") or "") == str(call_uuid):
+            url = raw.get("recording_url") or raw.get("recording") or ""
+            logger.info("Mango: fresh recording URL for %s via list scan: %s",
+                        call_uuid, "found" if url else "not available (no recording)")
+            if not url:
+                logger.info("Mango: call %s list keys: %s", call_uuid, list(raw.keys()))
+            return url
+
+    logger.warning("Mango: call %s not found in 200-call list scan", call_uuid)
+    return ""
+
+
 # ── Main sync entry point ─────────────────────────────────────────────────────
 
 # Module-level cursor: tracks last successful sync time
