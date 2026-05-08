@@ -866,7 +866,8 @@ async def gads_approve_action(action_id: str, request: Request):
                                _execute_bid_change, _execute_add_keyword,
                                _execute_add_negative, _execute_enable_keyword,
                                _execute_budget_change, _execute_update_rsa,
-                               _execute_geo_exclusion)
+                               _execute_geo_exclusion,
+                               _execute_add_to_shared_negative_list)
 
     row = get_audit_row(action_id)
     if not row:
@@ -1003,6 +1004,27 @@ async def gads_approve_action(action_id: str, request: Request):
             set_audit_approval(action_id, approver="admin")
             logger.info(f"Approved + executed add_negative_keyword: '{keyword_text}' "
                         f"({action_id[:8]})")
+
+        elif operation == "add_to_shared_negative_list":
+            after = json.loads(row["after_state_json"] or "{}")
+            keyword_text = after.get("keyword_text") or row["entity_name"]
+            match_type = after.get("match_type", "BROAD")
+            if not keyword_text:
+                raise HTTPException(status_code=422, detail="keyword_text missing")
+            client = _build_client()
+            try:
+                _execute_add_to_shared_negative_list(
+                    client, customer_id,
+                    keyword_text=keyword_text,
+                    match_type=match_type
+                )
+            except Exception as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise HTTPException(status_code=500, detail=f"Shared list update failed: {str(e)[:300]}")
+            update_gads_action_result(action_id, executed=True, execution_result="success", api_executed=True)
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + added to shared list: '{keyword_text}' ({action_id[:8]})")
 
         elif operation == "tighten_match_type":
             after = json.loads(row["after_state_json"] or "{}")
@@ -1548,7 +1570,8 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
                                        _execute_bid_change, _execute_add_keyword,
                                        _execute_add_negative, _execute_enable_keyword,
                                        _execute_budget_change, _execute_update_rsa,
-                                       _execute_geo_exclusion)
+                                       _execute_geo_exclusion,
+                                       _execute_add_to_shared_negative_list)
 
             row = get_audit_row(aid)
             if not row:
@@ -1594,6 +1617,15 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
                                       campaign_resource=after.get("campaign_resource") or row["entity_id"],
                                       keyword_text=after.get("keyword_text", row["entity_name"]),
                                       match_type=after.get("match_type", "BROAD"))
+
+            elif operation == "add_to_shared_negative_list":
+                after = json.loads(row["after_state_json"] or "{}")
+                client = _build_client()
+                _execute_add_to_shared_negative_list(
+                    client, customer_id,
+                    keyword_text=after.get("keyword_text", row["entity_name"]),
+                    match_type=after.get("match_type", "BROAD")
+                )
 
             elif operation == "tighten_match_type":
                 after = json.loads(row["after_state_json"] or "{}")

@@ -2223,8 +2223,9 @@ const OP_LABELS = {
   increase_bid:         { label: 'Increase Bid',         color: '#16a34a', icon: '📈' },
   decrease_bid:         { label: 'Decrease Bid',         color: '#d97706', icon: '📉' },
   add_exact_keyword:    { label: 'Add Exact Match',      color: '#2563eb', icon: '➕' },
-  add_negative_keyword: { label: 'Add Negative',         color: '#7c3aed', icon: '🚫' },
-  tighten_match_type:   { label: 'Tighten Match Type',   color: '#0891b2', icon: '🎯' },
+  add_negative_keyword:         { label: 'Add Negative',         color: '#7c3aed', icon: '🚫' },
+  add_to_shared_negative_list:  { label: 'Block Account-Wide',   color: '#be185d', icon: '🛡️' },
+  tighten_match_type:           { label: 'Tighten Match Type',   color: '#0891b2', icon: '🎯' },
   ad_copy_suggestion:   { label: 'Ad Copy Update',       color: '#0891b2', icon: '✍️' },
   geo_exclusion:        { label: 'Geo Exclusion',        color: '#7c3aed', icon: '📍' },
   change_budget:        { label: 'Budget Change',        color: '#d97706', icon: '💰' },
@@ -9315,7 +9316,7 @@ function LogViewerSection() {
   const [lineCount, setLineCount] = useState(200);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState('');
-  const bottomRef = React.useRef(null);
+  const logContainerRef = React.useRef(null);
   const [autoScroll, setAutoScroll] = useState(true);
 
   const load = React.useCallback(async (f, n) => {
@@ -9332,10 +9333,10 @@ function LogViewerSection() {
 
   React.useEffect(() => { load(); }, []);
 
-  // Auto-scroll to bottom when new lines arrive
+  // Auto-scroll to bottom within the log container (not the page)
   React.useEffect(() => {
-    if (autoScroll && bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (autoScroll && logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
   }, [lines, autoScroll]);
 
@@ -9407,7 +9408,7 @@ function LogViewerSection() {
         </div>
       )}
 
-      <div style={{
+      <div ref={logContainerRef} style={{
         background:'#0f172a', borderRadius:6, padding:'10px 12px',
         fontFamily:'monospace', fontSize:11, lineHeight:1.5,
         maxHeight:420, overflowY:'auto', border:'1px solid #1e293b',
@@ -9425,7 +9426,6 @@ function LogViewerSection() {
             {line}
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
     </div>
   );
@@ -11920,14 +11920,16 @@ function PendingApprovalsPanel() {
     increase_bid:        '⬆️',
     decrease_bid:        '⬇️',
     add_exact_keyword:   '✨',
-    add_negative_keyword:'🚫',
+    add_negative_keyword:        '🚫',
+    add_to_shared_negative_list: '🛡️',
   };
   const OP_COLORS = {
-    pause_keyword:       { bg:'#fef2f2', label:'#dc2626' },
-    increase_bid:        { bg:'#f0fdf4', label:'#16a34a' },
-    decrease_bid:        { bg:'#fffbeb', label:'#f59e0b' },
-    add_exact_keyword:   { bg:'#f0f9ff', label:'#0891b2' },
-    add_negative_keyword:{ bg:'var(--gray-light)', label:'#6b7280' },
+    pause_keyword:              { bg:'#fef2f2', label:'#dc2626' },
+    increase_bid:               { bg:'#f0fdf4', label:'#16a34a' },
+    decrease_bid:               { bg:'#fffbeb', label:'#f59e0b' },
+    add_exact_keyword:          { bg:'#f0f9ff', label:'#0891b2' },
+    add_negative_keyword:       { bg:'var(--gray-light)', label:'#6b7280' },
+    add_to_shared_negative_list:{ bg:'#fdf2f8', label:'#be185d' },
   };
 
   function fmtState(json_str, op) {
@@ -11942,6 +11944,7 @@ function PendingApprovalsPanel() {
       }
       if (op === 'add_exact_keyword')    return `[exact] "${obj.keyword_text}"`;
       if (op === 'add_negative_keyword') return `[neg/${obj.match_type||'broad'}] "${obj.keyword_text}"`;
+      if (op === 'add_to_shared_negative_list') return `[shared/${obj.match_type||'broad'}] "${obj.keyword_text}"`;
       return JSON.stringify(obj).slice(0,80);
     } catch { return json_str.slice(0,80); }
   }
@@ -12038,6 +12041,9 @@ function PendingApprovalsPanel() {
 function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize, onTabSwitch }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
+
+  // Scroll page to top on mount so we always start at Admin Actions
+  useEffect(() => { window.scrollTo(0, 0); }, []);
 
   async function handleAction(key, fn) {
     setLoading(prev=>({...prev, [key]:true}));
@@ -12211,9 +12217,10 @@ function InboxTab({ onOpenLead }) {
 
 // ── AiOptimizerTab ──────────────────────────────────────────────────────────
 const AI_OP_LABELS = Object.assign({}, OP_LABELS, {
-  change_bid_strategy: { label: 'Change Bid Strategy', color: '#9b59b6', icon: '💡' },
-  change_match_type:   { label: 'Change Match Type',   color: '#2980b9', icon: '🔄' },
-  add_asset:           { label: 'Add Asset',           color: '#27ae60', icon: '📎' },
+  change_bid_strategy:         { label: 'Change Bid Strategy', color: '#9b59b6', icon: '💡' },
+  change_match_type:           { label: 'Change Match Type',   color: '#2980b9', icon: '🔄' },
+  add_asset:                   { label: 'Add Asset',           color: '#27ae60', icon: '📎' },
+  add_to_shared_negative_list: { label: 'Block Account-Wide',  color: '#be185d', icon: '🛡️' },
 });
 
 // Helper: summarise after_state_json as a human-readable change string
@@ -12227,8 +12234,9 @@ function fmtRecChange(json_str, op) {
       const after  = obj.new_bid_micros     ? `$${(obj.new_bid_micros/1e6).toFixed(2)}`     : '—';
       return op === 'increase_bid' ? `${before} → ${after} ⬆` : `${before} → ${after} ⬇`;
     }
-    if (op === 'add_exact_keyword')    return `[exact] "${obj.keyword_text}"`;
-    if (op === 'add_negative_keyword') return `[neg/${obj.match_type||'phrase'}] "${obj.keyword_text}"`;
+    if (op === 'add_exact_keyword')             return `[exact] "${obj.keyword_text}"`;
+    if (op === 'add_negative_keyword')          return `[neg/${obj.match_type||'phrase'}] "${obj.keyword_text}"`;
+    if (op === 'add_to_shared_negative_list')   return `[account-wide/${obj.match_type||'broad'}] "${obj.keyword_text}"`;
     if (op === 'change_bid_strategy')  return obj.target_strategy || JSON.stringify(obj).slice(0,60);
     if (op === 'change_match_type')    return obj.new_match_type  || JSON.stringify(obj).slice(0,60);
     return JSON.stringify(obj).slice(0,80);

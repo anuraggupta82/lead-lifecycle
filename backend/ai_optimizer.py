@@ -31,10 +31,78 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from google.ads.googleads.client import GoogleAdsClient
+from google.protobuf import field_mask_pb2
 from config import get_settings
 from database import get_all_leads
 
 logger = logging.getLogger(__name__)
+
+
+# ── Negative keyword signals (module-level so all functions can use them) ─────
+
+_HARD_NEGATIVES = [
+    "dental school", "dental schools",        # looking for student-rate work
+    "diy", "home remed",                      # not seeking professional care
+    "complaint", "lawsuit", "malpractice",    # legal research
+    "salary", "job", "career", "how to become",  # career searches
+]
+_SOFT_NEGATIVES = []
+
+_COMPETITOR_NAMES = [
+    # Direct local competitors
+    "grace dental", "grace smiles",
+    "simply orthodontics", "simply ortho",
+    "grafton smiles",                         # different practice
+    "aspen dental",
+    "western mass dental",
+    "westborough dental",
+    "shrewsbury dental",
+    "worcester dental",
+    "millbury dental",
+    "auburn dental",
+    "northborough dental",
+    "framingham dental",
+    "gentle dental",
+    "comfort dental",
+    "perfect teeth",
+    "castle dental",
+    "bright now dental",
+    "affordable dentures",
+    "small smiles",
+    # Specific competitor dentists by name
+    "dr polasky", "polasky",
+    "dr. polasky",
+]
+_OUR_NAMES = ["grafton dental", "grafton dental care", "gdc", "dr gupta", "dr. gupta"]
+
+
+def _is_competitor_term(term: str) -> str:
+    """Return reason string if this search term is a competitor brand search, else empty."""
+    t = term.lower()
+    for own in _OUR_NAMES:
+        if own in t:
+            return ""
+    for comp in _COMPETITOR_NAMES:
+        if comp in t:
+            return f"Competitor brand search: '{comp}' — should not show our ads"
+    return ""
+
+
+def _is_negative_intent(term: str) -> str:
+    """Check if a search term has negative intent. Returns reason or empty string."""
+    t = term.lower()
+    comp_reason = _is_competitor_term(t)
+    if comp_reason:
+        return comp_reason
+    for signal in _HARD_NEGATIVES:
+        if signal in t:
+            return f"Negative intent: '{signal}'"
+    for signal in _SOFT_NEGATIVES:
+        if signal in t:
+            if "free gingival" in t or "free connective" in t:
+                return ""
+            return f"Likely negative: '{signal}'"
+    return ""
 
 
 def _build_client():
@@ -631,7 +699,9 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              feedback: str = "",
                              rsa_resources: list | None = None,
                              geo_resolutions: dict | None = None,
-                             google_recs: list | None = None) -> list:
+                             google_recs: list | None = None,
+                             optimizer_run_id: str = "",
+                             existing_negatives: set | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -717,6 +787,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "rsa_resources": (rsa_resources or [])[:10],
             "geo_resolutions": geo_resolutions or {},
             "google_recommendations": (google_recs or [])[:20],
+            "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -812,6 +883,7 @@ Rules:
 - For geo_exclusion: ONLY suggest if geo_target_resource is available in geo_resolutions
 - Prioritize recommendations that stop wasted spend first
 - COMPETITOR SEARCHES: Any search term containing a competitor practice name (e.g. "grace dental", "simply orthodontics", "aspen dental", "gentle dental", any "[name] dental [city]" that isn't Grafton Dental Care) MUST be flagged as add_negative_keyword. These waste budget showing our ads to people searching for a competitor.
+- EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already added as negatives in Google Ads. Do NOT suggest add_negative_keyword for any term that already appears in that list (exact or near-match). Only flag NEW terms not yet blocked.
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array""" + rsa_note + geo_note + feedback_block
 
         msg = client.messages.create(
@@ -822,6 +894,18 @@ Rules:
                 "content": prompt + "\n\nCAMPAIGN DATA:\n" + json.dumps(context, default=str)[:70000],
             }],
         )
+        try:
+            from ai_costs import log_claude
+            log_claude(
+                purpose="ad_optimization",
+                model="claude-opus-4-5",
+                input_tokens=msg.usage.input_tokens,
+                output_tokens=msg.usage.output_tokens,
+                campaign_id=campaign,
+                optimizer_run_id=optimizer_run_id if optimizer_run_id else "",
+            )
+        except Exception as _cost_err:
+            logger.debug(f"Cost tracking failed (non-fatal): {_cost_err}")
         text = msg.content[0].text if msg.content else "[]"
         m = _re.search(r"\[[\s\S]*\]", text)
         if m:
@@ -906,6 +990,8 @@ def _call_claude_account_level(
     summary: dict,
     campaign_spend: dict,
     google_recs: list | None = None,
+    optimizer_run_id: str = "",
+    existing_negatives: set | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -984,6 +1070,7 @@ def _call_claude_account_level(
             },
             "od_production_summary": od_production,
             "google_recommendations": (google_recs or [])[:20],
+            "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
         }
 
         prompt = """You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
@@ -1013,6 +1100,7 @@ Focus areas for account-level recs:
 IMPORTANT:
 - Only flag competitor negatives here if they appear in multiple campaigns (single-campaign terms were already handled per-campaign)
 - Use only campaign_resource values from the "campaign_resources" field in the data
+- EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already live as negatives in Google Ads. Do NOT recommend add_negative_keyword for any term already in that list. Only suggest NEW terms not yet blocked.
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array"""
 
         msg = client.messages.create(
@@ -1023,6 +1111,17 @@ IMPORTANT:
                 "content": prompt + "\n\nACCOUNT DATA:\n" + json.dumps(context, default=str)[:60000],
             }],
         )
+        try:
+            from ai_costs import log_claude
+            log_claude(
+                purpose="ad_optimization",
+                model="claude-opus-4-5",
+                input_tokens=msg.usage.input_tokens,
+                output_tokens=msg.usage.output_tokens,
+                optimizer_run_id=optimizer_run_id,
+            )
+        except Exception as _cost_err:
+            logger.debug(f"Cost tracking failed (non-fatal): {_cost_err}")
         text = msg.content[0].text if msg.content else "[]"
         m = _re.search(r"\[[\s\S]*\]", text)
         if m:
@@ -1431,82 +1530,14 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
             })
 
     # ── Negative keyword signals ──────────────────────────────────────
-    # Search terms that indicate the person can't/won't pay for treatment.
-    # These waste ad budget because they'll never convert to a $15k+ case.
-    # Hard negatives — genuinely not a dental patient searching for treatment
-    _HARD_NEGATIVES = [
-        "dental school", "dental schools",        # looking for student-rate work
-        "diy", "home remed",                      # not seeking professional care
-        "complaint", "lawsuit", "malpractice",    # legal research
-        "salary", "job", "career", "how to become",  # career searches
-    ]
-    # Soft negatives — empty for now, let the pipeline data decide
-    _SOFT_NEGATIVES = []
+    # _HARD_NEGATIVES, _SOFT_NEGATIVES, _COMPETITOR_NAMES, _OUR_NAMES,
+    # _is_competitor_term, _is_negative_intent are all defined at module level above.
     # EVERYTHING ELSE gets tracked and judged by real pipeline data:
     # cheap, low cost, affordable, discount, free — price-sensitive buyers
     # cost, price, how much, payment plan, financing — research/buying intent
     # review — evaluating the practice
     # clinical trial, medicaid, medicare — let data prove they don't convert
     # can't afford — might convert with financing options
-
-    # ── Competitor names — any search containing these is a competitor search
-    # and should ALWAYS be a negative keyword (no spend on competitor brand terms)
-    _COMPETITOR_NAMES = [
-        # Direct local competitors
-        "grace dental", "grace smiles",
-        "simply orthodontics", "simply ortho",
-        "grafton smiles",                         # different practice
-        "aspen dental",
-        "western mass dental",
-        "westborough dental",
-        "shrewsbury dental",
-        "worcester dental",
-        "millbury dental",
-        "auburn dental",
-        "northborough dental",
-        "framingham dental",
-        "gentle dental",
-        "comfort dental",
-        "perfect teeth",
-        "castle dental",
-        "bright now dental",
-        "affordable dentures",
-        "small smiles",
-        # Generic competitor signals — another named practice
-        # (catches "[name] dental [city]" patterns where name isn't ours)
-    ]
-    # Our own practice names — do NOT negative these
-    _OUR_NAMES = ["grafton dental", "grafton dental care", "gdc", "dr gupta", "dr. gupta"]
-
-    def _is_competitor_term(term: str) -> str:
-        """Return reason string if this search term is a competitor brand search, else empty."""
-        t = term.lower()
-        # Skip if it's our own practice name
-        for own in _OUR_NAMES:
-            if own in t:
-                return ""
-        for comp in _COMPETITOR_NAMES:
-            if comp in t:
-                return f"Competitor brand search: '{comp}' — should not show our ads"
-        return ""
-
-    def _is_negative_intent(term: str) -> str:
-        """Check if a search term has negative intent. Returns reason or empty string."""
-        t = term.lower()
-        # Check competitor first — highest priority negative
-        comp_reason = _is_competitor_term(t)
-        if comp_reason:
-            return comp_reason
-        for signal in _HARD_NEGATIVES:
-            if signal in t:
-                return f"Negative intent: '{signal}'"
-        for signal in _SOFT_NEGATIVES:
-            if signal in t:
-                # Make sure it's not a clinical term (e.g. "free gingival graft")
-                if "free gingival" in t or "free connective" in t:
-                    return ""
-                return f"Likely negative: '{signal}'"
-        return ""
 
     # Rule 4: Harvest search terms that converted AND have buying intent
     existing_keywords = {kw["keyword"].lower() for kw in keyword_perf}
@@ -1901,6 +1932,148 @@ def _execute_add_negative(client, customer_id: str, campaign_resource: str,
         raise
 
 
+# ── Shared Negative Keyword List ─────────────────────────────────────────────
+
+_SHARED_LIST_NAME = "GDC Competitor Negatives"
+
+
+def _get_or_create_shared_negative_list(client, customer_id: str) -> str:
+    """
+    Return the resource_name of the shared negative keyword list named
+    _SHARED_LIST_NAME.  Creates it if it doesn't exist yet.
+    """
+    ga_service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT shared_set.resource_name, shared_set.name, shared_set.type
+        FROM shared_set
+        WHERE shared_set.type = 'NEGATIVE_KEYWORDS'
+          AND shared_set.status = 'ENABLED'
+    """
+    try:
+        response = ga_service.search(customer_id=customer_id, query=query)
+        for row in response:
+            if row.shared_set.name == _SHARED_LIST_NAME:
+                logger.info(f"Found shared negative list: {row.shared_set.resource_name}")
+                return row.shared_set.resource_name
+    except Exception as e:
+        logger.warning(f"Could not query shared sets: {e}")
+
+    # Create new shared set
+    shared_set_service = client.get_service("SharedSetService")
+    operation = client.get_type("SharedSetOperation")
+    shared_set = operation.create
+    shared_set.name = _SHARED_LIST_NAME
+    shared_set.type_ = client.enums.SharedSetTypeEnum.NEGATIVE_KEYWORDS
+    try:
+        response = shared_set_service.mutate_shared_sets(
+            customer_id=customer_id, operations=[operation]
+        )
+        rn = response.results[0].resource_name
+        logger.info(f"Created shared negative list '{_SHARED_LIST_NAME}': {rn}")
+        return rn
+    except Exception as e:
+        logger.error(f"Failed to create shared negative list: {e}")
+        raise
+
+
+def _execute_add_to_shared_negative_list(client, customer_id: str,
+                                          keyword_text: str,
+                                          match_type: str = "BROAD") -> bool:
+    """
+    Add a keyword to the 'GDC Competitor Negatives' shared negative list
+    and ensure every ENABLED campaign is linked to that list.
+
+    This is the right approach for competitor brand terms — they are blocked
+    account-wide and automatically apply to any new campaigns added later.
+
+    Does NOT check kill switch — caller must check first.
+    Returns True on success.
+    """
+    match_type = (match_type or "BROAD").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        match_type = "BROAD"
+
+    # 1. Get or create the shared list
+    shared_set_rn = _get_or_create_shared_negative_list(client, customer_id)
+
+    # 2. Add keyword to the shared list
+    shared_criterion_service = client.get_service("SharedCriterionService")
+    op = client.get_type("SharedCriterionOperation")
+    criterion = op.create
+    criterion.shared_set = shared_set_rn
+    criterion.keyword.text = keyword_text
+    criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+    try:
+        shared_criterion_service.mutate_shared_criteria(
+            customer_id=customer_id, operations=[op]
+        )
+        logger.info(f"Added '{keyword_text}' [{match_type}] to shared list '{_SHARED_LIST_NAME}'")
+    except Exception as e:
+        err_str = str(e)
+        if "KEYWORD_ALREADY_EXISTS" in err_str or "already exists" in err_str.lower():
+            logger.info(f"'{keyword_text}' already in shared list — continuing")
+        else:
+            logger.error(f"Failed to add '{keyword_text}' to shared list: {e}")
+            raise
+
+    # 3. Link shared list to all ENABLED campaigns (idempotent)
+    ga_service = client.get_service("GoogleAdsService")
+    camp_query = """
+        SELECT campaign.resource_name
+        FROM campaign
+        WHERE campaign.status = 'ENABLED'
+          AND campaign.advertising_channel_type = 'SEARCH'
+    """
+    try:
+        camp_response = ga_service.search(customer_id=customer_id, query=camp_query)
+        campaign_resources = [row.campaign.resource_name for row in camp_response]
+    except Exception as e:
+        logger.warning(f"Could not fetch campaigns for shared list linking: {e}")
+        campaign_resources = []
+
+    if campaign_resources:
+        # Check which campaigns are already linked
+        link_query = f"""
+            SELECT campaign_shared_set.campaign, campaign_shared_set.shared_set
+            FROM campaign_shared_set
+            WHERE campaign_shared_set.shared_set = '{shared_set_rn}'
+        """
+        already_linked: set = set()
+        try:
+            link_response = ga_service.search(customer_id=customer_id, query=link_query)
+            for row in link_response:
+                already_linked.add(row.campaign_shared_set.campaign)
+        except Exception as e:
+            logger.warning(f"Could not check existing campaign links: {e}")
+
+        campaign_shared_set_service = client.get_service("CampaignSharedSetService")
+        link_ops = []
+        for camp_rn in campaign_resources:
+            if camp_rn not in already_linked:
+                link_op = client.get_type("CampaignSharedSetOperation")
+                css = link_op.create
+                css.campaign = camp_rn
+                css.shared_set = shared_set_rn
+                link_ops.append(link_op)
+
+        if link_ops:
+            try:
+                campaign_shared_set_service.mutate_campaign_shared_sets(
+                    customer_id=customer_id, operations=link_ops
+                )
+                logger.info(f"Linked shared list to {len(link_ops)} campaign(s)")
+            except Exception as e:
+                err_str = str(e)
+                if "already exists" in err_str.lower():
+                    logger.info("Shared list already linked to campaigns")
+                else:
+                    logger.warning(f"Could not link shared list to some campaigns: {e}")
+        else:
+            logger.info("Shared list already linked to all campaigns")
+
+    return True
+
+
 # ── New Execute Functions (Opus Plan — May 2026) ──────────────────────────────
 
 def _execute_enable_keyword(client, customer_id: str, resource_name: str) -> bool:
@@ -2192,7 +2365,7 @@ def _execute_update_rsa(client, customer_id: str, ad_group_ad_resource: str,
 
     client.copy_from(
         operation.update_mask,
-        client.get_type("FieldMask")(
+        field_mask_pb2.FieldMask(
             paths=["ad.responsive_search_ad.headlines",
                    "ad.responsive_search_ad.descriptions"]
         )
@@ -2299,6 +2472,162 @@ def _get_active_rsa_resources(client, customer_id: str, campaign_resource: str) 
     return results
 
 
+# ── Google Ads live negative keyword fetch ────────────────────────────────────
+
+def _fetch_existing_negatives(client, customer_id: str) -> set:
+    """
+    Pull all negative keywords currently live in Google Ads — both campaign-level
+    and from shared negative keyword lists (e.g. 'GDC Competitor Negatives').
+    Returns a set of lowercased keyword texts.
+    Also saves them to gads_negative_keywords table for offline reference.
+    """
+    ga_service = client.get_service("GoogleAdsService")
+    existing: set = set()
+    rows_to_save = []
+
+    # 1. Campaign-level negatives
+    camp_query = """
+        SELECT
+            campaign.name,
+            campaign.resource_name,
+            campaign_criterion.keyword.text,
+            campaign_criterion.keyword.match_type
+        FROM campaign_criterion
+        WHERE campaign_criterion.negative = TRUE
+          AND campaign_criterion.type = 'KEYWORD'
+          AND campaign.status = 'ENABLED'
+    """
+    try:
+        for row in ga_service.search(customer_id=customer_id, query=camp_query):
+            text = row.campaign_criterion.keyword.text.strip().lower()
+            if text:
+                existing.add(text)
+                rows_to_save.append((text,
+                                     row.campaign_criterion.keyword.match_type.name,
+                                     row.campaign.name,
+                                     row.campaign.resource_name))
+    except Exception as e:
+        logger.warning(f"Could not fetch campaign-level negative keywords: {e}")
+
+    # 2. Shared negative keyword lists
+    shared_query = """
+        SELECT
+            shared_criterion.keyword.text,
+            shared_criterion.keyword.match_type,
+            shared_set.name
+        FROM shared_criterion
+        WHERE shared_criterion.type = 'KEYWORD'
+    """
+    try:
+        for row in ga_service.search(customer_id=customer_id, query=shared_query):
+            text = row.shared_criterion.keyword.text.strip().lower()
+            if text:
+                existing.add(text)
+                rows_to_save.append((text,
+                                     row.shared_criterion.keyword.match_type.name,
+                                     f"[shared] {row.shared_set.name}",
+                                     ""))
+    except Exception as e:
+        logger.warning(f"Could not fetch shared list negatives: {e}")
+
+    logger.info(f"Fetched {len(existing)} unique existing negative keywords from Google Ads "
+                f"(campaign-level + shared lists)")
+
+    # Save to DB for reference (full refresh each run)
+    try:
+        from database import _conn as _db_conn
+        with _db_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS gads_negative_keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword_text TEXT NOT NULL,
+                    match_type TEXT DEFAULT 'BROAD',
+                    campaign_name TEXT DEFAULT '',
+                    campaign_resource TEXT DEFAULT '',
+                    synced_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("DELETE FROM gads_negative_keywords")
+            now_ts = datetime.now(timezone.utc).isoformat()
+            if rows_to_save:
+                conn.executemany(
+                    "INSERT INTO gads_negative_keywords "
+                    "(keyword_text, match_type, campaign_name, campaign_resource, synced_at) "
+                    "VALUES (?,?,?,?,?)",
+                    [(t, m, cn, cr, now_ts) for t, m, cn, cr in rows_to_save]
+                )
+    except Exception as e:
+        logger.warning(f"Could not save negative keywords to DB: {e}")
+
+    return existing
+
+
+# ── Deduplication helpers ─────────────────────────────────────────────────────
+
+def _negative_already_handled(keyword_text: str, campaign_name: str,
+                               account_level: bool = False,
+                               live_negatives: set | None = None) -> bool:
+    """
+    Return True if this negative keyword is already live in Google Ads OR
+    already in gads_audit_log as pending/queued/success.
+
+    live_negatives: set of lowercased keyword texts from _fetch_existing_negatives().
+      When provided, checked first (fast in-memory). If the keyword is already
+      live in Google Ads, no recommendation is needed regardless of DB state.
+
+    account_level=True: DB check spans ALL campaigns (not just the given campaign_name).
+    """
+    kw_lower = keyword_text.strip().lower()
+
+    # 1. Check live Google Ads negatives first (fastest — in-memory set)
+    if live_negatives is not None and kw_lower in live_negatives:
+        return True
+
+    # 2. Check our local audit log
+    from database import _conn
+    try:
+        with _conn() as conn:
+            # Check gads_negative_keywords table (synced from Google Ads this run)
+            try:
+                gads_row = conn.execute(
+                    "SELECT 1 FROM gads_negative_keywords WHERE keyword_text = ? LIMIT 1",
+                    (kw_lower,),
+                ).fetchone()
+                if gads_row:
+                    return True
+            except Exception:
+                pass  # table may not exist yet on first run
+
+            # Check audit log for already-pending/applied recs
+            if account_level:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM gads_audit_log
+                     WHERE operation = 'add_negative_keyword'
+                       AND entity_name = ?
+                       AND execution_result IN ('success', 'pending_approval', 'queued')
+                     LIMIT 1
+                    """,
+                    (kw_lower,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM gads_audit_log
+                     WHERE operation = 'add_negative_keyword'
+                       AND entity_name = ?
+                       AND campaign_name = ?
+                       AND execution_result IN ('success', 'pending_approval', 'queued')
+                     LIMIT 1
+                    """,
+                    (kw_lower, campaign_name),
+                ).fetchone()
+            return row is not None
+    except Exception as e:
+        logger.warning(f"Dedup check failed for '{keyword_text}' / '{campaign_name}': {e}")
+        return False  # fail open — log it rather than silently skip
+
+
 # ── Main Entry Point ─────────────────────────────────────────────────────────
 
 def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> dict:
@@ -2341,6 +2670,10 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     logger.info("=" * 60)
     if expired:
         logger.info(f"Expired {expired} stale pending rows before this run")
+
+    # Fetch live negative keywords from Google Ads — used throughout run to skip already-applied negatives
+    logger.info("Fetching existing negative keywords from Google Ads...")
+    live_negatives = _fetch_existing_negatives(client, customer_id)
 
     # Collect data
     logger.info("Collecting keyword performance...")
@@ -2586,24 +2919,29 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         actions_pending += 1
 
     for st in actions["new_negatives"]:
+        kw_text = st["search_term"]
+        camp_name = st.get("campaign", "")
+        if _negative_already_handled(kw_text, camp_name, live_negatives=live_negatives):
+            logger.debug(f"Skipping duplicate negative '{kw_text}' ({camp_name}) — already in Google Ads or DB")
+            continue
         aid = log_pending(
             operation="add_negative_keyword",
             entity_type="keyword",
-            entity_id=st.get("campaign_resource", st["search_term"]),
-            entity_name=st["search_term"],
+            entity_id=st.get("campaign_resource", kw_text),
+            entity_name=kw_text,
             before_state={
                 "type": "search_term",
                 "cost": st.get("cost", 0),
             },
             after_state={
-                "keyword_text": st["search_term"],
+                "keyword_text": kw_text,
                 "match_type": "BROAD",
                 "campaign_resource": st.get("campaign_resource", ""),
-                "campaign": st.get("campaign", ""),
+                "campaign": camp_name,
             },
             optimizer_run_id=run_id,
             reason=st.get("reason", ""),
-            campaign_name=st.get("campaign", ""),
+            campaign_name=camp_name,
             priority=15,
             impact_estimate={"savings_30d_usd": round(st.get("cost", 0), 2)},
         )
@@ -2660,7 +2998,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     # entity_id_field: which key in the rec dict to use as entity_id in audit log
     # entity_name_field: which key to use as the human-readable entity_name
     _OP_MAP = {
-        "add_negative_keyword": ("keyword",  "campaign_resource", "keyword_text"),  # id=campaign_resource, name=term
+        "add_negative_keyword":         ("keyword",  "campaign_resource", "keyword_text"),
+        "add_to_shared_negative_list":  ("keyword",  "keyword_text",      "keyword_text"),  # added to account-wide shared list
         "pause_keyword":        ("keyword",  "resource_name",     "keyword_text"),
         "enable_keyword":       ("keyword",  "resource_name",     "keyword_text"),
         "increase_bid":         ("keyword",  "resource_name",     "keyword_text"),
@@ -2735,6 +3074,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             rsa_resources=camp_rsa_resources,
             geo_resolutions=camp_geo_resolutions,
             google_recs=[r for r in google_recs if r.get('campaign_name','').lower() == camp_name.lower() or not r.get('campaign_name')],
+            optimizer_run_id=run_id,
+            existing_negatives=live_negatives,
         )
         if not structured:
             continue
@@ -2813,9 +3154,12 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         summary=summary,
         campaign_spend=camp_spend_for_acct,
         google_recs=[r for r in google_recs if not r.get("campaign_name")],
+        optimizer_run_id=run_id,
+        existing_negatives=live_negatives,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")
+    _acct_negatives_logged: set = set()  # track within this loop to catch Claude dupes
     for rec in acct_structured:
         op = rec.get("operation", "claude_advisory")
         reason = rec.get("reason", rec.get("insight", ""))
@@ -2830,6 +3174,19 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             entity_type = "account"
             entity_id   = "account"
             entity_name = "Account"
+
+        # Account-level negatives go to the shared list (applies to all campaigns, inc. future ones)
+        if op == "add_negative_keyword":
+            op = "add_to_shared_negative_list"
+        if op == "add_to_shared_negative_list":
+            kw = rec.get("keyword_text", entity_name).strip().lower()
+            if kw in _acct_negatives_logged:
+                logger.debug(f"Account-level Claude negative '{kw}' already logged this run — skipping")
+                continue
+            if _negative_already_handled(kw, "", account_level=True, live_negatives=live_negatives):
+                logger.debug(f"Account-level Claude negative '{kw}' already in Google Ads or DB — skipping")
+                continue
+            _acct_negatives_logged.add(kw)
 
         aid = log_pending(
             operation=op,
@@ -2860,6 +3217,65 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                     )
             except Exception as _grn_err:
                 logger.warning(f"Could not store google_rec_resource_name (account): {_grn_err}")
+
+    # ── Account-level rule-based competitor negatives ────────────────────────
+    # Find competitor terms that appeared in ≥2 campaigns in this run.
+    # These are logged as add_negative_keyword with campaign_name="" (Account Level section).
+    # The campaign_resource is set to the highest-spend campaign's resource.
+    from collections import defaultdict as _defdict
+    _comp_term_campaigns: dict = _defdict(list)  # term -> [(campaign_name, campaign_resource, cost)]
+    _camp_spend_map: dict = {}  # campaign_name -> total spend from keyword_perf
+    for _st in search_terms:
+        _term = _st.get("search_term", "").strip().lower()
+        _camp = _st.get("campaign", "").strip()
+        _camp_res = _st.get("campaign_resource", "")
+        if _term and _camp and _is_competitor_term(_term):
+            _comp_term_campaigns[_term].append((_camp, _camp_res, _st.get("cost", 0.0)))
+    for _kw in keyword_perf:
+        _cn = _kw.get("campaign", "").strip()
+        if _cn:
+            _camp_spend_map[_cn] = _camp_spend_map.get(_cn, 0.0) + _kw.get("cost", 0.0)
+
+    _acct_comp_logged = 0
+    for _term, _occurrences in _comp_term_campaigns.items():
+        _unique_camps = list({o[0] for o in _occurrences})
+        if len(_unique_camps) < 2:
+            continue  # single-campaign competitors are handled per-campaign
+        if _negative_already_handled(_term, "", account_level=True, live_negatives=live_negatives):
+            logger.debug(f"Account-level competitor '{_term}' already in Google Ads or DB — skipping")
+            continue
+        # Pick highest-spend campaign's resource for the API call
+        _best_camp = max(_unique_camps, key=lambda c: _camp_spend_map.get(c, 0.0))
+        _best_res = next((o[1] for o in _occurrences if o[0] == _best_camp and o[1]), "")
+        if not _best_res:
+            _best_res = next((o[1] for o in _occurrences if o[1]), "")
+        if not _best_res:
+            continue
+        _total_cost = sum(o[2] for o in _occurrences)
+        _camps_str = ", ".join(_unique_camps)
+        aid = log_pending(
+            operation="add_to_shared_negative_list",
+            entity_type="keyword",
+            entity_id=_term,
+            entity_name=_term,
+            before_state={"type": "competitor_search", "campaigns": _unique_camps, "cost": round(_total_cost, 2)},
+            after_state={
+                "keyword_text": _term,
+                "match_type": "BROAD",
+                "shared_list": _SHARED_LIST_NAME,
+            },
+            optimizer_run_id=run_id,
+            reason=f"Competitor term in {len(_unique_camps)} campaigns ({_camps_str}) — adding to '{_SHARED_LIST_NAME}' shared list so it blocks all current and future campaigns. Cost: ${_total_cost:.2f}.",
+            campaign_name="",   # account-level
+            priority=10,        # high priority
+            impact_estimate={"savings_30d_usd": round(_total_cost, 2)},
+        )
+        actions_pending += 1
+        _acct_comp_logged += 1
+        logger.info(f"  [ACCOUNT] [shared_list] '{_term}' (across {len(_unique_camps)} campaigns) → {aid[:8]}")
+
+    if _acct_comp_logged:
+        logger.info(f"Account-level: logged {_acct_comp_logged} cross-campaign competitor negatives")
 
     # Report
     report = {
