@@ -9306,6 +9306,131 @@ const JOB_META = {
   conversion_upload: { label: 'Conversion Upload',      schedule: '11:00 PM',     desc: 'Upload offline conversions to Google Ads' },
 };
 
+// ── Log Viewer ───────────────────────────────────────────────────────────────
+function LogViewerSection() {
+  const [lines, setLines] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState('');
+  const [inputFilter, setInputFilter] = useState('');
+  const [lineCount, setLineCount] = useState(200);
+  const [total, setTotal] = useState(0);
+  const [error, setError] = useState('');
+  const bottomRef = React.useRef(null);
+  const [autoScroll, setAutoScroll] = useState(true);
+
+  const load = React.useCallback(async (f, n) => {
+    setLoading(true); setError('');
+    try {
+      const params = new URLSearchParams({ lines: n || lineCount });
+      if (f || filter) params.set('filter', f !== undefined ? f : filter);
+      const d = await api('/api/admin/logs?' + params.toString());
+      if (d.error) { setError(d.error); setLines([]); }
+      else { setLines(d.lines || []); setTotal(d.total_matched || 0); }
+    } catch(e) { setError(e.message); }
+    finally { setLoading(false); }
+  }, [filter, lineCount]);
+
+  React.useEffect(() => { load(); }, []);
+
+  // Auto-scroll to bottom when new lines arrive
+  React.useEffect(() => {
+    if (autoScroll && bottomRef.current) {
+      bottomRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [lines, autoScroll]);
+
+  const levelColor = (line) => {
+    if (line.includes('[ERROR]'))   return '#dc2626';
+    if (line.includes('[WARNING]')) return '#d97706';
+    if (line.includes('[INFO]'))    return '#059669';
+    if (line.includes('500 Internal')) return '#dc2626';
+    if (line.includes('200 OK'))    return '#94a3b8';
+    return '#cbd5e1';
+  };
+
+  const levelBg = (line) => {
+    if (line.includes('[ERROR]') || line.includes('500 Internal')) return 'rgba(220,38,38,.06)';
+    if (line.includes('[WARNING]')) return 'rgba(217,119,6,.04)';
+    return 'transparent';
+  };
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+        <div className="report-title" style={{margin:0}}>📋 App Logs</div>
+        <span style={{fontSize:10,color:'var(--text-muted)'}}>
+          {total > 0 ? `${lines.length} of ${total} matched` : `${lines.length} lines`}
+        </span>
+        <div style={{marginLeft:'auto',display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
+          <input
+            value={inputFilter}
+            onChange={e => setInputFilter(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') { setFilter(inputFilter); load(inputFilter, lineCount); }}}
+            placeholder="Filter (Enter to apply)…"
+            style={{padding:'3px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4,width:180}}
+          />
+          {['ERROR','WARNING','optimizer','gads/approve','500'].map(f => (
+            <button key={f} onClick={() => { setInputFilter(f); setFilter(f); load(f, lineCount); }}
+              style={{padding:'2px 8px',fontSize:10,borderRadius:4,cursor:'pointer',
+                background: filter===f ? 'var(--teal)' : 'var(--gray-light)',
+                color: filter===f ? '#fff' : 'var(--text-muted)',
+                border:'1px solid var(--border)',fontWeight:600}}>
+              {f}
+            </button>
+          ))}
+          {filter && (
+            <button onClick={() => { setInputFilter(''); setFilter(''); load('', lineCount); }}
+              style={{padding:'2px 8px',fontSize:10,borderRadius:4,cursor:'pointer',
+                background:'#fee2e2',color:'#dc2626',border:'none',fontWeight:600}}>
+              ✕ Clear
+            </button>
+          )}
+          <select value={lineCount} onChange={e => { const n=Number(e.target.value); setLineCount(n); load(filter, n); }}
+            style={{padding:'3px 6px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}>
+            {[50,100,200,500].map(n => <option key={n} value={n}>{n} lines</option>)}
+          </select>
+          <label style={{display:'flex',alignItems:'center',gap:4,fontSize:11,cursor:'pointer',color:'var(--text-muted)'}}>
+            <input type="checkbox" checked={autoScroll} onChange={e=>setAutoScroll(e.target.checked)} />
+            Auto-scroll
+          </label>
+          <button onClick={() => load(filter, lineCount)} disabled={loading}
+            style={{padding:'3px 8px',fontSize:11,borderRadius:4,cursor:'pointer',
+              background:'var(--gray-light)',border:'1px solid var(--border)',color:'var(--text-muted)'}}>
+            {loading ? '…' : '↻ Refresh'}
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div style={{padding:'8px 10px',background:'#fee2e2',borderRadius:6,color:'#dc2626',fontSize:11,marginBottom:8}}>
+          {error}
+        </div>
+      )}
+
+      <div style={{
+        background:'#0f172a', borderRadius:6, padding:'10px 12px',
+        fontFamily:'monospace', fontSize:11, lineHeight:1.5,
+        maxHeight:420, overflowY:'auto', border:'1px solid #1e293b',
+      }}>
+        {lines.length === 0 && !loading && (
+          <div style={{color:'#64748b',fontStyle:'italic'}}>No log lines{filter ? ` matching "${filter}"` : ''}.</div>
+        )}
+        {lines.map((line, i) => (
+          <div key={i} style={{
+            color: levelColor(line),
+            background: levelBg(line),
+            padding:'1px 4px', borderRadius:2,
+            wordBreak:'break-all', whiteSpace:'pre-wrap',
+          }}>
+            {line}
+          </div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
+    </div>
+  );
+}
+
 function ScheduledJobsSection() {
   const [jobs, setJobs] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -11960,6 +12085,8 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
       <MemorySection />
 
       <ScheduledJobsSection />
+
+      <LogViewerSection />
 
       <div className="report-section">
         <div className="report-title">AI Report Engine</div>

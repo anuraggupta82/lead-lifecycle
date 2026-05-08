@@ -953,9 +953,21 @@ async def gads_approve_action(action_id: str, request: Request):
                     execution_result=f"rejected: {str(e)[:200]}")
                 raise HTTPException(status_code=422, detail=str(e))
             except Exception as e:
-                update_gads_action_result(action_id, executed=True,
-                    execution_result=f"failed: {str(e)[:200]}")
-                raise
+                err_str = str(e)
+                # Policy violations and invalid argument errors — reject cleanly, don't 500
+                if "POLICY_ERROR" in err_str or "policy_violation" in err_str.lower():
+                    msg = f"Google policy violation for '{keyword_text}' — keyword rejected by Google Ads policy"
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result=f"rejected: policy_violation", error_detail=err_str[:500])
+                    raise HTTPException(status_code=422, detail=msg)
+                elif "INVALID_ARGUMENT" in err_str:
+                    msg = f"Invalid argument adding '{keyword_text}' — ad group resource may be removed or invalid"
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result=f"rejected: invalid_argument", error_detail=err_str[:500])
+                    raise HTTPException(status_code=422, detail=msg)
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {err_str[:200]}", error_detail=err_str[:500])
+                raise HTTPException(status_code=500, detail=f"Add keyword failed: {err_str[:300]}")
             update_gads_action_result(action_id, executed=True, execution_result="success")
             set_audit_approval(action_id, approver="admin")
             logger.info(f"Approved + executed add_exact_keyword: '{keyword_text}' "
@@ -2662,6 +2674,35 @@ def debug_smile_resign(lead_id: str):
         except Exception as e:
             result["sign_error"] = str(e)
     return result
+
+
+# ─── Log Viewer ──────────────────────────────────────────────────────────────
+
+@app.get("/api/admin/logs", dependencies=[Depends(_require_admin)])
+def get_logs(lines: int = 200, filter: str = ""):
+    """
+    Return the last N lines of the app log file.
+    Optional filter: only return lines containing this string (case-insensitive).
+    """
+    log_path = os.path.join(os.path.dirname(__file__), "logs", "app.log")
+    if not os.path.exists(log_path):
+        return {"lines": [], "log_path": log_path, "error": "Log file not found"}
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        # Most recent last — return tail
+        tail = all_lines[-2000:]  # read last 2000, then filter
+        if filter:
+            fl = filter.lower()
+            tail = [l for l in tail if fl in l.lower()]
+        result = tail[-lines:]
+        return {
+            "lines": [l.rstrip("\n") for l in result],
+            "total_matched": len(tail),
+            "log_path": log_path,
+        }
+    except Exception as e:
+        return {"lines": [], "error": str(e)}
 
 
 # ─── GA4 Analytics ───────────────────────────────────────────────────────────
