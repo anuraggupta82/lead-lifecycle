@@ -204,6 +204,7 @@ def _get_search_terms(client, customer_id: str, days: int = 30) -> list:
             AND metrics.impressions > 0
             AND campaign.status = 'ENABLED'
             AND ad_group.status = 'ENABLED'
+            AND search_term_view.status != 'EXCLUDED'
     """
 
     results = []
@@ -2532,6 +2533,8 @@ def _fetch_existing_negatives(client, customer_id: str) -> set:
 
     logger.info(f"Fetched {len(existing)} unique existing negative keywords from Google Ads "
                 f"(campaign-level + shared lists)")
+    if existing:
+        logger.info(f"Live negatives sample: {sorted(existing)[:20]}")
 
     # Save to DB for reference (full refresh each run)
     try:
@@ -2568,64 +2571,50 @@ def _negative_already_handled(keyword_text: str, campaign_name: str,
                                account_level: bool = False,
                                live_negatives: set | None = None) -> bool:
     """
-    Return True if this negative keyword is already live in Google Ads OR
-    already in gads_audit_log as pending/queued/success.
+    Return True if this negative keyword is already covered by live Google Ads data.
+
+    Google Ads is the source of truth — if a negative (or a broader negative that
+    covers this search term via BROAD match) is already live, there is nothing to do.
 
     live_negatives: set of lowercased keyword texts from _fetch_existing_negatives().
-      When provided, checked first (fast in-memory). If the keyword is already
-      live in Google Ads, no recommendation is needed regardless of DB state.
+      Contains both campaign-level negatives and shared-list negatives.
 
-    account_level=True: DB check spans ALL campaigns (not just the given campaign_name).
+    Matching logic:
+      - Exact: "gentle dental" == "gentle dental" → covered
+      - Broader negative covers the search term: existing neg "gentle dental" is a
+        substring of search term "gentle dental worcester ma" → already blocked by
+        that BROAD negative, no new rec needed.
+
+    The audit log is NOT used as dedup — Google Ads live state is the only check.
+    account_level param kept for backward-compat but no longer changes behavior.
     """
+    if live_negatives is None:
+        return False
+
     kw_lower = keyword_text.strip().lower()
 
-    # 1. Check live Google Ads negatives first (fastest — in-memory set)
-    if live_negatives is not None and kw_lower in live_negatives:
+    # 1. Exact match — this specific text is already a negative
+    if kw_lower in live_negatives:
         return True
 
-    # 2. Check our local audit log
-    from database import _conn
-    try:
-        with _conn() as conn:
-            # Check gads_negative_keywords table (synced from Google Ads this run)
-            try:
-                gads_row = conn.execute(
-                    "SELECT 1 FROM gads_negative_keywords WHERE keyword_text = ? LIMIT 1",
-                    (kw_lower,),
-                ).fetchone()
-                if gads_row:
-                    return True
-            except Exception:
-                pass  # table may not exist yet on first run
+    # 2. Broader coverage — an existing BROAD negative covers this search term.
+    #    e.g. live negative "gentle dental" already blocks "gentle dental worcester ma".
+    #    Use word-boundary check: existing neg must match as whole words inside the term.
+    for existing_neg in live_negatives:
+        if not existing_neg:
+            continue
+        # existing_neg must appear as a whole-word sequence within kw_lower
+        # Simple approach: check it's a substring AND surrounded by word boundaries
+        idx = kw_lower.find(existing_neg)
+        if idx == -1:
+            continue
+        before_ok = (idx == 0 or not kw_lower[idx - 1].isalnum())
+        after_idx = idx + len(existing_neg)
+        after_ok = (after_idx == len(kw_lower) or not kw_lower[after_idx].isalnum())
+        if before_ok and after_ok:
+            return True
 
-            # Check audit log for already-pending/applied recs
-            if account_level:
-                row = conn.execute(
-                    """
-                    SELECT 1 FROM gads_audit_log
-                     WHERE operation = 'add_negative_keyword'
-                       AND entity_name = ?
-                       AND execution_result IN ('success', 'pending_approval', 'queued')
-                     LIMIT 1
-                    """,
-                    (kw_lower,),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    """
-                    SELECT 1 FROM gads_audit_log
-                     WHERE operation = 'add_negative_keyword'
-                       AND entity_name = ?
-                       AND campaign_name = ?
-                       AND execution_result IN ('success', 'pending_approval', 'queued')
-                     LIMIT 1
-                    """,
-                    (kw_lower, campaign_name),
-                ).fetchone()
-            return row is not None
-    except Exception as e:
-        logger.warning(f"Dedup check failed for '{keyword_text}' / '{campaign_name}': {e}")
-        return False  # fail open — log it rather than silently skip
+    return False
 
 
 # ── Main Entry Point ─────────────────────────────────────────────────────────
@@ -2922,7 +2911,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         kw_text = st["search_term"]
         camp_name = st.get("campaign", "")
         if _negative_already_handled(kw_text, camp_name, live_negatives=live_negatives):
-            logger.debug(f"Skipping duplicate negative '{kw_text}' ({camp_name}) — already in Google Ads or DB")
+            logger.info(f"  SKIPPED negative '{kw_text}' — already covered by live Google Ads negative")
             continue
         aid = log_pending(
             operation="add_negative_keyword",
@@ -3184,7 +3173,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 logger.debug(f"Account-level Claude negative '{kw}' already logged this run — skipping")
                 continue
             if _negative_already_handled(kw, "", account_level=True, live_negatives=live_negatives):
-                logger.debug(f"Account-level Claude negative '{kw}' already in Google Ads or DB — skipping")
+                logger.info(f"  SKIPPED account-level Claude negative '{kw}' — already covered by live Google Ads negative")
                 continue
             _acct_negatives_logged.add(kw)
 
@@ -3242,7 +3231,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         if len(_unique_camps) < 2:
             continue  # single-campaign competitors are handled per-campaign
         if _negative_already_handled(_term, "", account_level=True, live_negatives=live_negatives):
-            logger.debug(f"Account-level competitor '{_term}' already in Google Ads or DB — skipping")
+            logger.info(f"  SKIPPED account-level competitor '{_term}' — already covered by live Google Ads negative")
             continue
         # Pick highest-spend campaign's resource for the API call
         _best_camp = max(_unique_camps, key=lambda c: _camp_spend_map.get(c, 0.0))
