@@ -896,6 +896,164 @@ Rules:
             return validated
     except Exception as e:
         logger.warning(f"Claude advisory call failed (non-fatal): {e}")
+
+
+def _call_claude_account_level(
+    all_keyword_perf: list,
+    all_search_terms: list,
+    call_attribution: dict,
+    od_production: dict,
+    summary: dict,
+    campaign_spend: dict,
+    google_recs: list | None = None,
+) -> list:
+    """
+    Account-level Claude pass: runs once after all per-campaign passes.
+    Focuses on cross-campaign patterns and whole-account recommendations.
+    Returns recs with campaign_name="" (shown in Account Level section).
+
+    Account-level rec types:
+      - add_negative_keyword with campaign_resource set (competitor names seen across campaigns)
+      - change_bid_strategy  (account-wide strategy change)
+      - change_budget        (rebalance budget across campaigns)
+      - add_asset            (sitelinks / callouts that should apply broadly)
+      - claude_advisory      (account-level insight, no API action)
+    """
+    import os, re as _re
+    try:
+        from database import get_setting as _get_setting
+    except Exception:
+        _get_setting = lambda k: None
+    _api_key = _get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not _api_key:
+        return []
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=_api_key)
+
+        # Build cross-campaign summary
+        camp_resources = {}  # campaign_name -> campaign_resource
+        for kw in all_keyword_perf:
+            cn = kw.get("campaign", "")
+            cr = kw.get("campaign_resource", "")
+            if cn and cr and cn not in camp_resources:
+                camp_resources[cn] = cr
+
+        # Find competitor terms appearing across multiple campaigns
+        from collections import defaultdict
+        term_campaigns = defaultdict(set)
+        for st in all_search_terms:
+            t = st.get("search_term", "").strip().lower()
+            c = st.get("campaign", "").strip()
+            if t and c:
+                term_campaigns[t].add(c)
+        cross_camp_terms = {t: list(camps) for t, camps in term_campaigns.items() if len(camps) > 1}
+
+        # Build per-campaign budget/performance summary
+        camp_perf = {}
+        for cn, cr in camp_resources.items():
+            kws = [k for k in all_keyword_perf if k.get("campaign","") == cn]
+            spend = sum(k.get("cost", 0) for k in kws)
+            clicks = sum(k.get("clicks", 0) for k in kws)
+            calls = call_attribution.get(cn.lower(), {}).get("calls", 0)
+            booked = call_attribution.get(cn.lower(), {}).get("booked_calls", 0)
+            prod = 0.0
+            if isinstance(od_production, dict):
+                by_camp = od_production.get("by_campaign", {})
+                prod = float(by_camp.get(cn, 0))
+            camp_perf[cn] = {
+                "campaign_resource": cr,
+                "spend_30d": round(spend, 2),
+                "clicks": clicks,
+                "calls": calls,
+                "booked_calls": booked,
+                "production": prod,
+                "daily_budget": campaign_spend.get(cn, {}).get("daily_budget_usd") if isinstance(campaign_spend.get(cn), dict) else None,
+            }
+
+        context = {
+            "account_summary": summary,
+            "campaign_performance": camp_perf,
+            "campaign_resources": camp_resources,
+            "cross_campaign_search_terms": dict(list(cross_camp_terms.items())[:30]),
+            "top_search_terms_by_cost": sorted(all_search_terms, key=lambda s: -s.get("cost", 0))[:40],
+            "call_attribution": {
+                v["campaign_name"]: {"calls": v["calls"], "booked": v["booked_calls"], "confirmed_appts": v["confirmed_appts"]}
+                for v in call_attribution.values()
+            },
+            "od_production_summary": od_production,
+            "google_recommendations": (google_recs or [])[:20],
+        }
+
+        prompt = """You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
+
+You have already reviewed individual campaigns. Now identify issues and opportunities that span the whole account or cannot be attributed to one campaign.
+
+Return up to 6 ACCOUNT-LEVEL recommendations as a JSON array. Each must have:
+- "operation": one of: add_negative_keyword | change_bid_strategy | change_budget | add_asset | claude_advisory
+- "reason": 1-2 sentences with specific numbers. For cross-campaign negatives, cite which campaigns the term appeared in.
+- "campaign_name": MUST be "" (empty string) — these are account-level recs
+
+Operation-specific fields (same spec as campaign-level):
+- add_negative_keyword: "keyword_text", "match_type" ("EXACT"|"PHRASE"|"BROAD"), "campaign_resource" (use the campaign_resource for the campaign where this term appeared most — or the highest-spend campaign if cross-campaign)
+- change_bid_strategy: "bid_strategy", "target_cpa_micros" (optional), "target_roas" (optional), "campaign_resource"
+- change_budget: "new_daily_budget_usd", "campaign_resource"
+- add_asset: "asset_type" ("SITELINK"|"CALLOUT"|"CALL"), "campaign_resource", "description"
+- claude_advisory: "insight" (account-level observation, no API action needed)
+
+Focus areas for account-level recs:
+1. COMPETITOR NAMES appearing across multiple campaigns → add_negative_keyword (highest-spend campaign's resource)
+2. BUDGET REBALANCING — if one campaign has 0 conversions/calls but high spend vs another with conversions → change_budget
+3. BID STRATEGY — if a campaign has enough conversion data to switch strategies → change_bid_strategy
+4. MISSING ASSETS — sitelinks/callouts that should exist on all campaigns but don't → add_asset
+5. CROSS-CAMPAIGN WASTE — identical wasteful terms appearing in multiple campaigns
+6. ACCOUNT HEALTH — any account-wide pattern not captured by individual campaign reviews
+
+IMPORTANT:
+- Only flag competitor negatives here if they appear in multiple campaigns (single-campaign terms were already handled per-campaign)
+- Use only campaign_resource values from the "campaign_resources" field in the data
+- Return ONLY a valid JSON array, no markdown, no explanation outside the array"""
+
+        msg = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": prompt + "\n\nACCOUNT DATA:\n" + json.dumps(context, default=str)[:60000],
+            }],
+        )
+        text = msg.content[0].text if msg.content else "[]"
+        m = _re.search(r"\[[\s\S]*\]", text)
+        if m:
+            arr = json.loads(m.group(0))
+            valid_camp_resources = set(camp_resources.values())
+            validated = []
+            for item in arr:
+                if not isinstance(item, dict) or not item.get("operation"):
+                    continue
+                # Force campaign_name to empty — these are account-level
+                item["campaign_name"] = ""
+                op = item["operation"]
+                cr = item.get("campaign_resource", "")
+                if op in ("add_negative_keyword", "change_bid_strategy", "change_budget", "add_asset"):
+                    if cr and cr not in valid_camp_resources:
+                        logger.warning(f"Account-level: dropping '{op}' — unknown campaign_resource '{cr}'")
+                        continue
+                    if not cr and op != "add_asset" and op != "claude_advisory":
+                        # Try to pick the highest-spend campaign's resource
+                        if camp_resources:
+                            top_camp = max(camp_perf, key=lambda c: camp_perf[c]["spend_30d"])
+                            item["campaign_resource"] = camp_resources[top_camp]
+                            logger.info(f"Account-level: assigned campaign_resource for '{op}' → {camp_resources[top_camp][:30]}")
+                if op == "change_budget" and not item.get("new_daily_budget_usd"):
+                    logger.warning("Account-level: dropping change_budget — missing new_daily_budget_usd")
+                    continue
+                validated.append(item)
+            logger.info(f"Account-level Claude returned {len(arr)} recs, {len(validated)} passed validation")
+            return validated
+    except Exception as e:
+        logger.warning(f"Account-level Claude call failed (non-fatal): {e}")
     return []
 
 
@@ -2635,6 +2793,73 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         actions.setdefault("memory_applied", []).extend(
             [f"[claude:{camp_name}] {rec.get('reason','')}" for rec in structured]
         )
+
+    # ── Account-level pass (cross-campaign patterns) ─────────────────────────
+    logger.info("Calling Claude (Opus) for account-level recommendations...")
+    # Build campaign_spend dict with resource info for the account-level function
+    camp_spend_for_acct = {}
+    for cn in all_campaign_names:
+        cn_lower = cn.strip().lower()
+        kws = [k for k in keyword_perf if k.get("campaign","").strip().lower() == cn_lower]
+        camp_spend_for_acct[cn] = {
+            "daily_budget_usd": next((k.get("daily_budget_micros", 0) / 1e6 for k in kws if k.get("daily_budget_micros")), None),
+        }
+
+    acct_structured = _call_claude_account_level(
+        all_keyword_perf=keyword_perf,
+        all_search_terms=search_terms,
+        call_attribution=call_attribution,
+        od_production=od_production,
+        summary=summary,
+        campaign_spend=camp_spend_for_acct,
+        google_recs=[r for r in google_recs if not r.get("campaign_name")],
+    )
+
+    logger.info(f"Account-level recommendations: {len(acct_structured)}")
+    for rec in acct_structured:
+        op = rec.get("operation", "claude_advisory")
+        reason = rec.get("reason", rec.get("insight", ""))
+        advisories.append(f"[Account Level] {reason}")
+
+        op_meta = _OP_MAP.get(op)
+        if op_meta:
+            entity_type, id_field, name_field = op_meta
+            entity_id   = str(rec.get(id_field, "account"))
+            entity_name = str(rec.get(name_field, "Account"))
+        else:
+            entity_type = "account"
+            entity_id   = "account"
+            entity_name = "Account"
+
+        aid = log_pending(
+            operation=op,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            entity_name=entity_name,
+            before_state={},
+            after_state={k: v for k, v in rec.items() if k not in ("operation", "campaign_name")},
+            optimizer_run_id=run_id,
+            reason=reason,
+            campaign_name="",   # ← account-level: no campaign
+            priority=priority_counter,
+            impact_estimate={},
+        )
+        actions_pending += 1
+        priority_counter += 1
+        logger.info(f"  [ACCOUNT] [{op}] '{entity_name}' → {aid[:8]}")
+
+        # Store google_rec_resource_name if applicable
+        google_rec_rn = rec.get("google_rec_resource_name", "")
+        if google_rec_rn:
+            try:
+                from database import _conn as _db_conn_acct
+                with _db_conn_acct() as _c:
+                    _c.execute(
+                        "UPDATE gads_audit_log SET google_rec_resource_name=? WHERE action_id=?",
+                        (google_rec_rn, aid)
+                    )
+            except Exception as _grn_err:
+                logger.warning(f"Could not store google_rec_resource_name (account): {_grn_err}")
 
     # Report
     report = {
