@@ -215,6 +215,14 @@ async def lifespan(app: FastAPI):
                         logger.info(f"Mango sync: {n} calls upserted")
                 except Exception as e:
                     logger.error(f"Mango sync failed: {e}")
+                # Patient enrichment: match new calls to OD patients (runs after every sync)
+                try:
+                    from od_matcher import match_mango_calls_to_od_patients
+                    result = match_mango_calls_to_od_patients(limit=200)
+                    if result.get("total", 0) > 0:
+                        logger.info(f"Mango OD patient match: {result}")
+                except Exception as e:
+                    logger.error(f"Mango OD patient match failed: {e}")
 
             def _mango_reconcile_job():
                 _stamp("mango_reconcile")
@@ -224,6 +232,13 @@ async def lifespan(app: FastAPI):
                         logger.info(f"Mango reconcile: {n} calls attributed")
                 except Exception as e:
                     logger.error(f"Mango reconcile failed: {e}")
+                # Keyword attribution — runs after phone-number reconcile
+                try:
+                    from call_keyword_attribution import attribute_calls_to_keywords
+                    kw_result = attribute_calls_to_keywords(days=7)
+                    logger.info(f"Keyword attribution: {kw_result}")
+                except Exception as e:
+                    logger.error(f"Keyword attribution failed: {e}")
 
             def _mango_gads_call_view_job():
                 _stamp("mango_call_view")
@@ -741,6 +756,88 @@ def admin_optimize(dry_run: bool = True):
 
 # ─── Phase 1: Google Ads Campaign Management ───────────────────────────────��─
 
+@app.get("/api/admin/optimizer/dashboard-summary", dependencies=[Depends(_require_admin)])
+def optimizer_dashboard_summary():
+    """
+    Dashboard-facing optimizer snapshot:
+      - pending_count: how many actions need approval
+      - pending_rows: up to 25 pending actions (for display)
+      - last_run_at / last_run_id
+      - summary: KPI dict from last run (spend, clicks, leads, calls, appts, CPA...)
+      - advisories: Claude advisory strings from last run
+      - call_summary / od_production_summary from last run
+    """
+    from database import get_pending_approvals, get_optimizer_runs
+
+    # Pending actions
+    pending = get_pending_approvals()
+    pending_count = len(pending)
+    pending_rows = pending[:25]
+
+    # Latest completed run
+    runs = get_optimizer_runs(limit=1)
+    last_run = runs[0] if runs else None
+
+    last_run_at = None
+    last_run_id = None
+    summary = {}
+    advisories = []
+    call_summary = {}
+    od_production_summary = {}
+
+    per_campaign = []
+
+    if last_run:
+        last_run_at = last_run.get("completed_at") or last_run.get("started_at")
+        last_run_id = last_run.get("run_id")
+        try:
+            report = json.loads(last_run.get("report_json") or "{}")
+            summary = report.get("summary", {})
+            advisories = report.get("advisories", [])
+            call_summary = report.get("call_summary", {})
+            od_production_summary = report.get("od_production_summary", {})
+
+            # Build per_campaign array merging call + production data.
+            # od_production_summary is {"total_attributed": float, "by_campaign": {name: float}}
+            od_by_campaign = {}
+            if isinstance(od_production_summary, dict):
+                od_by_campaign = od_production_summary.get("by_campaign", {})
+                if not isinstance(od_by_campaign, dict):
+                    od_by_campaign = {}
+            all_campaign_names = set(call_summary.keys()) | set(od_by_campaign.keys())
+            for cname in sorted(all_campaign_names):
+                cs = call_summary.get(cname, {})
+                prod = od_by_campaign.get(cname, 0)
+                per_campaign.append({
+                    "campaign_name": cname,
+                    "calls": cs.get("calls", 0),
+                    "booked": cs.get("booked", 0),
+                    "confirmed_appts": cs.get("confirmed_appts", 0),
+                    "production": round(float(prod), 2),
+                })
+            # Sort by calls desc
+            per_campaign.sort(key=lambda x: x["calls"], reverse=True)
+        except Exception as exc:
+            logger.warning(f"optimizer_dashboard_summary per_campaign build failed: {exc}")
+        if not summary:
+            try:
+                summary = json.loads(last_run.get("summary_json") or "{}")
+            except Exception:
+                pass
+
+    return {
+        "pending_count": pending_count,
+        "pending_rows": pending_rows,
+        "last_run_at": last_run_at,
+        "last_run_id": last_run_id,
+        "summary": summary,
+        "advisories": advisories,
+        "call_summary": call_summary,
+        "od_production_summary": od_production_summary,
+        "per_campaign": per_campaign,
+    }
+
+
 @app.get("/api/admin/gads/audit-log", dependencies=[Depends(_require_admin)])
 def gads_audit_log(limit: int = 100, entity_id: str = "", operation: str = ""):
     """Return recent Google Ads audit log entries."""
@@ -767,7 +864,9 @@ async def gads_approve_action(action_id: str, request: Request):
     from campaign_safety import check_writes_enabled, WriteBlockedError
     from ai_optimizer import (_build_client, _execute_single_pause,
                                _execute_bid_change, _execute_add_keyword,
-                               _execute_add_negative)
+                               _execute_add_negative, _execute_enable_keyword,
+                               _execute_budget_change, _execute_update_rsa,
+                               _execute_geo_exclusion)
 
     row = get_audit_row(action_id)
     if not row:
@@ -893,6 +992,202 @@ async def gads_approve_action(action_id: str, request: Request):
             logger.info(f"Approved + executed add_negative_keyword: '{keyword_text}' "
                         f"({action_id[:8]})")
 
+        elif operation == "tighten_match_type":
+            after = json.loads(row["after_state_json"] or "{}")
+            client = _build_client()
+            # Step 1: Add EXACT first (no impression gap)
+            try:
+                _execute_add_keyword(
+                    client, customer_id,
+                    ad_group_resource=after.get("ad_group_resource", ""),
+                    keyword_text=row["entity_name"],
+                    match_type="EXACT",
+                )
+            except Exception as e:
+                update_gads_action_result(action_id, executed=True,
+                    execution_result=f"partial_failed: add_exact step: {str(e)[:150]}")
+                raise HTTPException(status_code=500,
+                    detail=f"Step 1 (add exact match) failed: {e}. Broad match still active.")
+            # Step 2: Pause BROAD
+            try:
+                _execute_single_pause(client, customer_id, resource_name=row["entity_id"])
+            except Exception as e:
+                update_gads_action_result(action_id, executed=True,
+                    execution_result=f"partial_success: exact added, broad pause failed: {str(e)[:150]}")
+                logger.warning(f"tighten_match_type: exact added but broad pause failed for "
+                               f"'{row['entity_name']}': {e}")
+                return {"status": "partial_success", "action_id": action_id,
+                        "detail": "Exact match keyword added. Broad match pause failed — please pause manually."}
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed tighten_match_type: '{row['entity_name']}' → EXACT ({action_id[:8]})")
+
+        elif operation == "claude_advisory":
+            # Advisory acknowledgment — no Google Ads API call needed.
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Advisory acknowledged: '{row['entity_name']}' ({action_id[:8]})")
+
+        elif operation == "enable_keyword":
+            client = _build_client()
+            try:
+                _execute_enable_keyword(client, customer_id, resource_name=row["entity_id"])
+            except Exception as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed enable_keyword: {row['entity_name']} ({action_id[:8]})")
+
+        elif operation == "ad_copy_suggestion":
+            after = json.loads(row["after_state_json"] or "{}")
+            ad_resource = after.get("ad_resource")
+            new_headlines = []
+            new_descriptions = []
+            if after.get("headline"):
+                new_headlines = [after["headline"]]
+            if after.get("description"):
+                new_descriptions = [after["description"]]
+
+            if ad_resource and new_headlines:
+                # Live API execution — update RSA via API
+                client = _build_client()
+                try:
+                    _execute_update_rsa(
+                        client, customer_id,
+                        ad_group_ad_resource=ad_resource,
+                        new_headlines=new_headlines,
+                        new_descriptions=new_descriptions,
+                    )
+                except ValueError as e:
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result=f"rejected: {str(e)[:200]}")
+                    raise HTTPException(status_code=422, detail=str(e))
+                except Exception as e:
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result=f"failed: {str(e)[:200]}")
+                    raise
+                update_gads_action_result(action_id, executed=True, execution_result="success")
+                set_audit_approval(action_id, approver="admin")
+                logger.info(f"Approved + executed ad_copy_suggestion (RSA updated): '{row['entity_name']}' ({action_id[:8]})")
+            else:
+                # Legacy or missing ad_resource — acknowledge only
+                update_gads_action_result(action_id, executed=True, execution_result="success")
+                set_audit_approval(action_id, approver="admin")
+                logger.info(f"Ad copy suggestion acknowledged (no ad_resource — manual action needed): '{row['entity_name']}' ({action_id[:8]})")
+
+        elif operation == "geo_exclusion":
+            after = json.loads(row["after_state_json"] or "{}")
+            geo_target_resource = after.get("geo_target_resource")
+            # campaign_resource: try entity_id first (set by _OP_MAP), then after_state
+            campaign_resource_for_geo = (
+                row.get("entity_id") or
+                after.get("campaign_resource") or ""
+            )
+
+            if geo_target_resource and campaign_resource_for_geo:
+                # Live API execution
+                client = _build_client()
+                try:
+                    _execute_geo_exclusion(
+                        client, customer_id,
+                        campaign_resource=campaign_resource_for_geo,
+                        geo_target_resource=geo_target_resource,
+                    )
+                except Exception as e:
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result=f"failed: {str(e)[:200]}")
+                    raise
+                update_gads_action_result(action_id, executed=True, execution_result="success")
+                set_audit_approval(action_id, approver="admin")
+                logger.info(f"Approved + executed geo_exclusion: '{row['entity_name']}' ({action_id[:8]})")
+            else:
+                # Legacy — no resolved geo target resource
+                update_gads_action_result(action_id, executed=True, execution_result="success")
+                set_audit_approval(action_id, approver="admin")
+                logger.info(f"Geo exclusion acknowledged (no geo_target_resource — manual action needed): '{row['entity_name']}' ({action_id[:8]})")
+
+        elif operation == "change_budget":
+            after = json.loads(row["after_state_json"] or "{}")
+            new_budget_usd = after.get("new_daily_budget_usd")
+            camp_resource_for_budget = (
+                after.get("campaign_resource") or row.get("entity_id") or ""
+            )
+            if not new_budget_usd or not camp_resource_for_budget:
+                raise HTTPException(
+                    status_code=422,
+                    detail="after_state_json missing new_daily_budget_usd or campaign_resource"
+                )
+            try:
+                new_budget_usd = float(new_budget_usd)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="new_daily_budget_usd must be a number")
+            client = _build_client()
+            try:
+                from campaign_safety import WriteBlockedError as _WBE
+                _execute_budget_change(client, customer_id,
+                    campaign_resource=camp_resource_for_budget,
+                    new_daily_budget_usd=new_budget_usd)
+            except _WBE as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"rejected: {str(e)[:200]}")
+                raise HTTPException(status_code=422, detail=str(e))
+            except Exception as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed change_budget: ${new_budget_usd:.2f}/day ({action_id[:8]})")
+
+        elif operation == "change_bid_strategy":
+            from ai_optimizer import _execute_change_bid_strategy
+            after = json.loads(row["after_state_json"] or "{}")
+            details = after
+            bid_strategy = after.get("bid_strategy") or details.get("bid_strategy", "")
+            target_cpa = int(after.get("target_cpa_micros") or details.get("target_cpa_micros", 0))
+            target_roas = float(after.get("target_roas") or details.get("target_roas", 0))
+            camp_res = after.get("campaign_resource") or details.get("campaign_resource", "") or row.get("entity_id", "")
+            if not bid_strategy or not camp_res:
+                raise HTTPException(status_code=422, detail="Missing bid_strategy or campaign_resource")
+            client = _build_client()
+            try:
+                _execute_change_bid_strategy(client, customer_id, camp_res, bid_strategy, target_cpa, target_roas)
+            except Exception as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed change_bid_strategy: {bid_strategy} ({action_id[:8]})")
+
+        elif operation == "change_match_type":
+            from ai_optimizer import _execute_change_match_type
+            after = json.loads(row["after_state_json"] or "{}")
+            details = after
+            resource_name_kw = after.get("resource_name") or details.get("resource_name", "") or row.get("entity_id", "")
+            new_mt = after.get("new_match_type") or details.get("new_match_type", "EXACT")
+            if not resource_name_kw:
+                raise HTTPException(status_code=422, detail="Missing keyword resource_name")
+            client = _build_client()
+            try:
+                _execute_change_match_type(client, customer_id, resource_name_kw, new_mt)
+            except Exception as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"Approved + executed change_match_type: {new_mt} on {resource_name_kw[:30]} ({action_id[:8]})")
+
+        elif operation == "add_asset":
+            # Advisory — user adds manually or via ApplyRecommendation
+            after = json.loads(row["after_state_json"] or "{}")
+            logger.info(f"Asset recommendation acknowledged: {after.get('asset_type')} for {after.get('campaign_resource')} ({action_id[:8]})")
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+
         else:
             raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
 
@@ -983,6 +1278,772 @@ async def gads_reject_action(action_id: str, request: Request):
         record_reject_reason(action_id, reject_reason)
         logger.info(f"[phase_a] Rejection recorded for {action_id[:8]}: {reject_reason[:80]}")
     return {"status": "ok", "action_id": action_id, "reject_reason": reject_reason}
+
+
+@app.post("/api/admin/gads/refine/{action_id}", dependencies=[Depends(_require_admin)])
+async def gads_refine_action(action_id: str, request: Request):
+    """
+    Store user feedback on a recommendation without rejecting it.
+    Body: {"feedback": "This keyword actually drives implant calls, don't pause it"}
+    The feedback is stored in user_feedback column and surfaced in the Optimization tab.
+    The AI optimizer reads this feedback on the next run via optimizer memory.
+    """
+    from database import get_audit_row, _conn as _db_conn
+    row = get_audit_row(action_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Action not found")
+    body = await request.json()
+    feedback = str(body.get("feedback", "")).strip()[:500]
+    if not feedback:
+        raise HTTPException(status_code=422, detail="feedback text is required")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _db_conn() as conn:
+        conn.execute(
+            "UPDATE gads_audit_log SET user_feedback=?, user_feedback_at=?, updated_at=? WHERE action_id=?",
+            (feedback, now, now, action_id)
+        )
+
+    # Save feedback to optimizer memory so it's applied on next run
+    try:
+        from database import add_optimizer_memory
+        entity_name   = row.get("entity_name", "")
+        operation     = row.get("operation", "")
+        campaign_name = row.get("campaign_name", "") or ""
+        memory_note   = f"[User feedback on {operation} for '{entity_name}']: {feedback}"
+        add_optimizer_memory(
+            category="general",
+            key=f"feedback_{action_id[:8]}",
+            value=memory_note,
+            reason=f"User refinement via Optimization tab for action {action_id[:8]}",
+            campaign=campaign_name,
+            author="admin",
+        )
+        logger.info(f"Refine feedback saved for {action_id[:8]}: {feedback[:80]}")
+    except Exception as _mem_err:
+        logger.warning(f"Could not save refine feedback to optimizer memory: {_mem_err}")
+
+    return {"status": "ok", "action_id": action_id, "feedback_saved": feedback}
+
+
+@app.get("/api/admin/optimizer/diagnose-calls", dependencies=[Depends(_require_admin)])
+def optimizer_diagnose_calls(days: int = 30):
+    """
+    Diagnostic: show how inbound calls are resolving to campaigns.
+    Use this to debug the '0 calls' issue — reveals which calls have no campaign linkage.
+    """
+    from database import _conn as _db_conn
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _db_conn() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM mango_calls WHERE direction='inbound' AND started_at >= ?",
+            (cutoff,)
+        ).fetchone()[0]
+
+        with_gads = conn.execute("""
+            SELECT COUNT(*) FROM mango_calls mc
+            JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+            WHERE mc.direction='inbound' AND mc.started_at >= ?
+        """, (cutoff,)).fetchone()[0]
+
+        with_lead = conn.execute("""
+            SELECT COUNT(*) FROM mango_calls mc
+            JOIN leads l ON l.id = mc.lead_id
+            WHERE mc.direction='inbound' AND mc.started_at >= ?
+              AND l.campaign_name IS NOT NULL AND l.campaign_name != ''
+        """, (cutoff,)).fetchone()[0]
+
+        resolved_rows = conn.execute("""
+            WITH resolved AS (
+              SELECT mc.uuid,
+                COALESCE(NULLIF(TRIM(gcv.campaign_name),''), NULLIF(TRIM(l.campaign_name),'')) AS campaign_name
+              FROM mango_calls mc
+              LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+              LEFT JOIN leads l ON l.id = mc.lead_id
+              WHERE mc.direction='inbound' AND mc.started_at >= ?
+            )
+            SELECT campaign_name, COUNT(*) AS cnt
+            FROM resolved
+            GROUP BY campaign_name
+            ORDER BY cnt DESC
+        """, (cutoff,)).fetchall()
+
+        camp_rows = conn.execute(
+            "SELECT id, campaign_name, campaign_id, gads_campaign_numeric_id FROM campaigns"
+        ).fetchall()
+
+    by_campaign = [{"campaign_name": r["campaign_name"] or "(unresolved)", "calls": r["cnt"]}
+                   for r in resolved_rows]
+    unresolved = sum(r["calls"] for r in by_campaign if not r["campaign_name"] or r["campaign_name"] == "(unresolved)")
+
+    return {
+        "days": days,
+        "total_inbound_calls": total,
+        "calls_with_gads_call_view_match": with_gads,
+        "calls_with_lead_campaign": with_lead,
+        "calls_unresolved_to_campaign": unresolved,
+        "by_campaign": by_campaign,
+        "campaigns_in_db": [dict(r) for r in camp_rows],
+        "hint": (
+            "If calls_unresolved_to_campaign > 0, the calls have neither a gads_call_view "
+            "match (from GAds call tracking) nor a lead with campaign_name. "
+            "Run Sync Now + Reconcile to link them."
+            if unresolved > 0 else "All calls resolved to a campaign ✓"
+        ),
+    }
+
+
+@app.get("/api/admin/optimizer/campaign/{campaign_name}/recommendations",
+         dependencies=[Depends(_require_admin)])
+def campaign_recommendations(campaign_name: str, status: str = "pending_approval", limit: int = 100):
+    """
+    Return optimizer recommendations for a specific campaign, grouped by operation type.
+    campaign_name: URL-encoded campaign name (or 'all' for all campaigns).
+    status: pending_approval | success | rejected | expired | all
+    """
+    from database import _conn as _db_conn
+    import urllib.parse
+    camp = urllib.parse.unquote(campaign_name)
+
+    with _db_conn() as conn:
+        if camp.lower() == "all":
+            if status == "all":
+                rows = conn.execute(
+                    "SELECT * FROM gads_audit_log ORDER BY priority ASC, created_at DESC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM gads_audit_log WHERE execution_result=? "
+                    "ORDER BY priority ASC, created_at DESC LIMIT ?",
+                    (status, limit)
+                ).fetchall()
+        else:
+            if status == "all":
+                rows = conn.execute(
+                    "SELECT * FROM gads_audit_log "
+                    "WHERE LOWER(TRIM(campaign_name))=LOWER(TRIM(?)) "
+                    "ORDER BY priority ASC, created_at DESC LIMIT ?",
+                    (camp, limit)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM gads_audit_log "
+                    "WHERE LOWER(TRIM(campaign_name))=LOWER(TRIM(?)) "
+                    "  AND execution_result=? "
+                    "ORDER BY priority ASC, created_at DESC LIMIT ?",
+                    (camp, status, limit)
+                ).fetchall()
+
+    grouped = {}
+    total_impact = 0.0
+    for r in rows:
+        op = r["operation"]
+        grouped.setdefault(op, [])
+        row_dict = dict(r)
+        # Parse JSON fields
+        try:
+            row_dict["before_state"] = json.loads(r["before_state_json"] or "{}")
+            row_dict["after_state"] = json.loads(r["after_state_json"] or "{}")
+            impact = json.loads(r["impact_estimate_json"] or "{}")
+            row_dict["impact_estimate"] = impact
+            total_impact += float(impact.get("savings_30d_usd", 0))
+        except Exception:
+            row_dict["before_state"] = {}
+            row_dict["after_state"] = {}
+            row_dict["impact_estimate"] = {}
+        grouped[op].append(row_dict)
+
+    return {
+        "campaign_name": camp,
+        "status_filter": status,
+        "recommendations": grouped,
+        "total": len(rows),
+        "summary": {
+            "total_pending": sum(1 for r in rows if r["execution_result"] == "pending_approval"),
+            "total_applied": sum(1 for r in rows if r["execution_result"] == "success"),
+            "total_rejected": sum(1 for r in rows if r["execution_result"] == "rejected"),
+            "estimated_savings_30d_usd": round(total_impact, 2),
+        },
+    }
+
+
+@app.get("/api/admin/optimizer/campaign/{campaign_name}/impact",
+         dependencies=[Depends(_require_admin)])
+def campaign_impact(campaign_name: str, days: int = 90):
+    """
+    Return applied outcomes and verdicts for a campaign (for the Optimization tab impact view).
+    """
+    from database import _conn as _db_conn
+    import urllib.parse
+    camp = urllib.parse.unquote(campaign_name)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    with _db_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM applied_outcomes
+            WHERE LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+              AND applied_at >= ?
+            ORDER BY applied_at DESC
+        """, (camp, cutoff)).fetchall()
+
+    outcomes = [dict(r) for r in rows]
+    for o in outcomes:
+        try:
+            o["post_7d"]  = json.loads(o.get("post_7d_json", "{}") or "{}")
+            o["post_30d"] = json.loads(o.get("post_30d_json", "{}") or "{}")
+        except Exception:
+            o["post_7d"] = {}
+            o["post_30d"] = {}
+
+    totals = {
+        "actions_applied": len(outcomes),
+        "improved": sum(1 for o in outcomes if o.get("verdict") == "improved"),
+        "neutral":  sum(1 for o in outcomes if o.get("verdict") == "neutral"),
+        "degraded": sum(1 for o in outcomes if o.get("verdict") == "degraded"),
+        "pending":  sum(1 for o in outcomes if o.get("verdict") == "pending"),
+    }
+    return {"campaign_name": camp, "days": days, "outcomes": outcomes, "totals": totals}
+
+
+@app.post("/api/admin/optimizer/campaign/{campaign_name}/apply-bulk",
+          dependencies=[Depends(_require_admin)])
+async def campaign_apply_bulk(campaign_name: str, request: Request):
+    """
+    Apply multiple recommendations at once (up to 25 per call — safety guard).
+    Body: {"action_ids": ["uuid1", "uuid2", ...]}
+    Returns per-action result map. Partial failures do NOT roll back other actions.
+    """
+    import urllib.parse
+    body = await request.json()
+    action_ids = body.get("action_ids", [])
+    if not action_ids:
+        raise HTTPException(status_code=422, detail="action_ids list is required")
+    if len(action_ids) > 25:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Bulk apply limited to 25 actions per call (got {len(action_ids)}). "
+                   "Split into smaller batches and review results between batches."
+        )
+
+    results = {}
+    for aid in action_ids:
+        try:
+            # Re-use the single-action approve endpoint logic via internal call
+            from database import get_audit_row, update_gads_action_result, set_audit_approval
+            from campaign_safety import check_writes_enabled, WriteBlockedError
+            from ai_optimizer import (_build_client, _execute_single_pause,
+                                       _execute_bid_change, _execute_add_keyword,
+                                       _execute_add_negative, _execute_enable_keyword,
+                                       _execute_budget_change, _execute_update_rsa,
+                                       _execute_geo_exclusion)
+
+            row = get_audit_row(aid)
+            if not row:
+                results[aid] = {"status": "error", "detail": "Action not found"}
+                continue
+            if row["execution_result"] != "pending_approval":
+                results[aid] = {"status": "skipped", "detail": f"Already {row['execution_result']}"}
+                continue
+
+            try:
+                check_writes_enabled()
+            except WriteBlockedError as e:
+                results[aid] = {"status": "blocked", "detail": str(e)}
+                continue
+
+            settings = get_settings()
+            customer_id = settings.google_ads_customer_id
+            operation = row["operation"]
+
+            if operation == "pause_keyword":
+                client = _build_client()
+                _execute_single_pause(client, customer_id, resource_name=row["entity_id"])
+
+            elif operation in ("increase_bid", "decrease_bid"):
+                after = json.loads(row["after_state_json"] or "{}")
+                new_bid_micros = int(after.get("new_bid_micros", 0))
+                client = _build_client()
+                _execute_bid_change(client, customer_id, resource_name=row["entity_id"],
+                                    new_bid_micros=new_bid_micros)
+
+            elif operation == "add_exact_keyword":
+                after = json.loads(row["after_state_json"] or "{}")
+                client = _build_client()
+                _execute_add_keyword(client, customer_id,
+                                     ad_group_resource=after.get("ad_group_resource") or row["entity_id"],
+                                     keyword_text=after.get("keyword_text", row["entity_name"]),
+                                     match_type=after.get("match_type", "EXACT"))
+
+            elif operation == "add_negative_keyword":
+                after = json.loads(row["after_state_json"] or "{}")
+                client = _build_client()
+                _execute_add_negative(client, customer_id,
+                                      campaign_resource=after.get("campaign_resource") or row["entity_id"],
+                                      keyword_text=after.get("keyword_text", row["entity_name"]),
+                                      match_type=after.get("match_type", "BROAD"))
+
+            elif operation == "tighten_match_type":
+                after = json.loads(row["after_state_json"] or "{}")
+                before = json.loads(row["before_state_json"] or "{}")
+                client = _build_client()
+                # Step 1: add exact match keyword first (so no impression gap)
+                _execute_add_keyword(client, customer_id,
+                                     ad_group_resource=after.get("ad_group_resource", ""),
+                                     keyword_text=row["entity_name"],
+                                     match_type="EXACT")
+                # Step 2: pause the broad match keyword
+                _execute_single_pause(client, customer_id, resource_name=row["entity_id"])
+
+            elif operation == "claude_advisory":
+                # Advisory acknowledgment — no API call
+                pass
+
+            elif operation == "enable_keyword":
+                client = _build_client()
+                _execute_enable_keyword(client, customer_id, resource_name=row["entity_id"])
+
+            elif operation == "ad_copy_suggestion":
+                after = json.loads(row["after_state_json"] or "{}")
+                ad_resource = after.get("ad_resource")
+                new_headlines = [after["headline"]] if after.get("headline") else []
+                new_descriptions = [after["description"]] if after.get("description") else []
+                if ad_resource and new_headlines:
+                    client = _build_client()
+                    _execute_update_rsa(client, customer_id,
+                                        ad_group_ad_resource=ad_resource,
+                                        new_headlines=new_headlines,
+                                        new_descriptions=new_descriptions)
+                # else: legacy row without ad_resource — acknowledge only
+
+            elif operation == "geo_exclusion":
+                after = json.loads(row["after_state_json"] or "{}")
+                geo_target_resource = after.get("geo_target_resource")
+                camp_resource_geo = after.get("campaign_resource") or row.get("entity_id") or ""
+                if geo_target_resource and camp_resource_geo:
+                    client = _build_client()
+                    _execute_geo_exclusion(client, customer_id,
+                                           campaign_resource=camp_resource_geo,
+                                           geo_target_resource=geo_target_resource)
+                # else: legacy row — acknowledge only
+
+            elif operation == "change_budget":
+                after = json.loads(row["after_state_json"] or "{}")
+                new_budget_usd = float(after.get("new_daily_budget_usd", 0))
+                camp_resource_budget = after.get("campaign_resource") or row.get("entity_id") or ""
+                if new_budget_usd and camp_resource_budget:
+                    client = _build_client()
+                    _execute_budget_change(client, customer_id,
+                                           campaign_resource=camp_resource_budget,
+                                           new_daily_budget_usd=new_budget_usd)
+
+            elif operation == "change_bid_strategy":
+                from ai_optimizer import _execute_change_bid_strategy
+                after = json.loads(row["after_state_json"] or "{}")
+                bid_strategy = after.get("bid_strategy", "")
+                target_cpa = int(after.get("target_cpa_micros", 0))
+                target_roas = float(after.get("target_roas", 0))
+                camp_res = after.get("campaign_resource", "") or row.get("entity_id", "")
+                if bid_strategy and camp_res:
+                    client = _build_client()
+                    _execute_change_bid_strategy(client, customer_id, camp_res, bid_strategy, target_cpa, target_roas)
+
+            elif operation == "change_match_type":
+                from ai_optimizer import _execute_change_match_type
+                after = json.loads(row["after_state_json"] or "{}")
+                resource_name_kw = after.get("resource_name", "") or row.get("entity_id", "")
+                new_mt = after.get("new_match_type", "EXACT")
+                if resource_name_kw:
+                    client = _build_client()
+                    _execute_change_match_type(client, customer_id, resource_name_kw, new_mt)
+
+            elif operation == "add_asset":
+                # Advisory — check for google_rec_resource_name for direct apply
+                google_rec_rn = row.get("google_rec_resource_name", "")
+                if google_rec_rn:
+                    from ai_optimizer import _apply_google_recommendation
+                    client = _build_client()
+                    _apply_google_recommendation(client, customer_id, google_rec_rn)
+                # else: acknowledged only
+
+            else:
+                results[aid] = {"status": "error", "detail": f"Unknown operation: {operation}"}
+                continue
+
+            update_gads_action_result(aid, executed=True, execution_result="success")
+            set_audit_approval(aid, approver="admin_bulk")
+
+            # Outcome snapshot for learning loop
+            try:
+                from database import snapshot_applied_outcome
+                before_state = json.loads(row.get("before_state_json") or "{}")
+                snapshot_applied_outcome(
+                    action_id=aid, operation=operation,
+                    entity_type=row.get("entity_type", "keyword"),
+                    entity_id=row.get("entity_id", ""),
+                    entity_name=row.get("entity_name", ""),
+                    campaign_id=row.get("campaign_id", ""),
+                    campaign_name=row.get("campaign_name", ""),
+                    before_state=before_state,
+                    ai_reason=row.get("reason", ""),
+                    optimizer_run_id=row.get("optimizer_run_id", ""),
+                )
+            except Exception as _snap_err:
+                logger.warning(f"Bulk apply: outcome snapshot failed for {aid}: {_snap_err}")
+
+            results[aid] = {"status": "success", "entity": row["entity_name"], "operation": operation}
+
+        except Exception as e:
+            try:
+                update_gads_action_result(aid, executed=False, execution_result="error",
+                                          error_detail=str(e)[:200])
+            except Exception:
+                pass
+            results[aid] = {"status": "error", "detail": str(e)[:200]}
+            logger.error(f"Bulk apply: action {aid} failed: {e}")
+
+    success_count = sum(1 for v in results.values() if v["status"] == "success")
+    error_count   = sum(1 for v in results.values() if v["status"] == "error")
+    return {
+        "results": results,
+        "summary": {"total": len(action_ids), "success": success_count, "error": error_count},
+    }
+
+
+@app.post("/api/admin/gads/queue/{action_id}", dependencies=[Depends(_require_admin)])
+async def gads_queue_action(action_id: str):
+    """
+    Move a pending_approval recommendation to 'queued' state.
+    Queued recs are held until POST /api/admin/gads/push-queued is called.
+    Idempotent: already-queued rows return 200 with state=queued.
+    """
+    from database import get_audit_row, queue_gads_action
+    row = get_audit_row(action_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Action not found")
+    if row["execution_result"] == "queued":
+        return {"status": "queued", "action_id": action_id, "detail": "Already queued"}
+    if row["execution_result"] != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Action already in state '{row['execution_result']}' — cannot queue"
+        )
+    queue_gads_action(action_id, approver="admin")
+    logger.info(f"Queued: {row['operation']} '{row['entity_name']}' ({action_id[:8]})")
+    return {"status": "queued", "action_id": action_id}
+
+
+@app.post("/api/admin/gads/unqueue/{action_id}", dependencies=[Depends(_require_admin)])
+async def gads_unqueue_action(action_id: str):
+    """Move a queued recommendation back to pending_approval."""
+    from database import get_audit_row, update_gads_action_result
+    row = get_audit_row(action_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Action not found")
+    if row["execution_result"] != "queued":
+        raise HTTPException(status_code=409, detail=f"Action is not queued (state='{row['execution_result']}')")
+    now = datetime.now(timezone.utc).isoformat()
+    from database import _conn as _db_conn
+    with _db_conn() as conn:
+        conn.execute(
+            "UPDATE gads_audit_log SET execution_result='pending_approval', queued_at='', updated_at=? WHERE action_id=?",
+            (now, action_id)
+        )
+    return {"status": "pending_approval", "action_id": action_id}
+
+
+@app.get("/api/admin/gads/queued", dependencies=[Depends(_require_admin)])
+def gads_get_queued():
+    """Return all queued recommendations (approved, pending push to Google)."""
+    from database import get_queued_actions
+    rows = get_queued_actions()
+    for r in rows:
+        try:
+            r["after_state"] = json.loads(r.get("after_state_json") or "{}")
+            r["before_state"] = json.loads(r.get("before_state_json") or "{}")
+        except Exception:
+            r["after_state"] = {}
+            r["before_state"] = {}
+    return {"queued": rows, "count": len(rows)}
+
+
+@app.post("/api/admin/gads/push-queued", dependencies=[Depends(_require_admin)])
+async def gads_push_queued():
+    """
+    Execute all queued recommendations against Google Ads API in one shot.
+    Each action is executed independently — partial failures do not stop others.
+    Returns per-action result map + summary.
+    """
+    from database import (get_queued_actions, mark_api_executed,
+                           set_audit_approval, snapshot_applied_outcome)
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from ai_optimizer import (_build_client, _execute_single_pause,
+                               _execute_bid_change, _execute_add_keyword,
+                               _execute_add_negative, _execute_enable_keyword,
+                               _execute_budget_change, _execute_update_rsa,
+                               _execute_geo_exclusion, _execute_change_bid_strategy,
+                               _execute_change_match_type, _apply_google_recommendation)
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    queued = get_queued_actions()
+    if not queued:
+        return {"results": {}, "summary": {"total": 0, "success": 0, "error": 0, "acknowledged": 0}}
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id
+    client = _build_client()
+
+    results = {}
+    success_count = error_count = ack_count = 0
+
+    for row in queued:
+        aid = row["action_id"]
+        operation = row["operation"]
+        try:
+            after = json.loads(row.get("after_state_json") or "{}")
+            api_hit = False  # will be True if we actually called the Google Ads API
+
+            if operation == "pause_keyword":
+                _execute_single_pause(client, customer_id, resource_name=row["entity_id"])
+                api_hit = True
+
+            elif operation in ("increase_bid", "decrease_bid"):
+                new_bid = int(after.get("new_bid_micros", 0))
+                _execute_bid_change(client, customer_id, resource_name=row["entity_id"],
+                                    new_bid_micros=new_bid)
+                api_hit = True
+
+            elif operation == "add_exact_keyword":
+                _execute_add_keyword(client, customer_id,
+                    ad_group_resource=after.get("ad_group_resource") or row["entity_id"],
+                    keyword_text=after.get("keyword_text", row["entity_name"]),
+                    match_type=after.get("match_type", "EXACT"))
+                api_hit = True
+
+            elif operation == "add_negative_keyword":
+                _execute_add_negative(client, customer_id,
+                    campaign_resource=after.get("campaign_resource") or row["entity_id"],
+                    keyword_text=after.get("keyword_text", row["entity_name"]),
+                    match_type=after.get("match_type", "BROAD"))
+                api_hit = True
+
+            elif operation == "tighten_match_type":
+                _execute_add_keyword(client, customer_id,
+                    ad_group_resource=after.get("ad_group_resource", ""),
+                    keyword_text=row["entity_name"], match_type="EXACT")
+                _execute_single_pause(client, customer_id, resource_name=row["entity_id"])
+                api_hit = True
+
+            elif operation == "enable_keyword":
+                _execute_enable_keyword(client, customer_id, resource_name=row["entity_id"])
+                api_hit = True
+
+            elif operation == "ad_copy_suggestion":
+                ad_resource = after.get("ad_resource")
+                new_headlines = [after["headline"]] if after.get("headline") else []
+                new_descriptions = [after["description"]] if after.get("description") else []
+                if ad_resource and new_headlines:
+                    _execute_update_rsa(client, customer_id,
+                        ad_group_ad_resource=ad_resource,
+                        new_headlines=new_headlines,
+                        new_descriptions=new_descriptions)
+                    api_hit = True
+
+            elif operation == "geo_exclusion":
+                geo_rn = after.get("geo_target_resource")
+                camp_rn = after.get("campaign_resource") or row.get("entity_id") or ""
+                if geo_rn and camp_rn:
+                    _execute_geo_exclusion(client, customer_id,
+                        campaign_resource=camp_rn, geo_target_resource=geo_rn)
+                    api_hit = True
+
+            elif operation == "change_budget":
+                new_budget = float(after.get("new_daily_budget_usd", 0))
+                camp_rn = after.get("campaign_resource") or row.get("entity_id") or ""
+                if new_budget and camp_rn:
+                    _execute_budget_change(client, customer_id,
+                        campaign_resource=camp_rn, new_daily_budget_usd=new_budget)
+                    api_hit = True
+
+            elif operation == "change_bid_strategy":
+                bid_strategy = after.get("bid_strategy", "")
+                target_cpa = int(after.get("target_cpa_micros", 0))
+                target_roas = float(after.get("target_roas", 0))
+                camp_res = after.get("campaign_resource", "") or row.get("entity_id", "")
+                if bid_strategy and camp_res:
+                    _execute_change_bid_strategy(client, customer_id, camp_res, bid_strategy, target_cpa, target_roas)
+                    api_hit = True
+
+            elif operation == "change_match_type":
+                details = after
+                resource_name_kw = after.get("resource_name") or details.get("resource_name", "") or row.get("entity_id", "")
+                new_mt = after.get("new_match_type") or details.get("new_match_type", "EXACT")
+                if resource_name_kw:
+                    _execute_change_match_type(client, customer_id, resource_name_kw, new_mt)
+                    api_hit = True
+
+            elif operation == "add_asset":
+                # Check if came from Google — try ApplyRecommendation for direct apply
+                google_rec_rn = row.get("google_rec_resource_name", "")
+                if google_rec_rn:
+                    try:
+                        _apply_google_recommendation(client, customer_id, google_rec_rn)
+                        api_hit = True
+                    except Exception as _are:
+                        logger.error(f"ApplyRecommendation failed for add_asset: {_are}")
+                        # fall through — api_hit stays False (acknowledged)
+                else:
+                    logger.info(f"Asset recommendation acknowledged: {after.get('asset_type')} for {after.get('campaign_resource')}")
+                    # api_hit stays False
+
+            # claude_advisory and other advisory ops — acknowledged only, api_hit stays False
+            # execution_result='success' always; api_executed=True only if we actually called the API
+            mark_api_executed(aid, success=True, api_executed=api_hit)
+            set_audit_approval(aid, approver="push_to_google")
+
+            # Outcome snapshot for learning loop
+            try:
+                before_state = json.loads(row.get("before_state_json") or "{}")
+                snapshot_applied_outcome(
+                    action_id=aid, operation=operation,
+                    entity_type=row.get("entity_type", "keyword"),
+                    entity_id=row.get("entity_id", ""),
+                    entity_name=row.get("entity_name", ""),
+                    campaign_id=row.get("campaign_id", ""),
+                    campaign_name=row.get("campaign_name", ""),
+                    before_state=before_state,
+                    ai_reason=row.get("reason", ""),
+                    optimizer_run_id=row.get("optimizer_run_id", ""),
+                )
+            except Exception:
+                pass
+
+            if api_hit:
+                success_count += 1
+                results[aid] = {"status": "success", "api_executed": True,
+                                 "entity": row["entity_name"], "operation": operation}
+                logger.info(f"Push: {operation} '{row['entity_name']}' → Google Ads ✓")
+            else:
+                ack_count += 1
+                results[aid] = {"status": "success", "api_executed": False,
+                                 "entity": row["entity_name"], "operation": operation,
+                                 "detail": "Acknowledged only (no API resource available)"}
+                logger.info(f"Push: {operation} '{row['entity_name']}' → acknowledged only")
+
+        except Exception as e:
+            mark_api_executed(aid, success=False, error_detail=str(e)[:300])
+            results[aid] = {"status": "error", "api_executed": False,
+                             "entity": row.get("entity_name", ""), "detail": str(e)[:200]}
+            error_count += 1
+            logger.error(f"Push: {operation} '{row.get('entity_name','')}' failed: {e}")
+
+    return {
+        "results": results,
+        "summary": {
+            "total": len(queued),
+            "pushed_to_google": success_count,
+            "acknowledged_only": ack_count,
+            "error": error_count,
+        },
+    }
+
+
+@app.get("/api/admin/optimizer/account/recommendations", dependencies=[Depends(_require_admin)])
+def account_recommendations(status: str = "all", limit: int = 500):
+    """
+    Return all recommendations across ALL campaigns (account-level view).
+    status: 'all' | 'pending_approval' | 'queued' | 'success' | 'rejected'
+    """
+    from database import _conn as _db_conn
+    import urllib.parse
+    valid_statuses = {"all", "pending_approval", "queued", "success", "rejected", "expired"}
+    if status not in valid_statuses:
+        raise HTTPException(status_code=422, detail=f"Invalid status '{status}'")
+
+    with _db_conn() as conn:
+        if status == "all":
+            rows = conn.execute(
+                "SELECT * FROM gads_audit_log ORDER BY priority ASC, created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM gads_audit_log WHERE execution_result=? ORDER BY priority ASC, created_at DESC LIMIT ?",
+                (status, limit)
+            ).fetchall()
+
+    grouped = {}
+    total_impact = 0.0
+    for r in rows:
+        op = r["operation"]
+        grouped.setdefault(op, [])
+        row_dict = dict(r)
+        try:
+            row_dict["before_state"] = json.loads(r["before_state_json"] or "{}")
+            row_dict["after_state"] = json.loads(r["after_state_json"] or "{}")
+            impact = json.loads(r["impact_estimate_json"] or "{}")
+            row_dict["impact_estimate"] = impact
+            total_impact += float(impact.get("savings_30d_usd", 0))
+        except Exception:
+            row_dict["before_state"] = {}
+            row_dict["after_state"] = {}
+            row_dict["impact_estimate"] = {}
+        grouped[op].append(row_dict)
+
+    return {
+        "campaign_name": "__all__",
+        "status_filter": status,
+        "recommendations": grouped,
+        "total": len(rows),
+        "summary": {
+            "total_pending": sum(1 for r in rows if r["execution_result"] == "pending_approval"),
+            "total_queued": sum(1 for r in rows if r["execution_result"] == "queued"),
+            "total_applied": sum(1 for r in rows if r["execution_result"] == "success"),
+            "total_rejected": sum(1 for r in rows if r["execution_result"] == "rejected"),
+            "estimated_savings_30d_usd": round(total_impact, 2),
+        },
+    }
+
+
+@app.get("/api/admin/optimizer/account/impact", dependencies=[Depends(_require_admin)])
+def account_impact(days: int = 90):
+    """Account-level aggregated impact across all campaigns."""
+    from database import get_account_impact_summary
+    return get_account_impact_summary(days=days)
+
+
+@app.get("/api/admin/gads/google-recs", dependencies=[Depends(_require_admin)])
+async def get_google_recs_endpoint():
+    """Get cached Google recommendations from last optimizer run."""
+    from database import get_google_recs
+    recs = get_google_recs(dismissed=False)
+    import json as _json
+    for r in recs:
+        try:
+            r['impact'] = _json.loads(r.get('impact_json') or '{}')
+            r['details'] = _json.loads(r.get('details_json') or '{}')
+        except Exception:
+            r['impact'] = {}
+            r['details'] = {}
+    return {"recs": recs}
+
+
+@app.post("/api/admin/gads/google-recs/{rec_id}/dismiss", dependencies=[Depends(_require_admin)])
+async def dismiss_google_rec_endpoint(rec_id: int):
+    """Dismiss a Google recommendation."""
+    from database import _conn
+    with _conn() as conn:
+        row = conn.execute("SELECT resource_name FROM gads_google_recs WHERE id=?", (rec_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Rec not found")
+        resource_name = row[0]
+    from database import dismiss_google_rec
+    dismiss_google_rec(resource_name)
+    return {"status": "dismissed"}
 
 
 @app.get("/api/admin/gads/writes-status", dependencies=[Depends(_require_admin)])
@@ -4141,13 +5202,208 @@ def admin_mango_sync_now(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/mango/match-patients", dependencies=[Depends(_require_admin)])
+def admin_mango_match_patients(limit: int = 500):
+    """
+    Match unmatched Mango inbound calls to OpenDental patients by phone.
+    Sets od_patient_status: new_patient | existing_active | existing_inactive | unknown.
+    """
+    try:
+        from od_matcher import match_mango_calls_to_od_patients
+        result = match_mango_calls_to_od_patients(limit=limit)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/calls/reconcile", dependencies=[Depends(_require_admin)])
-def admin_mango_reconcile_now():
-    """Manually trigger attribution reconciliation."""
+def admin_mango_reconcile_now(days: int = 14):
+    """Manually trigger attribution reconciliation. days can be widened up to 90."""
     try:
         from mango_service import reconcile_attribution
-        n = reconcile_attribution(days=14)
-        return {"attributed": n}
+        days = max(1, min(int(days), 90))
+        n = reconcile_attribution(days=days)
+        return {"attributed": n, "days": days}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/attribute-keywords", dependencies=[Depends(_require_admin)])
+def admin_attribute_keywords(days: int = 30):
+    """Manually trigger keyword attribution for Mango calls. Use days=90 for backfill."""
+    try:
+        from call_keyword_attribution import attribute_calls_to_keywords
+        days = max(1, min(int(days), 90))
+        result = attribute_calls_to_keywords(days=days)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/optimizer/diagnose-call-attribution", dependencies=[Depends(_require_admin)])
+def admin_diagnose_call_attribution(days: int = 30):
+    """
+    Diagnostic: shows method breakdown + top 10 unattributed inbound calls.
+    Use to verify keyword attribution quality before relying on optimizer recommendations.
+    """
+    try:
+        from call_keyword_attribution import get_attribution_diagnostics
+        days = max(1, min(int(days), 365))
+        return get_attribution_diagnostics(days=days)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/match-od-appointments", dependencies=[Depends(_require_admin)])
+def admin_match_calls_to_od(days: int = 90):
+    """
+    For all booked Mango calls not yet linked to an OD appointment,
+    search OpenDental for the matching appointment and store the AptNum.
+    Requires office LAN access to OpenDental MySQL.
+    days: how many days back to look (default 90, max 365).
+    """
+    try:
+        from od_matcher import match_calls_to_od_appointments
+        days = max(1, min(int(days), 365))
+        result = match_calls_to_od_appointments(days=days)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/{uuid}/match-od-appointment", dependencies=[Depends(_require_admin)])
+def admin_match_single_call_to_od(uuid: str):
+    """
+    For a single Mango call, search OpenDental for the matching appointment.
+    Used for on-demand triggering after grading a specific call.
+    """
+    try:
+        from od_matcher import match_calls_to_od_appointments
+        result = match_calls_to_od_appointments(days=90, target_uuid=uuid)
+        if result.get("matched", 0) == 0:
+            # Not an error — just no match found (patient not in OD or no appt in window)
+            return {"matched": 0, "message": "No matching OD appointment found", **result}
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/calls/campaign-attribution", dependencies=[Depends(_require_admin)])
+def admin_calls_campaign_attribution(days: int = 30):
+    """
+    Return per-campaign call counts and OD appointment counts.
+    Used by the campaign performance table to show Calls and Appts from Calls columns.
+    """
+    from database import _conn
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT
+                 COALESCE(NULLIF(gcv.campaign_name,''), NULLIF(l.campaign_name,'')) AS campaign_name,
+                 COALESCE(NULLIF(gcv.campaign_id,''),   NULLIF(l.campaign_id,''))   AS campaign_id,
+                 COUNT(*) AS total_calls,
+                 SUM(CASE WHEN mc.booked_outcome='booked' THEN 1 ELSE 0 END) AS booked_calls,
+                 SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
+                           AND mc.od_appointment_id != '' THEN 1 ELSE 0 END) AS confirmed_appts
+               FROM mango_calls mc
+               LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+               LEFT JOIN leads l ON l.id = mc.lead_id
+               WHERE mc.started_at >= ?
+                 AND mc.direction = 'inbound'
+                 AND (
+                   (gcv.campaign_name IS NOT NULL AND gcv.campaign_name != '')
+                   OR (l.campaign_name IS NOT NULL AND l.campaign_name != '')
+                 )
+               GROUP BY campaign_name, campaign_id
+               ORDER BY total_calls DESC""",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/admin/gads/{call_id}/match-and-transcribe", dependencies=[Depends(_require_admin)])
+def admin_gads_match_and_transcribe(call_id: str, request: Request, background_tasks: BackgroundTasks):
+    """For an unmatched GAds call: widen the reconciler window to 90 days to find the
+    Mango record, link it, then queue transcription. Returns 409 if no Mango call
+    matches after reconciliation (recording genuinely not available)."""
+    from database import _conn
+    from mango_service import reconcile_attribution
+
+    # 1. Confirm the GAds row exists
+    with _conn() as conn:
+        gads_row = conn.execute(
+            "SELECT * FROM gads_call_view WHERE call_id = ?", (call_id,)
+        ).fetchone()
+    if not gads_row:
+        raise HTTPException(status_code=404, detail="GAds call not found")
+
+    # 2. Check if already matched (race condition / user double-clicked)
+    with _conn() as conn:
+        already = conn.execute(
+            "SELECT uuid FROM mango_calls WHERE gads_call_id = ?", (call_id,)
+        ).fetchone()
+    if already and already["uuid"]:
+        # Already matched — just queue transcription
+        mango_uuid = already["uuid"]
+    else:
+        # 3. Run reconciler with 90-day window + targeted mode for detailed logging
+        reconcile_attribution(days=90, target_gads_call_id=call_id)
+
+        # 4. Re-check for a match
+        with _conn() as conn:
+            matched = conn.execute(
+                "SELECT uuid FROM mango_calls WHERE gads_call_id = ?", (call_id,)
+            ).fetchone()
+
+        if not matched or not matched["uuid"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No PBX recording found for this Google Ads call. "
+                    "The Mango call record may not exist — most likely the caller "
+                    "hung up before audio capture started, was routed to voicemail "
+                    "without leaving one, or this call predates the sync window."
+                ),
+            )
+        mango_uuid = matched["uuid"]
+
+    # 5. Queue the transcription pipeline (same as /api/admin/calls/{uuid}/process)
+    from database import get_mango_call
+    from mango_pipeline import process_call
+    call = get_mango_call(mango_uuid)
+    if not call:
+        raise HTTPException(status_code=404, detail="Mango call record not found after match")
+
+    token_mgr = getattr(request.app.state, "mango_token_mgr", None)
+    tok = token_mgr.get_token() if token_mgr else None
+
+    def _safe_process(call_dict, mango_token=None):
+        try:
+            process_call(call_dict, mango_token=mango_token)
+        except Exception as err:
+            logger.exception("[pipeline] Unhandled error in match-and-transcribe(%s): %s", call_dict.get("uuid"), err)
+            try:
+                from database import update_mango_call_analysis
+                update_mango_call_analysis(
+                    call_dict.get("uuid", ""),
+                    transcription_status="failed",
+                    pipeline_error=f"{type(err).__name__}: {str(err)[:480]}",
+                )
+            except Exception:
+                logger.exception("[pipeline] Could not persist failure state")
+
+    background_tasks.add_task(_safe_process, call, mango_token=tok)
+    return {"ok": True, "status": "queued", "uuid": mango_uuid, "gads_call_id": call_id}
+
+
+@app.post("/api/admin/gads/sync-call-view", dependencies=[Depends(_require_admin)])
+def admin_gads_sync_call_view():
+    """Manually trigger Google Ads call_view sync (normally runs at 6:05am)."""
+    try:
+        from google_ads_sync import sync_call_view
+        n = sync_call_view(days_back=14)
+        return {"synced": n}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4342,6 +5598,95 @@ def admin_grade_call(uuid: str):
         return {"ok": True, "grade": grade, "call": updated}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/{uuid}/suggest-action", dependencies=[Depends(_require_admin)])
+def admin_suggest_call_action(uuid: str):
+    """Generate/regenerate AI next-action suggestion for a single call."""
+    from database import get_mango_call, update_mango_call_analysis, get_lead, get_mango_settings as _get_mango
+    call = get_mango_call(uuid)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if not (call.get("call_summary") or "").strip():
+        raise HTTPException(status_code=400, detail="No summary available — transcribe and grade first")
+    msettings = _get_mango()
+    if not msettings.get("vertex_project_id"):
+        raise HTTPException(status_code=503, detail="VERTEX_PROJECT_ID not configured")
+    lead_stage = ""
+    if call.get("lead_id"):
+        ld = get_lead(call["lead_id"]) or {}
+        lead_stage = ld.get("stage", "")
+    try:
+        from mango_pipeline import _suggest_next_action
+        nxt = _suggest_next_action(
+            summary=call.get("call_summary", ""),
+            grade_overall_score=call.get("grade_overall_score"),
+            grade_overall_notes=call.get("grade_overall_notes", ""),
+            lead_stage=lead_stage,
+            booked_in_call=bool(call.get("od_appointment_id")),
+            vertex_project_id=msettings["vertex_project_id"],
+            vertex_location=msettings["vertex_location"],
+            vertex_credentials_path=msettings["vertex_credentials_path"],
+            vertex_model=msettings["vertex_model"],
+            call_uuid=uuid,
+        )
+        from datetime import date, timedelta
+        due_iso = ""
+        if nxt.get("action_type") != "no_action":
+            d = max(0, min(14, int(nxt.get("due_in_days") or 0)))
+            due_iso = (date.today() + timedelta(days=d)).isoformat()
+        update_mango_call_analysis(
+            uuid,
+            call_next_action=nxt.get("description", ""),
+            call_next_action_type=nxt.get("action_type", "other"),
+            call_next_action_due=due_iso,
+            call_next_action_priority=nxt.get("priority", "soon"),
+            call_next_action_reasoning=nxt.get("reasoning", ""),
+            call_next_action_suggested_at=datetime.now(timezone.utc).isoformat(),
+            call_next_action_completed=0,
+        )
+        return {"ok": True, "action": nxt, "call": get_mango_call(uuid)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/{uuid}/action/complete", dependencies=[Depends(_require_admin)])
+def admin_complete_call_action(uuid: str, request: Request):
+    """Mark a call's AI next-action as done."""
+    from database import get_mango_call, mark_call_action_completed
+    if not get_mango_call(uuid):
+        raise HTTPException(status_code=404, detail="Call not found")
+    by = ""
+    try:
+        by = request.session.get("admin_email", "") if hasattr(request, "session") else ""
+    except Exception:
+        pass
+    mark_call_action_completed(uuid, by_email=by)
+    return {"ok": True}
+
+
+@app.get("/api/admin/actions", dependencies=[Depends(_require_admin)])
+def admin_actions_feed():
+    """Unified prioritized feed for the Actions tab."""
+    from database import get_pending_actions
+    items = get_pending_actions(limit=200)
+    pending = [i for i in items if not i["completed"]]
+    counts = {
+        "urgent": sum(1 for i in pending if i["priority"] == "urgent"),
+        "soon":   sum(1 for i in pending if i["priority"] == "soon"),
+        "low":    sum(1 for i in pending if i["priority"] == "low"),
+        "total":  len(pending),
+    }
+    return {"items": items, "counts": counts}
+
+
+@app.get("/api/admin/campaigns/call-stats", dependencies=[Depends(_require_admin)])
+def admin_campaign_call_stats():
+    """Per-campaign call quality stats from v_campaign_call_stats view."""
+    from database import get_campaign_call_stats
+    return {"stats": get_campaign_call_stats()}
 
 
 @app.get("/api/admin/calls/analysis/criteria", dependencies=[Depends(_require_admin)])
@@ -4868,11 +6213,16 @@ def admin_inbox_unread():
             merged[lid] = {**el, "channel": "email", "has_unread_email": True, "latest_at": el_at}
 
     leads_list = sorted(merged.values(), key=lambda x: x.get("latest_at", ""), reverse=True)
+
+    # Lightweight urgent action count — avoids materialising the full 200-item feed on every 15s poll
+    from database import get_urgent_action_count
+    urgent_count = get_urgent_action_count()
     return {
         "count": sms_count + email_count,
         "sms_count": sms_count,
         "email_count": email_count,
         "leads": leads_list,
+        "urgent_action_count": urgent_count,
     }
 
 @app.post("/api/admin/lead/{lead_id}/mark-read", dependencies=[Depends(_require_admin)])
@@ -5811,6 +7161,7 @@ def admin_get_mango_settings():
         "mango_enabled":             s["mango_enabled"],
         "mango_pipeline_enabled":    s["mango_pipeline_enabled"],
         "mango_pipeline_auto_grade": s["mango_pipeline_auto_grade"],
+        "mango_pipeline_auto_suggest_action": s.get("mango_pipeline_auto_suggest_action", True),
     }
 
 
@@ -5838,9 +7189,10 @@ def admin_save_mango_settings(body: dict, request: Request):
 
     # Boolean toggles — always save even when False
     for key, field in [
-        ("mango_enabled",             "mango_enabled"),
-        ("mango_pipeline_enabled",    "mango_pipeline_enabled"),
-        ("mango_pipeline_auto_grade", "mango_pipeline_auto_grade"),
+        ("mango_enabled",                    "mango_enabled"),
+        ("mango_pipeline_enabled",           "mango_pipeline_enabled"),
+        ("mango_pipeline_auto_grade",        "mango_pipeline_auto_grade"),
+        ("mango_pipeline_auto_suggest_action", "mango_pipeline_auto_suggest_action"),
     ]:
         val = body.get(field)
         if val is not None:
@@ -5883,12 +7235,29 @@ def admin_play_recording(uuid: str, request: Request):
     call = get_mango_call(uuid)
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
-    recording_url = call.get("recording_url") or ""
-    if not recording_url:
-        raise HTTPException(status_code=404, detail="No recording URL for this call")
 
     token_mgr = getattr(request.app.state, "mango_token_mgr", None)
     tok = token_mgr.get_token() if token_mgr else None
+
+    recording_url = call.get("recording_url") or ""
+    if not recording_url:
+        # Older calls may have no stored recording_url (it expired at sync time).
+        # Re-fetch a fresh pre-signed URL from Mango API — same strategy as process_call.
+        try:
+            from mango_service import fetch_fresh_recording_url, MangoTokenManager
+            from database import get_mango_settings as _gms
+            msettings = _gms()
+            pbx_id = msettings.get("mango_pbx_id") or ""
+            api_base = msettings.get("mango_api_base") or "https://api.mangovoice.com"
+
+            class _SingleTokenMgr:
+                def get_token(self): return tok
+            recording_url = fetch_fresh_recording_url(_SingleTokenMgr(), uuid, pbx_id, api_base=api_base)
+        except Exception as e:
+            logger.warning("[play] Could not fetch fresh recording URL for %s: %s", uuid, e)
+
+    if not recording_url:
+        raise HTTPException(status_code=404, detail="No recording available for this call")
 
     try:
         path = _fetch_recording(recording_url, uuid, token=tok)

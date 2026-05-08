@@ -123,7 +123,7 @@ def upload_offline_conversions() -> dict:
     # Get all leads with a gclid
     db = _get_db()
     leads = db.execute("""
-        SELECT id, gclid, stage, created_at, attributed_production, email, first_name
+        SELECT id, gclid, stage, created_at, attributed_production, email, first_name, od_patient_num
         FROM leads
         WHERE gclid != '' AND gclid IS NOT NULL
         ORDER BY updated_at DESC
@@ -142,6 +142,16 @@ def upload_offline_conversions() -> dict:
         gclid = lead["gclid"]
         stage = lead["stage"]
         created_at = lead["created_at"]
+
+        # Skip existing OD patients — their gclid came from a recall/existing-patient search,
+        # not a new patient acquisition. Uploading their conversion would inflate our
+        # "new patient from ads" metrics and waste our conversion attribution budget.
+        if lead.get("od_patient_num"):
+            logger.debug(
+                f"Lead {lead_id} skipped: existing OD patient (PatNum={lead['od_patient_num']})"
+            )
+            skipped += 1
+            continue
 
         # Determine which conversion to upload based on current stage
         conversion_name = STAGE_TO_CONVERSION.get(stage)

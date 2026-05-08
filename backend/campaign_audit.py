@@ -38,12 +38,20 @@ def log_pending(
     optimizer_run_id: str = "",
     actor: str = "ai_optimizer",
     reason: str = "",
+    campaign_id: str = "",
+    campaign_name: str = "",
+    priority: int = 50,
+    impact_estimate: dict | None = None,
 ) -> str:
     """
     Step 1: Log a recommended action as pending_approval.
     Returns the action_id (UUID) for the frontend Apply button.
+
+    priority: 0=critical, 50=normal, 100=cosmetic (lower = shown first)
+    impact_estimate: optional dict with keys like savings_30d_usd, leads_recovered
     """
     from database import log_gads_action
+    import json as _json
     action_id = str(uuid.uuid4())
     log_gads_action(
         action_id=action_id,
@@ -59,6 +67,10 @@ def log_pending(
         reason=reason,
         error_detail="",
         optimizer_run_id=optimizer_run_id,
+        campaign_id=campaign_id,
+        campaign_name=campaign_name,
+        priority=priority,
+        impact_estimate_json=_json.dumps(impact_estimate or {}),
     )
     logger.debug(f"Audit pending: {operation} {entity_type} '{entity_name}' → action_id={action_id}")
     return action_id

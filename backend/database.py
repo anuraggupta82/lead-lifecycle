@@ -686,6 +686,27 @@ CREATE TABLE IF NOT EXISTS gads_call_view (
 CREATE INDEX IF NOT EXISTS idx_gads_cv_started  ON gads_call_view(start_call_date_time DESC);
 CREATE INDEX IF NOT EXISTS idx_gads_cv_area     ON gads_call_view(caller_area_code);
 CREATE INDEX IF NOT EXISTS idx_gads_cv_campaign ON gads_call_view(campaign_id);
+
+CREATE TABLE IF NOT EXISTS gads_google_recs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fetched_at TEXT NOT NULL,
+    resource_name TEXT NOT NULL UNIQUE,
+    rec_type TEXT NOT NULL,
+    campaign_resource TEXT DEFAULT '',
+    campaign_name TEXT DEFAULT '',
+    ad_group_resource TEXT DEFAULT '',
+    title TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    impact_json TEXT DEFAULT '{}',
+    details_json TEXT DEFAULT '{}',
+    claude_verdict TEXT DEFAULT '',
+    claude_reasoning TEXT DEFAULT '',
+    dismissed INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_google_recs_fetched ON gads_google_recs(fetched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_google_recs_dismissed ON gads_google_recs(dismissed);
 """
 
 LIFECYCLE_STAGES = [
@@ -713,16 +734,24 @@ STAGE_ORDER = {s: i for i, s in enumerate(LIFECYCLE_STAGES)}
 
 def _conn() -> sqlite3.Connection:
     settings = get_settings()
-    os.makedirs(os.path.dirname(settings.db_path), exist_ok=True)
-    conn = sqlite3.connect(settings.db_path, check_same_thread=False)
+    db_dir = os.path.dirname(settings.db_path)
+    if db_dir:
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception as _mk_err:
+            import logging as _logging
+            _logging.getLogger(__name__).error(f"_conn: makedirs failed for {db_dir!r}: {_mk_err}")
+    conn = sqlite3.connect(settings.db_path, check_same_thread=False, timeout=15)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
 def init_db():
     with _conn() as conn:
+        # WAL mode is a database-level persistent setting — set once at startup only
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
         _migrate(conn)
 
@@ -1160,6 +1189,8 @@ def _migrate(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_transcript ON mango_calls(transcription_status)")
 
     # ── Mango calls analysis columns Phase 2 (Call Analysis — May 2026) ─────────
+    # NOTE: Phase 2 columns must be migrated BEFORE v_campaign_call_stats view is created
+    # because the view references grade_overall_score which is a Phase 2 column.
     mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
     mango_phase2_cols = [
         ("team_member",                "TEXT DEFAULT ''"),
@@ -1167,11 +1198,11 @@ def _migrate(conn):
         ("grade_overall_score",        "REAL"),
         ("grade_overall_notes",        "TEXT DEFAULT ''"),
         ("grade_recommendations_json", "TEXT DEFAULT ''"),
-        ("grade_gradeable",            "INTEGER"),   # 1=gradeable, 0=not, NULL=ungraded
-        ("grade_reason",               "TEXT DEFAULT ''"),  # reason if not gradeable
+        ("grade_gradeable",            "INTEGER"),
+        ("grade_reason",               "TEXT DEFAULT ''"),
         ("graded_at",                  "TEXT DEFAULT ''"),
         ("summarized_at",              "TEXT DEFAULT ''"),
-        ("is_empty",                   "INTEGER DEFAULT 0"),  # 1=greeting/voicemail only
+        ("is_empty",                   "INTEGER DEFAULT 0"),
         ("pipeline_error",             "TEXT DEFAULT ''"),
         ("pipeline_attempts",          "INTEGER DEFAULT 0"),
     ]
@@ -1183,6 +1214,134 @@ def _migrate(conn):
                 pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_team_member    ON mango_calls(team_member)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_graded_at      ON mango_calls(graded_at DESC)")
+
+    # ── Mango calls Phase 3: AI next-action (May 2026) ─────────────────────────
+    mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
+    mango_phase3_cols = [
+        ("call_next_action",              "TEXT DEFAULT ''"),
+        ("call_next_action_type",         "TEXT DEFAULT ''"),
+        ("call_next_action_due",          "TEXT DEFAULT ''"),
+        ("call_next_action_completed",    "INTEGER DEFAULT 0"),
+        ("call_next_action_completed_at", "TEXT DEFAULT ''"),
+        ("call_next_action_completed_by", "TEXT DEFAULT ''"),
+        ("call_next_action_suggested_at", "TEXT DEFAULT ''"),
+        ("call_next_action_priority",     "TEXT DEFAULT 'soon'"),
+        ("call_next_action_reasoning",    "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_type in mango_phase3_cols:
+        if col_name not in mango_cols:
+            try:
+                conn.execute(f"ALTER TABLE mango_calls ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+
+    # ── Mango calls Phase 4: keyword attribution (May 2026) ──────────────────
+    mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
+    mango_phase4_cols = [
+        ("attributed_keyword",            "TEXT DEFAULT ''"),
+        ("attributed_match_type",         "TEXT DEFAULT ''"),
+        ("attributed_ad_group",           "TEXT DEFAULT ''"),
+        ("attributed_keyword_method",     "TEXT DEFAULT ''"),   # lead_gclid|lead_phone_recent_click|time_window_gclid|campaign_only
+        ("attributed_keyword_confidence", "REAL DEFAULT 0.0"),
+    ]
+    for col_name, col_type in mango_phase4_cols:
+        if col_name not in mango_cols:
+            try:
+                conn.execute(f"ALTER TABLE mango_calls ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_attr_kw ON mango_calls(attributed_keyword)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_attr_method ON mango_calls(attributed_keyword_method)")
+
+    # ── Mango calls patient enrichment (May 2026) ─────────────────────────────
+    mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
+    mango_patient_cols = [
+        ("od_patient_num",    "TEXT DEFAULT ''"),   # OD PatNum matched by phone
+        ("od_patient_status", "TEXT DEFAULT ''"),   # new_patient|existing_active|existing_inactive|unknown
+        ("od_patient_name",   "TEXT DEFAULT ''"),   # First + Last from OD (not from Mango caller_id_name)
+        ("od_matched_at",     "TEXT DEFAULT ''"),   # ISO timestamp of last OD match attempt
+    ]
+    for col_name, col_type in mango_patient_cols:
+        if col_name not in mango_cols:
+            try:
+                conn.execute(f"ALTER TABLE mango_calls ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_od_status ON mango_calls(od_patient_status)")
+
+    # ── gads_clicks — persisted click_view rows (for time-window attribution) ─
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_clicks (
+            gclid           TEXT PRIMARY KEY,
+            click_date      TEXT NOT NULL,
+            keyword_text    TEXT DEFAULT '',
+            match_type      TEXT DEFAULT '',
+            ad_group_name   TEXT DEFAULT '',
+            ad_group_id     TEXT DEFAULT '',
+            ad_id           TEXT DEFAULT '',
+            ad_name         TEXT DEFAULT '',
+            campaign_name   TEXT DEFAULT '',
+            campaign_id     TEXT DEFAULT '',
+            synced_at       TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_clicks_date     ON gads_clicks(click_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_clicks_kw       ON gads_clicks(keyword_text)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_clicks_campaign ON gads_clicks(campaign_id, click_date)")
+
+    # ── v_campaign_call_stats view ────────────────────────────────────────────
+    conn.executescript("""
+CREATE VIEW IF NOT EXISTS v_campaign_call_stats AS
+WITH attributed AS (
+  SELECT
+    (
+      CASE
+        WHEN gcv.campaign_id IS NOT NULL THEN
+          (SELECT id FROM campaigns WHERE gads_campaign_numeric_id = gcv.campaign_id LIMIT 1)
+        ELSE
+          (SELECT id FROM campaigns
+            WHERE LOWER(TRIM(campaign_name)) = LOWER(TRIM(l.campaign_name)) LIMIT 1)
+      END
+    )                     AS campaign_id,
+    mc.uuid               AS call_uuid,
+    mc.lead_id            AS lead_id,
+    mc.status             AS call_status,
+    mc.duration_sec       AS duration_sec,
+    mc.grade_overall_score AS grade
+  FROM mango_calls mc
+  LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+  LEFT JOIN leads l            ON l.id = mc.lead_id
+  WHERE (gcv.campaign_id IS NOT NULL OR l.campaign_name IS NOT NULL)
+),
+attrs_with_booked AS (
+  SELECT a.*, COALESCE(l.stage,'') AS lead_stage
+  FROM attributed a
+  LEFT JOIN leads l ON l.id = a.lead_id
+  WHERE a.campaign_id IS NOT NULL
+)
+SELECT
+  a.campaign_id,
+  c.campaign_name,
+  COUNT(*)                                                            AS calls_total,
+  SUM(CASE WHEN a.call_status = 'answered' THEN 1 ELSE 0 END)        AS calls_answered,
+  SUM(CASE WHEN a.grade IS NOT NULL THEN 1 ELSE 0 END)               AS calls_graded,
+  ROUND(AVG(a.grade), 1)                                             AS avg_call_grade,
+  SUM(CASE WHEN a.duration_sec >= 60 THEN 1 ELSE 0 END)              AS calls_converted,
+  COUNT(DISTINCT CASE WHEN a.lead_stage = 'booked' THEN a.lead_id END) AS calls_booked,
+  CASE
+    WHEN AVG(a.grade) IS NULL THEN 'no_data'
+    WHEN AVG(a.grade) >= 80   THEN 'excellent'
+    WHEN AVG(a.grade) >= 65   THEN 'good'
+    ELSE                           'needs_work'
+  END                                                                 AS call_quality_tier
+FROM attrs_with_booked a
+JOIN campaigns c ON c.id = a.campaign_id
+GROUP BY a.campaign_id, c.campaign_name;
+""")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_gads_lead ON mango_calls(gads_call_id, lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_messages_lead_dir ON sms_messages(lead_id, direction, received_at)")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_overall_score  ON mango_calls(grade_overall_score)")
 
     # ── AI usage cost ledger ──────────────────────────────────────────────────────
@@ -1583,10 +1742,42 @@ def _migrate(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ki_roas     ON keyword_intelligence(true_roas DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ki_sqs      ON keyword_intelligence(session_quality_score DESC)")
 
+    # Add google_rec_resource_name column to gads_audit_log (migration for existing DBs)
+    audit_cols_pre = {row[1] for row in conn.execute("PRAGMA table_info(gads_audit_log)").fetchall()}
+    try:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN google_rec_resource_name TEXT DEFAULT ''")
+    except Exception:
+        pass  # column already exists
+
     # Add reject_reason column to gads_audit_log (migration for existing DBs)
     audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(gads_audit_log)").fetchall()}
     if "reject_reason" not in audit_cols:
         conn.execute("ALTER TABLE gads_audit_log ADD COLUMN reject_reason TEXT DEFAULT ''")
+    # Phase 2+ columns: campaign linkage, priority, impact estimate, user feedback
+    if "campaign_id" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN campaign_id TEXT DEFAULT ''")
+    if "campaign_name" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN campaign_name TEXT DEFAULT ''")
+    if "priority" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN priority INTEGER DEFAULT 50")
+    if "impact_estimate_json" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN impact_estimate_json TEXT DEFAULT '{}'")
+    if "user_feedback" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN user_feedback TEXT DEFAULT ''")
+    if "user_feedback_at" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN user_feedback_at TEXT DEFAULT ''")
+    # api_executed: True = actually hit Google Ads API; False/NULL = acknowledged-only or pending
+    if "api_executed" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN api_executed INTEGER DEFAULT 0")
+    # queued_at: timestamp when admin moved rec to queue (before Push to Google)
+    if "queued_at" not in audit_cols:
+        conn.execute("ALTER TABLE gads_audit_log ADD COLUMN queued_at TEXT DEFAULT ''")
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_campaign ON gads_audit_log(campaign_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_priority ON gads_audit_log(priority, execution_result)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_queued ON gads_audit_log(execution_result, queued_at)")
+    except Exception:
+        pass
 
     # M4 fix: add UNIQUE(lead_id, od_patient_num) to keyword_production_log for existing DBs.
     # SQLite doesn't support ALTER TABLE ADD CONSTRAINT, so we use CREATE UNIQUE INDEX.
@@ -2206,6 +2397,7 @@ def get_mango_settings() -> dict:
         "mango_enabled":             (get_setting("mango_enabled")            or str(cfg.mango_enabled)).lower() == "true",
         "mango_pipeline_enabled":    (get_setting("mango_pipeline_enabled")   or str(cfg.mango_pipeline_enabled)).lower() == "true",
         "mango_pipeline_auto_grade": (get_setting("mango_pipeline_auto_grade") or str(cfg.mango_pipeline_auto_grade)).lower() == "true",
+        "mango_pipeline_auto_suggest_action": (get_setting("mango_pipeline_auto_suggest_action") or str(cfg.mango_pipeline_auto_suggest_action)).lower() == "true",
     }
 
 
@@ -3991,6 +4183,10 @@ def log_gads_action(
     reason: str = "",
     error_detail: str = "",
     optimizer_run_id: str = "",
+    campaign_id: str = "",
+    campaign_name: str = "",
+    priority: int = 50,
+    impact_estimate_json: str = "{}",
 ) -> None:
     """Insert a Google Ads audit log row. Called from campaign_audit.py."""
     now = _now()
@@ -4000,13 +4196,15 @@ def log_gads_action(
                 (action_id, operation, entity_type, entity_id, entity_name,
                  before_state_json, after_state_json, executed, execution_result,
                  actor, reason, error_detail, optimizer_run_id,
+                 campaign_id, campaign_name, priority, impact_estimate_json,
                  created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             action_id, operation, entity_type, entity_id, entity_name,
             before_state_json, after_state_json,
             1 if executed else 0, execution_result,
             actor, reason, error_detail, optimizer_run_id,
+            campaign_id, campaign_name, priority, impact_estimate_json,
             now, now,
         ))
 
@@ -4036,6 +4234,120 @@ def set_audit_approval(action_id: str, approver: str) -> None:
                SET approval_by=?, approved_at=?, updated_at=?
              WHERE action_id=?
         """, (approver, now, now, action_id))
+
+
+def queue_gads_action(action_id: str, approver: str = "admin") -> None:
+    """Move a pending_approval row to 'queued' state (admin approved, not yet pushed to Google)."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE gads_audit_log
+               SET execution_result='queued', approval_by=?, approved_at=?, queued_at=?, updated_at=?
+             WHERE action_id=? AND execution_result='pending_approval'
+        """, (approver, now, now, now, action_id))
+
+
+def get_queued_actions(limit: int = 200) -> list:
+    """Return all rows in 'queued' state, ordered by priority then created_at."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM gads_audit_log
+             WHERE execution_result = 'queued'
+             ORDER BY priority ASC, queued_at ASC
+             LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_api_executed(action_id: str, success: bool, error_detail: str = "",
+                      api_executed: bool | None = None) -> None:
+    """
+    After a push attempt, update the audit row.
+    - success: True → execution_result='success'; False → 'failed'
+    - api_executed: explicitly controls the api_executed column.
+      If None (default), mirrors the success flag.
+      Pass False for advisory/acknowledged-only ops that succeeded overall
+      but never made a real Google Ads API call.
+    """
+    now = _now()
+    result = "success" if success else "failed"
+    api_exec_val = (1 if success else 0) if api_executed is None else (1 if api_executed else 0)
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE gads_audit_log
+               SET executed=?, execution_result=?, api_executed=?, error_detail=?, updated_at=?
+             WHERE action_id=?
+        """, (1 if success else 0, result, api_exec_val, error_detail, now, action_id))
+
+
+def get_account_impact_summary(days: int = 90) -> dict:
+    """
+    Aggregate applied outcomes across ALL campaigns for account-level impact view.
+    Returns totals + per-campaign breakdown.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        # Per-operation type success counts
+        op_rows = conn.execute("""
+            SELECT operation,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN api_executed=1 THEN 1 ELSE 0 END) as api_pushed,
+                   SUM(CASE WHEN api_executed=0 THEN 1 ELSE 0 END) as acknowledged_only
+              FROM gads_audit_log
+             WHERE execution_result='success' AND updated_at >= ?
+             GROUP BY operation
+             ORDER BY total DESC
+        """, (cutoff,)).fetchall()
+
+        # Per-campaign summary
+        camp_rows = conn.execute("""
+            SELECT campaign_name,
+                   COUNT(*) as applied,
+                   SUM(CASE WHEN api_executed=1 THEN 1 ELSE 0 END) as api_pushed,
+                   MIN(updated_at) as first_action,
+                   MAX(updated_at) as last_action
+              FROM gads_audit_log
+             WHERE execution_result='success' AND updated_at >= ?
+               AND campaign_name != ''
+             GROUP BY campaign_name
+             ORDER BY applied DESC
+        """, (cutoff,)).fetchall()
+
+        # Outcome verdicts (from learning loop)
+        verdict_rows = conn.execute("""
+            SELECT verdict, COUNT(*) as cnt
+              FROM applied_outcomes
+             WHERE applied_at >= ?
+             GROUP BY verdict
+        """, (cutoff,)).fetchall()
+
+        # Recent applied actions (last 50)
+        recent_rows = conn.execute("""
+            SELECT action_id, operation, entity_name, campaign_name,
+                   execution_result, api_executed, queued_at, updated_at, reason
+              FROM gads_audit_log
+             WHERE execution_result='success' AND updated_at >= ?
+             ORDER BY updated_at DESC LIMIT 50
+        """, (cutoff,)).fetchall()
+
+    by_op = [dict(r) for r in op_rows]
+    by_camp = [dict(r) for r in camp_rows]
+    verdicts = {r["verdict"]: r["cnt"] for r in verdict_rows}
+    recent = [dict(r) for r in recent_rows]
+
+    total_applied = sum(r["total"] for r in op_rows)
+    total_api_pushed = sum(r["api_pushed"] for r in op_rows)
+
+    return {
+        "days": days,
+        "total_applied": total_applied,
+        "total_api_pushed": total_api_pushed,
+        "total_acknowledged_only": total_applied - total_api_pushed,
+        "by_operation": by_op,
+        "by_campaign": by_camp,
+        "verdicts": verdicts,
+        "recent_actions": recent,
+    }
 
 
 def log_admin_manual_action(
@@ -4944,65 +5256,89 @@ def record_reject_reason(action_id: str, reject_reason: str) -> None:
 
 # ─── Mango Voice helpers ──────────────────────────────────────────────────────
 
+_UPSERT_MANGO_SQL = """
+    INSERT INTO mango_calls
+       (uuid, started_at, ended_at, direction, from_number, to_number,
+        caller_id_name, caller_id_number, destination_number,
+        extension_number, answered_by, duration_sec, status,
+        recording_url, recording_local_path,
+        lead_id, gads_call_id, match_confidence, match_method,
+        raw_payload, synced_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(uuid) DO UPDATE SET
+         ended_at=excluded.ended_at,
+         direction=excluded.direction,
+         from_number=excluded.from_number,
+         to_number=excluded.to_number,
+         caller_id_name=excluded.caller_id_name,
+         caller_id_number=excluded.caller_id_number,
+         destination_number=excluded.destination_number,
+         extension_number=excluded.extension_number,
+         answered_by=excluded.answered_by,
+         duration_sec=excluded.duration_sec,
+         status=excluded.status,
+         recording_url=COALESCE(excluded.recording_url, mango_calls.recording_url),
+         recording_local_path=COALESCE(excluded.recording_local_path, mango_calls.recording_local_path),
+         lead_id=COALESCE(excluded.lead_id, mango_calls.lead_id),
+         gads_call_id=COALESCE(excluded.gads_call_id, mango_calls.gads_call_id),
+         match_confidence=COALESCE(excluded.match_confidence, mango_calls.match_confidence),
+         match_method=COALESCE(excluded.match_method, mango_calls.match_method),
+         raw_payload=excluded.raw_payload,
+         updated_at=excluded.updated_at
+"""
+
+
+def _mango_call_params(call: dict, now: str) -> tuple:
+    return (
+        call["uuid"],
+        call.get("started_at", ""),
+        call.get("ended_at"),
+        call.get("direction", "inbound"),
+        call.get("from_number"),
+        call.get("to_number"),
+        call.get("caller_id_name"),
+        call.get("caller_id_number"),
+        call.get("destination_number"),
+        call.get("extension_number"),
+        call.get("answered_by"),
+        int(call.get("duration_sec", 0)),
+        call.get("status"),
+        call.get("recording_url"),
+        call.get("recording_local_path"),
+        call.get("lead_id"),
+        call.get("gads_call_id"),
+        call.get("match_confidence"),
+        call.get("match_method"),
+        call.get("raw_payload"),
+        now,
+        now,
+    )
+
+
 def upsert_mango_call(call: dict) -> None:
-    """Insert or update a Mango call record. call must have 'uuid' key."""
+    """Insert or update a single Mango call record. Opens its own connection.
+    For bulk syncs use upsert_mango_calls_batch() to avoid fd exhaustion."""
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
-        conn.execute(
-            """INSERT INTO mango_calls
-               (uuid, started_at, ended_at, direction, from_number, to_number,
-                caller_id_name, caller_id_number, destination_number,
-                extension_number, answered_by, duration_sec, status,
-                recording_url, recording_local_path,
-                lead_id, gads_call_id, match_confidence, match_method,
-                raw_payload, synced_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(uuid) DO UPDATE SET
-                 ended_at=excluded.ended_at,
-                 direction=excluded.direction,
-                 from_number=excluded.from_number,
-                 to_number=excluded.to_number,
-                 caller_id_name=excluded.caller_id_name,
-                 caller_id_number=excluded.caller_id_number,
-                 destination_number=excluded.destination_number,
-                 extension_number=excluded.extension_number,
-                 answered_by=excluded.answered_by,
-                 duration_sec=excluded.duration_sec,
-                 status=excluded.status,
-                 recording_url=COALESCE(excluded.recording_url, mango_calls.recording_url),
-                 recording_local_path=COALESCE(excluded.recording_local_path, mango_calls.recording_local_path),
-                 lead_id=COALESCE(excluded.lead_id, mango_calls.lead_id),
-                 gads_call_id=COALESCE(excluded.gads_call_id, mango_calls.gads_call_id),
-                 match_confidence=COALESCE(excluded.match_confidence, mango_calls.match_confidence),
-                 match_method=COALESCE(excluded.match_method, mango_calls.match_method),
-                 raw_payload=excluded.raw_payload,
-                 updated_at=excluded.updated_at
-            """,
-            (
-                call["uuid"],
-                call.get("started_at", ""),
-                call.get("ended_at"),
-                call.get("direction", "inbound"),
-                call.get("from_number"),
-                call.get("to_number"),
-                call.get("caller_id_name"),
-                call.get("caller_id_number"),
-                call.get("destination_number"),
-                call.get("extension_number"),
-                call.get("answered_by"),
-                int(call.get("duration_sec", 0)),
-                call.get("status"),
-                call.get("recording_url"),
-                call.get("recording_local_path"),
-                call.get("lead_id"),
-                call.get("gads_call_id"),
-                call.get("match_confidence"),
-                call.get("match_method"),
-                call.get("raw_payload"),
-                now,
-                now,
-            ),
-        )
+        conn.execute(_UPSERT_MANGO_SQL, _mango_call_params(call, now))
+
+
+def upsert_mango_calls_batch(calls: list) -> int:
+    """Insert or update a list of Mango call dicts in a single connection/transaction.
+    Returns count of successfully upserted rows.
+    Use this instead of calling upsert_mango_call() in a loop to avoid hitting
+    the OS file descriptor limit (each _conn() open = 3 fds for WAL mode)."""
+    if not calls:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    with _conn() as conn:
+        for call in calls:
+            if not call.get("uuid"):
+                continue
+            conn.execute(_UPSERT_MANGO_SQL, _mango_call_params(call, now))
+            count += 1
+    return count
 
 
 def get_mango_calls(
@@ -5012,37 +5348,100 @@ def get_mango_calls(
     status: str = "",
     days: int = 30,
 ) -> list:
-    """Return mango_calls rows, newest first."""
+    """Return mango_calls rows enriched with GAds campaign name, newest first."""
     cutoff = (datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     ) - __import__("datetime").timedelta(days=days)).isoformat()
-    clauses = ["started_at >= ?"]
+    clauses = ["mc.started_at >= ?"]
     params: list = [cutoff]
     if direction:
-        clauses.append("direction = ?")
+        clauses.append("mc.direction = ?")
         params.append(direction)
     if status:
-        clauses.append("status = ?")
+        clauses.append("mc.status = ?")
         params.append(status)
     where = " AND ".join(clauses)
     params.extend([limit, offset])
     with _conn() as conn:
         rows = conn.execute(
-            f"SELECT * FROM mango_calls WHERE {where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            f"""SELECT mc.uuid, mc.started_at, mc.ended_at, mc.direction,
+                       mc.from_number, mc.to_number, mc.caller_id_name, mc.caller_id_number,
+                       mc.destination_number, mc.extension_number, mc.answered_by,
+                       mc.duration_sec, mc.status, mc.recording_url, mc.recording_local_path,
+                       mc.lead_id, mc.gads_call_id, mc.match_confidence, mc.match_method,
+                       mc.call_transcript, mc.call_summary, mc.lead_quality, mc.handling_grade,
+                       mc.booked_outcome, mc.call_category, mc.transcription_status,
+                       mc.transcript_model, mc.transcribed_at, mc.od_appointment_id,
+                       mc.grade_overridden_by, mc.grade_overridden_at, mc.grade_override_reason,
+                       mc.raw_payload, mc.synced_at, mc.updated_at,
+                       mc.team_member, mc.grade_overall_score, mc.grade_overall_notes,
+                       mc.grade_gradeable, mc.grade_scores_json, mc.is_empty,
+                       -- GAds enrichment
+                       gcv.campaign_name  AS gads_campaign_name,
+                       gcv.campaign_id    AS gads_campaign_id,
+                       gcv.call_duration_sec AS gads_duration_sec,
+                       -- Lead enrichment
+                       l.campaign_name   AS lead_campaign_name,
+                       l.campaign_id     AS lead_campaign_id,
+                       l.od_patient_num  AS lead_od_patient_num,
+                       -- Unified campaign: prefer GAds attribution, fall back to lead's campaign
+                       COALESCE(
+                           NULLIF(gcv.campaign_name, ''),
+                           NULLIF(l.campaign_name, '')
+                       ) AS effective_campaign_name,
+                       COALESCE(
+                           NULLIF(gcv.campaign_id, ''),
+                           NULLIF(l.campaign_id, '')
+                       ) AS effective_campaign_id
+                FROM mango_calls mc
+                LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+                LEFT JOIN leads l ON l.id = mc.lead_id
+                WHERE {where}
+                ORDER BY mc.started_at DESC LIMIT ? OFFSET ?""",
             params,
         ).fetchall()
         total = conn.execute(
-            f"SELECT COUNT(*) FROM mango_calls WHERE {where}",
+            f"SELECT COUNT(*) FROM mango_calls mc WHERE {where}",
             params[:-2],
         ).fetchone()[0]
     return [dict(r) for r in rows], total
 
 
 def get_mango_call(uuid: str) -> dict | None:
-    """Return a single mango_call by uuid."""
+    """Return a single mango_call by uuid, enriched with campaign + lead data."""
     with _conn() as conn:
         row = conn.execute(
-            "SELECT * FROM mango_calls WHERE uuid=?", (uuid,)
+            """SELECT mc.uuid, mc.started_at, mc.ended_at, mc.direction,
+                      mc.from_number, mc.to_number, mc.caller_id_name, mc.caller_id_number,
+                      mc.destination_number, mc.extension_number, mc.answered_by,
+                      mc.duration_sec, mc.status, mc.recording_url, mc.recording_local_path,
+                      mc.lead_id, mc.gads_call_id, mc.match_confidence, mc.match_method,
+                      mc.call_transcript, mc.call_summary, mc.lead_quality, mc.handling_grade,
+                      mc.booked_outcome, mc.call_category, mc.transcription_status,
+                      mc.transcript_model, mc.transcribed_at, mc.od_appointment_id,
+                      mc.grade_overridden_by, mc.grade_overridden_at, mc.grade_override_reason,
+                      mc.raw_payload, mc.synced_at, mc.updated_at,
+                      mc.team_member, mc.grade_overall_score, mc.grade_overall_notes,
+                      mc.grade_gradeable, mc.grade_scores_json, mc.is_empty,
+                      gcv.campaign_name  AS gads_campaign_name,
+                      gcv.campaign_id    AS gads_campaign_id,
+                      gcv.call_duration_sec AS gads_duration_sec,
+                      l.campaign_name   AS lead_campaign_name,
+                      l.campaign_id     AS lead_campaign_id,
+                      l.od_patient_num  AS lead_od_patient_num,
+                      COALESCE(
+                          NULLIF(gcv.campaign_name, ''),
+                          NULLIF(l.campaign_name, '')
+                      ) AS effective_campaign_name,
+                      COALESCE(
+                          NULLIF(gcv.campaign_id, ''),
+                          NULLIF(l.campaign_id, '')
+                      ) AS effective_campaign_id
+               FROM mango_calls mc
+               LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+               LEFT JOIN leads l ON l.id = mc.lead_id
+               WHERE mc.uuid=?""",
+            (uuid,),
         ).fetchone()
     return dict(row) if row else None
 
@@ -5067,6 +5466,38 @@ def update_mango_call_attribution(
                WHERE uuid=?""",
             (lead_id, gads_call_id, match_confidence, match_method, now, uuid),
         )
+
+
+def update_mango_call_od_appointment(uuid: str, od_appointment_id: str) -> None:
+    """Store the matched OD appointment ID on a mango_calls row.
+    Only overwrites if od_appointment_id is currently NULL or empty (preserves manual edits)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE mango_calls SET od_appointment_id=?, updated_at=?
+               WHERE uuid=?
+                 AND (od_appointment_id IS NULL OR od_appointment_id = '')""",
+            (od_appointment_id, now, uuid),
+        )
+
+
+def get_booked_calls_needing_od_match(days: int = 90) -> list:
+    """Return calls graded as booked but not yet matched to an OD appointment."""
+    cutoff = (datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - __import__("datetime").timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT mc.uuid, mc.started_at, mc.from_number, mc.caller_id_number,
+                      mc.booked_outcome, mc.od_appointment_id, mc.lead_id
+               FROM mango_calls mc
+               WHERE mc.booked_outcome = 'booked'
+                 AND (mc.od_appointment_id IS NULL OR mc.od_appointment_id = '')
+                 AND mc.started_at >= ?
+               ORDER BY mc.started_at DESC""",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_mango_calls_unmatched(days: int = 7) -> list:
@@ -5094,6 +5525,39 @@ def get_missed_mango_calls_since(since_iso: str) -> list:
             (since_iso,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_mango_calls_needing_od_match(limit: int = 500) -> list:
+    """Return inbound calls that haven't been matched against OpenDental yet."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT uuid, from_number, caller_id_name, started_at
+               FROM mango_calls
+               WHERE direction='inbound'
+                 AND (od_matched_at IS NULL OR od_matched_at = '')
+                 AND from_number IS NOT NULL AND from_number != ''
+               ORDER BY started_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_mango_call_od_status(
+    uuid: str,
+    od_patient_num: str,
+    od_patient_status: str,
+    od_patient_name: str,
+) -> None:
+    """Persist OD patient match result for a Mango call."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE mango_calls
+               SET od_patient_num=?, od_patient_status=?, od_patient_name=?, od_matched_at=?, updated_at=?
+               WHERE uuid=?""",
+            (od_patient_num, od_patient_status, od_patient_name, now, now, uuid),
+        )
 
 
 # ─── Google Ads call_view helpers ─────────────────────────────────────────────
@@ -5127,6 +5591,46 @@ def upsert_gads_call_view(call: dict) -> None:
                 now,
             ),
         )
+
+
+def upsert_gads_clicks(clicks: list) -> int:
+    """
+    Bulk-upsert click_view rows into gads_clicks table.
+    clicks: list of dicts with keys: gclid, click_date, keyword_text, match_type,
+            ad_group_name, ad_group_id, ad_id, ad_name, campaign_name, campaign_id
+    Returns number of rows upserted.
+    """
+    if not clicks:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.executemany(
+            """INSERT INTO gads_clicks
+               (gclid, click_date, keyword_text, match_type,
+                ad_group_name, ad_group_id, ad_id, ad_name,
+                campaign_name, campaign_id, synced_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(gclid) DO UPDATE SET
+                 click_date=excluded.click_date,
+                 keyword_text=excluded.keyword_text,
+                 match_type=excluded.match_type,
+                 ad_group_name=excluded.ad_group_name,
+                 campaign_name=excluded.campaign_name,
+                 campaign_id=excluded.campaign_id,
+                 synced_at=excluded.synced_at""",
+            [
+                (
+                    c["gclid"], c["click_date"],
+                    c.get("keyword_text", ""), c.get("match_type", ""),
+                    c.get("ad_group_name", ""), c.get("ad_group_id", ""),
+                    c.get("ad_id", ""), c.get("ad_name", ""),
+                    c.get("campaign_name", ""), c.get("campaign_id", ""),
+                    now,
+                )
+                for c in clicks
+            ],
+        )
+    return len(clicks)
 
 
 def get_gads_call_view(days: int = 30) -> list:
@@ -5182,7 +5686,9 @@ def get_gads_call_conversions(days: int = 30, min_duration_sec: int = 0) -> list
                 mc.grade_overall_score,
                 mc.grade_overall_notes,
                 mc.grade_gradeable,
+                mc.grade_scores_json      AS grade_scores,
                 mc.transcription_status,
+                mc.recording_url,
                 mc.lead_id,
                 -- Lead match fields (NULL when no lead)
                 TRIM(COALESCE(l.first_name,'') || ' ' || COALESCE(l.last_name,'')) AS lead_name,
@@ -5402,6 +5908,11 @@ def update_mango_call_analysis(uuid: str, **kwargs) -> None:
         "grade_recommendations_json", "grade_gradeable", "grade_reason",
         "graded_at", "summarized_at", "is_empty", "pipeline_error", "pipeline_attempts",
         "lead_id", "gads_resource_name", "transcription_status",
+        # Phase 3: AI next-action columns
+        "call_next_action", "call_next_action_type", "call_next_action_due",
+        "call_next_action_completed", "call_next_action_completed_at",
+        "call_next_action_completed_by", "call_next_action_suggested_at",
+        "call_next_action_priority", "call_next_action_reasoning",
     }
     fields = {k: v for k, v in kwargs.items() if k in _ALLOWED_COLS}
     if not fields:
@@ -5436,3 +5947,278 @@ def get_calls_needing_processing(
             (min_seconds, max_attempts, cutoff, batch_size)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def mark_call_action_completed(uuid: str, by_email: str = "") -> None:
+    """Mark a call's AI next-action as completed."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE mango_calls SET call_next_action_completed=1, "
+            "call_next_action_completed_at=?, call_next_action_completed_by=?, "
+            "updated_at=? WHERE uuid=?",
+            (now, by_email, now, uuid)
+        )
+
+
+def get_campaign_call_stats(campaign_id: int | None = None) -> list[dict]:
+    """Return call quality stats per campaign from v_campaign_call_stats.
+    Synthetic (unmanaged) campaigns have no row in the view — callers must handle None gracefully.
+    """
+    with _conn() as conn:
+        if campaign_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM v_campaign_call_stats WHERE campaign_id=?", (campaign_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM v_campaign_call_stats").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_urgent_action_count() -> int:
+    """Lightweight count of urgent pending actions for the bell badge.
+    Runs 3 fast COUNT queries instead of materialising the full 200-item feed.
+    Called every 15s by the inbox/unread poll — must be cheap.
+    """
+    from datetime import date
+    today = date.today().isoformat()
+    count = 0
+    with _conn() as conn:
+        # Overdue AI call next-actions
+        r = conn.execute("""
+            SELECT COUNT(*) FROM mango_calls
+            WHERE COALESCE(call_next_action,'') != ''
+              AND COALESCE(call_next_action_completed,0) = 0
+              AND COALESCE(call_next_action_type,'') NOT IN ('no_action','')
+              AND COALESCE(call_next_action_due,'') != ''
+              AND call_next_action_due < ?
+        """, (today,)).fetchone()
+        count += r[0] if r else 0
+        # Missed callbacks in last 7 days with no outbound follow-up
+        r = conn.execute("""
+            SELECT COUNT(*) FROM mango_calls mc
+            WHERE mc.direction = 'inbound'
+              AND mc.status IN ('missed','no_answer','busy','voicemail')
+              AND mc.started_at >= datetime('now','-7 days')
+              AND NOT EXISTS (
+                  SELECT 1 FROM mango_calls mc2
+                  WHERE mc2.lead_id = mc.lead_id
+                    AND mc2.direction = 'outbound'
+                    AND mc2.started_at > mc.started_at
+              )
+        """).fetchone()
+        count += r[0] if r else 0
+        # Overdue user-set lead next actions
+        r = conn.execute("""
+            SELECT COUNT(*) FROM leads
+            WHERE COALESCE(next_action_at,'') != ''
+              AND next_action_at < datetime('now')
+        """).fetchone()
+        count += r[0] if r else 0
+    return count
+
+
+def get_pending_actions(limit: int = 200) -> list[dict]:
+    """
+    Unified prioritized feed for the Actions tab.
+    Merges 4 sources: AI call next-actions, unread messages, missed callbacks, overdue lead next-actions.
+    Returns list of dicts sorted by priority (urgent→soon→low) then due_at.
+    """
+    from datetime import datetime, timezone, date
+    now_iso = datetime.now(timezone.utc).isoformat()
+    today = date.today().isoformat()
+    items = []
+
+    with _conn() as conn:
+        # Source A: AI call next-actions (uncompleted, non-no_action)
+        rows = conn.execute("""
+            SELECT mc.uuid, mc.call_next_action, mc.call_next_action_type,
+                   mc.call_next_action_due, mc.call_next_action_priority,
+                   mc.call_next_action_reasoning, mc.call_next_action_suggested_at,
+                   mc.lead_id, mc.from_number, mc.started_at,
+                   l.first_name, l.last_name, l.email, l.phone
+              FROM mango_calls mc
+              LEFT JOIN leads l ON l.id = mc.lead_id
+             WHERE COALESCE(mc.call_next_action,'') != ''
+               AND COALESCE(mc.call_next_action_completed,0) = 0
+               AND COALESCE(mc.call_next_action_type,'') NOT IN ('no_action','')
+             ORDER BY mc.call_next_action_due ASC
+             LIMIT ?
+        """, (limit,)).fetchall()
+        for r in rows:
+            r = dict(r)
+            prio = r.get("call_next_action_priority") or "soon"
+            due = r.get("call_next_action_due") or ""
+            if due and due < today:
+                prio = "urgent"  # overdue → escalate
+            lead_name = " ".join(filter(None, [r.get("first_name"), r.get("last_name")])) or r.get("from_number") or "Unknown Caller"
+            items.append({
+                "action_id": f"call:{r['uuid']}",
+                "kind": "ai_call_action",
+                "priority": prio,
+                "action_type": r.get("call_next_action_type", "other"),
+                "lead_id": r.get("lead_id"),
+                "lead_name": lead_name,
+                "lead_phone": r.get("phone"),
+                "lead_email": r.get("email"),
+                "title": r.get("call_next_action", ""),
+                "description": r.get("call_next_action_reasoning", ""),
+                "due_at": due or None,
+                "source_call_uuid": r["uuid"],
+                "completed": False,
+            })
+
+        # Source B: Unread SMS leads
+        sms_rows = conn.execute("""
+            SELECT l.id AS lead_id, l.first_name, l.last_name, l.phone, l.email,
+                   MAX(sm.received_at) AS last_msg
+              FROM sms_messages sm
+              JOIN leads l ON l.id = sm.lead_id
+             WHERE sm.direction='inbound' AND (sm.read_at IS NULL OR sm.read_at='')
+             GROUP BY l.id
+        """).fetchall()
+        for r in sms_rows:
+            r = dict(r)
+            lead_name = " ".join(filter(None, [r.get("first_name"), r.get("last_name")])) or "Unknown"
+            items.append({
+                "action_id": f"sms:{r['lead_id']}",
+                "kind": "unread_message",
+                "priority": "soon",
+                "action_type": "reply",
+                "lead_id": r["lead_id"],
+                "lead_name": lead_name,
+                "lead_phone": r.get("phone"),
+                "lead_email": r.get("email"),
+                "title": f"Unread SMS from {lead_name}",
+                "description": "",
+                "due_at": None,
+                "source_call_uuid": None,
+                "completed": False,
+            })
+
+        # Source C: Missed callbacks (inbound missed within 7 days, no outbound follow-up)
+        missed_rows = conn.execute("""
+            SELECT mc.uuid, mc.from_number, mc.caller_id_name, mc.started_at, mc.lead_id,
+                   l.first_name, l.last_name, l.phone, l.email
+              FROM mango_calls mc
+              LEFT JOIN leads l ON l.id = mc.lead_id
+             WHERE mc.direction = 'inbound'
+               AND mc.status IN ('missed','no_answer','busy','voicemail')
+               AND mc.started_at >= datetime('now','-7 days')
+               AND NOT EXISTS (
+                    SELECT 1 FROM mango_calls mc2
+                    WHERE mc2.lead_id = mc.lead_id
+                      AND mc2.direction = 'outbound'
+                      AND mc2.started_at > mc.started_at
+               )
+             ORDER BY mc.started_at DESC
+             LIMIT ?
+        """, (limit,)).fetchall()
+        for r in missed_rows:
+            r = dict(r)
+            lead_name = " ".join(filter(None, [r.get("first_name"), r.get("last_name")])) or r.get("caller_id_name") or r.get("from_number") or "Unknown Caller"
+            items.append({
+                "action_id": f"missed:{r['uuid']}",
+                "kind": "missed_callback",
+                "priority": "urgent",
+                "action_type": "callback",
+                "lead_id": r.get("lead_id"),
+                "lead_name": lead_name,
+                "lead_phone": r.get("phone") or r.get("from_number"),
+                "lead_email": r.get("email"),
+                "title": f"Missed call — call back {lead_name}",
+                "description": f"Missed inbound call at {r.get('started_at','')}",
+                "due_at": None,
+                "source_call_uuid": r["uuid"],
+                "completed": False,
+            })
+
+        # Source D: Overdue user-set lead next actions
+        overdue_rows = conn.execute("""
+            SELECT id, first_name, last_name, phone, email, next_action_at, next_action_note
+              FROM leads
+             WHERE COALESCE(next_action_at,'') != ''
+               AND next_action_at < ?
+        """, (now_iso,)).fetchall()
+        for r in overdue_rows:
+            r = dict(r)
+            lead_name = " ".join(filter(None, [r.get("first_name"), r.get("last_name")])) or "Unknown"
+            items.append({
+                "action_id": f"lead:{r['id']}",
+                "kind": "overdue_action",
+                "priority": "urgent",
+                "action_type": "follow_up_call",
+                "lead_id": r["id"],
+                "lead_name": lead_name,
+                "lead_phone": r.get("phone"),
+                "lead_email": r.get("email"),
+                "title": r.get("next_action_note") or f"Follow up with {lead_name}",
+                "description": f"Overdue since {r.get('next_action_at','')}",
+                "due_at": r.get("next_action_at"),
+                "source_call_uuid": None,
+                "completed": False,
+            })
+
+    PRIO = {"urgent": 0, "soon": 1, "low": 2}
+    items.sort(key=lambda x: (PRIO.get(x["priority"], 3), x.get("due_at") or "9999"))
+    return items[:limit]
+
+
+# ── Google Recommendations ────────────────────────────────────────────────────
+
+def upsert_google_rec(resource_name: str, rec_type: str, campaign_resource: str,
+                      campaign_name: str, ad_group_resource: str, title: str,
+                      description: str, impact_json: str, details_json: str,
+                      fetched_at: str) -> int:
+    """Insert or update a Google recommendation row. Returns row id."""
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO gads_google_recs
+                (resource_name, rec_type, campaign_resource, campaign_name,
+                 ad_group_resource, title, description, impact_json, details_json, fetched_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(resource_name) DO UPDATE SET
+                rec_type=excluded.rec_type,
+                campaign_resource=excluded.campaign_resource,
+                campaign_name=excluded.campaign_name,
+                title=excluded.title,
+                description=excluded.description,
+                impact_json=excluded.impact_json,
+                details_json=excluded.details_json,
+                fetched_at=excluded.fetched_at,
+                claude_verdict='',
+                claude_reasoning='',
+                dismissed=0
+        """, (resource_name, rec_type, campaign_resource, campaign_name,
+              ad_group_resource, title, description, impact_json, details_json, fetched_at))
+        row = conn.execute("SELECT id FROM gads_google_recs WHERE resource_name=?", (resource_name,)).fetchone()
+        return row[0] if row else 0
+
+
+def update_google_rec_verdict(resource_name: str, verdict: str, reasoning: str):
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE gads_google_recs SET claude_verdict=?, claude_reasoning=?
+            WHERE resource_name=?
+        """, (verdict, reasoning, resource_name))
+
+
+def get_google_recs(dismissed: bool = False) -> list:
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT id, resource_name, rec_type, campaign_resource, campaign_name,
+                   ad_group_resource, title, description, impact_json, details_json,
+                   claude_verdict, claude_reasoning, dismissed, fetched_at
+            FROM gads_google_recs
+            WHERE dismissed = ?
+            ORDER BY fetched_at DESC
+        """, (1 if dismissed else 0,)).fetchall()
+        cols = ['id','resource_name','rec_type','campaign_resource','campaign_name',
+                'ad_group_resource','title','description','impact_json','details_json',
+                'claude_verdict','claude_reasoning','dismissed','fetched_at']
+        return [dict(zip(cols, r)) for r in rows]
+
+
+def dismiss_google_rec(resource_name: str):
+    with _conn() as conn:
+        conn.execute("UPDATE gads_google_recs SET dismissed=1 WHERE resource_name=?", (resource_name,))

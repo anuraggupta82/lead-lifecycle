@@ -367,6 +367,50 @@ Transcript:
 {transcript}
 """
 
+_NEXT_ACTION_PROMPT = """\
+You are a dental practice front-desk manager reviewing a call to decide the single \
+best next action for the lead.
+
+Inputs:
+- Call summary: {summary}
+- Overall grade (0-100, null if ungraded): {grade_score}
+- Grade notes: {grade_notes}
+- Lead lifecycle stage: {lead_stage}
+- Appointment booked on this call: {booked_in_call}
+
+Pick exactly ONE next action. Output STRICT JSON only — no markdown, no code fences, \
+no commentary.
+
+Action types (pick exactly one string):
+  "book_appointment"  — lead is qualified and ready but no appointment yet
+  "follow_up_call"    — needs a phone follow-up (hesitation, financing, missed details)
+  "send_email"        — info/quote/insurance docs requested
+  "no_action"         — handled in this call, spam, or wrong number
+  "other"             — rare edge case
+
+Priority levels:
+  "urgent"  — patient is hot/ready, or same-day commitment made
+  "soon"    — should happen in 1-3 days
+  "low"     — informational, can wait a week+
+
+due_in_days: integer, 0-14 (0=today). Use 0 for "no_action".
+
+Output format (single JSON object):
+{{
+  "action_type": "follow_up_call",
+  "priority": "soon",
+  "description": "Follow up in 2 days about financing options for implant consult.",
+  "due_in_days": 2,
+  "reasoning": "Patient asked about cost and seemed hesitant; financing info may close them."
+}}
+
+Rules:
+- description: one sentence, action-oriented, under 25 words, no PHI
+- reasoning: one sentence, under 25 words, no PHI
+- If call is spam/voicemail with no callback ask, return action_type="no_action"
+- If appointment was already booked on this call, return action_type="no_action"
+"""
+
 
 def _call_vertex(prompt: str, model: str, project_id: str, location: str,
                  credentials_path: str, temperature: float = 0.25,
@@ -529,6 +573,130 @@ def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
                     repair_err, raw[:300])
 
     return {"gradeable": False, "reason": "AI returned unparseable JSON — check logs"}
+
+
+def _extract_json_object(raw: str) -> dict | None:
+    """Multi-tier JSON parser: strip fences → regex extract → sanitize → json_repair fallback.
+    Returns a parsed dict or None on complete failure.
+    """
+    if not raw:
+        return None
+
+    # Tier 1: strip markdown code fences
+    if raw.startswith("```"):
+        raw = re.sub(r'^```\w*\n?', '', raw)
+        raw = re.sub(r'\n?```$', '', raw)
+        raw = raw.strip()
+
+    # Tier 2: regex-extract first JSON object
+    m = re.search(r'\{[\s\S]*\}', raw)
+    if m:
+        raw = m.group(0)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Tier 3: sanitize embedded control characters
+    def _sanitize(s: str) -> str:
+        result = []
+        in_str = False
+        esc = False
+        for ch in s:
+            if esc:
+                result.append(ch)
+                esc = False
+            elif ch == '\\':
+                result.append(ch)
+                esc = True
+            elif ch == '"':
+                result.append(ch)
+                in_str = not in_str
+            elif in_str and ch == '\n':
+                result.append(' ')
+            elif in_str and ch == '\r':
+                pass
+            elif in_str and ch == '\t':
+                result.append(' ')
+            else:
+                result.append(ch)
+        return ''.join(result)
+
+    try:
+        return json.loads(_sanitize(raw))
+    except json.JSONDecodeError:
+        pass
+
+    # Tier 4: json_repair last resort
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(raw, return_objects=True)
+        if isinstance(repaired, dict):
+            return repaired
+    except Exception:
+        pass
+
+    return None
+
+
+_NEXT_ACTION_FALLBACK = {
+    "action_type": "other",
+    "priority": "low",
+    "description": "Manual review needed.",
+    "due_in_days": 1,
+    "reasoning": "",
+}
+
+
+def _suggest_next_action(
+    summary: str,
+    grade_overall_score,
+    grade_overall_notes: str,
+    lead_stage: str,
+    booked_in_call: bool,
+    vertex_project_id: str,
+    vertex_location: str,
+    vertex_credentials_path: str,
+    vertex_model: str,
+    call_uuid: str,
+) -> dict:
+    """Generate an AI next-action suggestion for a call. PHI-safe — works on summary only."""
+    prompt = _NEXT_ACTION_PROMPT.format(
+        summary=summary or "(no summary)",
+        grade_score=grade_overall_score if grade_overall_score is not None else "null",
+        grade_notes=grade_overall_notes or "(none)",
+        lead_stage=lead_stage or "unknown",
+        booked_in_call="yes" if booked_in_call else "no",
+    )
+    try:
+        raw, in_tok, out_tok = _call_vertex(
+            prompt=prompt,
+            model=vertex_model,
+            project_id=vertex_project_id,
+            location=vertex_location,
+            credentials_path=vertex_credentials_path,
+            temperature=0.2,
+            max_tokens=400,
+            response_mime_type="application/json",
+        )
+        log_gemini(
+            purpose="call_next_action",
+            model=vertex_model,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            call_id=call_uuid,
+        )
+        result = _extract_json_object(raw)
+        if not result:
+            log.warning("[pipeline] next_action JSON parse failed for %s — using fallback", call_uuid)
+            return _NEXT_ACTION_FALLBACK.copy()
+        # Clamp due_in_days
+        result["due_in_days"] = max(0, min(14, int(result.get("due_in_days") or 0)))
+        return result
+    except Exception as e:
+        log.warning("[pipeline] _suggest_next_action failed for %s: %s", call_uuid, e)
+        return _NEXT_ACTION_FALLBACK.copy()
 
 
 # ── Team member resolution ────────────────────────────────────────────────────
@@ -726,6 +894,10 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             db.update_mango_call_analysis(uuid, team_member=team_member)
 
         # ── 6. Grade ─────────────────────────────────────────────────────────
+        # Initialize grade state for Step 7 scope
+        grade: dict = {}
+        gradeable: bool = False
+        overall_pct: int | None = None
         if msettings["mango_pipeline_auto_grade"]:
             try:
                 grade = _grade(
@@ -734,7 +906,8 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
                 )
                 now_iso2 = datetime.now(timezone.utc).isoformat()
 
-                if grade.get("gradeable"):
+                gradeable = bool(grade.get("gradeable"))
+                if gradeable:
                     # Normalise 1–10 scores → 0–100 scale and rename explanation→notes
                     raw_scores = grade.get("scores", [])
                     normalised_scores = [
@@ -767,11 +940,69 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
                         graded_at=now_iso2,
                     )
             except Exception as grade_err:
+                gradeable = False
                 log.warning("[pipeline] Grading failed for %s: %s", uuid, grade_err)
                 db.update_mango_call_analysis(
                     uuid,
                     pipeline_error=f"Grading error: {grade_err}",
                 )
+
+        # ── Step 7: AI next-action suggestion ──────────────────────────────────
+        if msettings.get("mango_pipeline_auto_suggest_action", True):
+            try:
+                # Re-read to check idempotency — skip if already suggested
+                current = db.get_mango_call(uuid) or {}
+                if not current.get("call_next_action"):
+                    lead_stage = ""
+                    if current.get("lead_id"):
+                        ld = db.get_lead(current["lead_id"]) or {}
+                        lead_stage = ld.get("stage", "")
+                    booked_in_call = bool(current.get("od_appointment_id"))
+                    nxt = _suggest_next_action(
+                        summary=summary or "",
+                        grade_overall_score=overall_pct if gradeable else None,
+                        grade_overall_notes=grade.get("overall_notes", "") if gradeable else "",
+                        lead_stage=lead_stage,
+                        booked_in_call=booked_in_call,
+                        vertex_project_id=vertex_project,
+                        vertex_location=vertex_location,
+                        vertex_credentials_path=vertex_creds,
+                        vertex_model=vertex_model,
+                        call_uuid=uuid,
+                    )
+                    due_iso = ""
+                    if nxt.get("action_type") != "no_action":
+                        from datetime import date as _date, timedelta
+                        d = max(0, min(14, int(nxt.get("due_in_days") or 0)))
+                        due_iso = (_date.today() + timedelta(days=d)).isoformat()
+                    db.update_mango_call_analysis(
+                        uuid,
+                        call_next_action=nxt.get("description", ""),
+                        call_next_action_type=nxt.get("action_type", "other"),
+                        call_next_action_due=due_iso,
+                        call_next_action_priority=nxt.get("priority", "soon"),
+                        call_next_action_reasoning=nxt.get("reasoning", ""),
+                        call_next_action_suggested_at=datetime.now(timezone.utc).isoformat(),
+                        call_next_action_completed=0,
+                    )
+            except Exception as nxt_err:
+                log.warning("[pipeline] next-action suggest failed for %s: %s", uuid, nxt_err)
+
+        # ── Step 8: Auto-match to OD appointment if graded as booked ─────────
+        # Non-blocking — failure must NOT affect the rest of the pipeline.
+        try:
+            refreshed = db.get_mango_call(uuid) or {}
+            if (refreshed.get("booked_outcome") == "booked"
+                    and not refreshed.get("od_appointment_id")):
+                from od_matcher import match_calls_to_od_appointments
+                od_result = match_calls_to_od_appointments(days=90, target_uuid=uuid)
+                if od_result.get("matched", 0) > 0:
+                    log.info("[pipeline] Step 8: OD appointment matched for call %s", uuid)
+                else:
+                    log.debug("[pipeline] Step 8: No OD appointment found for call %s "
+                              "(new patient or OD offline)", uuid)
+        except Exception as od_err:
+            log.warning("[pipeline] Step 8 OD match failed for %s (non-fatal): %s", uuid, od_err)
 
         log.info("[pipeline] Call %s processed successfully", uuid)
 

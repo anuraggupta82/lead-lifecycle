@@ -5,10 +5,11 @@ Also syncs treatment plan stages for matched patients.
 Runs as a nightly job. Never stores raw PHI — uses SHA-256 hashes for comparison.
 Only accessible on the office LAN (GraftonServer).
 
-Three functions:
-  1. match_leads_to_od()         — match unmatched leads to OD patients
-  2. sync_treatment_stages()     — update stages for already-matched leads
-  3. run_full_od_sync()          — runs both (called by scheduler)
+Four functions:
+  1. match_leads_to_od()              — match unmatched leads to OD patients
+  2. sync_treatment_stages()          — update stages for already-matched leads
+  3. run_full_od_sync()               — runs both (called by scheduler)
+  4. match_calls_to_od_appointments() — link booked Mango calls → OD appointments
 """
 import hashlib
 import logging
@@ -659,6 +660,362 @@ def run_full_od_sync() -> dict:
     return {
         "match": match_result,
         "treatment_stages": stage_result,
+    }
+
+
+# ── Part 4: Match booked Mango calls → OD appointments ──────────────────────
+
+def _normalize_phone(raw: str) -> str:
+    """Strip non-digits, return last 10 digits."""
+    digits = "".join(c for c in (raw or "") if c.isdigit())
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def _get_od_patient_by_phone(conn, phone_10: str) -> str | None:
+    """
+    Look up OD PatNum by phone number (home or wireless).
+    Uses nested REPLACE chains (MySQL 5.x compatible, no REGEXP_REPLACE needed).
+    Returns PatNum as string, or None if not found.
+    """
+    if not phone_10 or len(phone_10) < 10:
+        return None
+
+    # Normalize digits using nested REPLACE (works on all MySQL versions)
+    # Strips: spaces, dashes, dots, parens, plus signs
+    normalize_sql = (
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE({col},' ',''),'-',''),'(',''),')',''),'.',''),'+','')"
+    )
+    hm_norm = normalize_sql.format(col="HmPhone")
+    cell_norm = normalize_sql.format(col="WirelessPhone")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT PatNum FROM patient
+                   WHERE PatStatus = 0
+                     AND (
+                         RIGHT({hm_norm}, 10) = %s
+                      OR RIGHT({cell_norm}, 10) = %s
+                     )
+                   LIMIT 1""",
+                (phone_10, phone_10),
+            )
+            row = cur.fetchone()
+            return str(row[0]) if row else None
+    except Exception as e:
+        # Last-resort Python-side fallback — no row limit so we get all patients
+        logger.warning(f"SQL phone lookup failed ({e}), falling back to Python normalization")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT PatNum, HmPhone, WirelessPhone FROM patient
+                       WHERE PatStatus = 0
+                         AND (HmPhone != '' OR WirelessPhone != '')""",
+                )
+                for row in cur.fetchall():
+                    for raw in [row[1] or "", row[2] or ""]:
+                        if _normalize_phone(raw) == phone_10:
+                            return str(row[0])
+        except Exception as e2:
+            logger.warning(f"Phone lookup fallback also failed: {e2}")
+        return None
+
+
+def _find_od_appointment_near_call(conn, pat_num: str, call_dt: datetime,
+                                    forward_days: int = 14, back_days: int = 1) -> str | None:
+    """
+    Find the OD appointment (AptNum) for pat_num that was CREATED on or after the call
+    and scheduled within a forward/back window of the call date.
+
+    Strategy:
+    - Prefer appointments created (DateTStamp) within 24h of the call — high confidence
+    - Fall back to any Scheduled/ASAP appointment in the forward window
+    - Last resort: recently Completed appointment (patient already came in same day)
+    - AptStatus: 1=Scheduled, 2=Complete, 4=ASAP (skip 3=UnschedList, 5=Broken, 6=Planned)
+
+    Returns AptNum as string, or None.
+    """
+    if not pat_num:
+        return None
+    if call_dt.tzinfo is None:
+        call_dt = call_dt.replace(tzinfo=_EASTERN)
+    call_local = call_dt.astimezone(_EASTERN).replace(tzinfo=None)
+    # Window: look forward more than back (booked appointments are usually future)
+    start = call_local - timedelta(days=back_days)
+    end = call_local + timedelta(days=forward_days)
+    # Appointments created within 24h of call = strong match signal
+    created_cutoff = call_local - timedelta(hours=1)  # 1h before call (buffer for creation timing)
+    created_end = call_local + timedelta(hours=24)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT AptNum, AptDateTime, AptStatus, DateTStamp
+                   FROM appointment
+                   WHERE PatNum = %s
+                     AND AptStatus IN (1, 2, 4)
+                     AND AptDateTime BETWEEN %s AND %s
+                   ORDER BY DateTStamp DESC""",
+                (int(pat_num), start, end),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return None
+
+            # Phase 1: prefer appointments CREATED near the call time (DateTStamp)
+            created_near = [
+                r for r in rows
+                if r[3] and created_cutoff <= r[3] <= created_end and int(r[2]) in (1, 4)
+            ]
+            if created_near:
+                # Among these, pick the one scheduled soonest after the call
+                best = min(created_near, key=lambda r: abs((r[1] - call_local).total_seconds()))
+                logger.debug(f"[call_od_match] PatNum={pat_num} — matched via DateTStamp, AptNum={best[0]}")
+                return str(best[0])
+
+            # Phase 2: any Scheduled/ASAP appointment in window (no DateTStamp filter)
+            scheduled = [(r[0], r[1]) for r in rows if int(r[2]) in (1, 4)]
+            if scheduled:
+                best = min(scheduled, key=lambda r: abs((r[1] - call_local).total_seconds()))
+                logger.debug(f"[call_od_match] PatNum={pat_num} — matched via window (no DateTStamp), AptNum={best[0]}")
+                return str(best[0])
+
+            # Phase 3: completed appointment same day (patient came in quickly)
+            completed = [(r[0], r[1]) for r in rows if int(r[2]) == 2
+                         and abs((r[1] - call_local).total_seconds()) < 86400]
+            if completed:
+                best = min(completed, key=lambda r: abs((r[1] - call_local).total_seconds()))
+                logger.debug(f"[call_od_match] PatNum={pat_num} — matched via same-day Complete, AptNum={best[0]}")
+                return str(best[0])
+
+            return None
+    except Exception as e:
+        logger.warning(f"OD appointment lookup failed for PatNum {pat_num}: {e}")
+        return None
+
+
+def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> dict:
+    """
+    For Mango calls graded as booked but not yet linked to an OD appointment:
+    1. Normalize caller phone number
+    2. Look up OD patient by phone
+    3. Find the closest OD appointment within ±7 days of the call
+    4. Store AptNum in mango_calls.od_appointment_id
+
+    Args:
+        days:         How many days back to look for unmatched booked calls
+        target_uuid:  If set, only process this specific call (for on-demand triggering)
+
+    Returns dict with matched/skipped/errors counts.
+    """
+    from database import get_booked_calls_needing_od_match, update_mango_call_od_appointment
+
+    od_conn = _get_db()
+    if not od_conn:
+        return {"matched": 0, "skipped": 0, "errors": 1,
+                "error": "OpenDental MySQL unavailable (office network required)"}
+
+    calls = get_booked_calls_needing_od_match(days=days)
+    if target_uuid:
+        calls = [c for c in calls if c["uuid"] == target_uuid]
+
+    logger.info(f"[call_od_match] Processing {len(calls)} booked calls for OD appointment match")
+
+    matched = skipped = errors = 0
+
+    try:
+        for call in calls:
+            try:
+                # Guard: started_at must be a valid string
+                if not call.get("started_at"):
+                    logger.debug(f"[call_od_match] uuid={call.get('uuid')} — no started_at, skipping")
+                    skipped += 1
+                    continue
+
+                # Get caller phone — prefer from_number, fall back to caller_id_number
+                raw_phone = call.get("from_number") or call.get("caller_id_number") or ""
+                phone_10 = _normalize_phone(raw_phone)
+                if not phone_10:
+                    logger.debug(f"[call_od_match] uuid={call['uuid']} — no phone, skipping")
+                    skipped += 1
+                    continue
+
+                # Parse call datetime (stored as ISO string in UTC)
+                started_str = call["started_at"].replace("Z", "+00:00")
+                call_dt = datetime.fromisoformat(started_str)
+
+                # Look up OD patient
+                pat_num = _get_od_patient_by_phone(od_conn, phone_10)
+                if not pat_num:
+                    logger.debug(f"[call_od_match] uuid={call['uuid']} phone={phone_10} — no OD patient found")
+                    skipped += 1
+                    continue
+
+                # Find appointment (forward-biased window: 14 days forward, 1 day back)
+                apt_num = _find_od_appointment_near_call(od_conn, pat_num, call_dt)
+                if not apt_num:
+                    logger.debug(f"[call_od_match] uuid={call['uuid']} PatNum={pat_num} — no appointment in window")
+                    skipped += 1
+                    continue
+
+                # Store the match
+                update_mango_call_od_appointment(call["uuid"], apt_num)
+                logger.info(
+                    f"[call_od_match] uuid={call['uuid']} phone={phone_10} "
+                    f"PatNum={pat_num} → AptNum={apt_num}"
+                )
+                matched += 1
+
+            except Exception as e:
+                logger.error(f"[call_od_match] Error processing call {call.get('uuid')}: {e}")
+                errors += 1
+    finally:
+        od_conn.close()
+
+    logger.info(f"[call_od_match] Done: matched={matched} skipped={skipped} errors={errors}")
+    return {"matched": matched, "skipped": skipped, "errors": errors, "total": len(calls)}
+
+
+# ── Part 5: Match Mango calls → OD patient status ────────────────────────────
+
+def _get_od_patient_info_by_phone(conn, phone_10: str) -> dict | None:
+    """
+    Look up OD patient name, PatNum and PatStatus by caller phone.
+    Checks both active (PatStatus=0) and inactive (PatStatus=1) patients.
+    Returns dict with keys: pat_num, first_name, last_name, pat_status
+    or None if not found.
+    PatStatus codes: 0=Patient, 1=NonPatient, 2=Inactive, 3=Archived, 4=Deceased, 5=Prospective
+    """
+    if not phone_10 or len(phone_10) < 7:
+        return None
+
+    normalize_sql = (
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE({col},' ',''),'-',''),'(',''),')',''),'.',''),'+','')"
+    )
+    hm_norm = normalize_sql.format(col="HmPhone")
+    cell_norm = normalize_sql.format(col="WirelessPhone")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT PatNum, FName, LName, PatStatus FROM patient
+                   WHERE (
+                       RIGHT({hm_norm}, 10) = %s
+                    OR RIGHT({cell_norm}, 10) = %s
+                   )
+                   AND PatStatus IN (0, 2, 3)
+                   ORDER BY PatStatus ASC, PatNum DESC
+                   LIMIT 1""",
+                (phone_10, phone_10),
+            )
+            row = cur.fetchone()
+            if row:
+                return {
+                    "pat_num":    str(row[0]),
+                    "first_name": (row[1] or "").strip(),
+                    "last_name":  (row[2] or "").strip(),
+                    "pat_status": int(row[3]),
+                }
+    except Exception as e:
+        logger.warning(f"OD patient info lookup failed for phone {phone_10}: {e}")
+    return None
+
+
+def _classify_od_status(pat_info: dict | None, check_recent_visit: bool = False,
+                         od_conn=None) -> str:
+    """
+    Classify caller as: new_patient | existing_active | existing_inactive | unknown
+    PatStatus=0 → existing_active
+    PatStatus=2 (Inactive) or 3 (Archived) → existing_inactive
+    No match → new_patient
+    """
+    if pat_info is None:
+        return "new_patient"
+    ps = pat_info.get("pat_status", -1)
+    if ps == 0:
+        return "existing_active"
+    elif ps in (2, 3):
+        return "existing_inactive"
+    return "unknown"
+
+
+def match_mango_calls_to_od_patients(limit: int = 500) -> dict:
+    """
+    Match unmatched inbound Mango calls to OpenDental patients by phone number.
+    Sets od_patient_num, od_patient_status, od_patient_name on each call.
+
+    od_patient_status values:
+      new_patient       — phone not found in OD (likely a new patient inquiry)
+      existing_active   — PatStatus=0 active patient
+      existing_inactive — PatStatus=2/3 inactive/archived patient
+      unknown           — OD found but status unclear (shouldn't happen often)
+
+    This is used to:
+      1. Show New/Existing badge in the call inbox
+      2. Gate offline conversion uploads (skip existing patients)
+    """
+    from database import get_mango_calls_needing_od_match, update_mango_call_od_status
+
+    od_conn = _get_db()
+    if od_conn is None:
+        logger.warning("[mango_od_match] OpenDental unavailable — skipping patient match")
+        return {"matched": 0, "new_patient": 0, "existing": 0, "errors": 0, "skipped": 0,
+                "detail": "OpenDental unavailable"}
+
+    calls = get_mango_calls_needing_od_match(limit=limit)
+    logger.info(f"[mango_od_match] Matching {len(calls)} calls to OD patients")
+
+    new_patient = existing = errors = skipped = 0
+
+    try:
+        for call in calls:
+            try:
+                raw_phone = call.get("from_number") or ""
+                phone_10 = _normalize_phone(raw_phone)
+
+                if not phone_10:
+                    # Mark as attempted so we don't retry empty-phone calls forever
+                    update_mango_call_od_status(call["uuid"], "", "unknown", "")
+                    skipped += 1
+                    continue
+
+                pat_info = _get_od_patient_info_by_phone(od_conn, phone_10)
+                status = _classify_od_status(pat_info)
+                pat_num = pat_info["pat_num"] if pat_info else ""
+                pat_name = ""
+                if pat_info:
+                    fn = pat_info.get("first_name", "")
+                    ln = pat_info.get("last_name", "")
+                    pat_name = f"{fn} {ln}".strip()
+
+                update_mango_call_od_status(call["uuid"], pat_num, status, pat_name)
+
+                if status == "new_patient":
+                    new_patient += 1
+                    logger.debug(f"[mango_od_match] uuid={call['uuid']} phone={phone_10} → new_patient")
+                else:
+                    existing += 1
+                    logger.debug(
+                        f"[mango_od_match] uuid={call['uuid']} phone={phone_10} "
+                        f"→ {status} PatNum={pat_num} Name={pat_name}"
+                    )
+
+            except Exception as e:
+                logger.error(f"[mango_od_match] Error for uuid={call.get('uuid')}: {e}")
+                errors += 1
+    finally:
+        od_conn.close()
+
+    total = len(calls)
+    logger.info(
+        f"[mango_od_match] Done: total={total} new={new_patient} "
+        f"existing={existing} errors={errors} skipped={skipped}"
+    )
+    return {
+        "total": total,
+        "new_patient": new_patient,
+        "existing": existing,
+        "errors": errors,
+        "skipped": skipped,
     }
 
 

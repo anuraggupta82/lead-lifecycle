@@ -135,11 +135,12 @@ class Settings(BaseSettings):
     # ── Call Analysis pipeline ───────────────────────────────────────────────
     mango_pipeline_enabled: bool = False       # Master on/off switch
     mango_pipeline_auto_grade: bool = True     # Run Gemini/Vertex grading after each summary
+    mango_pipeline_auto_suggest_action: bool = True  # Run AI next-action suggestion after each grade
     mango_pipeline_only_inbound: bool = True   # Skip outbound calls
     mango_pipeline_min_seconds: int = 30       # Skip calls shorter than this
     mango_pipeline_max_per_run: int = 20       # Cost guard: max calls per scheduler tick
     mango_pipeline_interval_min: int = 10      # Minutes between pipeline runs
-    mango_pipeline_recording_ttl_min: int = 30 # Delete cached recordings older than this
+    mango_pipeline_recording_ttl_min: int = 60 # Delete cached recordings older than this
     mango_recording_dir: str = "/tmp/gdc_recordings"
 
     # Whisper backend: 'api' = OpenAI cloud (default), 'local' = on-device GPU

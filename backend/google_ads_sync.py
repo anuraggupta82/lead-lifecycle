@@ -20,7 +20,7 @@ from database import (
     get_all_leads, upsert_lead, save_gads_keywords_cache,
     save_gads_geo_cache, save_gads_schedule_cache,
     save_gads_daily_stats, save_gads_ads, save_gads_ad_metrics,
-    upsert_gads_call_view,
+    upsert_gads_call_view, upsert_gads_clicks,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
 
     days_with_data = 0
     days_queried = 0
+    clicks_to_persist = []  # batch for gads_clicks upsert
 
     current_date = start_date
     while current_date <= end_date:
@@ -89,7 +90,8 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
                 if not gclid:
                     continue
 
-                gclid_map[gclid] = {
+                click_data = {
+                    "gclid": gclid,
                     "keyword_text": row.click_view.keyword_info.text or "",
                     "match_type": str(row.click_view.keyword_info.match_type) if row.click_view.keyword_info.match_type else "",
                     "ad_group_name": row.ad_group.name or "",
@@ -100,6 +102,8 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
                     "campaign_id": str(row.campaign.id) if row.campaign.id else "",
                     "click_date": row.segments.date or date_str,
                 }
+                gclid_map[gclid] = click_data
+                clicks_to_persist.append(click_data)
                 day_count += 1
 
             if day_count > 0:
@@ -116,6 +120,14 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
         current_date += timedelta(days=1)
 
     logger.info(f"click_view complete: {len(gclid_map)} gclids from {days_with_data}/{days_queried} days")
+
+    # Persist all clicks to gads_clicks for time-window call attribution
+    if clicks_to_persist:
+        try:
+            persisted = upsert_gads_clicks(clicks_to_persist)
+            logger.info(f"Persisted {persisted} click rows to gads_clicks")
+        except Exception as e:
+            logger.warning(f"Failed to persist clicks to gads_clicks: {e}")
 
     return gclid_map
 

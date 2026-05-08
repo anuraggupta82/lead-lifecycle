@@ -24,6 +24,7 @@ import requests
 
 from database import (
     upsert_mango_call,
+    upsert_mango_calls_batch,
     get_mango_calls_unmatched,
     get_gads_call_view,
     get_all_leads,
@@ -416,25 +417,46 @@ def sync_mango_calls(
         logger.error(f"Mango sync: fetch error: {e}")
         return 0
 
-    count = 0
+    # Normalize all calls first, then batch-upsert in a single DB connection
+    # to avoid [Errno 24] Too many open files (WAL mode = 3 fds per connection)
+    normalized_calls = []
     for raw in raw_calls:
         normalized = normalize_call(raw)
-        if not normalized["uuid"]:
-            continue
+        if normalized["uuid"]:
+            normalized_calls.append(normalized)
+
+    count = 0
+    if normalized_calls:
         try:
-            upsert_mango_call(normalized)
-            count += 1
+            count = upsert_mango_calls_batch(normalized_calls)
         except Exception as e:
-            logger.error(f"Mango sync: upsert error for {normalized.get('uuid')}: {e}")
+            import traceback
+            logger.error(f"Mango sync: batch upsert error: {e}\n{traceback.format_exc()}")
 
     _last_sync_cursor = datetime.now(timezone.utc)
-    logger.info(f"Mango sync: upserted {count} calls")
+    logger.info(f"Mango sync: upserted {count}/{len(normalized_calls)} calls")
     return count
 
 
 # ── Attribution reconciler ────────────────────────────────────────────────────
 
-def reconcile_attribution(days: int = 7) -> int:
+def _parse_gads_dt(gc_start_str: str) -> Optional[datetime]:
+    """Parse a GAds start_call_date_time string to UTC-aware datetime.
+    GAds returns Eastern naive strings like '2026-04-19 10:16:00'."""
+    try:
+        gc_dt = datetime.fromisoformat(gc_start_str.replace("Z", "+00:00"))
+        if gc_dt.tzinfo is None:
+            try:
+                from zoneinfo import ZoneInfo
+                gc_dt = gc_dt.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+            except Exception:
+                gc_dt = gc_dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        return gc_dt
+    except Exception:
+        return None
+
+
+def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
     """
     Match unattributed inbound Mango calls against:
       1. Google Ads call_view rows (ad-driven calls by area code + time window)
@@ -442,6 +464,10 @@ def reconcile_attribution(days: int = 7) -> int:
 
     Updates mango_calls.lead_id / gads_call_id / match_confidence / match_method.
     Safe to run repeatedly — only updates NULL attribution rows.
+
+    target_gads_call_id: if set, only attempt to match this one GAds row (used by
+    the match-and-transcribe endpoint for targeted matching with extra diagnostics).
+
     Returns count of calls newly attributed.
     """
     unmatched = get_mango_calls_unmatched(days=days)
@@ -449,12 +475,23 @@ def reconcile_attribution(days: int = 7) -> int:
     # Use a large limit to get all leads for phone matching — default 200 is too small.
     all_leads = get_all_leads(limit=10000)
 
+    # Filter to specific GAds call if targeted
+    if target_gads_call_id:
+        gads_calls = [g for g in gads_calls if g["call_id"] == target_gads_call_id]
+
     # Build phone → lead_id lookup (strip non-digits for comparison)
     phone_to_lead: dict[str, str] = {}
     for lead in all_leads:
         phone = re.sub(r"\D", "", lead.get("phone", "") or "")
         if len(phone) >= 10:
             phone_to_lead[phone[-10:]] = lead["id"]
+
+    # Pre-parse GAds datetimes once (avoid re-parsing for every Mango call)
+    gads_parsed = []
+    for gc in gads_calls:
+        gc_dt = _parse_gads_dt(gc.get("start_call_date_time", ""))
+        if gc_dt:
+            gads_parsed.append((gc, gc_dt))
 
     attributed = 0
 
@@ -477,41 +514,47 @@ def reconcile_attribution(days: int = 7) -> int:
         best_confidence = 0.0
         best_method = ""
 
-        for gc in gads_calls:
+        for gc, gc_dt in gads_parsed:
             gc_area = gc.get("caller_area_code", "")
-            # Skip if either area code is empty (call < 15s or unparseable number)
-            if not gc_area or not mc_area or gc_area != mc_area:
-                continue
             gc_dur = int(gc.get("call_duration_sec") or 0)
-            gc_start_str = gc.get("start_call_date_time", "")
-            try:
-                gc_dt = datetime.fromisoformat(gc_start_str.replace("Z", "+00:00"))
-                if gc_dt.tzinfo is None:
-                    # Google Ads reports time in account timezone (Eastern).
-                    # Use zoneinfo for correct EST/EDT offset — avoids 1-hour
-                    # miss in Nov-Mar when EDT offset assumption (+4h) is wrong.
-                    try:
-                        from zoneinfo import ZoneInfo
-                        gc_dt = gc_dt.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
-                    except Exception:
-                        # zoneinfo not available — fall back to EST (-5h, conservative)
-                        gc_dt = gc_dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
-            except Exception:
-                continue
 
             time_delta = abs((mc_dt - gc_dt).total_seconds())
             dur_delta = abs(mc_dur - gc_dur)
 
-            if time_delta <= 90 and dur_delta <= 5:
+            area_match = gc_area and mc_area and gc_area == mc_area
+
+            # Tight match: area code + ±90s time + ±5s duration
+            if area_match and time_delta <= 90 and dur_delta <= 5:
                 if 0.95 > best_confidence:
                     best_gads_id = gc["call_id"]
                     best_confidence = 0.95
                     best_method = "gads_window"
-            elif time_delta <= 300 and dur_delta <= 30:
+            # Loose match: area code + ±300s time + ±30s duration
+            elif area_match and time_delta <= 300 and dur_delta <= 30:
                 if 0.75 > best_confidence:
                     best_gads_id = gc["call_id"]
                     best_confidence = 0.75
                     best_method = "gads_window_loose"
+            # Very loose: area code + ±600s time (no duration check — GAds/Mango measure differently)
+            elif area_match and time_delta <= 600:
+                if 0.60 > best_confidence:
+                    best_gads_id = gc["call_id"]
+                    best_confidence = 0.60
+                    best_method = "gads_window_time_only"
+            # Last resort for targeted matching: time only, no area code (±120s)
+            elif target_gads_call_id and time_delta <= 120:
+                if 0.50 > best_confidence:
+                    best_gads_id = gc["call_id"]
+                    best_confidence = 0.50
+                    best_method = "gads_time_only"
+
+            if target_gads_call_id and gc["call_id"] == target_gads_call_id:
+                logger.info(
+                    "reconcile[targeted] GAds=%s Mango=%s | area: gc=%s mc=%s | "
+                    "time_delta=%.0fs dur_delta=%ds | best_so_far=%.2f via %s",
+                    gc["call_id"], mc_uuid, gc_area, mc_area,
+                    time_delta, dur_delta, best_confidence, best_method or "none",
+                )
 
         if best_gads_id:
             update_mango_call_attribution(

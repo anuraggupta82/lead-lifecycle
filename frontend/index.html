@@ -323,10 +323,10 @@
     .followup-pill-btn .pill-count { font-weight: 700; }
 
     /* ── Dashboard Tab ────────────────────────────────────────────────────── */
-    .dash-layout { display: grid; grid-template-columns: 1fr 260px; gap: 12px; align-items: start; }
+    .dash-layout { display: grid; grid-template-columns: 1fr 300px; gap: 12px; align-items: start; }
     .dash-left { display: flex; flex-direction: column; gap: 12px; }
     .dash-right { display: flex; flex-direction: column; gap: 12px; }
-    .dash-kpi-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; }
+    .dash-kpi-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; }
     .dash-kpi { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
     .dash-kpi-val { font-size: 26px; font-weight: 700; color: var(--teal); line-height: 1.1; }
     .dash-kpi-label { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
@@ -1663,16 +1663,193 @@ const OD_REL_COLORS = {
   cold:             '#9ca3af',
 };
 
+// ── OptimizerWidget — AI optimizer summary for Dashboard ─────────────────────
+function OptimizerWidget({ onTabSwitch }) {
+  const [data, setData] = React.useState(null);
+  const [loading, setLoading] = React.useState(true);
+  const [approving, setApproving] = React.useState({});
+  const [rejecting, setRejecting] = React.useState({});
+
+  const load = () => {
+    setLoading(true);
+    api('/api/admin/optimizer/dashboard-summary')
+      .then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  };
+
+  React.useEffect(() => { load(); }, []);
+
+  const handleApprove = (actionId) => {
+    setApproving(p => ({ ...p, [actionId]: true }));
+    api(`/api/admin/gads/approve/${actionId}`, { method: 'POST' })
+      .then(() => load())
+      .catch(e => alert('Approve failed: ' + (e.message || e)))
+      .finally(() => setApproving(p => { const n = { ...p }; delete n[actionId]; return n; }));
+  };
+
+  const handleReject = (actionId) => {
+    setRejecting(p => ({ ...p, [actionId]: true }));
+    api(`/api/admin/gads/reject/${actionId}`, { method: 'POST' })
+      .then(() => load())
+      .catch(e => alert('Reject failed: ' + (e.message || e)))
+      .finally(() => setRejecting(p => { const n = { ...p }; delete n[actionId]; return n; }));
+  };
+
+  const s = data?.summary || {};
+  const pendingCount = data?.pending_count || 0;
+  const advisories = data?.advisories || [];
+  const lastRun = data?.last_run_at;
+  const fmtLastRun = lastRun
+    ? new Date(lastRun).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : null;
+
+  const spend = s.total_spend != null ? `$${Number(s.total_spend).toFixed(2)}` : '—';
+  const formLeads = s.total_leads || 0;
+  const bookedCalls = s.total_booked_calls || 0;
+  const totalCalls = s.total_calls || 0;
+  const confirmedAppts = s.total_confirmed_appts || 0;
+  const kwWithCalls = s.keywords_with_call_attribution || 0;
+  const combinedAcq = formLeads + bookedCalls;
+  const cpa = s.cost_per_acquisition != null && s.cost_per_acquisition !== 'N/A'
+    ? `$${Number(s.cost_per_acquisition).toFixed(0)}`
+    : (combinedAcq > 0 && s.total_spend ? `$${Math.round(s.total_spend / combinedAcq)}` : '—');
+  const perCampaign = data?.per_campaign || [];
+
+  const OP_LABELS = {
+    pause_keyword:       'Pause keyword',
+    increase_bid:        'Bid up',
+    decrease_bid:        'Bid down',
+    add_exact_keyword:   'Add exact',
+    add_negative_keyword:'Add negative',
+    tighten_match_type:  'Tighten match',
+    claude_advisory:     'AI Advisory',
+  };
+
+  return (
+    <div className="dash-section" style={{borderTop: pendingCount > 0 ? '2px solid var(--teal)' : undefined}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+        <div className="dash-section-title" style={{margin:0}}>🤖 AI Optimizer</div>
+        {pendingCount > 0 && (
+          <span style={{background:'var(--teal)',color:'#fff',borderRadius:10,
+            padding:'1px 7px',fontSize:10,fontWeight:700}}>
+            {pendingCount} pending
+          </span>
+        )}
+        {loading && <span style={{fontSize:10,color:'var(--text-muted)'}}>Loading…</span>}
+        <button onClick={load} style={{marginLeft:'auto',fontSize:10,padding:'2px 8px',
+          background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+          color:'var(--text-muted)'}}>↻ Refresh</button>
+      </div>
+
+      {/* KPI tiles — row 1: spend / form leads / calls / conf. appts / CPA */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:6,marginBottom:6}}>
+        {[
+          { val: spend, label: '30d Spend' },
+          { val: formLeads, label: 'Form Leads' },
+          { val: totalCalls, label: 'Inbound Calls', sub: bookedCalls > 0 ? `${bookedCalls} booked` : null },
+          { val: confirmedAppts, label: 'Conf. Appts' },
+          { val: cpa, label: 'Cost / Acq.' },
+        ].map(({ val, label, sub }) => (
+          <div key={label} style={{background:'var(--bg)',border:'1px solid var(--border)',
+            borderRadius:6,padding:'6px 8px',textAlign:'center'}}>
+            <div style={{fontSize:14,fontWeight:700,color:'var(--text)'}}>{val}</div>
+            <div style={{fontSize:9,color:'var(--text-muted)',marginTop:1}}>{label}</div>
+            {sub && <div style={{fontSize:8,color:'var(--teal)',marginTop:1}}>{sub}</div>}
+          </div>
+        ))}
+      </div>
+
+      {/* Attribution quality pill + per-campaign table */}
+      {(kwWithCalls > 0 || perCampaign.length > 0) && (
+        <div style={{marginBottom:10}}>
+          {kwWithCalls > 0 && (
+            <div style={{marginBottom:6}}>
+              <span style={{fontSize:9,background:'var(--teal-light)',color:'var(--teal)',
+                borderRadius:10,padding:'2px 7px',fontWeight:700}}>
+                🔑 {kwWithCalls} keyword{kwWithCalls !== 1 ? 's' : ''} with call attribution
+              </span>
+            </div>
+          )}
+          {perCampaign.length > 0 && (
+            <div style={{border:'1px solid var(--border)',borderRadius:6,overflow:'hidden'}}>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 40px 44px 52px 60px',
+                background:'var(--bg-alt,#f5f5f5)',padding:'4px 8px',
+                fontSize:9,fontWeight:700,color:'var(--text-muted)',gap:4}}>
+                <div>Campaign</div>
+                <div style={{textAlign:'center'}}>Calls</div>
+                <div style={{textAlign:'center'}}>Booked</div>
+                <div style={{textAlign:'center'}}>Conf.</div>
+                <div style={{textAlign:'right'}}>Production</div>
+              </div>
+              {perCampaign.map((c, i) => (
+                <div key={c.campaign_name} style={{
+                  display:'grid',gridTemplateColumns:'1fr 40px 44px 52px 60px',
+                  padding:'4px 8px',gap:4,fontSize:10,
+                  borderTop: i === 0 ? 'none' : '1px solid var(--border)',
+                  background: i % 2 === 0 ? 'transparent' : 'var(--bg)',
+                }}>
+                  <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',
+                    color:'var(--text)',fontWeight:500}} title={c.campaign_name}>
+                    {c.campaign_name}
+                  </div>
+                  <div style={{textAlign:'center',color:'var(--text)'}}>{c.calls}</div>
+                  <div style={{textAlign:'center',color: c.booked > 0 ? 'var(--teal)' : 'var(--text-muted)'}}>
+                    {c.booked > 0 ? c.booked : '—'}
+                  </div>
+                  <div style={{textAlign:'center',color: c.confirmed_appts > 0 ? 'var(--teal)' : 'var(--text-muted)'}}>
+                    {c.confirmed_appts > 0 ? c.confirmed_appts : '—'}
+                  </div>
+                  <div style={{textAlign:'right',color: c.production > 0 ? 'var(--text)' : 'var(--text-muted)'}}>
+                    {c.production > 0 ? `$${c.production.toLocaleString()}` : '—'}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Claude advisories */}
+      {advisories.length > 0 && (
+        <div style={{background:'#fffbeb',border:'1px solid #fcd34d',borderRadius:6,
+          padding:'8px 10px',marginBottom:10,fontSize:11}}>
+          <div style={{fontWeight:700,color:'#92400e',marginBottom:4,fontSize:10}}>
+            💡 Claude Advisory ({advisories.length})
+          </div>
+          {advisories.slice(0, 3).map((a, i) => (
+            <div key={i} style={{color:'#78350f',marginBottom:2,lineHeight:1.4}}>• {a}</div>
+          ))}
+          {advisories.length > 3 && (
+            <div style={{color:'#92400e',fontSize:10,marginTop:2}}>+{advisories.length - 3} more</div>
+          )}
+        </div>
+      )}
+
+      {/* Pending action summary — actions are managed in AI Optimizer tab */}
+      {pendingCount > 0 ? (
+        <button onClick={() => onTabSwitch && onTabSwitch('ai_optimizer')}
+          style={{width:'100%',marginTop:4,padding:'7px 12px',borderRadius:6,cursor:'pointer',
+            background:'var(--teal)',color:'#fff',border:'none',fontWeight:600,fontSize:11,
+            display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
+          ⚡ Review {pendingCount} Pending Recommendation{pendingCount !== 1 ? 's' : ''} →
+        </button>
+      ) : (
+        <div style={{fontSize:11,color:'var(--text-muted)',textAlign:'center',padding:'8px 0'}}>
+          No pending recommendations
+        </div>
+      )}
+
+      {fmtLastRun && (
+        <div style={{fontSize:9,color:'var(--text-muted)',marginTop:8,textAlign:'right'}}>
+          Last run: {fmtLastRun}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DashboardTab({ pipeline, stats, onTabSwitch }) {
   const now = Date.now();
-  const [hotLeads, setHotLeads] = React.useState([]);
-  const [hotLoading, setHotLoading] = React.useState(true);
-
-  React.useEffect(() => {
-    api('/api/admin/hot-leads')
-      .then(d => { setHotLeads(d.leads || []); setHotLoading(false); })
-      .catch(() => setHotLoading(false));
-  }, []);
 
   // Compute KPIs from pipeline data (exclude cold leads — they are archived, not active)
   const activeLeads = pipeline.filter(l => l.stage !== 'cold');
@@ -1709,19 +1886,9 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
     return appt >= now && appt <= now + 7 * 24 * 60 * 60 * 1000;
   }).length;
 
-  // Funnel data
-  const FUNNEL_STAGES = [
-    { key: 'new', label: 'New Lead' },
-    { key: 'auto_nurture', label: 'Auto-Nurture' },
-    { key: 'scheduled', label: 'Scheduled' },
-    { key: 'showed', label: 'Showed' },
-    { key: 'treatment_presented', label: 'Tx Presented' },
-    { key: 'treatment_accepted', label: 'Tx Accepted' },
-    { key: 'treatment_completed', label: 'Tx Completed' },
-  ];
+  // Stage counts (used by Leads by Stage panel)
   const stageCounts = {};
   pipeline.forEach(l => { stageCounts[l.stage] = (stageCounts[l.stage] || 0) + 1; });
-  const maxCount = Math.max(...FUNNEL_STAGES.map(s => stageCounts[s.key] || 0), 1);
 
   return (
     <div className="dash-layout">
@@ -1758,101 +1925,10 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
             <div className="dash-kpi-label">Revenue / Lead</div>
             <div className="dash-kpi-sub">Avg across all leads</div>
           </div>
-          <div className="dash-kpi" style={{borderColor: (stats?.hot_leads_count || 0) > 0 ? 'var(--red)' : undefined}}>
-            <div className="dash-kpi-val" style={{color: (stats?.hot_leads_count || 0) > 0 ? 'var(--red)' : undefined}}>
-              {stats?.hot_leads_count ?? hotLeads.length}
-            </div>
-            <div className="dash-kpi-label">🔥 Hot Leads</div>
-            <div className="dash-kpi-sub">Implant prospects + reactivations</div>
-          </div>
         </div>
 
-        {/* Funnel */}
-        <div className="dash-section">
-          <div className="dash-section-title">Funnel</div>
-          {FUNNEL_STAGES.map((s, i) => {
-            const count = stageCounts[s.key] || 0;
-            const widthPct = Math.round(count / maxCount * 100);
-            const prevCount = i > 0 ? (stageCounts[FUNNEL_STAGES[i-1].key] || 0) : null;
-            const dropPct = prevCount !== null && prevCount > 0
-              ? Math.round(count / prevCount * 100) + '%'
-              : '';
-            return (
-              <div key={s.key} className="funnel-row">
-                <span className="funnel-label">{s.label}</span>
-                <div className="funnel-bar-wrap">
-                  <div className="funnel-bar" style={{
-                    width: widthPct + '%',
-                    background: STAGE_COLORS[s.key] || '#6b7280',
-                    opacity: 0.75
-                  }} />
-                </div>
-                <span className="funnel-count">{count}</span>
-                <span className="funnel-pct">{dropPct}</span>
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Hot Leads tile */}
-        <div className="dash-section">
-          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
-            <div className="dash-section-title" style={{margin:0}}>🔥 Hot Leads</div>
-            {hotLeads.length > 0 && (
-              <span style={{background:'var(--red)',color:'#fff',borderRadius:10,
-                padding:'1px 7px',fontSize:10,fontWeight:700}}>
-                {hotLeads.length}
-              </span>
-            )}
-          </div>
-          {hotLoading ? (
-            <div style={{fontSize:11,color:'var(--text-muted)',padding:'8px 0'}}>Loading…</div>
-          ) : hotLeads.length === 0 ? (
-            <div style={{fontSize:11,color:'var(--text-muted)',padding:'12px 0',textAlign:'center'}}>
-              No hot leads — keep it up 🎉
-            </div>
-          ) : hotLeads.slice(0, 10).map(l => {
-            const name = [l.first_name, l.last_name].filter(Boolean).join(' ') || l.phone || 'Unknown';
-            const rel  = l.od_relationship || 'cold';
-            const relLabel = OD_REL_LABELS[rel] || rel;
-            const relColor = OD_REL_COLORS[rel] || '#9ca3af';
-            return (
-              <div key={l.id}
-                onClick={() => onTabSwitch('pipeline')}
-                style={{display:'flex',alignItems:'center',gap:8,padding:'7px 0',
-                  borderBottom:'1px solid var(--border)',cursor:'pointer'}}
-                onMouseOver={e => e.currentTarget.style.background='var(--teal-light)'}
-                onMouseOut={e => e.currentTarget.style.background='transparent'}>
-                <div style={{width:28,height:28,borderRadius:'50%',background:'var(--teal-light)',
-                  display:'flex',alignItems:'center',justifyContent:'center',
-                  fontSize:11,fontWeight:700,color:'var(--teal)',flexShrink:0}}>
-                  {(name[0]||'?').toUpperCase()}
-                </div>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontWeight:600,fontSize:11,color:'var(--text)',
-                    whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{name}</div>
-                  <div style={{display:'flex',gap:4,marginTop:2,flexWrap:'wrap'}}>
-                    <span style={{fontSize:9,fontWeight:600,padding:'1px 5px',borderRadius:4,
-                      background:relColor+'22',color:relColor}}>{relLabel}</span>
-                    <span style={{fontSize:9,padding:'1px 5px',borderRadius:4,
-                      background:'var(--bg)',color:'var(--text-muted)',
-                      border:'1px solid var(--border)'}}>{STAGE_LABELS[l.stage] || l.stage}</span>
-                  </div>
-                </div>
-                {l.treatment_plan_value > 0 && (
-                  <div style={{fontSize:10,fontWeight:700,color:'var(--teal)',flexShrink:0}}>
-                    {fmtMoney(l.treatment_plan_value)}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-          {hotLeads.length > 10 && (
-            <div style={{fontSize:10,color:'var(--text-muted)',padding:'6px 0',textAlign:'center'}}>
-              +{hotLeads.length - 10} more — view in Pipeline
-            </div>
-          )}
-        </div>
+        {/* AI Optimizer — full width in left column */}
+        <OptimizerWidget onTabSwitch={onTabSwitch} />
       </div>
 
       <div className="dash-right">
@@ -1903,6 +1979,7 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
             </div>
           ))}
         </div>
+
       </div>
     </div>
   );
@@ -2139,6 +2216,544 @@ function SearchTermsView({ searchTermStats }) {
   );
 }
 
+// ── OptimizationTab ─────────────────────────────────────────────────────────
+const OP_LABELS = {
+  pause_keyword:        { label: 'Pause Keyword',        color: '#dc2626', icon: '⏸' },
+  enable_keyword:       { label: 'Enable Keyword',       color: '#16a34a', icon: '▶️' },
+  increase_bid:         { label: 'Increase Bid',         color: '#16a34a', icon: '📈' },
+  decrease_bid:         { label: 'Decrease Bid',         color: '#d97706', icon: '📉' },
+  add_exact_keyword:    { label: 'Add Exact Match',      color: '#2563eb', icon: '➕' },
+  add_negative_keyword: { label: 'Add Negative',         color: '#7c3aed', icon: '🚫' },
+  tighten_match_type:   { label: 'Tighten Match Type',   color: '#0891b2', icon: '🎯' },
+  ad_copy_suggestion:   { label: 'Ad Copy Update',       color: '#0891b2', icon: '✍️' },
+  geo_exclusion:        { label: 'Geo Exclusion',        color: '#7c3aed', icon: '📍' },
+  change_budget:        { label: 'Budget Change',        color: '#d97706', icon: '💰' },
+  claude_advisory:      { label: 'AI Advisory',          color: '#92400e', icon: '💡' },
+};
+
+function RecommendationCard({ rec, onQueue, onIgnore, onRefine }) {
+  const [refineOpen, setRefineOpen] = React.useState(false);
+  const [refineTxt, setRefineTxt]   = React.useState('');
+  const [busy, setBusy] = React.useState(null); // 'queue'|'ignore'|'refine'|null
+  const [done, setDone] = React.useState(null); // 'queued'|'ignored'|null
+  const [err, setErr]   = React.useState('');
+
+  const op = OP_LABELS[rec.operation] || { label: rec.operation, color: '#64748b', icon: '•' };
+  const impact = rec.impact_estimate || {};
+
+  if (done === 'queued') return (
+    <div style={{padding:'8px 12px',marginBottom:6,borderRadius:6,
+      border:'1px solid #a3e635',background:'#f7fee7',
+      display:'flex',alignItems:'center',gap:8,fontSize:11}}>
+      <span>🟢</span>
+      <span style={{fontWeight:600,color:'#365314'}}>{rec.entity_name}</span>
+      <span style={{color:'#4d7c0f'}}>— Queued for Push to Google</span>
+    </div>
+  );
+  if (done === 'ignored') return (
+    <div style={{padding:'8px 12px',marginBottom:6,borderRadius:6,border:'1px solid var(--border)',
+      background:'#fafafa',display:'flex',alignItems:'center',gap:8,fontSize:11,color:'var(--text-muted)'}}>
+      <span>🙈</span>
+      <span style={{fontWeight:600}}>{rec.entity_name}</span>
+      <span>— Ignored</span>
+    </div>
+  );
+
+  return (
+    <div style={{padding:'10px 12px',marginBottom:8,borderRadius:6,
+      border:`1px solid ${op.color}33`,background:'#fff',fontSize:12}}>
+      {/* Header row */}
+      <div style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:4}}>
+        <span style={{fontSize:14}}>{op.icon}</span>
+        <div style={{flex:1}}>
+          <span style={{fontWeight:700,color:'var(--text-main)',marginRight:6}}>{rec.entity_name}</span>
+          <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:op.color+'22',
+            color:op.color,fontWeight:600}}>{op.label}</span>
+          {impact.savings_30d_usd > 0 &&
+            <span style={{fontSize:10,marginLeft:6,color:'#16a34a',fontWeight:600}}>
+              saves ~${impact.savings_30d_usd}/mo
+            </span>}
+        </div>
+        <div style={{display:'flex',gap:4,flexShrink:0}}>
+          <button onClick={async()=>{
+            setBusy('queue'); setErr('');
+            try {
+              await onQueue(rec.action_id);
+              setDone('queued');
+            } catch(e){ setErr(e.message||'Queue failed'); }
+            finally{ setBusy(null); }
+          }} disabled={!!busy}
+            style={{padding:'3px 10px',fontSize:11,fontWeight:600,borderRadius:4,cursor:'pointer',
+              border:'1px solid #65a30d',background:busy==='queue'?'#f7fee7':'#65a30d',
+              color:busy==='queue'?'#65a30d':'#fff'}}>
+            {busy==='queue'?'Queuing…':'✓ Approve'}
+          </button>
+          <button onClick={async()=>{
+            setBusy('ignore'); setErr('');
+            try {
+              await onIgnore(rec.action_id);
+              setDone('ignored');
+            } catch(e){ setErr(e.message||'Ignore failed'); }
+            finally{ setBusy(null); }
+          }} disabled={!!busy}
+            style={{padding:'3px 10px',fontSize:11,borderRadius:4,cursor:'pointer',
+              border:'1px solid #94a3b8',background:'#f8fafc',color:'#64748b'}}>
+            {busy==='ignore'?'…':'✕ Ignore'}
+          </button>
+          <button onClick={()=>setRefineOpen(o=>!o)}
+            title="Give feedback to the AI about this recommendation"
+            style={{padding:'3px 8px',fontSize:11,borderRadius:4,cursor:'pointer',
+              border:'1px solid #e2e8f0',background:refineOpen?'#f1f5f9':'#fff',color:'#475569'}}>
+            ✏️ Refine
+          </button>
+        </div>
+      </div>
+
+      {/* Rationale */}
+      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:rec.user_feedback?4:0,paddingLeft:22}}>
+        {rec.reason}
+      </div>
+
+      {/* Existing user feedback badge */}
+      {rec.user_feedback && (
+        <div style={{paddingLeft:22,marginTop:3,fontSize:10,color:'#7c3aed',fontStyle:'italic'}}>
+          💬 Your note: {rec.user_feedback}
+        </div>
+      )}
+
+      {/* Refine input */}
+      {refineOpen && (
+        <div style={{paddingLeft:22,marginTop:8,display:'flex',gap:6}}>
+          <input value={refineTxt} onChange={e=>setRefineTxt(e.target.value)}
+            placeholder="e.g. 'This keyword drives implant calls, don't pause it'"
+            style={{flex:1,padding:'4px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}
+            onKeyDown={async e=>{
+              if(e.key==='Enter' && refineTxt.trim()){
+                setBusy('refine'); setErr('');
+                try{
+                  await onRefine(rec.action_id, refineTxt.trim());
+                  setRefineOpen(false); setRefineTxt('');
+                } catch(er){ setErr(er.message||'Refine failed'); }
+                finally{ setBusy(null); }
+              }
+            }} />
+          <button onClick={async()=>{
+            if(!refineTxt.trim()) return;
+            setBusy('refine'); setErr('');
+            try{
+              await onRefine(rec.action_id, refineTxt.trim());
+              setRefineOpen(false); setRefineTxt('');
+            } catch(er){ setErr(er.message||'Refine failed'); }
+            finally{ setBusy(null); }
+          }} disabled={!refineTxt.trim()||busy==='refine'}
+            style={{padding:'4px 10px',fontSize:11,borderRadius:4,cursor:'pointer',
+              border:'1px solid #7c3aed',background:'#7c3aed',color:'#fff'}}>
+            {busy==='refine'?'Saving…':'Save'}
+          </button>
+        </div>
+      )}
+
+      {err && <div style={{paddingLeft:22,marginTop:4,fontSize:10,color:'#dc2626'}}>{err}</div>}
+    </div>
+  );
+}
+
+function OptimizationTab({ campaign }) {
+  const campName = campaign?.campaign || '';
+  // If a specific campaign is given, also show account-wide recs for full picture
+  const showAllCampaigns = true; // always fetch account-level
+
+  const [recs, setRecs]               = React.useState(null);
+  const [accountImpact, setAccImpact] = React.useState(null);
+  const [queued, setQueued]           = React.useState([]);
+  const [loading, setLoading]         = React.useState(true);
+  const [pushBusy, setPushBusy]       = React.useState(false);
+  const [pushResult, setPushResult]   = React.useState(null);
+  const [selected, setSelected]       = React.useState(new Set());
+  const [bulkBusy, setBulkBusy]       = React.useState(false);
+  const [bulkMsg, setBulkMsg]         = React.useState('');
+  const [showHistory, setShowHistory] = React.useState(false);
+
+  // Always fetch ALL campaigns — account-level view
+  const loadRecs = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const d = await api(`/api/admin/optimizer/account/recommendations?status=all&limit=500`);
+      setRecs(d);
+    } catch(e) { console.error('Opt recs load error', e); }
+    finally { setLoading(false); }
+  }, []);
+
+  const loadQueued = React.useCallback(async () => {
+    try {
+      const d = await api(`/api/admin/gads/queued`);
+      setQueued(d.queued || []);
+    } catch(e) { console.error('Queued load error', e); }
+  }, []);
+
+  const loadImpact = React.useCallback(async () => {
+    try {
+      const d = await api(`/api/admin/optimizer/account/impact?days=90`);
+      setAccImpact(d);
+    } catch(e) { console.error('Impact load error', e); }
+  }, []);
+
+  React.useEffect(() => { loadRecs(); loadQueued(); loadImpact(); }, [loadRecs, loadQueued, loadImpact]);
+
+  // Approve = queue (hold until Push to Google)
+  const handleQueue = async (actionId) => {
+    await api(`/api/admin/gads/queue/${actionId}`, {method:'POST'});
+    await loadQueued();
+    await loadRecs();
+  };
+
+  const handleIgnore = async (actionId) => {
+    await api(`/api/admin/gads/reject/${actionId}`, {method:'POST', body:JSON.stringify({reason:''})});
+    await loadRecs();
+  };
+
+  const handleRefine = async (actionId, feedback) => {
+    await api(`/api/admin/gads/refine/${actionId}`, {method:'POST', body:JSON.stringify({feedback})});
+    await loadRecs();
+  };
+
+  const handleUnqueue = async (actionId) => {
+    await api(`/api/admin/gads/unqueue/${actionId}`, {method:'POST'});
+    await loadQueued();
+    await loadRecs();
+  };
+
+  // Bulk approve → queue all selected
+  const handleBulkQueue = async () => {
+    const ids = [...selected];
+    if (!ids.length) return;
+    setBulkBusy(true); setBulkMsg('');
+    try {
+      let ok = 0, fail = 0;
+      for (const id of ids) {
+        try { await api(`/api/admin/gads/queue/${id}`, {method:'POST'}); ok++; }
+        catch(e) { fail++; }
+      }
+      setBulkMsg(`✓ ${ok} queued${fail > 0 ? `, ${fail} failed` : ''}`);
+      setSelected(new Set());
+      await loadQueued();
+      await loadRecs();
+    } catch(e) { setBulkMsg('✗ ' + (e.message||'Bulk queue failed')); }
+    finally { setBulkBusy(false); }
+  };
+
+  // Push all queued → Google Ads
+  const handlePushToGoogle = async () => {
+    setPushBusy(true); setPushResult(null);
+    try {
+      const r = await api(`/api/admin/gads/push-queued`, {method:'POST'});
+      setPushResult(r);
+      await loadQueued();
+      await loadRecs();
+      await loadImpact();
+    } catch(e) { setPushResult({error: e.message||'Push failed'}); }
+    finally { setPushBusy(false); }
+  };
+
+  // What "Push" actually does for each operation type
+  const OP_EFFECT = {
+    add_negative_keyword: { live: true,  note: 'Adds negative keyword to campaign.' },
+    add_exact_keyword:    { live: true,  note: 'Adds keyword as exact match to ad group.' },
+    pause_keyword:        { live: true,  note: 'Pauses this keyword.' },
+    enable_keyword:       { live: true,  note: 'Re-enables a paused keyword.' },
+    increase_bid:         { live: true,  note: 'Raises max CPC bid.' },
+    decrease_bid:         { live: true,  note: 'Lowers max CPC bid.' },
+    tighten_match_type:   { live: true,  note: 'Adds exact match, pauses broad match.' },
+    ad_copy_suggestion:   { live: true,  note: 'Updates RSA via API (needs ad_resource).' },
+    geo_exclusion:        { live: true,  note: 'Adds negative geo target to campaign.' },
+    change_budget:        { live: true,  note: 'Updates daily budget (max +25%, $5–$500).' },
+    claude_advisory:      { live: false, note: 'Advisory — acknowledged only, no API call.' },
+  };
+
+  // Flatten all recs — then filter to this campaign if we're inside a campaign card
+  // campName is empty when opened from the standalone Admin optimizer view (shows all)
+  const campLower = (campName || '').trim().toLowerCase();
+  const allRecs    = Object.values(recs?.recommendations||{}).flat();
+  const matchesCamp = r => {
+    if (!campLower) return true; // account-level view — show everything
+    const rCamp = (r.campaign_name || '').trim().toLowerCase();
+    return rCamp === campLower || rCamp === '' || !rCamp; // show recs for this campaign + unattributed
+  };
+  const pending    = allRecs.filter(r => r.execution_result === 'pending_approval' && matchesCamp(r));
+  const applied    = allRecs.filter(r => r.execution_result === 'success'          && matchesCamp(r));
+  const ignored    = allRecs.filter(r => r.execution_result === 'rejected'         && matchesCamp(r));
+
+  function CampBadge({ name }) {
+    if (!name) return <span style={{fontSize:9,background:'#f3f4f6',color:'#6b7280',padding:'1px 6px',borderRadius:3}}>Account</span>;
+    return <span style={{fontSize:9,background:'#eff6ff',color:'#1d4ed8',padding:'1px 6px',borderRadius:3,fontWeight:600,maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{name}</span>;
+  }
+
+  function EffectBadge({ op }) {
+    const e = OP_EFFECT[op] || { live: false, note: 'No API call.' };
+    return (
+      <span style={{fontSize:9,padding:'1px 6px',borderRadius:3,fontWeight:600,
+        background: e.live ? '#f0fdf4' : '#fef9c3',
+        color: e.live ? '#166534' : '#854d0e',
+        border: `1px solid ${e.live ? '#bbf7d0' : '#fde68a'}`}}>
+        {e.live ? '⚡' : 'ℹ️'} {e.note}
+      </span>
+    );
+  }
+
+  function AppliedBadge({ rec }) {
+    // api_executed: 1 = actually hit Google Ads API; 0 = acknowledged only
+    const hit = rec.api_executed == 1 || rec.api_executed === true;
+    return (
+      <span style={{fontSize:10,fontWeight:700,padding:'1px 7px',borderRadius:10,
+        background: hit ? '#dcfce7' : '#fef9c3',
+        color:      hit ? '#15803d' : '#92400e',
+        border:     `1px solid ${hit ? '#86efac' : '#fde68a'}`}}>
+        {hit ? '⚡ Pushed to Google' : '📋 Acknowledged'}
+      </span>
+    );
+  }
+
+  function RecRow({ rec, showActions }) {
+    return (
+      <div style={{marginBottom:8, opacity: rec.execution_result==='rejected' ? 0.65 : 1}}>
+        <div style={{display:'flex',alignItems:'center',gap:5,marginBottom:3,flexWrap:'wrap'}}>
+          <CampBadge name={rec.campaign_name} />
+          <EffectBadge op={rec.operation} />
+        </div>
+        {showActions
+          ? <RecommendationCard rec={rec} onQueue={handleQueue} onIgnore={handleIgnore} onRefine={handleRefine} />
+          : <div style={{padding:'7px 10px',borderRadius:6,border:'1px solid var(--border)',
+              background: rec.execution_result==='success'?'#f0fdf4': rec.execution_result==='queued'?'#f7fee7':'#fafafa',
+              fontSize:11,display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+              <span>{(OP_LABELS[rec.operation]?.icon)||'•'}</span>
+              <span style={{fontWeight:600,maxWidth:180,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{rec.entity_name}</span>
+              <span style={{color:'var(--text-muted)',fontSize:10}}>{OP_LABELS[rec.operation]?.label||rec.operation}</span>
+              <span style={{marginLeft:'auto',display:'flex',gap:6,alignItems:'center'}}>
+                {rec.execution_result==='success' && <AppliedBadge rec={rec} />}
+                {rec.execution_result==='queued' && <span style={{fontSize:10,fontWeight:700,color:'#4d7c0f'}}>🟢 Queued</span>}
+                {rec.execution_result==='rejected' && <span style={{fontSize:10,color:'#94a3b8'}}>❌ Ignored</span>}
+                <span style={{fontSize:9,color:'var(--text-muted)'}}>{(rec.approved_at||rec.updated_at||'').slice(0,10)}</span>
+              </span>
+            </div>
+        }
+      </div>
+    );
+  }
+
+  // Account impact breakdown
+  function AccountImpactPanel() {
+    if (!accountImpact) return null;
+    const ai = accountImpact;
+    const verdicts = ai.verdicts || {};
+    return (
+      <div style={{marginBottom:14,padding:'10px 14px',background:'#f8fafc',
+        borderRadius:8,border:'1px solid var(--border)',fontSize:11}}>
+        <div style={{fontWeight:700,fontSize:12,marginBottom:8,color:'var(--text-main)'}}>
+          📊 Account-Level Impact (last 90d)
+        </div>
+        {/* Totals row */}
+        <div style={{display:'flex',gap:16,marginBottom:10,flexWrap:'wrap'}}>
+          <span><b>{ai.total_applied||0}</b> actions applied</span>
+          <span style={{color:'#16a34a'}}><b>{ai.total_api_pushed||0}</b> ⚡ pushed to Google</span>
+          <span style={{color:'#92400e'}}><b>{ai.total_acknowledged_only||0}</b> 📋 acknowledged only</span>
+          {verdicts.improved > 0 && <span style={{color:'#16a34a'}}>✅ {verdicts.improved} improved</span>}
+          {verdicts.neutral > 0 && <span style={{color:'#d97706'}}>➖ {verdicts.neutral} neutral</span>}
+          {verdicts.degraded > 0 && <span style={{color:'#dc2626'}}>⚠️ {verdicts.degraded} degraded</span>}
+        </div>
+        {/* Per-campaign breakdown */}
+        {(ai.by_campaign||[]).length > 0 && (
+          <div>
+            <div style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.04em'}}>By Campaign</div>
+            <div style={{display:'flex',flexDirection:'column',gap:3}}>
+              {(ai.by_campaign||[]).slice(0,8).map(c=>(
+                <div key={c.campaign_name} style={{display:'flex',alignItems:'center',gap:8,fontSize:11}}>
+                  <span style={{flex:1,fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{c.campaign_name}</span>
+                  <span style={{color:'#64748b'}}>{c.applied} applied</span>
+                  <span style={{color:'#16a34a'}}>{c.api_pushed} ⚡</span>
+                  <span style={{color:'#94a3b8',fontSize:9}}>{(c.last_action||'').slice(0,10)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {/* Per-operation breakdown */}
+        {(ai.by_operation||[]).length > 0 && (
+          <div style={{marginTop:8,paddingTop:8,borderTop:'1px solid var(--border)'}}>
+            <div style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.04em'}}>By Action Type</div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+              {(ai.by_operation||[]).map(o=>(
+                <span key={o.operation} style={{fontSize:10,padding:'2px 8px',borderRadius:10,
+                  background:'#f1f5f9',border:'1px solid var(--border)',color:'#475569'}}>
+                  {OP_LABELS[o.operation]?.icon||'•'} {OP_LABELS[o.operation]?.label||o.operation}: <b>{o.total}</b>
+                  {o.api_pushed > 0 ? ` (${o.api_pushed} ⚡)` : ''}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{padding:'4px 0'}}>
+
+      {/* ── Account Impact Panel ── */}
+      <AccountImpactPanel />
+
+      {/* ── Queued / Push to Google Panel ── always shows account total, push pushes ALL ── */}
+      {queued.length > 0 && (
+        <div style={{marginBottom:14,padding:'10px 14px',background:'#f0fdf4',
+          borderRadius:8,border:'2px solid #86efac'}}>
+          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8,flexWrap:'wrap'}}>
+            <span style={{fontWeight:700,fontSize:12,color:'#14532d'}}>
+              🟢 {queued.length} change{queued.length!==1?'s':''} queued across all campaigns
+            </span>
+            {campLower && queued.filter(q=>(q.campaign_name||'').toLowerCase()===campLower).length > 0 &&
+              <span style={{fontSize:11,color:'#4d7c0f'}}>
+                ({queued.filter(q=>(q.campaign_name||'').toLowerCase()===campLower).length} for this campaign)
+              </span>
+            }
+            <button onClick={handlePushToGoogle} disabled={pushBusy}
+              style={{padding:'5px 18px',fontSize:12,fontWeight:700,borderRadius:6,cursor:'pointer',
+                border:'2px solid #15803d',
+                background:pushBusy?'#dcfce7':'#15803d',
+                color:pushBusy?'#15803d':'#fff',marginLeft:'auto'}}>
+              {pushBusy ? '⏳ Pushing…' : '🚀 Push All to Google Ads'}
+            </button>
+          </div>
+          {/* Queued list — show all campaigns' items, highlight current campaign */}
+          <div style={{display:'flex',flexDirection:'column',gap:4}}>
+            {queued.map(q=>{
+              const op = OP_LABELS[q.operation]||{icon:'•',label:q.operation};
+              const e = OP_EFFECT[q.operation]||{live:false};
+              const isCurrent = campLower && (q.campaign_name||'').toLowerCase() === campLower;
+              return (
+                <div key={q.action_id} style={{display:'flex',alignItems:'center',gap:8,
+                  padding:'5px 8px',borderRadius:5,fontSize:11,
+                  background: isCurrent ? '#f0fdf4' : '#fff',
+                  border:`1px solid ${isCurrent ? '#86efac' : '#d1fae5'}`}}>
+                  <span>{op.icon}</span>
+                  <span style={{fontWeight:600,flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{q.entity_name}</span>
+                  <span style={{fontSize:9,color:'#64748b'}}>{op.label}</span>
+                  {q.campaign_name && <CampBadge name={q.campaign_name} />}
+                  <span style={{fontSize:9,color: e.live?'#16a34a':'#92400e'}}>{e.live?'⚡ API':'📋 Ack'}</span>
+                  <button onClick={()=>handleUnqueue(q.action_id)}
+                    title="Move back to pending"
+                    style={{fontSize:9,padding:'1px 6px',borderRadius:3,cursor:'pointer',
+                      border:'1px solid #fca5a5',background:'#fff',color:'#dc2626'}}>
+                    ✕
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          {/* Push result */}
+          {pushResult && !pushResult.error && (
+            <div style={{marginTop:8,fontSize:11,padding:'6px 10px',borderRadius:5,
+              background:'#dcfce7',border:'1px solid #86efac',color:'#14532d'}}>
+              ✅ Pushed: <b>{pushResult.summary?.pushed_to_google||0} to Google Ads</b>
+              {pushResult.summary?.acknowledged_only > 0 && `, ${pushResult.summary.acknowledged_only} acknowledged`}
+              {pushResult.summary?.error > 0 && <span style={{color:'#dc2626'}}>, {pushResult.summary.error} failed</span>}
+            </div>
+          )}
+          {pushResult?.error && (
+            <div style={{marginTop:8,fontSize:11,padding:'6px 10px',borderRadius:5,
+              background:'#fee2e2',border:'1px solid #fca5a5',color:'#991b1b'}}>
+              ✗ {pushResult.error}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Bulk approve toolbar ── */}
+      {pending.length > 1 && (
+        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,padding:'6px 10px',
+          background:'#f0f9ff',borderRadius:5,border:'1px solid #bae6fd',fontSize:11}}>
+          <input type="checkbox"
+            checked={selected.size === pending.length}
+            onChange={e=>setSelected(e.target.checked ? new Set(pending.map(r=>r.action_id)) : new Set())} />
+          <span style={{color:'#0369a1'}}>{selected.size ? `${selected.size} selected` : `Select all ${pending.length} pending`}</span>
+          {selected.size > 0 && (
+            <button onClick={handleBulkQueue} disabled={bulkBusy}
+              style={{padding:'3px 12px',fontSize:11,fontWeight:600,borderRadius:4,cursor:'pointer',
+                border:'1px solid #65a30d',background:bulkBusy?'#f7fee7':'#65a30d',
+                color:bulkBusy?'#65a30d':'#fff',marginLeft:4}}>
+              {bulkBusy?'Queueing…':`✓ Approve ${selected.size} → Queue`}
+            </button>
+          )}
+          {bulkMsg && <span style={{color:bulkMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{bulkMsg}</span>}
+        </div>
+      )}
+
+      {loading ? (
+        <div style={{padding:'16px',textAlign:'center',color:'var(--text-muted)',fontSize:11}}>Loading…</div>
+      ) : (
+        <>
+          {/* ── Pending ── */}
+          {pending.length > 0 && (
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+                letterSpacing:'.05em',marginBottom:8}}>
+                Pending — {pending.length} recommendation{pending.length!==1?'s':''}
+              </div>
+              {pending.map(rec=>(
+                <div key={rec.action_id} style={{display:'flex',alignItems:'flex-start',gap:6}}>
+                  {pending.length > 1 && (
+                    <input type="checkbox" style={{marginTop:14}}
+                      checked={selected.has(rec.action_id)}
+                      onChange={e=>{const s=new Set(selected);e.target.checked?s.add(rec.action_id):s.delete(rec.action_id);setSelected(s);}} />
+                  )}
+                  <div style={{flex:1}}><RecRow rec={rec} showActions={true} /></div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {pending.length === 0 && applied.length === 0 && ignored.length === 0 && queued.length === 0 && (
+            <div style={{padding:'24px',textAlign:'center',color:'var(--text-muted)',fontSize:11}}>
+              No recommendations yet across any campaign.<br/>
+              <span style={{fontSize:10}}>Run the optimizer (Dashboard → AI Optimizer → Run Now) to generate new ones.</span>
+            </div>
+          )}
+
+          {/* ── Applied / Ignored history toggle ── */}
+          {(applied.length > 0 || ignored.length > 0) && (
+            <div>
+              <button onClick={()=>setShowHistory(h=>!h)}
+                style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',background:'none',border:'none',
+                  cursor:'pointer',textTransform:'uppercase',letterSpacing:'.05em',marginBottom:8}}>
+                {showHistory ? '▾' : '▸'} History — {applied.length} applied, {ignored.length} ignored
+              </button>
+
+              {showHistory && (
+                <>
+                  {/* ── Applied history ── */}
+                  {applied.length > 0 && (
+                    <div style={{marginBottom:12}}>
+                      <div style={{fontSize:10,fontWeight:600,color:'#64748b',textTransform:'uppercase',
+                        letterSpacing:'.04em',marginBottom:6}}>Applied — {applied.length}</div>
+                      {applied.map(rec=><RecRow key={rec.action_id} rec={rec} showActions={false} />)}
+                    </div>
+                  )}
+                  {/* ── Ignored history ── */}
+                  {ignored.length > 0 && (
+                    <div>
+                      <div style={{fontSize:10,fontWeight:600,color:'#64748b',textTransform:'uppercase',
+                        letterSpacing:'.04em',marginBottom:6}}>Ignored — {ignored.length}</div>
+                      {ignored.map(rec=><RecRow key={rec.action_id} rec={rec} showActions={false} />)}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, colSpan }) {
   const [panelTab, setPanelTab] = useState('analytics');
   const campName = (campaign.campaign||'').toLowerCase();
@@ -2306,6 +2921,8 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, co
           {panelTab==='trend' && (
             <CampaignTrendChart campaignName={campaign.campaign||''} dailyStats={dailyStats||[]} />
           )}
+
+          {/* Optimization moved to AI Optimizer tab */}
         </div>
       </td>
     </tr>
@@ -3030,6 +3647,23 @@ function _gradeBadge(score) {
     background:color+'22',color,border:`1px solid ${color}44`}}>{score}%</span>;
 }
 
+function _patientBadge(status, name) {
+  if (!status) return <span style={{color:'var(--text-muted)',fontSize:10}}>—</span>;
+  const cfg = {
+    new_patient:        { bg:'#f0fdf4', color:'#15803d', label:'🆕 New' },
+    existing_active:    { bg:'#eff6ff', color:'#1d4ed8', label:'✅ Existing' },
+    existing_inactive:  { bg:'#fefce8', color:'#a16207', label:'😴 Inactive' },
+    unknown:            { bg:'#f8fafc', color:'#64748b', label:'?' },
+  };
+  const c = cfg[status] || cfg.unknown;
+  return (
+    <span title={name||status} style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
+      background:c.bg,color:c.color,border:`1px solid ${c.color}33`,whiteSpace:'nowrap'}}>
+      {c.label}
+    </span>
+  );
+}
+
 // ── CallsSubView — enhanced call list with analysis columns ───────────────────
 
 function CallsSubView() {
@@ -3054,6 +3688,9 @@ function CallsSubView() {
   // Per-call grade-only state: { uuid: 'idle'|'working'|'done'|'error' }
   const [gradeOnlyState, setGradeOnlyState] = useState({});
   const [gradeOnlyError, setGradeOnlyError] = useState({});
+  // GAds unmatched row — match + transcribe state: { call_id: 'idle'|'matching'|'no_record'|'error' }
+  const [matchState, setMatchState] = useState({});
+  const [matchError, setMatchError] = useState({});
   // Bulk job state
   const [bulkJob, setBulkJob] = useState(null); // {id, status, total, done, errors, current_label}
   const [bulkStarting, setBulkStarting] = useState(false);
@@ -3106,6 +3743,32 @@ function CallsSubView() {
     finally { setSyncing(false); }
   }
 
+  // GAds call view sync + reconcile
+  const [convSyncState, setConvSyncState] = useState('idle'); // idle|syncing-gads|syncing-mango|reconciling|done|error
+  const [convSyncMsg, setConvSyncMsg]     = useState('');
+
+  async function handleSyncAll() {
+    setConvSyncMsg('');
+    try {
+      // Step 1: sync Mango calls
+      setConvSyncState('syncing-mango');
+      const m = await api('/api/admin/calls/sync', { method: 'POST' });
+      // Step 2: sync GAds call_view
+      setConvSyncState('syncing-gads');
+      const g = await api('/api/admin/gads/sync-call-view', { method: 'POST' });
+      // Step 3: reconcile (match GAds rows to Mango rows)
+      setConvSyncState('reconciling');
+      const r = await api('/api/admin/calls/reconcile', { method: 'POST' });
+      setConvSyncState('done');
+      setConvSyncMsg(`✓ Mango: ${m.synced} calls · GAds: ${g.synced} rows · Matched: ${r.attributed}`);
+      await loadCalls();
+      await loadConversions();
+    } catch(e) {
+      setConvSyncState('error');
+      setConvSyncMsg('✗ ' + (e.message || 'Sync failed'));
+    }
+  }
+
   // ── Per-call analyze ──────────────────────────────────────────────────────
   async function handleAnalyze(uuid) {
     setAnalyzeState(s => ({...s, [uuid]: 'processing'}));
@@ -3146,6 +3809,42 @@ function CallsSubView() {
       setAnalyzeError(err => ({...err, [uuid]: 'Failed to start: ' + (e.message||'error')}));
       setCalls(cs => cs.map(c => c.uuid === uuid ? {...c, transcription_status: null} : c));
     }
+  }
+
+  function PlayButton({uuid}) {
+    const [pState, setPState] = React.useState('idle'); // idle | loading | playing | error
+    const audioRef = React.useRef(null);
+    const url = `/api/admin/calls/recording/${uuid}/play`;
+    const toggle = e => {
+      e.stopPropagation();
+      if (pState === 'playing') {
+        audioRef.current && audioRef.current.pause();
+        setPState('idle');
+        return;
+      }
+      if (!audioRef.current) {
+        const a = new Audio(url);
+        audioRef.current = a;
+        a.onended = () => setPState('idle');
+        a.onerror = () => setPState('error');
+      }
+      setPState('loading');
+      audioRef.current.play()
+        .then(() => setPState('playing'))
+        .catch(() => setPState('error'));
+    };
+    React.useEffect(() => () => { audioRef.current && audioRef.current.pause(); }, []);
+    const label = pState === 'loading' ? '⏳' : pState === 'playing' ? '⏸' : pState === 'error' ? '⚠' : '▶';
+    const color  = pState === 'error' ? '#dc2626' : pState === 'playing' ? '#7c3aed' : '#0369a1';
+    const bg     = pState === 'error' ? '#fef2f2' : pState === 'playing' ? '#f5f3ff' : '#e0f2fe';
+    const border = pState === 'error' ? '#dc2626' : pState === 'playing' ? '#7c3aed' : '#0369a1';
+    return (
+      <button onClick={toggle} title={pState==='playing'?'Pause':'Play recording (auto-deleted after 60 min)'}
+        style={{fontSize:11,padding:'3px 8px',border:`1px solid ${border}`,borderRadius:3,
+          cursor:'pointer',color,background:bg,whiteSpace:'nowrap'}}>
+        {label}
+      </button>
+    );
   }
 
   function analyzeButton(call) {
@@ -3290,12 +3989,57 @@ function CallsSubView() {
     } catch(e) { return {ok: false, error: e.message}; }
   }
 
+  // For unmatched GAds rows: widen reconciler window to find the Mango record, then transcribe
+  async function handleMatchAndTranscribe(callId) {
+    setMatchState(s => ({...s, [callId]: 'matching'}));
+    setMatchError(e => ({...e, [callId]: null}));
+    try {
+      const d = await api(`/api/admin/gads/${callId}/match-and-transcribe`, { method: 'POST' });
+      if (d.ok && d.uuid) {
+        // Matched — refresh convCalls so the row turns green and gets normal buttons
+        await loadConversions();
+        // Also kick off polling on the newly-matched call (it was queued for transcription)
+        setAnalyzeState(s => ({...s, [d.uuid]: 'polling'}));
+        let attempts = 0;
+        const MAX = 24;
+        const poll = setInterval(async () => {
+          attempts++;
+          try {
+            const updated = await api(`/api/admin/calls/${d.uuid}`);
+            const st = updated.transcription_status;
+            setCalls(cs => cs.map(c => c.uuid === d.uuid ? {...c, ...updated} : c));
+            if (st === 'done' || st === 'failed' || attempts >= MAX) {
+              clearInterval(poll);
+              delete activePolls.current[d.uuid];
+              setAnalyzeState(s => ({...s, [d.uuid]: st === 'done' ? 'done' : 'error'}));
+              if (st === 'failed') setAnalyzeError(e => ({...e, [d.uuid]: 'Analysis failed'}));
+              // Refresh conv panel so transcript/grade columns update
+              await loadConversions();
+            }
+          } catch(err) {
+            clearInterval(poll);
+            delete activePolls.current[d.uuid];
+            setAnalyzeState(s => ({...s, [d.uuid]: 'error'}));
+          }
+        }, 5000);
+        activePolls.current[d.uuid] = poll;
+        setMatchState(s => ({...s, [callId]: 'idle'}));
+      }
+    } catch(e) {
+      const noRecord = e.message && e.message.includes('No PBX recording');
+      setMatchState(s => ({...s, [callId]: noRecord ? 'no_record' : 'error'}));
+      setMatchError(err => ({...err, [callId]: e.message || 'Failed'}));
+    }
+  }
+
   async function handleGradeOnly(uuid) {
     setGradeOnlyState(s => ({...s, [uuid]: 'working'}));
     setGradeOnlyError(e => ({...e, [uuid]: null}));
     try {
       const d = await api(`/api/admin/calls/${uuid}/grade`, { method: 'POST' });
-      if (d.ok && d.call) updateCallInState(uuid, d.call);
+      if (d.ok && d.call) {
+        updateCallInState(uuid, d.call);
+      }
       setGradeOnlyState(s => ({...s, [uuid]: 'done'}));
       setTimeout(() => setGradeOnlyState(s => ({...s, [uuid]: 'idle'})), 3000);
     } catch(e) {
@@ -3356,11 +4100,28 @@ function CallsSubView() {
               <option value={120}>≥2 min</option>
               <option value={180}>≥3 min</option>
             </select>
+            <button onClick={e=>{e.stopPropagation();handleSyncAll();}}
+                    disabled={convSyncState==='syncing-mango'||convSyncState==='syncing-gads'||convSyncState==='reconciling'}
+                    style={{fontSize:11,padding:'3px 10px',border:'1px solid #0369a1',borderRadius:4,cursor:'pointer',
+                      background:convSyncState==='done'?'#f0fdf4':convSyncState==='error'?'#fef2f2':'#eff6ff',
+                      color:convSyncState==='done'?'#16a34a':convSyncState==='error'?'#dc2626':'#0369a1',
+                      fontWeight:600,whiteSpace:'nowrap'}}>
+              {convSyncState==='syncing-mango' ? '⏳ Syncing Mango…'
+               : convSyncState==='syncing-gads' ? '⏳ Syncing GAds…'
+               : convSyncState==='reconciling'  ? '⏳ Matching…'
+               : convSyncState==='done'         ? '✓ Synced'
+               : convSyncState==='error'        ? '✗ Failed'
+               : '⟳ Sync All'}
+            </button>
+            {convSyncMsg && (
+              <span style={{fontSize:10,color:convSyncState==='error'?'#dc2626':'#16a34a',maxWidth:220,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                    title={convSyncMsg}>{convSyncMsg}</span>
+            )}
             <span style={{fontSize:11,color:'var(--text-muted)'}}>{convExpanded ? '▲' : '▼'}</span>
           </div>
         </div>
 
-        {/* Expanded table */}
+        {/* Expanded table — same columns/rows/drawer as main calls list */}
         {convExpanded && (
           convCalls.length === 0
           ? <div style={{padding:'12px 14px',fontSize:12,color:'var(--text-muted)',fontStyle:'italic'}}>
@@ -3370,50 +4131,89 @@ function CallsSubView() {
               <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
                 <thead>
                   <tr style={{background:'#f8fafc',borderTop:'1px solid var(--border)'}}>
-                    {['Time (GAds)','Campaign','Area Code','Duration','Status','Caller Number','Answered By','Grade','Lead','Transcript'].map(h=>(
-                      <th key={h} style={{padding:'6px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap',borderBottom:'1px solid var(--border)'}}>{h}</th>
+                    {['Time','Dir','From','To','Answered By','Duration','Status','Attribution','Transcript','Grade','Actions','Play'].map(h=>(
+                      <th key={h} style={{padding:'8px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap',borderBottom:'1px solid var(--border)'}}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {convCalls.map((c,i)=>{
                     const matched = !!c.mango_uuid;
-                    const ts = c.start_call_date_time ? new Date(c.start_call_date_time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}) : '—';
-                    const dur = c.gads_duration_sec ? _fmtDur(c.gads_duration_sec) : '—';
+                    // Build a call-shaped object for rows that came from a matched Mango record
+                    // For unmatched rows we still render the row but greyed out / no actions
                     const isConv = (c.gads_duration_sec||0) >= 60;
+                    const callObj = matched ? {
+                      ...c,
+                      uuid: c.mango_uuid,
+                      started_at: c.started_at || c.start_call_date_time,
+                      attribution_label: 'Ad call ✓',
+                    } : null;
+                    const ts = (c.started_at || c.start_call_date_time)
+                      ? new Date(c.started_at || c.start_call_date_time).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true})
+                      : '—';
                     return (
-                      <tr key={c.call_id||i} style={{borderBottom:'1px solid var(--border)',background:matched?'#f0fdf4':'#fffbeb'}}>
-                        <td style={{padding:'6px 10px',whiteSpace:'nowrap'}}>
+                      <tr key={c.call_id||i}
+                          onClick={matched ? ()=>openDrawer(callObj) : undefined}
+                          style={{borderBottom:'1px solid var(--border)',
+                            background: drawerCall&&drawerCall.uuid===c.mango_uuid ? '#dbeafe'
+                              : matched ? '#f0fdf4' : '#fffbeb',
+                            cursor:matched?'pointer':'default'}}>
+                        <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
                           {ts}
                           {isConv && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
                         </td>
-                        <td style={{padding:'6px 10px',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={c.campaign_name||''}>{c.campaign_name||'—'}</td>
-                        <td style={{padding:'6px 10px',fontFamily:'monospace'}}>{c.caller_area_code ? `(${c.caller_area_code}) ***-****` : '—'}</td>
-                        <td style={{padding:'6px 10px',fontFamily:'monospace'}}>{dur}</td>
-                        <td style={{padding:'6px 10px'}}>
-                          <span style={{fontSize:10,fontWeight:700,color:c.gads_call_status==='RECEIVED'?'#16a34a':'#94a3b8'}}>{c.gads_call_status||'—'}</span>
-                        </td>
-                        {/* Mango-enriched columns */}
-                        <td style={{padding:'6px 10px',fontFamily:'monospace'}}>
+                        <td style={{padding:'8px 10px'}}>
                           {matched
-                            ? <span style={{color:'#0f172a',fontWeight:600}}>{c.from_number||'—'}</span>
-                            : <span style={{color:'#94a3b8',fontStyle:'italic'}}>unmatched</span>}
+                            ? <span style={{fontSize:10,fontWeight:600,color:c.direction==='inbound'?'#0369a1':'#7c3aed'}}>{c.direction==='inbound'?'↙ IN':'↗ OUT'}</span>
+                            : <span style={{fontSize:10,color:'#94a3b8'}}>↙ IN</span>}
                         </td>
-                        <td style={{padding:'6px 10px'}}>{c.team_member||c.answered_by||'—'}</td>
-                        <td style={{padding:'6px 10px'}}>
-                          {c.grade_overall_score != null
-                            ? _gradeBadge(c.grade_overall_score)
-                            : <span style={{color:'var(--text-muted)',fontSize:11}}>{matched?(c.transcription_status==='done'?'Not graded':'No transcript'):'—'}</span>}
+                        <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>
+                          {matched
+                            ? <span style={{fontWeight:600}}>{c.from_number||'—'}</span>
+                            : <span style={{color:'#94a3b8',fontStyle:'italic'}}>{c.caller_area_code?`(${c.caller_area_code}) ***-****`:'unmatched'}</span>}
                         </td>
-                        <td style={{padding:'6px 10px'}}>
-                          {c.lead_name
-                            ? <span style={{fontSize:11,color:'#0369a1',fontWeight:600}}>{c.lead_name}</span>
-                            : <span style={{color:'var(--text-muted)',fontSize:11}}>—</span>}
+                        <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>{c.to_number||'(508) 318-4477'}</td>
+                        <td style={{padding:'8px 10px',fontWeight:600}}>{c.team_member||c.answered_by||'—'}</td>
+                        <td style={{padding:'8px 10px'}}>{c.duration_sec ? _fmtDur(c.duration_sec) : c.gads_duration_sec ? _fmtDur(c.gads_duration_sec) : '—'}</td>
+                        <td style={{padding:'8px 10px'}}>{matched ? _statusBadge(c.mango_status||c.status) : <span style={{fontSize:10,fontWeight:700,color:'#94a3b8'}}>{c.gads_call_status||'—'}</span>}</td>
+                        <td style={{padding:'8px 10px'}}>
+                          {matched
+                            ? <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,background:'#0369a133',color:'#0369a1',border:'1px solid #0369a144'}}>Ad call ✓</span>
+                            : <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,background:'#f1f5f9',color:'#94a3b8',border:'1px solid #e2e8f0'}}>unmatched</span>}
                         </td>
-                        <td style={{padding:'6px 10px',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={c.call_summary||''}>
-                          {c.call_summary
-                            ? <span style={{fontSize:10,color:'var(--text-muted)'}}>{c.call_summary.slice(0,80)}{c.call_summary.length>80?'…':''}</span>
-                            : <span style={{color:'var(--text-muted)',fontSize:11}}>—</span>}
+                        <td style={{padding:'8px 10px'}}>{matched ? _transcriptBadge(c.transcription_status) : <span style={{color:'var(--text-muted)'}}>—</span>}</td>
+                        <td style={{padding:'8px 10px'}}>{matched ? _gradeBadge(c.grade_overall_score) : <span style={{color:'var(--text-muted)'}}>—</span>}</td>
+                        <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}>
+                          {matched ? analyzeButton(callObj) : (()=>{
+                            const ms = matchState[c.call_id] || 'idle';
+                            const me = matchError[c.call_id];
+                            if (ms === 'matching') return <span style={{fontSize:11,color:'#d97706'}}>⚙ Finding…</span>;
+                            if (ms === 'no_record') return (
+                              <span style={{fontSize:10,color:'#94a3b8'}} title={me||'No PBX recording for this call'}>
+                                No recording
+                              </span>
+                            );
+                            if (ms === 'error') return (
+                              <span style={{display:'flex',gap:4,alignItems:'center'}}>
+                                <button onClick={()=>handleMatchAndTranscribe(c.call_id)}
+                                  style={{fontSize:9,padding:'2px 6px',border:'1px solid #dc2626',borderRadius:3,cursor:'pointer',color:'#dc2626',background:'#fef2f2'}}>
+                                  ↺ Retry
+                                </button>
+                                <span style={{fontSize:9,color:'#dc2626'}} title={me}>⚠</span>
+                              </span>
+                            );
+                            return (
+                              <button onClick={()=>handleMatchAndTranscribe(c.call_id)}
+                                title="Search for Mango PBX recording and transcribe"
+                                style={{fontSize:9,padding:'2px 6px',border:'1px solid #0369a1',borderRadius:3,cursor:'pointer',
+                                  color:'#0369a1',background:'#e0f2fe',whiteSpace:'nowrap'}}>
+                                🎙 Transcribe
+                              </button>
+                            );
+                          })()}
+                        </td>
+                        <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}>
+                          {matched ? <PlayButton uuid={c.mango_uuid} /> : <span style={{color:'var(--text-muted)'}}>—</span>}
                         </td>
                       </tr>
                     );
@@ -3421,7 +4221,7 @@ function CallsSubView() {
                 </tbody>
               </table>
               <div style={{padding:'6px 14px',fontSize:10,color:'var(--text-muted)',borderTop:'1px solid var(--border)'}}>
-                🟢 Green rows = matched to Mango call record (full caller ID visible) · 🟡 Yellow = GAds call with no Mango match yet · CONV badge = duration ≥60s (counts as conversion)
+                🟢 Matched = full Mango record (click to open) · 🟡 Unmatched = GAds call not yet linked to PBX · CONV badge = ≥60s
               </div>
             </div>
         )}
@@ -3504,7 +4304,7 @@ function CallsSubView() {
         <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
           <thead>
             <tr style={{background:'var(--bg-card)',borderBottom:'1px solid var(--border)'}}>
-              {['Time','Dir','From','To','Answered By','Duration','Status','Attribution','Transcript','Grade','Actions'].map(h=>(
+              {['Time','Dir','From','To','Answered By','Duration','Status','Patient','Attribution','Transcript','Grade','Actions','Play'].map(h=>(
                 <th key={h} style={{padding:'8px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',whiteSpace:'nowrap'}}>{h}</th>
               ))}
             </tr>
@@ -3520,7 +4320,10 @@ function CallsSubView() {
                 <tr onClick={()=>openDrawer(call)}
                   style={{borderBottom:'1px solid var(--border)',cursor:'pointer',
                     background:drawerCall&&drawerCall.uuid===call.uuid?'#dbeafe':call.status==='missed'?'#fef2f2':'#fff'}}>
-                  <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>{_fmtTime(call.started_at)}</td>
+                  <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
+                    {_fmtTime(call.started_at)}
+                    {(call.gads_duration_sec||0)>=60 && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
+                  </td>
                   <td style={{padding:'8px 10px'}}>
                     <span style={{fontSize:10,fontWeight:600,color:call.direction==='inbound'?'#0369a1':'#7c3aed'}}>
                       {call.direction==='inbound'?'↙ IN':'↗ OUT'}
@@ -3531,10 +4334,12 @@ function CallsSubView() {
                   <td style={{padding:'8px 10px',fontWeight:600}}>{call.answered_by||'—'}</td>
                   <td style={{padding:'8px 10px'}}>{_fmtDur(call.duration_sec)}</td>
                   <td style={{padding:'8px 10px'}}>{_statusBadge(call.status)}</td>
+                  <td style={{padding:'8px 10px'}}>{_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}</td>
                   <td style={{padding:'8px 10px'}}>{_attrBadge(call)}</td>
                   <td style={{padding:'8px 10px'}}>{_transcriptBadge(call.transcription_status)}</td>
                   <td style={{padding:'8px 10px'}}>{_gradeBadge(call.grade_overall_score)}</td>
                   <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}>{analyzeButton(call)}</td>
+                  <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}><PlayButton uuid={call.uuid} /></td>
                 </tr>
               </React.Fragment>
             ))}
@@ -3679,6 +4484,33 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                   </div>
                 ))}
               </div>
+
+              {/* OD Patient status */}
+              {call.od_patient_status && (
+                <div style={{marginBottom:12,padding:'8px 12px',borderRadius:8,
+                  background:'#f8fafc',border:'1px solid var(--border)',fontSize:12}}>
+                  <div style={{display:'flex',alignItems:'center',gap:10}}>
+                    <span style={{fontWeight:600,color:'var(--text-muted)',fontSize:10}}>OD PATIENT</span>
+                    {_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}
+                    {call.od_patient_name && (
+                      <span style={{fontWeight:600,color:'var(--text)'}}>{call.od_patient_name}</span>
+                    )}
+                    {call.od_patient_num && (
+                      <span style={{fontSize:10,color:'var(--text-muted)'}}>PatNum: {call.od_patient_num}</span>
+                    )}
+                  </div>
+                  {call.od_patient_status === 'new_patient' && (
+                    <div style={{marginTop:4,fontSize:10,color:'#15803d'}}>
+                      📋 Phone not found in OpenDental — likely a new patient inquiry
+                    </div>
+                  )}
+                  {call.od_patient_status === 'existing_active' && (
+                    <div style={{marginTop:4,fontSize:10,color:'#1d4ed8'}}>
+                      ℹ️ Existing active patient — exclude from offline conversion upload
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Outcome badges */}
               <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:16}}>
@@ -3868,6 +4700,38 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                   </React.Fragment>
                 ))}
 
+                {/* Campaign — GAds preferred, lead fallback */}
+                {(call.effective_campaign_name || call.gads_campaign_name || call.lead_campaign_name) && (
+                  <React.Fragment>
+                    <div style={{color:'var(--text-muted)',fontWeight:500}}>Campaign</div>
+                    <div>
+                      <span style={{fontWeight:600,color:'#0369a1'}}>
+                        {call.effective_campaign_name || call.gads_campaign_name || call.lead_campaign_name}
+                      </span>
+                      {call.gads_campaign_name
+                        ? <span style={{marginLeft:6,fontSize:10,background:'#dbeafe',color:'#1e40af',padding:'1px 5px',borderRadius:3}}>GAds</span>
+                        : <span style={{marginLeft:6,fontSize:10,background:'#f0fdf4',color:'#166534',padding:'1px 5px',borderRadius:3}}>Lead</span>
+                      }
+                    </div>
+                  </React.Fragment>
+                )}
+
+                {/* OD Appointment */}
+                {call.od_appointment_id ? (
+                  <React.Fragment>
+                    <div style={{color:'var(--text-muted)',fontWeight:500}}>OD Appointment</div>
+                    <div>
+                      <span style={{fontWeight:600,color:'#166534'}}>✓ Confirmed</span>
+                      <span style={{marginLeft:8,fontSize:10,color:'var(--text-muted)'}}>AptNum {call.od_appointment_id}</span>
+                    </div>
+                  </React.Fragment>
+                ) : call.booked_outcome === 'booked' ? (
+                  <React.Fragment>
+                    <div style={{color:'var(--text-muted)',fontWeight:500}}>OD Appointment</div>
+                    <div style={{color:'#92400e'}}>⏳ Graded booked — OD match pending</div>
+                  </React.Fragment>
+                ) : null}
+
                 {call.gads_call_id && (<React.Fragment>
                   <div style={{color:'var(--text-muted)',fontWeight:500}}>GAds Call ID</div>
                   <code style={{fontSize:10}}>{call.gads_call_id}</code>
@@ -3889,7 +4753,7 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                 <code style={{fontSize:10,wordBreak:'break-all'}}>{call.uuid}</code>
               </div>
 
-              {!call.gads_call_id && !call.match_method && !call.lead_id && (
+              {!call.gads_call_id && !call.match_method && !call.lead_id && !call.effective_campaign_name && (
                 <div style={{marginTop:16,color:'var(--text-muted)',fontStyle:'italic'}}>
                   No Google Ads or lead attribution for this call.
                 </div>
@@ -4437,6 +5301,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [unifiedLoading, setUnifiedLoading] = useState(false);
   const [showInactive, setShowInactive] = useState(false);
   const [unifiedDays, setUnifiedDays] = useState(30);
+  const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts}}
   const [aiReviewSaving, setAiReviewSaving] = useState({});
   const [aiMaxSaving, setAiMaxSaving] = useState({});
   const [syncingFromGads, setSyncingFromGads] = useState({});  // {campaign_id: bool}
@@ -4505,8 +5370,18 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   async function loadUnifiedCamps() {
     setUnifiedLoading(true);
     try {
-      const d = await api(`/api/admin/campaigns/unified?days=${unifiedDays}&include_inactive=${showInactive}`);
+      const [d, callRows] = await Promise.all([
+        api(`/api/admin/campaigns/unified?days=${unifiedDays}&include_inactive=${showInactive}`),
+        api(`/api/admin/calls/campaign-attribution?days=${unifiedDays}`).catch(()=>[]),
+      ]);
       setUnifiedCamps(d.campaigns || []);
+      // Build lookup: campaign_id → call stats (also index by name for fallback)
+      const attrib = {};
+      (callRows || []).forEach(r => {
+        if (r.campaign_id) attrib[r.campaign_id] = r;
+        if (r.campaign_name) attrib[r.campaign_name] = r; // fallback key by name
+      });
+      setCampCallAttrib(attrib);
     } catch(e) { console.error('Failed to load unified campaigns', e); }
     finally { setUnifiedLoading(false); }
   }
@@ -5087,6 +5962,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               <th style={{width:88}}>End</th>
               <th className="num">Daily Budget</th>
               <th className="num">Leads</th>
+              <th className="num" title="Inbound calls attributed to this campaign">Calls</th>
+              <th className="num" title="Calls graded booked that matched an OD appointment">Appts</th>
               <th className="num">Cost</th>
               <th className="num">CPL</th>
               <th className="num">ROI</th>
@@ -5097,10 +5974,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
           </thead>
           <tbody>
             {unifiedLoading && (
-              <tr><td colSpan={13} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
+              <tr><td colSpan={15} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
             )}
             {!unifiedLoading && unifiedCamps.length === 0 && (
-              <tr><td colSpan={13} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
+              <tr><td colSpan={15} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
                 No campaigns yet — click "+ New Campaign" or "⬇ Import from Google Ads".
               </td></tr>
             )}
@@ -5165,6 +6042,26 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                     <td style={{fontSize:11}}>{c.end_date || '—'}</td>
                     <td className="num">{c.monthly_budget > 0 ? fmtDailyBudget(c.monthly_budget) : '—'}</td>
                     <td className="num">{m.leads > 0 ? m.leads : '—'}</td>
+                    {/* Calls + Appts from call attribution */}
+                    {(()=>{
+                      const ca = campCallAttrib[c.campaign_id] || campCallAttrib[c.campaign_name] || {};
+                      return (
+                        <React.Fragment>
+                          <td className="num">
+                            {ca.total_calls > 0
+                              ? <span title={`${ca.booked_calls||0} graded booked`}>{ca.total_calls}</span>
+                              : <span style={{color:'var(--text-muted)'}}>—</span>}
+                          </td>
+                          <td className="num">
+                            {ca.confirmed_appts > 0
+                              ? <span style={{color:'#059669',fontWeight:600}}>{ca.confirmed_appts}</span>
+                              : ca.booked_calls > 0
+                                ? <span style={{color:'#92400e'}} title="Booked calls, OD match pending">~{ca.booked_calls}</span>
+                                : <span style={{color:'var(--text-muted)'}}>—</span>}
+                          </td>
+                        </React.Fragment>
+                      );
+                    })()}
                     <td className="num">{m.cost > 0 ? fmtMoney(m.cost) : '—'}</td>
                     <td className="num">{m.cpl != null ? '$'+Number(m.cpl).toFixed(0) : '—'}</td>
                     <td className="num" style={{
@@ -5271,7 +6168,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   {/* Strategy expansion row */}
                   {strategyOpen && parsedStrategy && (
                     <tr>
-                      <td colSpan={13} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
+                      <td colSpan={15} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
                         <div style={{padding:'16px 18px',borderLeft:'3px solid var(--teal)'}}>
                           <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
                             <span style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>🧠 Opus Strategy</span>
@@ -5775,21 +6672,21 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
                     // Wizard step completion helpers
                     const stepDone = {
-                      strategy:    !!strategy,
-                      keywords:    !!build.keywords,
-                      ad_copy:     !!build.ad_copy,
-                      ad_groups:   !!build.ad_groups,
-                      launch:      !!(build.launch_checklist && build.launch_checklist.some(x=>x.category==='required') && build.launch_checklist.filter(x=>x.category==='required').every(x=>x.done)),
-                      performance: true,
+                      strategy:     !!strategy,
+                      keywords:     !!build.keywords,
+                      ad_copy:      !!build.ad_copy,
+                      ad_groups:    !!build.ad_groups,
+                      launch:       !!(build.launch_checklist && build.launch_checklist.some(x=>x.category==='required') && build.launch_checklist.filter(x=>x.category==='required').every(x=>x.done)),
+                      performance:  true,
                     };
                     const WIZARD_ORDER = ['strategy','keywords','ad_copy','ad_groups','launch','performance'];
                     const TABS = [
-                      { id: 'strategy',    label: '🧠 Strategy' },
-                      { id: 'keywords',    label: '🔍 Keywords' },
-                      { id: 'ad_copy',     label: '✍ Ad Copy' },
-                      { id: 'ad_groups',   label: '📂 Ad Groups' },
-                      { id: 'launch',      label: '🚀 Launch' },
-                      { id: 'performance', label: '📊 Performance' },
+                      { id: 'strategy',     label: '🧠 Strategy' },
+                      { id: 'keywords',     label: '🔍 Keywords' },
+                      { id: 'ad_copy',      label: '✍ Ad Copy' },
+                      { id: 'ad_groups',    label: '📂 Ad Groups' },
+                      { id: 'launch',       label: '🚀 Launch' },
+                      { id: 'performance',  label: '📊 Performance' },
                     ];
                     const currentIdx = WIZARD_ORDER.indexOf(detailTab);
                     const nextStep = WIZARD_ORDER[currentIdx + 1];
@@ -5887,7 +6784,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     marginBottom:-2,whiteSpace:'nowrap',display:'flex',alignItems:'center',gap:4}}
                                   onClick={()=>{setDetailTab(t.id);setRefinedPreview(null);setRefineInput('');}}>
                                   {t.label}
-                                  {done && t.id !== 'performance' && (
+                                  {done && t.id !== 'performance' && t.id !== 'optimization' && (
                                     <span style={{fontSize:9,color:'#059669',fontWeight:700}}>✓</span>
                                   )}
                                 </button>
@@ -7814,6 +8711,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               )}
                             </div>
                           )}
+
+                          {/* Optimization moved to AI Optimizer tab */}
 
                         </div>
                       </div>
@@ -10656,45 +11555,27 @@ function AISpendCard() {
             </div>
           ) : (
             <>
-              <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:10,marginBottom:16}}>
-                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
-                  <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>Total Spend</div>
-                  <div style={{fontSize:20,fontWeight:700,color:'var(--teal)'}}>{fmtCost(bucket.total_cost)}</div>
+              {/* 4-tile breakdown: Total / Whisper / Gemini / Claude */}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:16}}>
+                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 12px',textAlign:'center'}}>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:3}}>Total Spend</div>
+                  <div style={{fontSize:18,fontWeight:700,color:'var(--teal)'}}>{fmtCost(bucket.total_cost)}</div>
                 </div>
-                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
-                  <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>Whisper Audio</div>
-                  <div style={{fontSize:16,fontWeight:700,color:'#0369a1'}}>
-                    {fmtCost(bucket.by_api?.openai?.cost)}
-                  </div>
-                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
-                    {(bucket.by_api?.openai?.mins||0).toFixed(1)} min
-                  </div>
+                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 12px',textAlign:'center'}}>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:3}}>🎙 Whisper</div>
+                  <div style={{fontSize:14,fontWeight:700,color:'#0369a1'}}>{fmtCost(bucket.by_api?.openai?.cost)}</div>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginTop:2}}>Transcription · {(bucket.by_api?.openai?.mins||0).toFixed(1)} min</div>
                 </div>
-                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 14px',textAlign:'center'}}>
-                  <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>Claude + Gemini</div>
-                  <div style={{fontSize:16,fontWeight:700,color:'#7c3aed'}}>
-                    {fmtCost((bucket.by_api?.claude?.cost||0) + (bucket.by_api?.gemini?.cost||0))}
-                  </div>
-                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
-                    {((bucket.by_api?.claude?.tokens||0)+(bucket.by_api?.gemini?.tokens||0)).toLocaleString()} tokens
-                  </div>
+                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 12px',textAlign:'center'}}>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:3}}>✨ Gemini</div>
+                  <div style={{fontSize:14,fontWeight:700,color:'#7c3aed'}}>{fmtCost(bucket.by_api?.gemini?.cost)}</div>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginTop:2}}>Call Summary · {bucket.by_api?.gemini?.calls||0} calls</div>
                 </div>
-              </div>
-
-              {/* Per-API breakdown */}
-              <div style={{display:'flex',gap:12,marginBottom:16,flexWrap:'wrap'}}>
-                {APIs.map(({key, label, icon}) => {
-                  const a = bucket.by_api?.[key];
-                  if (!a) return null;
-                  return (
-                    <div key={key} style={{flex:'1 1 100px',background:'#f8fafc',border:'1px solid var(--border)',
-                      borderRadius:6,padding:'8px 12px',fontSize:11}}>
-                      <div style={{fontWeight:600,marginBottom:4}}>{icon} {label}</div>
-                      <div style={{color:'var(--text-muted)'}}>{fmtCost(a.cost)}</div>
-                      <div style={{color:'var(--text-muted)',fontSize:10}}>{a.calls || 0} calls</div>
-                    </div>
-                  );
-                })}
+                <div style={{background:'var(--bg-card)',borderRadius:8,padding:'10px 12px',textAlign:'center'}}>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:3}}>🤖 Claude</div>
+                  <div style={{fontSize:14,fontWeight:700,color:'#d97706'}}>{fmtCost(bucket.by_api?.claude?.cost)}</div>
+                  <div style={{fontSize:9,color:'var(--text-muted)',marginTop:2}}>Ad Creation + Optimization · {bucket.by_api?.claude?.calls||0} calls</div>
+                </div>
               </div>
 
               {/* By-purpose bar chart */}
@@ -10866,20 +11747,14 @@ function ODConnectionCard() {
 
 // ── Pending Approvals Panel ────────────────────────────────────────────────────
 function PendingApprovalsPanel() {
-  const [rows, setRows]           = useState(null);   // null = loading
-  const [writesStatus, setWrites] = useState(null);   // {enabled, env_enabled, runtime_enabled}
-  const [acting, setActing]       = useState({});     // {action_id: 'apply'|'reject'}
-  const [togglingWrites, setTW]   = useState(false);
-  const [error, setError]         = useState(null);
+  const [rows, setRows]     = useState(null);   // null = loading
+  const [acting, setActing] = useState({});     // {action_id: 'apply'|'reject'}
+  const [error, setError]   = useState(null);
 
   async function load() {
     try {
-      const [pr, wr] = await Promise.all([
-        api('/api/admin/gads/pending-approvals'),
-        api('/api/admin/gads/writes-status'),
-      ]);
+      const pr = await api('/api/admin/gads/pending-approvals');
       setRows(pr.pending || []);
-      setWrites(wr);
       setError(null);
     } catch(e) {
       setError(e.message);
@@ -10890,10 +11765,6 @@ function PendingApprovalsPanel() {
   useEffect(() => { load(); }, []);
 
   async function handleApply(action_id) {
-    if (writesStatus && !writesStatus.enabled) {
-      alert('Google Ads writes are disabled. Enable writes first.');
-      return;
-    }
     if (!confirm('Apply this recommendation to Google Ads now?')) return;
     setActing(prev => ({...prev, [action_id]: 'apply'}));
     try {
@@ -10917,22 +11788,6 @@ function PendingApprovalsPanel() {
       alert('Reject failed: ' + e.message);
     }
     setActing(prev => ({...prev, [action_id]: null}));
-  }
-
-  async function toggleWrites() {
-    if (!writesStatus) return;
-    const newVal = !writesStatus.runtime_enabled;
-    if (newVal && !confirm('Enable live Google Ads writes? This allows keyword pauses, bid changes, and keyword additions to execute immediately.')) return;
-    setTW(true);
-    try {
-      await api('/api/admin/gads/writes-enabled', { method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ enabled: newVal }) });
-      setWrites(prev => ({...prev, runtime_enabled: newVal, enabled: prev.env_enabled && newVal}));
-    } catch(e) {
-      alert('Toggle failed: ' + e.message);
-    }
-    setTW(false);
   }
 
   const OP_ICONS = {
@@ -10966,49 +11821,12 @@ function PendingApprovalsPanel() {
     } catch { return json_str.slice(0,80); }
   }
 
-  const writesEnabled = writesStatus?.enabled ?? false;
-
   return (
     <div className="report-section">
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
         <div className="report-title" style={{marginBottom:0}}>Pending Recommendations</div>
         <button className="btn" style={{fontSize:10,padding:'3px 8px'}} onClick={load}>↻ Refresh</button>
       </div>
-
-      {/* Write Controls Banner */}
-      {writesStatus && (
-        <div style={{
-          display:'flex', alignItems:'center', gap:10, marginBottom:12,
-          padding:'8px 12px', borderRadius:6,
-          background: writesEnabled ? '#f0fdf4' : '#fef9c3',
-          border: `1px solid ${writesEnabled ? '#86efac' : '#fde68a'}`,
-          fontSize:11
-        }}>
-          <span style={{fontWeight:600, color: writesEnabled ? '#15803d' : '#854d0e'}}>
-            Google Ads Writes: {writesEnabled ? '✅ ENABLED' : '⚠️ DISABLED'}
-          </span>
-          {!writesStatus.env_enabled && (
-            <span style={{color:'#92400e',fontSize:10}}>
-              (CAMPAIGN_WRITE_OPS_ENABLED env var is off — set to true to allow writes)
-            </span>
-          )}
-          {writesStatus.env_enabled && (
-            <button
-              className="btn"
-              style={{fontSize:10, padding:'2px 10px',
-                background: writesEnabled ? '#fef2f2' : '#f0fdf4',
-                color: writesEnabled ? '#dc2626' : '#16a34a'}}
-              onClick={toggleWrites}
-              disabled={togglingWrites}
-            >
-              {togglingWrites ? '…' : writesEnabled ? 'Disable Writes' : 'Enable Writes'}
-            </button>
-          )}
-          <span style={{color:'var(--text-muted)',fontSize:9,marginLeft:'auto'}}>
-            Both env var and runtime switch must be on for any action to execute
-          </span>
-        </div>
-      )}
 
       {error && (
         <div style={{padding:10,background:'#fef2f2',borderRadius:6,color:'#dc2626',fontSize:11,marginBottom:8}}>
@@ -11068,10 +11886,10 @@ function PendingApprovalsPanel() {
               <div style={{display:'flex',gap:6}}>
                 <button
                   className="btn btn-teal"
-                  style={{fontSize:10,padding:'3px 12px',opacity: writesEnabled?1:0.5}}
+                  style={{fontSize:10,padding:'3px 12px'}}
                   onClick={()=>handleApply(row.action_id)}
                   disabled={!!busy}
-                  title={writesEnabled?'Apply this recommendation':'Enable Google Ads writes first'}
+                  title="Apply this recommendation to Google Ads"
                 >
                   {busy==='apply' ? '…' : '✅ Apply'}
                 </button>
@@ -11092,14 +11910,13 @@ function PendingApprovalsPanel() {
   );
 }
 
-function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize }) {
+function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize, onTabSwitch }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
-  const [optimizerResult, setOptimizerResult] = useState(null);
 
   async function handleAction(key, fn) {
     setLoading(prev=>({...prev, [key]:true}));
-    try { const r = await fn(); if (key==='optimize') setOptimizerResult(r); }
+    try { await fn(); }
     catch (e) { alert('Error: '+e.message); }
     setLoading(prev=>({...prev, [key]:false}));
   }
@@ -11118,15 +11935,12 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
           <button className="btn btn-teal" onClick={()=>handleAction('gads', onGAds)} disabled={loading.gads}>
             {loading.gads?'Syncing...':'Google Ads Sync'}
           </button>
-          {/* Upload Conversions — hidden until conversion actions are created in Google Ads */}
-          {/* <button className="btn btn-teal" onClick={()=>handleAction('conv', onConversions)} disabled={loading.conv}>
-            {loading.conv?'Uploading...':'Upload Conversions'}
-          </button> */}
           <button className="btn btn-teal" onClick={()=>handleAction('ga4', onGA4Refresh)} disabled={loading.ga4}>
             {loading.ga4?'Pulling...':'Refresh GA4 Data'}
           </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('optimize', onOptimize)} disabled={loading.optimize}>
-            {loading.optimize?'Analyzing...':'Run AI Optimizer'}
+          <button className="btn btn-teal" onClick={()=>onTabSwitch && onTabSwitch('ai_optimizer')}
+            style={{background:'#7c3aed'}}>
+            🤖 AI Optimizer →
           </button>
         </div>
       </div>
@@ -11142,118 +11956,6 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
       <ODConnectionCard />
 
       <PendingApprovalsPanel />
-
-      {optimizerResult && (
-        <div className="report-section">
-          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8}}>
-            <div className="report-title">AI Optimizer Report — {optimizerResult.mode}</div>
-            <span style={{fontSize:10,color:'var(--text-muted)'}}>{new Date(optimizerResult.timestamp).toLocaleString()}</span>
-          </div>
-
-          {optimizerResult.error && (
-            <div style={{padding:12,background:'#fef2f2',borderRadius:6,color:'#dc2626',fontSize:12}}>
-              Error: {optimizerResult.error}
-            </div>
-          )}
-
-          {optimizerResult.summary && (
-            <>
-              <div style={{display:'grid',gridTemplateColumns:'repeat(6,1fr)',gap:8,marginBottom:12}}>
-                {[
-                  ['Total Spend',`$${optimizerResult.summary.total_spend}`],
-                  ['Total Clicks',optimizerResult.summary.total_clicks],
-                  ['Total Leads',optimizerResult.summary.total_leads],
-                  ['ROAS',optimizerResult.summary.overall_roas+'x'],
-                  ['CPL',`$${optimizerResult.summary.cost_per_lead}`],
-                  ['Production',`$${optimizerResult.summary.total_production}`],
-                ].map(([label,val])=>(
-                  <div key={label} style={{background:'var(--gray-light)',borderRadius:6,padding:'8px 10px',textAlign:'center'}}>
-                    <div style={{fontSize:9,color:'var(--text-muted)',marginBottom:2}}>{label}</div>
-                    <div style={{fontSize:14,fontWeight:700,color:'var(--teal)'}}>{val}</div>
-                  </div>
-                ))}
-              </div>
-
-              {optimizerResult.actions?.pause?.length > 0 && (
-                <div style={{marginBottom:10}}>
-                  <div style={{fontSize:11,fontWeight:600,color:'#dc2626',marginBottom:4}}>⛔ Pause ({optimizerResult.actions.pause.length} keywords)</div>
-                  {optimizerResult.actions.pause.map((k,i)=>(
-                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#fef2f2',borderRadius:4,marginBottom:3}}>
-                      <strong>"{k.keyword}"</strong> — {k.reason}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {optimizerResult.actions?.increase_bid?.length > 0 && (
-                <div style={{marginBottom:10}}>
-                  <div style={{fontSize:11,fontWeight:600,color:'#16a34a',marginBottom:4}}>⬆️ Bid Up ({optimizerResult.actions.increase_bid.length} keywords)</div>
-                  {optimizerResult.actions.increase_bid.map((k,i)=>(
-                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#f0fdf4',borderRadius:4,marginBottom:3}}>
-                      <strong>"{k.keyword}"</strong> — {k.reason}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {optimizerResult.actions?.decrease_bid?.length > 0 && (
-                <div style={{marginBottom:10}}>
-                  <div style={{fontSize:11,fontWeight:600,color:'#f59e0b',marginBottom:4}}>⬇️ Bid Down ({optimizerResult.actions.decrease_bid.length} keywords)</div>
-                  {optimizerResult.actions.decrease_bid.map((k,i)=>(
-                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#fffbeb',borderRadius:4,marginBottom:3}}>
-                      <strong>"{k.keyword}"</strong> — {k.reason}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {optimizerResult.actions?.new_exact?.length > 0 && (
-                <div style={{marginBottom:10}}>
-                  <div style={{fontSize:11,fontWeight:600,color:'#0891b2',marginBottom:4}}>✨ Add as Exact Match ({optimizerResult.actions.new_exact.length} terms)</div>
-                  {optimizerResult.actions.new_exact.map((k,i)=>(
-                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'#f0f9ff',borderRadius:4,marginBottom:3}}>
-                      <strong>"{k.search_term}"</strong> — {k.clicks} clicks, {k.conversions} conversions
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {optimizerResult.actions?.new_negatives?.length > 0 && (
-                <div style={{marginBottom:10}}>
-                  <div style={{fontSize:11,fontWeight:600,color:'#6b7280',marginBottom:4}}>🚫 Add as Negative ({optimizerResult.actions.new_negatives.length} terms)</div>
-                  {optimizerResult.actions.new_negatives.slice(0,10).map((k,i)=>(
-                    <div key={i} style={{fontSize:11,padding:'4px 8px',background:'var(--gray-light)',borderRadius:4,marginBottom:3}}>
-                      <strong>"{k.search_term}"</strong> — {k.reason}
-                    </div>
-                  ))}
-                  {optimizerResult.actions.new_negatives.length > 10 && (
-                    <div style={{fontSize:10,color:'var(--text-muted)',padding:'2px 8px'}}>+{optimizerResult.actions.new_negatives.length-10} more</div>
-                  )}
-                </div>
-              )}
-
-              {optimizerResult.memory_applied?.length > 0 && (
-                <div style={{marginBottom:10}}>
-                  <div style={{fontSize:11,fontWeight:600,color:'#8b5cf6',marginBottom:4}}>🧠 Memory Overrides Applied ({optimizerResult.memory_applied.length})</div>
-                  {optimizerResult.memory_applied.map((m,i)=>(
-                    <div key={i} style={{fontSize:10,padding:'3px 8px',background:'#f5f3ff',borderRadius:4,marginBottom:2,color:'#6d28d9'}}>
-                      {m}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {optimizerResult.summary.keywords_to_pause === 0 &&
-               optimizerResult.summary.keywords_to_bid_up === 0 &&
-               optimizerResult.summary.new_negatives === 0 && (
-                <div style={{fontSize:12,color:'var(--text-muted)',textAlign:'center',padding:12}}>
-                  Not enough data yet for recommendations. Needs gclid attribution from new leads.
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
 
       <KeywordResearchSection />
 
@@ -11377,6 +12079,370 @@ function InboxTab({ onOpenLead }) {
             </div>
           );
         })
+      )}
+    </div>
+  );
+}
+
+// ── AiOptimizerTab ──────────────────────────────────────────────────────────
+const AI_OP_LABELS = Object.assign({}, OP_LABELS, {
+  change_bid_strategy: { label: 'Change Bid Strategy', color: '#9b59b6', icon: '💡' },
+  change_match_type:   { label: 'Change Match Type',   color: '#2980b9', icon: '🔄' },
+  add_asset:           { label: 'Add Asset',           color: '#27ae60', icon: '📎' },
+});
+
+const REC_TYPE_COLORS = {
+  KEYWORD:                      '#2563eb',
+  KEYWORD_MATCH_TYPE:           '#0891b2',
+  MAXIMIZE_CONVERSIONS_OPT_IN:  '#9b59b6',
+  TARGET_CPA_OPT_IN:            '#7c3aed',
+  TARGET_ROAS_OPT_IN:           '#6d28d9',
+  MARGINAL_ROI_CAMPAIGN_BUDGET: '#d97706',
+  CAMPAIGN_BUDGET:              '#d97706',
+  MOVE_UNUSED_BUDGET:           '#d97706',
+  RESPONSIVE_SEARCH_AD:         '#0891b2',
+  SITELINK_EXTENSION:           '#16a34a',
+  CALLOUT_EXTENSION:            '#16a34a',
+  CALL_EXTENSION:               '#16a34a',
+  MAXIMIZE_CLICKS_OPT_IN:       '#9b59b6',
+  ENHANCED_CPC_OPT_IN:          '#9b59b6',
+};
+
+function GoogleRecCard({ rec, onDismiss }) {
+  const [open, setOpen] = React.useState(false);
+  const [dismissing, setDismissing] = React.useState(false);
+  const [dismissed, setDismissed] = React.useState(false);
+
+  if (dismissed) return null;
+
+  const color = REC_TYPE_COLORS[rec.rec_type] || '#64748b';
+  const impact = rec.impact || {};
+  const clickDelta = (impact.potential_clicks || 0) - (impact.base_clicks || 0);
+  const convDelta = (impact.potential_conversions || 0) - (impact.base_conversions || 0);
+
+  const verdictBadge = () => {
+    if (!rec.claude_verdict) return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#e2e8f022',color:'#94a3b8',fontWeight:600}}>⏳ Pending analysis</span>;
+    if (rec.claude_verdict === 'endorsed') return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#dcfce7',color:'#16a34a',fontWeight:600}}>✅ Endorsed</span>;
+    if (rec.claude_verdict === 'advisory') return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#fef9c3',color:'#854d0e',fontWeight:600}}>⚠️ Advisory</span>;
+    if (rec.claude_verdict === 'rejected') return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#fee2e2',color:'#dc2626',fontWeight:600}}>🚫 Not recommended</span>;
+    return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#e0f2fe',color:'#0369a1',fontWeight:600}}>{rec.claude_verdict}</span>;
+  };
+
+  return (
+    <div style={{padding:'10px 12px',marginBottom:8,borderRadius:6,border:`1px solid ${color}33`,background:'#fff',fontSize:12}}>
+      <div style={{display:'flex',alignItems:'flex-start',gap:8}}>
+        <div style={{flex:1}}>
+          <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:4}}>
+            <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:color+'22',color,fontWeight:700}}>{rec.rec_type}</span>
+            <span style={{fontWeight:700,color:'var(--text-main)'}}>{rec.title}</span>
+            {verdictBadge()}
+          </div>
+          <div style={{color:'var(--text-muted)',fontSize:11,marginBottom:2}}>{rec.description}</div>
+          {rec.campaign_name && <div style={{fontSize:10,color:'#64748b'}}>Campaign: {rec.campaign_name}</div>}
+          {(clickDelta !== 0 || convDelta !== 0) && (
+            <div style={{marginTop:4,fontSize:10,display:'flex',gap:8}}>
+              {clickDelta > 0 && <span style={{color:'#16a34a',fontWeight:600}}>+{Math.round(clickDelta)} clicks</span>}
+              {clickDelta < 0 && <span style={{color:'#dc2626',fontWeight:600}}>{Math.round(clickDelta)} clicks</span>}
+              {convDelta > 0 && <span style={{color:'#16a34a',fontWeight:600}}>+{convDelta.toFixed(1)} conv</span>}
+            </div>
+          )}
+          {rec.claude_reasoning && (
+            <div>
+              <button onClick={()=>setOpen(o=>!o)} style={{fontSize:10,color:'var(--teal)',background:'none',border:'none',cursor:'pointer',padding:'2px 0',marginTop:2}}>
+                {open ? '▲ Hide reasoning' : '▼ Show AI reasoning'}
+              </button>
+              {open && <div style={{fontSize:10,color:'#475569',marginTop:4,fontStyle:'italic',borderLeft:'2px solid var(--teal)',paddingLeft:8}}>{rec.claude_reasoning}</div>}
+            </div>
+          )}
+        </div>
+        <button onClick={async()=>{
+          setDismissing(true);
+          try {
+            await api(`/api/admin/gads/google-recs/${rec.id}/dismiss`, {method:'POST'});
+            setDismissed(true);
+            if (onDismiss) onDismiss(rec.id);
+          } catch(e) { alert('Dismiss failed: ' + e.message); }
+          finally { setDismissing(false); }
+        }} disabled={dismissing}
+          title="Dismiss this recommendation"
+          style={{padding:'3px 8px',fontSize:11,borderRadius:4,cursor:'pointer',
+            border:'1px solid #e2e8f0',background:'#f8fafc',color:'#94a3b8',flexShrink:0}}>
+          {dismissing ? '…' : '✕'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AiOptimizerTab() {
+  const [running, setRunning] = React.useState(false);
+  const [lastRun, setLastRun] = React.useState('');
+  const [googleRecs, setGoogleRecs] = React.useState([]);
+  const [recs, setRecs] = React.useState(null);
+  const [queued, setQueued] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [googleLoading, setGoogleLoading] = React.useState(true);
+  const [pushBusy, setPushBusy] = React.useState(false);
+  const [pushResult, setPushResult] = React.useState(null);
+  const [activeSection, setActiveSection] = React.useState('account');
+  const [selectedCampaign, setSelectedCampaign] = React.useState('');
+  const [runMsg, setRunMsg] = React.useState('');
+
+  const loadGoogleRecs = React.useCallback(async () => {
+    setGoogleLoading(true);
+    try {
+      const d = await api('/api/admin/gads/google-recs');
+      setGoogleRecs(d.recs || []);
+      if (d.recs && d.recs.length > 0) {
+        setLastRun(d.recs[0].fetched_at || '');
+      }
+    } catch(e) { console.error('Google recs load error', e); }
+    finally { setGoogleLoading(false); }
+  }, []);
+
+  const loadRecs = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const d = await api('/api/admin/optimizer/account/recommendations?status=all&limit=500');
+      setRecs(d);
+    } catch(e) { console.error('Recs load error', e); }
+    finally { setLoading(false); }
+  }, []);
+
+  const loadQueued = React.useCallback(async () => {
+    try {
+      const d = await api('/api/admin/gads/queued');
+      setQueued(d.queued || []);
+    } catch(e) { console.error('Queued load error', e); }
+  }, []);
+
+  React.useEffect(() => {
+    loadGoogleRecs();
+    loadRecs();
+    loadQueued();
+  }, [loadGoogleRecs, loadRecs, loadQueued]);
+
+  const handleRunOptimizer = async () => {
+    setRunning(true); setRunMsg('Running optimizer...');
+    try {
+      await api('/api/admin/optimize', {method:'POST'});
+      setRunMsg('Optimizer triggered — fetching new Google recs...');
+      // Poll for new google recs
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        try {
+          const d = await api('/api/admin/gads/google-recs');
+          setGoogleRecs(d.recs || []);
+          if (d.recs && d.recs.length > 0) setLastRun(d.recs[0].fetched_at || '');
+        } catch(_) {}
+        if (attempts >= 10) {
+          clearInterval(poll);
+          setRunMsg('Done ✓');
+          setRunning(false);
+          await loadRecs();
+          await loadQueued();
+        }
+      }, 3000);
+    } catch(e) {
+      setRunMsg('Error: ' + (e.message || 'Optimizer failed'));
+      setRunning(false);
+    }
+  };
+
+  const handleQueue = async (actionId) => {
+    await api(`/api/admin/gads/queue/${actionId}`, {method:'POST'});
+    await loadQueued();
+    await loadRecs();
+  };
+
+  const handleIgnore = async (actionId) => {
+    await api(`/api/admin/gads/reject/${actionId}`, {method:'POST', body:JSON.stringify({reason:''})});
+    await loadRecs();
+  };
+
+  const handleRefine = async (actionId, feedback) => {
+    await api(`/api/admin/gads/refine/${actionId}`, {method:'POST', body:JSON.stringify({feedback})});
+    await loadRecs();
+  };
+
+  const handlePushToGoogle = async () => {
+    setPushBusy(true); setPushResult(null);
+    try {
+      const r = await api('/api/admin/gads/push-queued', {method:'POST'});
+      setPushResult(r);
+      await loadQueued();
+      await loadRecs();
+    } catch(e) { setPushResult({error: e.message || 'Push failed'}); }
+    finally { setPushBusy(false); }
+  };
+
+  // Flatten recs into pending/queued/applied
+  const allRecs = recs ? Object.values(recs.recommendations || {}).flat() : [];
+  const pending = allRecs.filter(r => r.execution_result === 'pending_approval');
+  const applied = allRecs.filter(r => r.execution_result === 'success');
+
+  // Get distinct campaign names from pending
+  const campNames = [...new Set(pending.map(r => r.campaign_name || '').filter(Boolean))].sort();
+
+  const filteredPending = selectedCampaign
+    ? pending.filter(r => (r.campaign_name || '') === selectedCampaign)
+    : (activeSection === 'account' ? pending.filter(r => !r.campaign_name) : pending);
+
+  const timeAgoStr = (iso) => {
+    if (!iso) return 'never';
+    const diff = Date.now() - new Date(iso).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 2) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.floor(hrs/24)}d ago`;
+  };
+
+  return (
+    <div style={{padding:'16px 20px',maxWidth:900,margin:'0 auto'}}>
+      {/* Header */}
+      <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+        <div>
+          <div style={{fontSize:18,fontWeight:700,color:'var(--text-main)'}}>🤖 AI Optimizer</div>
+          {lastRun && <div style={{fontSize:11,color:'var(--text-muted)'}}>Last run: {timeAgoStr(lastRun)}</div>}
+        </div>
+        <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+          {runMsg && <span style={{fontSize:11,color:'var(--text-muted)'}}>{runMsg}</span>}
+          <button onClick={handleRunOptimizer} disabled={running}
+            style={{padding:'8px 18px',borderRadius:6,cursor:running?'not-allowed':'pointer',
+              background:running?'#a3e635':'#16a34a',color:'#fff',border:'none',fontWeight:700,fontSize:13}}>
+            {running ? '⏳ Running...' : '▶ Run AI Optimizer'}
+          </button>
+        </div>
+      </div>
+
+      {/* Google Recommendations Panel */}
+      <div style={{background:'#f8fafc',border:'1px solid var(--border)',borderRadius:8,padding:'14px 16px',marginBottom:16}}>
+        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+          <span style={{fontWeight:700,fontSize:13}}>📊 Google's Recommendations</span>
+          <span style={{background:'#2563eb',color:'#fff',borderRadius:10,padding:'1px 7px',fontSize:10,fontWeight:700}}>
+            {googleRecs.length}
+          </span>
+          <button onClick={loadGoogleRecs} disabled={googleLoading}
+            style={{marginLeft:'auto',padding:'3px 10px',fontSize:11,borderRadius:4,cursor:'pointer',
+              border:'1px solid var(--border)',background:'#fff',color:'var(--text-muted)'}}>
+            {googleLoading ? '...' : '⟳ Refresh'}
+          </button>
+        </div>
+        {googleLoading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading...</div>}
+        {!googleLoading && googleRecs.length === 0 && (
+          <div style={{color:'var(--text-muted)',fontSize:12,fontStyle:'italic'}}>
+            No Google recommendations yet. Run the AI Optimizer to fetch them.
+          </div>
+        )}
+        {!googleLoading && googleRecs.map(gr => (
+          <GoogleRecCard key={gr.id} rec={gr} onDismiss={() => loadGoogleRecs()} />
+        ))}
+      </div>
+
+      {/* Section tabs */}
+      <div style={{display:'flex',gap:0,borderBottom:'2px solid var(--border)',marginBottom:12}}>
+        {[{k:'account',l:'Account Level'},{k:'campaign',l:'Campaign Level'}].map(t => (
+          <button key={t.k}
+            onClick={()=>{setActiveSection(t.k); setSelectedCampaign('');}}
+            style={{padding:'7px 18px',fontSize:12,fontWeight:600,cursor:'pointer',background:'none',border:'none',
+              borderBottom:activeSection===t.k?'2px solid var(--teal)':'2px solid transparent',
+              color:activeSection===t.k?'var(--teal)':'var(--text-muted)',marginBottom:-2}}>
+            {t.l}
+          </button>
+        ))}
+      </div>
+
+      {/* Campaign filter (campaign level only) */}
+      {activeSection === 'campaign' && (
+        <div style={{marginBottom:12,display:'flex',gap:8,alignItems:'center'}}>
+          <span style={{fontSize:12,color:'var(--text-muted)'}}>Campaign:</span>
+          <select value={selectedCampaign} onChange={e=>setSelectedCampaign(e.target.value)}
+            style={{padding:'4px 8px',fontSize:12,border:'1px solid var(--border)',borderRadius:4}}>
+            <option value="">All campaigns</option>
+            {campNames.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </div>
+      )}
+
+      {/* Pending recommendations */}
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:12,fontWeight:700,color:'var(--text-main)',marginBottom:8}}>
+          Pending Recommendations
+          <span style={{marginLeft:6,fontWeight:400,color:'var(--text-muted)'}}>({filteredPending.length})</span>
+        </div>
+        {loading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading...</div>}
+        {!loading && filteredPending.length === 0 && (
+          <div style={{padding:'16px',textAlign:'center',color:'var(--text-muted)',fontSize:12,
+            border:'1px solid var(--border)',borderRadius:6,background:'#fafafa'}}>
+            No pending recommendations{selectedCampaign ? ` for ${selectedCampaign}` : ''}.
+          </div>
+        )}
+        {filteredPending.map(rec => (
+          <RecommendationCard key={rec.action_id} rec={rec}
+            onQueue={handleQueue} onIgnore={handleIgnore} onRefine={handleRefine} />
+        ))}
+      </div>
+
+      {/* Queue panel */}
+      {queued.length > 0 && (
+        <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,padding:'14px 16px'}}>
+          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+            <span style={{fontWeight:700,fontSize:13,color:'#15803d'}}>🚀 Queue</span>
+            <span style={{background:'#16a34a',color:'#fff',borderRadius:10,padding:'1px 7px',fontSize:10,fontWeight:700}}>
+              {queued.length}
+            </span>
+            <button onClick={handlePushToGoogle} disabled={pushBusy}
+              style={{marginLeft:'auto',padding:'6px 16px',borderRadius:6,cursor:pushBusy?'not-allowed':'pointer',
+                background:pushBusy?'#a3e635':'#15803d',color:'#fff',border:'none',fontWeight:700,fontSize:12}}>
+              {pushBusy ? '⏳ Pushing...' : '🚀 Push All to Google Ads'}
+            </button>
+          </div>
+          {queued.map(q => {
+            const op = AI_OP_LABELS[q.operation] || {label: q.operation, color:'#64748b', icon:'•'};
+            return (
+              <div key={q.action_id} style={{padding:'8px 10px',marginBottom:6,borderRadius:6,
+                border:'1px solid #a3e635',background:'#fff',fontSize:11,
+                display:'flex',alignItems:'center',gap:8}}>
+                <span>{op.icon}</span>
+                <span style={{fontWeight:600}}>{q.entity_name}</span>
+                <span style={{color:'#64748b'}}>{q.operation}</span>
+                {q.campaign_name && <span style={{color:'#94a3b8',fontSize:10}}>({q.campaign_name})</span>}
+              </div>
+            );
+          })}
+          {pushResult && (
+            <div style={{marginTop:8,fontSize:11,padding:'8px 12px',borderRadius:6,
+              background: pushResult.error ? '#fee2e2' : '#dcfce7',
+              color: pushResult.error ? '#dc2626' : '#15803d'}}>
+              {pushResult.error ? `Error: ${pushResult.error}` :
+                `✓ ${pushResult.summary?.pushed_to_google || 0} pushed to Google, ${pushResult.summary?.acknowledged_only || 0} acknowledged, ${pushResult.summary?.error || 0} errors`}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Applied history */}
+      {applied.length > 0 && (
+        <div style={{marginTop:16,opacity:0.7}}>
+          <div style={{fontSize:12,color:'var(--text-muted)',marginBottom:8}}>
+            Applied ({applied.length}) — recent history
+          </div>
+          {applied.slice(0, 5).map(rec => {
+            const op = AI_OP_LABELS[rec.operation] || {label: rec.operation, color:'#64748b', icon:'•'};
+            return (
+              <div key={rec.action_id} style={{padding:'6px 10px',marginBottom:4,borderRadius:6,
+                border:'1px solid #d1fae5',background:'#f0fdf4',fontSize:11,display:'flex',gap:8,alignItems:'center'}}>
+                <span style={{color:'#16a34a'}}>✓</span>
+                <span style={{fontWeight:600}}>{rec.entity_name}</span>
+                <span style={{color:'#64748b'}}>{op.label}</span>
+                {rec.campaign_name && <span style={{color:'#94a3b8',fontSize:10}}>({rec.campaign_name})</span>}
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );
@@ -11596,6 +12662,7 @@ function App() {
         <button className={'tab' + (tab === 'reports' ? ' active' : '')} onClick={() => setTab('reports')}>Reports & Campaigns</button>
         <button className={'tab' + (tab === 'workflows' ? ' active' : '')} onClick={() => setTab('workflows')}>Workflows</button>
         <button className={'tab' + (tab === 'calls' ? ' active' : '')} onClick={() => setTab('calls')}>📋 Call Analysis</button>
+        <button className={'tab' + (tab === 'ai_optimizer' ? ' active' : '')} onClick={() => setTab('ai_optimizer')}>🤖 AI Optimizer</button>
         <button className={'tab' + (tab === 'admin' ? ' active' : '')} onClick={() => setTab('admin')}>Admin</button>
       </div>
       <div className="main">
@@ -11623,6 +12690,7 @@ function App() {
             {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} />}
             {tab === 'workflows' && <WorkflowsSection />}
             {tab === 'calls' && <CallAnalysisView />}
+            {tab === 'ai_optimizer' && <AiOptimizerTab onTabSwitch={setTab} />}
             {tab === 'admin' && (
               <AdminTab
                 onSync={() => api('/api/admin/sync', { method: 'POST' })}
@@ -11630,7 +12698,8 @@ function App() {
                 onGAds={() => api('/api/admin/gads-sync', { method: 'POST' })}
                 onConversions={() => api('/api/admin/upload-conversions', { method: 'POST' })}
                 onGA4Refresh={() => api('/api/admin/ga4/refresh', { method: 'POST' })}
-                onOptimize={() => api('/api/admin/optimize?dry_run=true', { method: 'POST' })} />
+                onOptimize={() => api('/api/admin/optimize', { method: 'POST' })}
+                onTabSwitch={setTab} />
             )}
           </React.Fragment>
         )}

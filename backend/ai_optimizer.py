@@ -134,6 +134,8 @@ def _get_search_terms(client, customer_id: str, days: int = 30) -> list:
         FROM search_term_view
         WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
             AND metrics.impressions > 0
+            AND campaign.status = 'ENABLED'
+            AND ad_group.status = 'ENABLED'
     """
 
     results = []
@@ -157,6 +159,214 @@ def _get_search_terms(client, customer_id: str, days: int = 30) -> list:
         logger.error(f"Failed to get search terms: {e}")
 
     return results
+
+
+def _get_google_recommendations(client, customer_id: str) -> list:
+    """
+    Pull Google's own recommendations via RecommendationService.
+    Returns list of dicts with type, resource_name, title, description, impact, details.
+
+    IMPORTANT: Only select top-level GAQL-selectable fields in the query.
+    Nested sub-fields (impact.base_metrics.*, keyword_recommendation.keyword.text, etc.)
+    are NOT selectable via GAQL — they are returned automatically on the proto object
+    once the parent message is in the SELECT list. We read them via getattr after fetch.
+    """
+    service = client.get_service("GoogleAdsService")
+    query = """
+        SELECT
+            recommendation.resource_name,
+            recommendation.type,
+            recommendation.campaign,
+            recommendation.ad_group,
+            recommendation.dismissed,
+            campaign.name,
+            campaign.resource_name
+        FROM recommendation
+        WHERE recommendation.dismissed = FALSE
+    """
+    results = []
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            rec = row.recommendation
+            # rec_type: use .name for enum, fall back to int string
+            try:
+                rec_type = rec.type_.name
+            except AttributeError:
+                rec_type = str(int(rec.type_))
+
+            # Impact — proto fields are populated on the object even though we
+            # didn't SELECT the sub-fields in GAQL (they come as part of the message)
+            try:
+                base = rec.impact.base_metrics
+                potential = rec.impact.potential_metrics
+                impact = {
+                    "base_impressions": float(getattr(base, 'impressions', 0) or 0),
+                    "base_clicks": float(getattr(base, 'clicks', 0) or 0),
+                    "base_cost": (int(getattr(base, 'cost_micros', 0) or 0)) / 1_000_000,
+                    "base_conversions": float(getattr(base, 'conversions', 0) or 0),
+                    "potential_impressions": float(getattr(potential, 'impressions', 0) or 0),
+                    "potential_clicks": float(getattr(potential, 'clicks', 0) or 0),
+                    "potential_cost": (int(getattr(potential, 'cost_micros', 0) or 0)) / 1_000_000,
+                    "potential_conversions": float(getattr(potential, 'conversions', 0) or 0),
+                }
+            except Exception:
+                impact = {
+                    "base_impressions": 0, "base_clicks": 0, "base_cost": 0, "base_conversions": 0,
+                    "potential_impressions": 0, "potential_clicks": 0, "potential_cost": 0, "potential_conversions": 0,
+                }
+
+            # Extract type-specific details — use try/except per type since
+            # proto oneof fields throw AttributeError if the wrong variant is accessed
+            details = {}
+            title = rec_type.replace("_", " ").title()
+            description = ""
+
+            try:
+                if rec_type == "KEYWORD":
+                    kw = rec.keyword_recommendation
+                    kw_text = kw.keyword.text or ""
+                    try:
+                        kw_match = kw.keyword.match_type.name
+                    except AttributeError:
+                        kw_match = str(kw.keyword.match_type)
+                    bid = (kw.recommended_cpc_bid_micros or 0) / 1_000_000
+                    details = {"keyword_text": kw_text, "match_type": kw_match, "recommended_cpc_bid": bid}
+                    title = f"Add Keyword: {kw_text}"
+                    description = f"Add '{kw_text}' [{kw_match}] at ${bid:.2f} CPC"
+
+                elif rec_type == "KEYWORD_MATCH_TYPE":
+                    km = rec.keyword_match_type_recommendation
+                    kw_text = km.keyword.text or ""
+                    try:
+                        from_type = km.keyword.match_type.name
+                        to_type = km.recommended_match_type.name
+                    except AttributeError:
+                        from_type = str(km.keyword.match_type)
+                        to_type = str(km.recommended_match_type)
+                    details = {"keyword_text": kw_text, "from_match_type": from_type, "to_match_type": to_type}
+                    title = f"Change Match Type: {kw_text}"
+                    description = f"Change '{kw_text}' from {from_type} → {to_type}"
+
+                elif rec_type == "MAXIMIZE_CONVERSIONS_OPT_IN":
+                    budget = (rec.maximize_conversions_opt_in_recommendation.recommended_budget_amount_micros or 0) / 1_000_000
+                    details = {"recommended_budget": budget}
+                    title = "Switch to Maximize Conversions"
+                    description = f"Switch bid strategy to Maximize Conversions (recommended budget: ${budget:.0f}/day)"
+
+                elif rec_type == "TARGET_CPA_OPT_IN":
+                    r = rec.target_cpa_opt_in_recommendation
+                    cpa = (r.recommended_target_cpa_micros or 0) / 1_000_000
+                    req_budget = (r.required_campaign_budget_amount_micros or 0) / 1_000_000
+                    details = {"recommended_target_cpa": cpa, "required_budget": req_budget}
+                    title = "Switch to Target CPA Bidding"
+                    description = f"Switch to Target CPA at ${cpa:.2f} (requires ${req_budget:.0f}/day budget)"
+
+                elif rec_type == "TARGET_ROAS_OPT_IN":
+                    roas = rec.target_roas_opt_in_recommendation.recommended_target_roas or 0
+                    details = {"recommended_target_roas": roas}
+                    title = "Switch to Target ROAS Bidding"
+                    description = f"Switch to Target ROAS at {roas:.1%}"
+
+                elif rec_type in ("MARGINAL_ROI_CAMPAIGN_BUDGET", "CAMPAIGN_BUDGET"):
+                    budget_rec = (rec.marginal_roi_campaign_budget_recommendation
+                                  if rec_type == "MARGINAL_ROI_CAMPAIGN_BUDGET"
+                                  else rec.campaign_budget_recommendation)
+                    rec_budget = (budget_rec.recommended_budget_amount_micros or 0) / 1_000_000
+                    cur_budget = (budget_rec.current_budget_amount_micros or 0) / 1_000_000
+                    details = {"current_budget": cur_budget, "recommended_budget": rec_budget,
+                               "campaign_resource": rec.campaign or ""}
+                    title = "Increase Campaign Budget"
+                    description = f"Increase daily budget from ${cur_budget:.0f} to ${rec_budget:.0f}"
+
+                elif rec_type == "MOVE_UNUSED_BUDGET":
+                    mu = rec.move_unused_budget_recommendation
+                    # budget_recommendation is a CampaignBudgetRecommendation sub-message
+                    rec_amount = (mu.budget_recommendation.recommended_budget_amount_micros or 0) / 1_000_000
+                    details = {"recommended_budget_amount": rec_amount,
+                               "excess_campaign_budget": mu.excess_campaign_budget or ""}
+                    title = "Move Unused Budget"
+                    description = f"Reallocate unused budget (${rec_amount:.0f}) to this campaign"
+
+                elif rec_type in ("RESPONSIVE_SEARCH_AD", "RESPONSIVE_SEARCH_AD_IMPROVE_AD_STRENGTH"):
+                    details = {"has_rsa_suggestion": True}
+                    title = "Improve Responsive Search Ad"
+                    description = "Google recommends updating ad copy for better Ad Strength"
+
+                elif rec_type in ("SITELINK_ASSET", "SITELINK_EXTENSION"):
+                    title = "Add Sitelink Assets"
+                    description = "Add sitelink assets to improve ad visibility (+10-20% CTR)"
+
+                elif rec_type in ("CALLOUT_ASSET", "CALLOUT_EXTENSION"):
+                    title = "Add Callout Assets"
+                    description = "Add callout assets to highlight practice features"
+
+                elif rec_type in ("CALL_ASSET", "CALL_EXTENSION"):
+                    title = "Add Call Asset"
+                    description = "Add call asset to enable direct calling from ads"
+
+                elif rec_type == "MAXIMIZE_CLICKS_OPT_IN":
+                    title = "Switch to Maximize Clicks"
+                    description = "Switch bid strategy to Maximize Clicks"
+
+                elif rec_type == "ENHANCED_CPC_OPT_IN":
+                    title = "Enable Enhanced CPC"
+                    description = "Enable Enhanced CPC to optimize manual bids with AI"
+
+                elif rec_type == "USE_BROAD_MATCH_KEYWORD":
+                    r = rec.use_broad_match_keyword_recommendation
+                    kw_count = r.suggested_keywords_count or 0
+                    details = {"suggested_keywords_count": kw_count,
+                               "required_budget": (r.required_campaign_budget_amount_micros or 0) / 1_000_000}
+                    title = "Use Broad Match Keywords"
+                    description = f"Switch {kw_count} keywords to broad match for wider reach"
+
+                elif rec_type == "RAISE_TARGET_CPA":
+                    r = rec.raise_target_cpa_recommendation
+                    details = {"target_adjustment": str(getattr(r, 'target_adjustment', ''))}
+                    title = "Raise Target CPA"
+                    description = "Google recommends raising Target CPA to get more conversions"
+
+            except Exception as detail_err:
+                logger.debug(f"Could not extract details for {rec_type}: {detail_err}")
+
+            results.append({
+                "resource_name": rec.resource_name,
+                "rec_type": rec_type,
+                "campaign_resource": row.campaign.resource_name if row.campaign.resource_name else "",
+                "campaign_name": row.campaign.name if row.campaign.name else "",
+                "ad_group_resource": rec.ad_group if rec.ad_group else "",
+                "title": title,
+                "description": description,
+                "impact": impact,
+                "details": details,
+            })
+    except Exception as e:
+        logger.error(f"Failed to get Google recommendations: {e}")
+    logger.info(f"Fetched {len(results)} Google recommendations")
+    return results
+
+
+def _apply_google_recommendation(client, customer_id: str, resource_name: str) -> bool:
+    """
+    Apply a Google recommendation directly via ApplyRecommendation.
+    This is the simplest path for most rec types — Google applies it server-side.
+    Returns True on success.
+    """
+    service = client.get_service("RecommendationService")
+    operation = client.get_type("ApplyRecommendationOperation")
+    operation.resource_name = resource_name
+    try:
+        response = service.apply_recommendation(
+            customer_id=customer_id,
+            operations=[operation],
+            partial_failure=True,
+        )
+        logger.info(f"Applied Google rec {resource_name}: {response}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to apply Google rec {resource_name}: {e}")
+        raise
 
 
 # ── Lead-Level Attribution ───────────────────────────────────────────────────
@@ -197,16 +407,610 @@ def _get_keyword_attribution() -> dict:
     return attribution
 
 
+def _get_call_attribution(days: int = 30) -> dict:
+    """
+    Return per-campaign inbound call attribution directly from mango_calls.
+    Bypasses v_campaign_call_stats (which requires gads_campaign_numeric_id on campaigns
+    rows — often unpopulated — causing false-zero call counts).
+
+    Resolution order for campaign name:
+      1. gads_call_view.campaign_name  (most authoritative — came from GAds API)
+      2. leads.campaign_name           (form-fill attribution)
+      3. campaigns.campaign_name via gads_campaign_numeric_id (ID-based lookup)
+
+    Returns: {campaign_name_lower: {campaign_name, calls, booked_calls, confirmed_appts,
+                                    avg_duration_sec, gcv_campaign_id}}
+    """
+    from database import _conn
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    out = {}
+    try:
+        with _conn() as conn:
+            rows = conn.execute("""
+                WITH resolved AS (
+                  SELECT
+                    mc.uuid,
+                    mc.duration_sec,
+                    mc.booked_outcome,
+                    mc.od_appointment_id,
+                    gcv.campaign_id   AS gcv_campaign_id,
+                    COALESCE(
+                      NULLIF(TRIM(gcv.campaign_name), ''),
+                      NULLIF(TRIM(l.campaign_name),   ''),
+                      (SELECT campaign_name FROM campaigns
+                         WHERE gads_campaign_numeric_id = gcv.campaign_id LIMIT 1)
+                    ) AS campaign_name
+                  FROM mango_calls mc
+                  LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+                  LEFT JOIN leads l            ON l.id = mc.lead_id
+                  WHERE mc.started_at >= ?
+                    AND mc.direction = 'inbound'
+                )
+                SELECT
+                  LOWER(TRIM(campaign_name))  AS key,
+                  campaign_name,
+                  gcv_campaign_id,
+                  COUNT(DISTINCT uuid)         AS calls,
+                  SUM(CASE WHEN booked_outcome = 'booked' THEN 1 ELSE 0 END) AS booked_calls,
+                  SUM(CASE WHEN od_appointment_id IS NOT NULL
+                            AND od_appointment_id != '' THEN 1 ELSE 0 END)   AS confirmed_appts,
+                  AVG(duration_sec)            AS avg_duration_sec
+                FROM resolved
+                WHERE campaign_name IS NOT NULL AND TRIM(campaign_name) != ''
+                GROUP BY LOWER(TRIM(campaign_name)), campaign_name, gcv_campaign_id
+            """, (cutoff,)).fetchall()
+
+            for r in rows:
+                key = r["key"]
+                if not key:
+                    continue
+                if key not in out:
+                    out[key] = {
+                        "campaign_name": r["campaign_name"],
+                        "gcv_campaign_id": r["gcv_campaign_id"] or "",
+                        "calls": 0, "booked_calls": 0,
+                        "confirmed_appts": 0, "avg_duration_sec": 0.0,
+                    }
+                # Merge rows (multiple gcv_campaign_id values can share a campaign name)
+                out[key]["calls"]          += int(r["calls"] or 0)
+                out[key]["booked_calls"]   += int(r["booked_calls"] or 0)
+                out[key]["confirmed_appts"] += int(r["confirmed_appts"] or 0)
+                # Weighted average for duration
+                prev_avg = out[key]["avg_duration_sec"]
+                prev_n   = out[key]["calls"] - int(r["calls"] or 0)
+                new_n    = int(r["calls"] or 0)
+                if out[key]["calls"] > 0:
+                    out[key]["avg_duration_sec"] = (
+                        (prev_avg * prev_n + float(r["avg_duration_sec"] or 0.0) * new_n)
+                        / out[key]["calls"]
+                    )
+
+            # Log unresolved calls for diagnostics
+            unresolved = conn.execute("""
+                SELECT COUNT(*) FROM mango_calls mc
+                LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+                LEFT JOIN leads l ON l.id = mc.lead_id
+                WHERE mc.started_at >= ? AND mc.direction = 'inbound'
+                  AND COALESCE(NULLIF(TRIM(gcv.campaign_name),''),
+                               NULLIF(TRIM(l.campaign_name),'')) IS NULL
+            """, (cutoff,)).fetchone()[0]
+            if unresolved > 0:
+                logger.warning(f"Call attribution: {unresolved} inbound calls have no resolvable campaign name "
+                               f"(no gads_call_view match AND no lead campaign). Run Sync Now to fix.")
+
+    except Exception as e:
+        logger.error(f"Failed to build call attribution: {e}", exc_info=True)
+    return out
+
+
+def _get_keyword_call_attribution(days: int = 30) -> dict:
+    """
+    Return per-keyword inbound call attribution using the attributed_keyword column
+    set by call_keyword_attribution.py (Methods A/B/C only — excludes campaign_only).
+
+    Returns: {keyword_lower: {keyword, match_type, ad_group, calls, booked_calls,
+                               confirmed_appts, avg_duration_sec, campaigns: [str]}}
+    """
+    from database import _conn
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    out = {}
+    try:
+        with _conn() as conn:
+            # Pre-aggregate per call in a CTE to prevent JOIN row multiplication.
+            # gads_call_view or leads may match multiple rows per call; the CTE
+            # collapses mango_calls first, then joins for campaign label only.
+            rows = conn.execute("""
+                WITH call_agg AS (
+                  SELECT
+                    mc.uuid,
+                    LOWER(TRIM(mc.attributed_keyword))  AS kw_lower,
+                    mc.attributed_keyword               AS keyword,
+                    mc.attributed_match_type            AS match_type,
+                    mc.attributed_ad_group              AS ad_group,
+                    mc.gads_call_id,
+                    mc.lead_id,
+                    CASE WHEN mc.booked_outcome = 'booked' THEN 1 ELSE 0 END AS is_booked,
+                    CASE WHEN mc.od_appointment_id IS NOT NULL
+                          AND mc.od_appointment_id != '' THEN 1 ELSE 0 END   AS is_confirmed,
+                    COALESCE(mc.duration_sec, 0)        AS duration_sec
+                  FROM mango_calls mc
+                  WHERE mc.started_at >= ?
+                    AND mc.direction = 'inbound'
+                    AND mc.attributed_keyword IS NOT NULL
+                    AND mc.attributed_keyword != ''
+                    AND mc.attributed_keyword_method NOT IN ('campaign_only', 'no_signal')
+                )
+                SELECT
+                  ca.kw_lower,
+                  ca.keyword,
+                  MAX(ca.match_type)   AS match_type,
+                  MAX(ca.ad_group)     AS ad_group,
+                  COALESCE(NULLIF(gcv.campaign_name,''),
+                           NULLIF(l.campaign_name,''), '')  AS campaign_name,
+                  COUNT(DISTINCT ca.uuid)                   AS calls,
+                  SUM(ca.is_booked)                         AS booked_calls,
+                  SUM(ca.is_confirmed)                      AS confirmed_appts,
+                  SUM(ca.duration_sec)                      AS total_duration_sec
+                FROM call_agg ca
+                LEFT JOIN gads_call_view gcv ON gcv.call_id = ca.gads_call_id
+                LEFT JOIN leads l            ON l.id        = ca.lead_id
+                GROUP BY ca.kw_lower, ca.keyword,
+                         COALESCE(NULLIF(gcv.campaign_name,''), NULLIF(l.campaign_name,''), '')
+            """, (cutoff,)).fetchall()
+
+            # Merge rows with the same keyword across campaigns
+            for r in rows:
+                kw_lower = r["kw_lower"] or ""
+                if not kw_lower:
+                    continue
+                if kw_lower not in out:
+                    out[kw_lower] = {
+                        "keyword": r["keyword"],
+                        "match_type": r["match_type"] or "",
+                        "ad_group": r["ad_group"] or "",
+                        "calls": 0,
+                        "booked_calls": 0,
+                        "confirmed_appts": 0,
+                        "_total_duration_sec": 0.0,   # internal accumulator, removed before return
+                        "campaigns": [],
+                    }
+                entry = out[kw_lower]
+                entry["calls"] += int(r["calls"] or 0)
+                entry["booked_calls"] += int(r["booked_calls"] or 0)
+                entry["confirmed_appts"] += int(r["confirmed_appts"] or 0)
+                entry["_total_duration_sec"] += float(r["total_duration_sec"] or 0.0)
+                if r["campaign_name"] and r["campaign_name"] not in entry["campaigns"]:
+                    entry["campaigns"].append(r["campaign_name"])
+
+        # Compute avg_duration_sec and remove internal accumulator
+        for entry in out.values():
+            entry["avg_duration_sec"] = (
+                round(entry["_total_duration_sec"] / entry["calls"], 1)
+                if entry["calls"] > 0 else 0.0
+            )
+            del entry["_total_duration_sec"]
+
+    except Exception as e:
+        logger.error(f"Failed to build keyword call attribution: {e}")
+    return out
+
+
+def _get_od_production_summary(days: int = 30) -> dict:
+    """
+    Roll up attributed_production from leads over the last N days.
+    Returns: {"total_attributed": float, "by_campaign": {campaign_name: float}}
+    """
+    from database import _conn
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    total = 0.0
+    by_camp: dict = {}
+    try:
+        with _conn() as conn:
+            rows = conn.execute("""
+                SELECT COALESCE(NULLIF(campaign_name,''),'(unknown)') AS campaign_name,
+                       SUM(COALESCE(attributed_production,0))         AS prod
+                  FROM leads
+                 WHERE created_at >= ?
+                 GROUP BY campaign_name
+            """, (cutoff,)).fetchall()
+            for r in rows:
+                amt = float(r["prod"] or 0.0)
+                if amt <= 0:
+                    continue
+                total += amt
+                by_camp[r["campaign_name"]] = round(amt, 2)
+    except Exception as e:
+        logger.error(f"OD production summary failed: {e}")
+    return {"total_attributed": round(total, 2), "by_campaign": by_camp}
+
+
+def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms: list,
+                             call_attribution: dict, od_production: dict,
+                             summary: dict, campaign: str,
+                             keyword_call_attribution: dict | None = None,
+                             feedback: str = "",
+                             rsa_resources: list | None = None,
+                             geo_resolutions: dict | None = None,
+                             google_recs: list | None = None) -> list:
+    """
+    Ask Claude (Opus) for structured, actionable recommendations for this campaign.
+    Each recommendation is a dict with operation + exact parameters ready to execute via API.
+
+    Supported operations Claude may return:
+      add_negative_keyword  — {keyword_text, match_type, reason}
+      pause_keyword         — {keyword_text, resource_name, reason}
+      increase_bid          — {keyword_text, resource_name, new_bid_micros, reason}
+      decrease_bid          — {keyword_text, resource_name, new_bid_micros, reason}
+      add_exact_keyword     — {keyword_text, ad_group_resource, reason}
+      ad_copy_suggestion    — {headline, description, reason}  (informational — no API call)
+      geo_exclusion         — {location_name, reason}          (informational — logged for review)
+
+    Returns list of dicts. Never raises — failure returns [].
+    """
+    import os, re as _re
+    try:
+        from database import get_setting as _get_setting
+    except Exception:
+        _get_setting = lambda k: None
+    _api_key = _get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not _api_key:
+        return []
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=_api_key)
+
+        call_summary = {
+            v["campaign_name"]: {
+                "calls": v["calls"],
+                "booked": v["booked_calls"],
+                "confirmed_appts": v["confirmed_appts"],
+                "avg_duration_sec": round(v.get("avg_duration_sec") or 0),
+            }
+            for v in call_attribution.values()
+        }
+        kw_call_summary = {
+            kw: {
+                "calls": v["calls"],
+                "booked_calls": v["booked_calls"],
+                "confirmed_appts": v["confirmed_appts"],
+                "avg_duration_sec": round(v.get("avg_duration_sec") or 0),
+            }
+            for kw, v in sorted(
+                (keyword_call_attribution or {}).items(),
+                key=lambda x: -(x[1].get("confirmed_appts", 0) * 10 + x[1].get("calls", 0))
+            )[:20]
+        }
+
+        # Enrich search terms with resource names from keyword_perf for API execution
+        kw_resource_map = {
+            kw.get("keyword", "").strip().lower(): {
+                "resource_name": kw.get("resource_name", ""),
+                "ad_group_resource": kw.get("ad_group_resource", ""),
+                "campaign_resource": kw.get("campaign_resource", ""),
+                "current_bid_micros": kw.get("cpc_bid_micros", 0),
+                "match_type": kw.get("match_type", "BROAD"),
+            }
+            for kw in keyword_perf if kw.get("keyword")
+        }
+        # Campaign resource name from keyword_perf (first match for this campaign)
+        campaign_resource = ""
+        for kw in keyword_perf:
+            if kw.get("campaign", "").strip().lower() == campaign.strip().lower():
+                campaign_resource = kw.get("campaign_resource", "")
+                if campaign_resource:
+                    break
+
+        context = {
+            "campaign_name": campaign,
+            "campaign_resource": campaign_resource,
+            "summary": summary,
+            "keyword_performance": [
+                {**k, **kw_resource_map.get(k.get("keyword","").lower(), {})}
+                for k in keyword_perf[:50]
+            ],
+            "search_terms_top": sorted(search_terms, key=lambda s: -s.get("cost", 0))[:30],
+            "form_attribution": attribution,
+            "call_summary": call_summary,
+            "keyword_call_summary": kw_call_summary,
+            "od_production_summary": od_production,
+            "keyword_resource_map": kw_resource_map,
+            "rsa_resources": (rsa_resources or [])[:10],
+            "geo_resolutions": geo_resolutions or {},
+            "google_recommendations": (google_recs or [])[:20],
+        }
+
+        feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
+
+        rsa_note = ""
+        if rsa_resources:
+            rsa_note = (
+                "\n\nRSA RESOURCES (use ad_group_ad_resource for ad_copy_suggestion):\n"
+                + json.dumps(rsa_resources[:5], default=str)
+            )
+        geo_note = ""
+        if geo_resolutions:
+            geo_note = (
+                "\n\nPRE-RESOLVED GEO TARGETS (use geo_target_resource for geo_exclusion):\n"
+                + json.dumps(geo_resolutions, default=str)
+            )
+
+        prompt = """You are a Google Ads specialist optimizing a dental practice's campaigns.
+Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
+
+Each recommendation MUST be a JSON object with these fields:
+- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset
+- "reason": 1-2 sentence explanation with specific numbers from the data
+- Operation-specific fields:
+
+For add_negative_keyword:
+  "keyword_text": exact term to block, "match_type": "EXACT"|"PHRASE"|"BROAD",
+  "campaign_resource": the campaign resource name from the data
+
+For pause_keyword:
+  "keyword_text": keyword, "resource_name": the keyword resource_name from data
+
+For enable_keyword:
+  "keyword_text": keyword, "resource_name": the keyword resource_name from data (must be a PAUSED keyword)
+
+For increase_bid / decrease_bid:
+  "keyword_text": keyword, "resource_name": resource_name,
+  "new_bid_micros": integer (current bid ± 10-20%)
+
+For add_exact_keyword:
+  "keyword_text": search term, "ad_group_resource": ad_group_resource from data
+
+For ad_copy_suggestion:
+  "headline": new headline (STRICT MAX 30 chars — count carefully),
+  "description": new description (STRICT MAX 90 chars — count carefully),
+  "ad_resource": the ad_group_ad_resource from rsa_resources data (required for API execution)
+
+For geo_exclusion:
+  "location_name": city/region name to exclude,
+  "geo_target_resource": resource_name from geo_resolutions data (required for API execution)
+
+For change_budget:
+  "new_daily_budget_usd": float (e.g. 35.0), max 25% increase from current,
+  "campaign_resource": the campaign resource name from the data
+
+For change_bid_strategy:
+  "bid_strategy": "MAXIMIZE_CONVERSIONS"|"TARGET_CPA"|"TARGET_ROAS"|"MAXIMIZE_CLICKS",
+  "target_cpa_micros": integer (only for TARGET_CPA),
+  "target_roas": float (only for TARGET_ROAS),
+  "campaign_resource": campaign resource name
+
+For change_match_type:
+  "keyword_text": keyword text,
+  "resource_name": keyword resource_name,
+  "new_match_type": "EXACT"|"PHRASE"|"BROAD"
+
+For add_asset:
+  "asset_type": "SITELINK"|"CALLOUT"|"CALL",
+  "campaign_resource": campaign resource name,
+  "description": what to add (advisory — no API call)
+
+GOOGLE'S OWN RECOMMENDATIONS (pulled live from Google Ads API):
+Google has flagged the following recommendations for this account. Evaluate each one against the campaign data and lead/call attribution above. For each Google rec:
+- If the data supports it → include it as your recommendation with operation matching the rec type, add "google_rec_resource_name": the resource_name field
+- If the data contradicts it (e.g. Google says add keyword X but our data shows it converts poorly) → explicitly reject it in your reasoning but do NOT include it
+- If neutral/unknown → include it as advisory
+
+When endorsing a Google recommendation, use these operation mappings:
+- KEYWORD rec → "add_exact_keyword" operation (or add_negative if it looks like a negative)
+- KEYWORD_MATCH_TYPE → "change_match_type" operation
+- MARGINAL_ROI_CAMPAIGN_BUDGET / CAMPAIGN_BUDGET → "change_budget" operation
+- MAXIMIZE_CONVERSIONS_OPT_IN → "change_bid_strategy" operation
+- TARGET_CPA_OPT_IN → "change_bid_strategy" operation
+- SITELINK_EXTENSION / CALLOUT_EXTENSION / CALL_EXTENSION → "add_asset" operation (advisory)
+- RESPONSIVE_SEARCH_AD → "ad_copy_suggestion" operation
+
+Always include "google_rec_resource_name" field in any rec that came from Google.
+
+Rules:
+- Only use resource_names that appear in the data — never invent them
+- If resource_name is unavailable for a keyword operation, skip that recommendation
+- For ad_copy_suggestion: ALWAYS include ad_resource from rsa_resources — skip if none available
+- For geo_exclusion: ONLY suggest if geo_target_resource is available in geo_resolutions
+- Prioritize recommendations that stop wasted spend first
+- COMPETITOR SEARCHES: Any search term containing a competitor practice name (e.g. "grace dental", "simply orthodontics", "aspen dental", "gentle dental", any "[name] dental [city]" that isn't Grafton Dental Care) MUST be flagged as add_negative_keyword. These waste budget showing our ads to people searching for a competitor.
+- Return ONLY a valid JSON array, no markdown, no explanation outside the array""" + rsa_note + geo_note + feedback_block
+
+        msg = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": prompt + "\n\nCAMPAIGN DATA:\n" + json.dumps(context, default=str)[:70000],
+            }],
+        )
+        text = msg.content[0].text if msg.content else "[]"
+        m = _re.search(r"\[[\s\S]*\]", text)
+        if m:
+            arr = json.loads(m.group(0))
+            # Build sets of valid resource names from actual keyword_perf data
+            valid_kw_resources   = {kw.get("resource_name","")      for kw in keyword_perf if kw.get("resource_name")}
+            valid_ag_resources   = {kw.get("ad_group_resource","")  for kw in keyword_perf if kw.get("ad_group_resource")}
+            valid_camp_resources = {kw.get("campaign_resource","")  for kw in keyword_perf if kw.get("campaign_resource")}
+
+            validated = []
+            for item in arr:
+                if not isinstance(item, dict) or not item.get("operation"):
+                    continue
+                op = item["operation"]
+                # Validate resource names Claude returned are real — drop hallucinated ones
+                if op in ("pause_keyword", "increase_bid", "decrease_bid"):
+                    rn = item.get("resource_name","")
+                    if rn and rn not in valid_kw_resources:
+                        logger.warning(f"Dropping Claude rec — unknown resource_name '{rn}' for op={op}")
+                        continue
+                elif op == "add_exact_keyword":
+                    ag = item.get("ad_group_resource","")
+                    if ag and ag not in valid_ag_resources:
+                        logger.warning(f"Dropping Claude rec — unknown ad_group_resource '{ag}' for op={op}")
+                        continue
+                elif op == "add_negative_keyword":
+                    cr = item.get("campaign_resource","")
+                    if cr and cr not in valid_camp_resources:
+                        logger.warning(f"Dropping Claude rec — unknown campaign_resource '{cr}' for op={op}")
+                        # Fall back: use the campaign_resource we derived from keyword_perf
+                        if campaign_resource:
+                            item["campaign_resource"] = campaign_resource
+                            logger.info(f"  Fixed campaign_resource for '{item.get('keyword_text','?')}' → {campaign_resource}")
+                        else:
+                            continue
+                elif op == "ad_copy_suggestion":
+                    # Validate character limits — drop silently if over limit
+                    headline = item.get("headline", "")
+                    description = item.get("description", "")
+                    if len(headline) > 30:
+                        logger.warning(f"Dropping ad_copy_suggestion — headline too long: '{headline}' ({len(headline)} chars)")
+                        continue
+                    if len(description) > 90:
+                        logger.warning(f"Dropping ad_copy_suggestion — description too long ({len(description)} chars)")
+                        continue
+                    # ad_resource is required for API execution; warn if missing but keep rec
+                    if not item.get("ad_resource"):
+                        logger.warning(f"ad_copy_suggestion missing ad_resource — will be acknowledged-only")
+                elif op == "geo_exclusion":
+                    # Drop if no pre-resolved geo_target_resource
+                    if not item.get("geo_target_resource"):
+                        logger.warning(f"Dropping geo_exclusion '{item.get('location_name','')}' — no geo_target_resource resolved")
+                        continue
+                elif op == "enable_keyword":
+                    rn = item.get("resource_name","")
+                    if rn and rn not in valid_kw_resources:
+                        logger.warning(f"Dropping Claude rec — unknown resource_name '{rn}' for op={op}")
+                        continue
+                elif op == "change_budget":
+                    cr = item.get("campaign_resource","")
+                    if cr and cr not in valid_camp_resources:
+                        if campaign_resource:
+                            item["campaign_resource"] = campaign_resource
+                        else:
+                            logger.warning(f"Dropping change_budget — no valid campaign_resource")
+                            continue
+                    if not item.get("new_daily_budget_usd"):
+                        logger.warning("Dropping change_budget — missing new_daily_budget_usd")
+                        continue
+                validated.append(item)
+            logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
+            return validated
+    except Exception as e:
+        logger.warning(f"Claude advisory call failed (non-fatal): {e}")
+    return []
+
+
+def _refine_claude_action(action_row: dict, feedback: str) -> dict | None:
+    """
+    Re-run Claude on a single existing action with user feedback.
+    Returns a revised action dict, or None on failure.
+    """
+    import os, re as _re
+    try:
+        from database import get_setting as _get_setting
+    except Exception:
+        _get_setting = lambda k: None
+    _api_key = _get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not _api_key:
+        return None
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=_api_key)
+
+        after_state = json.loads(action_row.get("after_state_json") or "{}")
+        prompt = f"""You are refining a Google Ads recommendation based on user feedback.
+
+Original recommendation:
+Operation: {action_row.get('operation')}
+Entity: {action_row.get('entity_name')}
+Reason: {action_row.get('reason')}
+Parameters: {json.dumps(after_state)}
+
+User feedback: {feedback}
+
+Return a SINGLE revised recommendation as a JSON object with the same operation type and all required fields updated per the feedback. Return ONLY the JSON object, no markdown."""
+
+        msg = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = msg.content[0].text if msg.content else "{}"
+        m = _re.search(r"\{[\s\S]*\}", text)
+        if m:
+            revised = json.loads(m.group(0))
+            if isinstance(revised, dict) and revised.get("operation"):
+                return revised
+    except Exception as e:
+        logger.warning(f"Claude refine call failed: {e}")
+    return None
+
+
+# ── Outcome History (AI Learning Loop) ───────────────────────────────────────
+
+def _load_outcome_history(days_back: int = 90) -> dict:
+    """
+    Load the history of applied actions and their measured outcomes.
+    Returns: {(entity_id, operation): {improved, degraded, neutral, last_applied_at}}
+
+    Used by _analyze_keywords to skip or downgrade recommendations for entities
+    where previous identical actions degraded performance.
+    Guards against noise:
+      - Only counts outcomes with pre_clicks_7d >= 5 (minimum sample)
+      - 90-day window prevents stale data from blocking valid current recommendations
+    """
+    from database import _conn
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    out = {}
+    try:
+        with _conn() as conn:
+            rows = conn.execute("""
+                SELECT entity_id, entity_name, operation,
+                       SUM(CASE WHEN verdict='improved' THEN 1 ELSE 0 END) AS n_improved,
+                       SUM(CASE WHEN verdict='degraded' THEN 1 ELSE 0 END) AS n_degraded,
+                       SUM(CASE WHEN verdict='neutral'  THEN 1 ELSE 0 END) AS n_neutral,
+                       MAX(applied_at) AS last_applied_at
+                  FROM applied_outcomes
+                 WHERE applied_at >= ?
+                   AND pre_clicks_7d >= 5
+                 GROUP BY entity_id, operation
+            """, (cutoff,)).fetchall()
+        for r in rows:
+            out[(r["entity_id"], r["operation"])] = {
+                "improved": int(r["n_improved"] or 0),
+                "degraded": int(r["n_degraded"] or 0),
+                "neutral":  int(r["n_neutral"] or 0),
+                "last_applied_at": r["last_applied_at"] or "",
+            }
+    except Exception as e:
+        logger.warning(f"Could not load outcome history (non-fatal): {e}")
+    return out
+
+
 # ── Rule-Based Optimization ──────────────────────────────────────────────────
 
-def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list, campaign: str = "") -> dict:
+# Stop words for harvest-exact token-overlap check (Rule 4).
+# Single-word match on these alone is too generic for a dental practice
+# and would cause false-positive exact-match harvesting.
+_HARVEST_STOP_WORDS = frozenset({
+    "a", "an", "the", "of", "and", "or", "in", "near", "my", "me", "i",
+    "for", "to", "at", "on", "with", "is", "are",
+    "dental", "dentist", "dentistry", "tooth", "teeth", "oral",
+    "care", "office", "clinic", "practice",
+})
+
+
+def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
+                      call_attribution: dict | None = None,
+                      keyword_call_attribution: dict | None = None,
+                      campaign: str = "",
+                      outcome_history: dict | None = None) -> dict:
     """
     Apply optimization rules. Returns recommended actions.
     campaign: name of the campaign being evaluated — used to scope memory lookups.
               Empty string = global memory only.
+    outcome_history: pre-loaded from _load_outcome_history(); if None, loaded here.
     """
     # Load persistent memory — what the optimizer has been taught
-    # Two-pass: global entries first, campaign-specific overrides second
     try:
         from database import get_optimizer_memory_dict
         mem = get_optimizer_memory_dict(campaign=campaign)
@@ -214,33 +1018,56 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
         logger.warning(f"Could not load optimizer memory: {e}")
         mem = {'term_classifications': {}, 'keyword_overrides': {}, 'campaign_rules': {}, 'general': {}}
 
-    term_classifications = mem.get('term_classifications', {})   # search term → 'negative'/'good_keyword'/'irrelevant'
-    keyword_overrides = mem.get('keyword_overrides', {})         # keyword → 'never_pause'/'always_bid_up' etc.
-    campaign_rules = mem.get('campaign_rules', {})               # 'min_spend_before_pause' → value
+    term_classifications = mem.get('term_classifications', {})
+    keyword_overrides = mem.get('keyword_overrides', {})
+    campaign_rules = mem.get('campaign_rules', {})
 
-    # Pull configurable thresholds from memory (with sensible defaults)
-    min_spend_before_pause = float(campaign_rules.get('min_spend_before_pause', 20))
-    min_clicks_before_pause = int(campaign_rules.get('min_clicks_before_pause', 10))
+    min_spend_before_pause = float(campaign_rules.get('min_spend_before_pause', 40))
+    min_clicks_before_pause = int(campaign_rules.get('min_clicks_before_pause', 20))
+
+    # Load outcome history (AI learning loop)
+    if outcome_history is None:
+        outcome_history = _load_outcome_history(days_back=90)
 
     logger.info(f"Optimizer memory loaded: {len(term_classifications)} term classifications, "
-                f"{len(keyword_overrides)} keyword overrides, {len(campaign_rules)} campaign rules")
+                f"{len(keyword_overrides)} keyword overrides, {len(campaign_rules)} campaign rules, "
+                f"{len(outcome_history)} outcome history entries")
 
     actions = {
-        "pause": [],           # Keywords to pause (high spend, no results)
-        "increase_bid": [],    # Keywords to bid up (proven production)
-        "decrease_bid": [],    # Keywords to bid down (high cost, low conversion)
-        "new_exact": [],       # Search terms to add as exact match keywords
-        "new_negatives": [],   # Search terms to add as negatives
+        "pause": [],            # Keywords to pause (high spend, no results)
+        "increase_bid": [],     # Keywords to bid up (proven production)
+        "decrease_bid": [],     # Keywords to bid down (high cost, low conversion)
+        "new_exact": [],        # Search terms to add as exact match keywords
+        "new_negatives": [],    # Search terms to add as negatives
+        "tighten_match": [],    # Broad keywords to convert to exact match
         "summary": {},
-        "memory_applied": [],  # Log of memory overrides that changed the outcome
+        "memory_applied": [],   # Log of memory overrides that changed the outcome
     }
+
+    call_attribution = call_attribution or {}
+    keyword_call_attribution = keyword_call_attribution or {}
+
+    def _calls_for(camp_name: str) -> dict:
+        """Return call attribution for a campaign name (case-insensitive)."""
+        return call_attribution.get((camp_name or "").lower(), {
+            "calls": 0, "booked_calls": 0, "confirmed_appts": 0, "avg_duration_sec": 0,
+        })
+
+    def _kw_calls_for(kw_text: str) -> dict:
+        """Return keyword-level call attribution (case-insensitive)."""
+        return keyword_call_attribution.get((kw_text or "").lower().strip(), {
+            "calls": 0, "booked_calls": 0, "confirmed_appts": 0, "avg_duration_sec": 0.0,
+        })
 
     total_spend = sum(k["cost"] for k in keyword_perf)
     total_clicks = sum(k["clicks"] for k in keyword_perf)
     total_leads = sum(a["leads"] for a in attribution.values())
     total_production = sum(a["production"] for a in attribution.values())
+    total_calls = sum(c["calls"] for c in call_attribution.values())
+    total_booked_calls = sum(c["booked_calls"] for c in call_attribution.values())
+    total_confirmed_appts = sum(c["confirmed_appts"] for c in call_attribution.values())
 
-    # Rule 1: Pause keywords with spend > threshold and zero leads
+    # Rule 1: Pause keywords with spend > threshold and zero leads/calls
     for kw in keyword_perf:
         keyword = kw["keyword"]
         keyword_lower = keyword.lower()
@@ -253,20 +1080,72 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
             continue
 
         if kw["cost"] > min_spend_before_pause and attr["leads"] == 0 and kw["clicks"] > min_clicks_before_pause:
+            kw_calls = _kw_calls_for(keyword)
+            camp_calls = _calls_for(kw.get("campaign", ""))
+
+            # Learning loop guard: if previous pause of this keyword DEGRADED performance, skip
+            hist = outcome_history.get((kw["resource_name"], "pause_keyword"))
+            if hist and hist["degraded"] >= 1 and hist["improved"] == 0:
+                actions["memory_applied"].append(
+                    f"SKIP PAUSE '{keyword}': previous pause degraded campaign performance — learning loop override"
+                )
+                continue
+
+            # Guard 1: this specific keyword drove a call or confirmed appt — protect it
+            if kw_calls["confirmed_appts"] > 0 or kw_calls["booked_calls"] > 0:
+                actions["memory_applied"].append(
+                    f"SKIP PAUSE '{keyword}': drove {kw_calls['calls']} calls / "
+                    f"{kw_calls['confirmed_appts']} confirmed appts directly"
+                )
+                continue
+            if kw_calls["calls"] >= 2:
+                actions["memory_applied"].append(
+                    f"SKIP PAUSE '{keyword}': drove {kw_calls['calls']} inbound calls "
+                    f"(keyword-level attribution)"
+                )
+                continue
+
+            # Guard 2 (legacy fallback): this keyword has no keyword-level call data yet,
+            # but the campaign is generating calls or confirmed appts — protect it.
+            # Fires when: no keyword-level attribution for this kw AND campaign has any calls
+            # (not just confirmed appts) so brand-new campaigns with unattributed calls are safe.
+            camp_has_signal = (camp_calls["confirmed_appts"] > 0 or camp_calls["calls"] >= 3)
+            if not kw_calls["calls"] and camp_has_signal:
+                actions["memory_applied"].append(
+                    f"SKIP PAUSE '{keyword}': campaign '{kw.get('campaign','')}' has "
+                    f"{camp_calls['calls']} call(s) / {camp_calls['confirmed_appts']} confirmed OD appt(s) — "
+                    f"no keyword-level call data yet for this keyword"
+                )
+                continue
+
             actions["pause"].append({
                 "keyword": keyword,
                 "match_type": kw["match_type"],
                 "resource_name": kw["resource_name"],
-                "reason": f"${kw['cost']:.2f} spent, {kw['clicks']} clicks, 0 leads",
+                "reason": (
+                    f"${kw['cost']:.2f} spent, {kw['clicks']} clicks, "
+                    f"0 form leads, 0 calls attributed"
+                ),
                 "cost": kw["cost"],
             })
 
-    # Rule 2: Increase bids on keywords with production
+    # Rule 2: Increase bids on keywords with production or strong call conversions
     for kw in keyword_perf:
         keyword = kw["keyword"]
         attr = attribution.get(keyword, {"leads": 0, "booked": 0, "production": 0})
+        kw_calls = _kw_calls_for(keyword)
+        camp_calls = _calls_for(kw.get("campaign", ""))
+
+        # Learning loop guard: skip bid increase if previous increases degraded performance
+        bid_hist = outcome_history.get((kw["resource_name"], "increase_bid"))
+        if bid_hist and bid_hist["degraded"] >= 1 and bid_hist["improved"] == 0:
+            actions["memory_applied"].append(
+                f"SKIP BID UP '{keyword}': previous bid increase degraded performance — learning loop override"
+            )
+            continue
 
         if attr["production"] > 0:
+            # Gold standard: keyword has OD-attributed production revenue
             roas = attr["production"] / kw["cost"] if kw["cost"] > 0 else float("inf")
             actions["increase_bid"].append({
                 "keyword": keyword,
@@ -276,15 +1155,61 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "reason": f"ROAS {roas:.1f}x — ${attr['production']:.0f} production from ${kw['cost']:.2f} spend",
                 "roas": roas,
             })
-        elif attr["booked"] > 0 and kw["cost"] > 0:
-            cost_per_booking = kw["cost"] / attr["booked"]
-            if cost_per_booking < 50:  # Good cost per booking
+        elif kw_calls["confirmed_appts"] > 0 and kw["cost"] > 0:
+            # This specific keyword drove confirmed OD appointments via inbound calls
+            cost_per_appt = kw["cost"] / kw_calls["confirmed_appts"]
+            if cost_per_appt < 300:
                 actions["increase_bid"].append({
                     "keyword": keyword,
                     "match_type": kw["match_type"],
                     "resource_name": kw["resource_name"],
                     "current_bid_micros": kw.get("current_bid_micros", 0),
-                    "reason": f"${cost_per_booking:.2f}/booking — {attr['booked']} bookings",
+                    "reason": (
+                        f"Keyword drove {kw_calls['confirmed_appts']} confirmed OD appt(s) "
+                        f"via {kw_calls['calls']} inbound calls (${cost_per_appt:.0f}/appt)"
+                    ),
+                    "roas": 0,
+                })
+        elif kw_calls["booked_calls"] > 0 and kw["cost"] > 0:
+            # Keyword drove booked calls (no OD match yet but call outcome = booked)
+            cost_per_booking = kw["cost"] / kw_calls["booked_calls"]
+            if cost_per_booking < 80:
+                actions["increase_bid"].append({
+                    "keyword": keyword,
+                    "match_type": kw["match_type"],
+                    "resource_name": kw["resource_name"],
+                    "current_bid_micros": kw.get("current_bid_micros", 0),
+                    "reason": (
+                        f"Keyword drove {kw_calls['booked_calls']} booked call(s) "
+                        f"at ${cost_per_booking:.2f}/booking"
+                    ),
+                    "roas": 0,
+                })
+        elif attr["booked"] > 0 and kw["cost"] > 0:
+            # Form booking signal (checked after call signals — call data is stronger)
+            cost_per_booking = kw["cost"] / attr["booked"]
+            if cost_per_booking < 50:
+                actions["increase_bid"].append({
+                    "keyword": keyword,
+                    "match_type": kw["match_type"],
+                    "resource_name": kw["resource_name"],
+                    "current_bid_micros": kw.get("current_bid_micros", 0),
+                    "reason": f"${cost_per_booking:.2f}/booking — {attr['booked']} form bookings",
+                    "roas": 0,
+                })
+        elif not kw_calls["calls"] and camp_calls["confirmed_appts"] > 0 and kw["cost"] > 0:
+            # Legacy fallback: this keyword has no call attribution data, use campaign-level signal
+            cost_per_appt = kw["cost"] / camp_calls["confirmed_appts"]
+            if cost_per_appt < 300:
+                actions["increase_bid"].append({
+                    "keyword": keyword,
+                    "match_type": kw["match_type"],
+                    "resource_name": kw["resource_name"],
+                    "current_bid_micros": kw.get("current_bid_micros", 0),
+                    "reason": (
+                        f"Campaign has {camp_calls['confirmed_appts']} confirmed OD appt(s) "
+                        f"from inbound calls (${cost_per_appt:.0f}/appt — campaign-level only)"
+                    ),
                     "roas": 0,
                 })
 
@@ -300,6 +1225,51 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "resource_name": kw["resource_name"],
                 "current_bid_micros": kw.get("current_bid_micros", 0),
                 "reason": f"{attr['leads']} leads but 0 bookings from ${kw['cost']:.2f} spend",
+            })
+
+    # Rule 6: Tighten match type — broad keywords with call/lead signal but poor CPA
+    # Do Add EXACT first, then Pause BROAD (so no impression gap between the two GAds calls).
+    for kw in keyword_perf:
+        keyword = kw["keyword"]
+        match_type = (kw.get("match_type") or "").upper()
+        if "BROAD" not in match_type:
+            continue  # Only targets broad match keywords
+
+        kw_calls = _kw_calls_for(keyword)
+        attr = attribution.get(keyword, {"leads": 0, "booked": 0, "production": 0})
+        acquisitions = kw_calls["calls"] + attr["leads"]
+
+        # Skip if keyword has no signal at all (nothing worth keeping in exact)
+        if acquisitions == 0:
+            continue
+
+        cpa = kw["cost"] / acquisitions if acquisitions else 0
+        # Tighten if: has signal (calls or leads) but high CPA from broad waste
+        if kw["cost"] > 20 and cpa > 40:
+            # Learning loop guard: skip if previous tighten degraded
+            tighten_hist = outcome_history.get((kw["resource_name"], "tighten_match_type"))
+            if tighten_hist and tighten_hist["degraded"] >= 1 and tighten_hist["improved"] == 0:
+                actions["memory_applied"].append(
+                    f"SKIP TIGHTEN '{keyword}': previous match-type change degraded performance"
+                )
+                continue
+
+            actions["tighten_match"].append({
+                "keyword": keyword,
+                "current_match_type": match_type,
+                "proposed_match_type": "EXACT",
+                "resource_name": kw["resource_name"],
+                "ad_group_resource": kw.get("ad_group_resource", ""),
+                "campaign": kw.get("campaign", ""),
+                "campaign_resource": kw.get("campaign_resource", ""),
+                "cost": kw["cost"],
+                "calls": kw_calls["calls"],
+                "leads": attr["leads"],
+                "reason": (
+                    f"Broad match '{keyword}' spent ${kw['cost']:.2f} with {acquisitions} acquisition(s) "
+                    f"(${cpa:.0f}/acq). Tighten to exact match to eliminate irrelevant search terms "
+                    f"while keeping proven converting queries."
+                ),
             })
 
     # ── Negative keyword signals ──────────────────────────────────────
@@ -321,9 +1291,54 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
     # clinical trial, medicaid, medicare — let data prove they don't convert
     # can't afford — might convert with financing options
 
+    # ── Competitor names — any search containing these is a competitor search
+    # and should ALWAYS be a negative keyword (no spend on competitor brand terms)
+    _COMPETITOR_NAMES = [
+        # Direct local competitors
+        "grace dental", "grace smiles",
+        "simply orthodontics", "simply ortho",
+        "grafton smiles",                         # different practice
+        "aspen dental",
+        "western mass dental",
+        "westborough dental",
+        "shrewsbury dental",
+        "worcester dental",
+        "millbury dental",
+        "auburn dental",
+        "northborough dental",
+        "framingham dental",
+        "gentle dental",
+        "comfort dental",
+        "perfect teeth",
+        "castle dental",
+        "bright now dental",
+        "affordable dentures",
+        "small smiles",
+        # Generic competitor signals — another named practice
+        # (catches "[name] dental [city]" patterns where name isn't ours)
+    ]
+    # Our own practice names — do NOT negative these
+    _OUR_NAMES = ["grafton dental", "grafton dental care", "gdc", "dr gupta", "dr. gupta"]
+
+    def _is_competitor_term(term: str) -> str:
+        """Return reason string if this search term is a competitor brand search, else empty."""
+        t = term.lower()
+        # Skip if it's our own practice name
+        for own in _OUR_NAMES:
+            if own in t:
+                return ""
+        for comp in _COMPETITOR_NAMES:
+            if comp in t:
+                return f"Competitor brand search: '{comp}' — should not show our ads"
+        return ""
+
     def _is_negative_intent(term: str) -> str:
         """Check if a search term has negative intent. Returns reason or empty string."""
         t = term.lower()
+        # Check competitor first — highest priority negative
+        comp_reason = _is_competitor_term(t)
+        if comp_reason:
+            return comp_reason
         for signal in _HARD_NEGATIVES:
             if signal in t:
                 return f"Negative intent: '{signal}'"
@@ -380,14 +1395,23 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "reason": neg_reason,
             })
         elif st["conversions"] > 0 and term not in existing_keywords:
-            # Only add as exact match if it has real lead attribution
-            # (not just a Google Ads "conversion" which could be just a form view)
+            # Count as real acquisition if: form lead attribution OR keyword-level call attribution
             term_has_real_leads = any(
                 term in a_kw.lower() or a_kw.lower() in term
                 for a_kw in attribution.keys()
             ) if attribution else False
 
-            if term_has_real_leads:
+            # Word-boundary check: split both into tokens and look for *significant* overlap.
+            # Filter stop words so generic dental terms don't trigger false-positive harvesting.
+            term_tokens = set(term.split()) - _HARVEST_STOP_WORDS
+            term_has_call_attr = bool(term_tokens) and any(
+                term_tokens & (set(kw_lower.split()) - _HARVEST_STOP_WORDS)
+                for kw_lower in keyword_call_attribution.keys()
+            ) if keyword_call_attribution else False
+
+            if term_has_real_leads or term_has_call_attr:
+                signal = "form lead + call attribution" if (term_has_real_leads and term_has_call_attr) \
+                    else ("call attribution" if term_has_call_attr else "form lead attribution")
                 actions["new_exact"].append({
                     "search_term": st["search_term"],
                     "clicks": st["clicks"],
@@ -396,10 +1420,10 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                     "ad_group_resource": st.get("ad_group_resource", ""),
                     "ad_group": st.get("ad_group", ""),
                     "campaign_resource": st.get("campaign_resource", ""),
-                    "reason": "Has real lead attribution + Google conversion",
+                    "reason": f"Has real {signal} + Google conversion",
                 })
             else:
-                # Conversion in Google but no lead in our system — flag for review
+                # Conversion in Google but no signal in our system — flag for review
                 actions["new_exact"].append({
                     "search_term": st["search_term"],
                     "clicks": st["clicks"],
@@ -408,7 +1432,7 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                     "ad_group_resource": st.get("ad_group_resource", ""),
                     "ad_group": st.get("ad_group", ""),
                     "campaign_resource": st.get("campaign_resource", ""),
-                    "reason": "Google conversion but NO lead in pipeline — verify before adding",
+                    "reason": "Google conversion but NO lead/call in pipeline — verify before adding",
                 })
 
     # Rule 5: Negative keywords — high spend with no results
@@ -431,11 +1455,35 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
             })
         elif st.get("clicks", 0) > 5 and st["cost"] > 15 and st["conversions"] == 0:
             term_lower = st["search_term"].lower()
+            # Guard A: term matches a form-attributed keyword
             has_leads = any(
-                term_lower in (a_kw.lower())
+                term_lower in a_kw.lower()
                 for a_kw in attribution.keys()
             )
-            if not has_leads:
+            # Guard B: term has significant token overlap with a call-attributed keyword.
+            # This prevents negativing search terms that drove inbound calls even when
+            # Google's conversion column shows 0 (calls tracked via Mango, not GAds).
+            has_call_signal = False
+            if keyword_call_attribution and not has_leads:
+                sig_term = set(term_lower.split()) - _HARVEST_STOP_WORDS
+                if sig_term:
+                    for kw_lower_key, kw_data in keyword_call_attribution.items():
+                        sig_kw = set(kw_lower_key.split()) - _HARVEST_STOP_WORDS
+                        if sig_term & sig_kw and kw_data.get("calls", 0) > 0:
+                            has_call_signal = True
+                            break
+            # Guard C: if we have ZERO keyword-level call data (gads_clicks sync hasn't
+            # run yet), we can't distinguish converting vs junk terms — hold off on all
+            # negatives for campaigns that are generating calls.
+            # Once keyword attribution is populated, Guard B handles per-term protection.
+            no_kw_data = not keyword_call_attribution
+            camp_lower = st.get("campaign", "").lower()
+            camp_has_calls = False
+            if no_kw_data and call_attribution:
+                camp_calls = call_attribution.get(camp_lower, {})
+                camp_has_calls = camp_calls.get("calls", 0) >= 3
+
+            if not has_leads and not has_call_signal and not camp_has_calls:
                 actions["new_negatives"].append({
                     "search_term": st["search_term"],
                     "clicks": st.get("clicks", 0),
@@ -443,10 +1491,11 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                     "campaign_resource": st.get("campaign_resource", ""),
                     "campaign": st.get("campaign", ""),
                     "ad_group_resource": st.get("ad_group_resource", ""),
-                    "reason": f"${st['cost']:.2f} spent, {st.get('clicks',0)} clicks, 0 conversions/leads",
+                    "reason": f"${st['cost']:.2f} spent, {st.get('clicks',0)} clicks, 0 conversions/leads/calls",
                 })
 
     # Summary
+    combined_acq = total_leads + total_booked_calls
     actions["summary"] = {
         "total_spend": round(total_spend, 2),
         "total_clicks": total_clicks,
@@ -454,6 +1503,12 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
         "total_production": round(total_production, 2),
         "overall_roas": round(total_production / total_spend, 1) if total_spend > 0 else 0,
         "cost_per_lead": round(total_spend / total_leads, 2) if total_leads > 0 else 0,
+        # Call enrichment
+        "total_calls": total_calls,
+        "total_booked_calls": total_booked_calls,
+        "total_confirmed_appts": total_confirmed_appts,
+        "cost_per_acquisition": round(total_spend / combined_acq, 2) if combined_acq > 0 else 0,
+        # Actions
         "keywords_to_pause": len(actions["pause"]),
         "keywords_to_bid_up": len(actions["increase_bid"]),
         "keywords_to_bid_down": len(actions["decrease_bid"]),
@@ -688,6 +1743,404 @@ def _execute_add_negative(client, customer_id: str, campaign_resource: str,
         raise
 
 
+# ── New Execute Functions (Opus Plan — May 2026) ──────────────────────────────
+
+def _execute_enable_keyword(client, customer_id: str, resource_name: str) -> bool:
+    """
+    Enable a paused keyword by resource_name.
+    Does NOT check kill switch — caller must check first.
+    Returns True on success.
+    """
+    service = client.get_service("AdGroupCriterionService")
+    operation = client.get_type("AdGroupCriterionOperation")
+    criterion = operation.update
+    criterion.resource_name = resource_name
+    criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+    client.copy_from(
+        operation.update_mask,
+        client.get_type("FieldMask")(paths=["status"])
+    )
+    try:
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"Enabled keyword: {resource_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Enable keyword failed for {resource_name}: {e}")
+        raise
+
+
+def _get_campaign_budget_resource(client, customer_id: str, campaign_resource: str) -> tuple:
+    """
+    Return (budget_resource_name, current_amount_micros) for a campaign.
+    Raises ValueError if campaign not found.
+    """
+    service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT campaign.campaign_budget, campaign_budget.amount_micros
+        FROM campaign
+        WHERE campaign.resource_name = '{campaign_resource}'
+        LIMIT 1
+    """
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            return row.campaign.campaign_budget, row.campaign_budget.amount_micros
+    except Exception as e:
+        logger.error(f"Failed to get budget for {campaign_resource}: {e}")
+        raise
+    raise ValueError(f"Campaign not found: {campaign_resource}")
+
+
+def _execute_budget_change(client, customer_id: str, campaign_resource: str,
+                            new_daily_budget_usd: float) -> bool:
+    """
+    Update the daily budget for a campaign.
+    Performs safety checks (absolute limits + 25% increase guard) before writing.
+    Does NOT check kill switch — caller must check first.
+    Returns True on success.
+    """
+    from campaign_safety import check_budget_absolute_limits, check_budget_change_safe, WriteBlockedError
+
+    new_micros = int(new_daily_budget_usd * 1_000_000)
+
+    # Absolute limits first
+    check_budget_absolute_limits(new_micros)
+
+    # Get current budget
+    budget_resource, current_micros = _get_campaign_budget_resource(client, customer_id, campaign_resource)
+
+    # 25% increase guard
+    if not check_budget_change_safe(current_micros, new_micros):
+        raise WriteBlockedError(
+            f"Budget increase from ${current_micros/1_000_000:.2f} to ${new_daily_budget_usd:.2f} "
+            f"exceeds 25% limit. Increase manually if needed."
+        )
+
+    service = client.get_service("CampaignBudgetService")
+    operation = client.get_type("CampaignBudgetOperation")
+    budget = operation.update
+    budget.resource_name = budget_resource
+    budget.amount_micros = new_micros
+    client.copy_from(
+        operation.update_mask,
+        client.get_type("FieldMask")(paths=["amount_micros"])
+    )
+    try:
+        service.mutate_campaign_budgets(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"Budget updated for {campaign_resource}: "
+                    f"${current_micros/1_000_000:.2f} → ${new_daily_budget_usd:.2f}/day")
+        return True
+    except Exception as e:
+        logger.error(f"Budget change failed for {campaign_resource}: {e}")
+        raise
+
+
+def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: str,
+                                   bid_strategy: str, target_cpa_micros: int = 0,
+                                   target_roas: float = 0.0) -> bool:
+    """
+    Change a campaign's bid strategy.
+    Supports: MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS, MAXIMIZE_CLICKS
+    """
+    campaign_service = client.get_service("CampaignService")
+    campaign = client.get_type("Campaign")
+    campaign.resource_name = campaign_resource
+
+    strategy = bid_strategy.upper()
+    if strategy == "MAXIMIZE_CONVERSIONS":
+        campaign.maximize_conversions.CopyFrom(client.get_type("MaximizeConversions"))
+    elif strategy == "TARGET_CPA":
+        tc = client.get_type("TargetCpa")
+        tc.target_cpa_micros = int(target_cpa_micros)
+        campaign.target_cpa.CopyFrom(tc)
+    elif strategy == "TARGET_ROAS":
+        tr = client.get_type("TargetRoas")
+        tr.target_roas = float(target_roas)
+        campaign.target_roas.CopyFrom(tr)
+    elif strategy == "MAXIMIZE_CLICKS":
+        campaign.maximize_clicks.CopyFrom(client.get_type("MaximizeClicks"))
+    else:
+        raise ValueError(f"Unknown bid strategy: {bid_strategy}")
+
+    from google.protobuf import field_mask_pb2
+    field_mask = field_mask_pb2.FieldMask()
+    if strategy == "MAXIMIZE_CONVERSIONS":
+        field_mask.paths.append("maximize_conversions")
+    elif strategy == "TARGET_CPA":
+        field_mask.paths.extend(["target_cpa", "target_cpa.target_cpa_micros"])
+    elif strategy == "TARGET_ROAS":
+        field_mask.paths.extend(["target_roas", "target_roas.target_roas"])
+    elif strategy == "MAXIMIZE_CLICKS":
+        field_mask.paths.append("maximize_clicks")
+
+    operation = client.get_type("CampaignOperation")
+    operation.update.CopyFrom(campaign)
+    operation.update_mask.CopyFrom(field_mask)
+
+    try:
+        response = campaign_service.mutate_campaigns(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"Changed bid strategy to {bid_strategy} for {campaign_resource}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to change bid strategy: {e}")
+        raise
+
+
+def _execute_change_match_type(client, customer_id: str, resource_name: str,
+                                new_match_type: str) -> bool:
+    """
+    Change a keyword's match type.
+    """
+    service = client.get_service("AdGroupCriterionService")
+    criterion = client.get_type("AdGroupCriterion")
+    criterion.resource_name = resource_name
+    match_type_enum = client.enums.KeywordMatchTypeEnum[new_match_type.upper()]
+    criterion.keyword.match_type = match_type_enum
+
+    from google.protobuf import field_mask_pb2
+    field_mask = field_mask_pb2.FieldMask(paths=["keyword.match_type"])
+
+    operation = client.get_type("AdGroupCriterionOperation")
+    operation.update.CopyFrom(criterion)
+    operation.update_mask.CopyFrom(field_mask)
+
+    try:
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"Changed match type to {new_match_type} for {resource_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to change match type: {e}")
+        raise
+
+
+def _get_rsa_current_assets(client, customer_id: str, ad_group_ad_resource: str) -> dict:
+    """
+    Fetch the current headlines and descriptions for a Responsive Search Ad.
+    Returns: {
+        "headlines": [{"text": str, "pinned_field": str|None}],
+        "descriptions": [{"text": str, "pinned_field": str|None}],
+        "ad_group_ad_resource": str
+    }
+    Returns empty dict if not found.
+    """
+    service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT
+            ad_group_ad.resource_name,
+            ad_group_ad.ad.responsive_search_ad.headlines,
+            ad_group_ad.ad.responsive_search_ad.descriptions
+        FROM ad_group_ad
+        WHERE ad_group_ad.resource_name = '{ad_group_ad_resource}'
+        LIMIT 1
+    """
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            rsa = row.ad_group_ad.ad.responsive_search_ad
+            headlines = []
+            for h in rsa.headlines:
+                headlines.append({
+                    "text": h.text,
+                    "pinned_field": str(h.pinned_field) if h.pinned_field else None,
+                })
+            descriptions = []
+            for d in rsa.descriptions:
+                descriptions.append({
+                    "text": d.text,
+                    "pinned_field": str(d.pinned_field) if d.pinned_field else None,
+                })
+            return {
+                "headlines": headlines,
+                "descriptions": descriptions,
+                "ad_group_ad_resource": ad_group_ad_resource,
+            }
+    except Exception as e:
+        logger.error(f"Failed to get RSA assets for {ad_group_ad_resource}: {e}")
+    return {}
+
+
+def _execute_update_rsa(client, customer_id: str, ad_group_ad_resource: str,
+                         new_headlines: list, new_descriptions: list) -> bool:
+    """
+    Update a Responsive Search Ad by reading current assets, merging new ones,
+    and writing back the full set.
+
+    RSA constraint: max 15 headlines, max 4 descriptions.
+    Character limits: headline ≤ 30 chars, description ≤ 90 chars.
+
+    new_headlines: list of str (text only, no pinning — appended after existing unique ones)
+    new_descriptions: list of str
+
+    Does NOT check kill switch — caller must check first.
+    Returns True on success.
+    """
+    # Validate character limits
+    for h in new_headlines:
+        if len(h) > 30:
+            raise ValueError(f"Headline '{h}' exceeds 30-char limit ({len(h)} chars)")
+    for d in new_descriptions:
+        if len(d) > 90:
+            raise ValueError(f"Description '{d}' exceeds 90-char limit ({len(d)} chars)")
+
+    # Fetch current assets
+    current = _get_rsa_current_assets(client, customer_id, ad_group_ad_resource)
+    if not current:
+        raise ValueError(f"RSA not found: {ad_group_ad_resource}")
+
+    existing_headline_texts = {h["text"].lower() for h in current.get("headlines", [])}
+    existing_desc_texts = {d["text"].lower() for d in current.get("descriptions", [])}
+
+    # Merge: keep existing assets, append unique new ones up to max
+    merged_headlines = list(current.get("headlines", []))
+    for text in new_headlines:
+        if text.lower() not in existing_headline_texts and len(merged_headlines) < 15:
+            merged_headlines.append({"text": text, "pinned_field": None})
+
+    merged_descriptions = list(current.get("descriptions", []))
+    for text in new_descriptions:
+        if text.lower() not in existing_desc_texts and len(merged_descriptions) < 4:
+            merged_descriptions.append({"text": text, "pinned_field": None})
+
+    # Build the update operation
+    service = client.get_service("AdGroupAdService")
+    operation = client.get_type("AdGroupAdOperation")
+    ad_group_ad = operation.update
+    ad_group_ad.resource_name = ad_group_ad_resource
+
+    rsa = ad_group_ad.ad.responsive_search_ad
+    rsa.headlines.clear()
+    for h in merged_headlines:
+        asset = client.get_type("AdTextAsset")
+        asset.text = h["text"]
+        rsa.headlines.append(asset)
+
+    rsa.descriptions.clear()
+    for d in merged_descriptions:
+        asset = client.get_type("AdTextAsset")
+        asset.text = d["text"]
+        rsa.descriptions.append(asset)
+
+    client.copy_from(
+        operation.update_mask,
+        client.get_type("FieldMask")(
+            paths=["ad.responsive_search_ad.headlines",
+                   "ad.responsive_search_ad.descriptions"]
+        )
+    )
+
+    try:
+        response = service.mutate_ad_group_ads(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"RSA updated: {ad_group_ad_resource} — "
+                    f"{len(merged_headlines)} headlines, {len(merged_descriptions)} descriptions")
+        return True
+    except Exception as e:
+        logger.error(f"RSA update failed for {ad_group_ad_resource}: {e}")
+        raise
+
+
+def _resolve_geo_target_id(client, location_name: str, country_code: str = "US") -> tuple:
+    """
+    Resolve a location name to a GeoTargetConstant resource name.
+    Returns (resource_name, canonical_name) or ("", "") if not found.
+    """
+    service = client.get_service("GeoTargetConstantService")
+    try:
+        request = client.get_type("SuggestGeoTargetConstantsRequest")
+        request.locale = "en"
+        request.country_code = country_code
+        request.location_names.names.append(location_name)
+        response = service.suggest_geo_target_constants(request=request)
+        for suggestion in response.geo_target_constant_suggestions:
+            gtc = suggestion.geo_target_constant
+            return gtc.resource_name, gtc.canonical_name
+    except Exception as e:
+        logger.error(f"Failed to resolve geo target '{location_name}': {e}")
+    return "", ""
+
+
+def _execute_geo_exclusion(client, customer_id: str, campaign_resource: str,
+                            geo_target_resource: str) -> bool:
+    """
+    Add a campaign-level geo exclusion (negative location target).
+    Handles ALREADY_EXISTS gracefully (returns True).
+    Does NOT check kill switch — caller must check first.
+    Returns True on success or duplicate.
+    """
+    service = client.get_service("CampaignCriterionService")
+    operation = client.get_type("CampaignCriterionOperation")
+    criterion = operation.create
+    criterion.campaign = campaign_resource
+    criterion.negative = True
+    criterion.location.geo_target_constant = geo_target_resource
+
+    try:
+        service.mutate_campaign_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(f"Geo exclusion added: {geo_target_resource} on {campaign_resource}")
+        return True
+    except Exception as e:
+        err_str = str(e)
+        if "DUPLICATE_CAMPAIGN_CRITERION" in err_str or "already exists" in err_str.lower():
+            logger.info(f"Geo exclusion already exists: {geo_target_resource} — treating as success")
+            return True
+        logger.error(f"Geo exclusion failed: {geo_target_resource} on {campaign_resource}: {e}")
+        raise
+
+
+def _get_active_rsa_resources(client, customer_id: str, campaign_resource: str) -> list:
+    """
+    Fetch all ENABLED RSA ad resources for a campaign.
+    Returns list of {ad_group_ad_resource, ad_group, ad_group_resource, headlines_count, descriptions_count}
+    """
+    service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT
+            ad_group_ad.resource_name,
+            ad_group.name,
+            ad_group.resource_name,
+            ad_group_ad.ad.responsive_search_ad.headlines,
+            ad_group_ad.ad.responsive_search_ad.descriptions
+        FROM ad_group_ad
+        WHERE campaign.resource_name = '{campaign_resource}'
+            AND ad_group_ad.status = 'ENABLED'
+            AND ad_group_ad.ad.type = 'RESPONSIVE_SEARCH_AD'
+            AND ad_group.status = 'ENABLED'
+    """
+    results = []
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            rsa = row.ad_group_ad.ad.responsive_search_ad
+            results.append({
+                "ad_group_ad_resource": row.ad_group_ad.resource_name,
+                "ad_group": row.ad_group.name,
+                "ad_group_resource": row.ad_group.resource_name,
+                "headlines_count": len(rsa.headlines),
+                "descriptions_count": len(rsa.descriptions),
+                "headline_texts": [h.text for h in rsa.headlines[:5]],  # preview for Claude context
+            })
+    except Exception as e:
+        logger.warning(f"Could not fetch RSA resources for {campaign_resource}: {e}")
+    return results
+
+
 # ── Main Entry Point ─────────────────────────────────────────────────────────
 
 def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> dict:
@@ -741,26 +2194,66 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     logger.info("Building lead attribution...")
     attribution = _get_keyword_attribution()
 
-    # ── AI Review allow-list filter ────────────────────────────────────────────
-    # Only analyze campaigns with ai_review_enabled=1. If none are flagged,
-    # skip the run entirely to avoid wasted Anthropic calls.
-    try:
-        from database import _conn as _db_conn
-        with _db_conn() as _c:
-            _allow_rows = _c.execute(
-                "SELECT campaign_name FROM campaigns WHERE ai_review_enabled=1"
-            ).fetchall()
-        ai_allow = {r[0].strip().lower() for r in _allow_rows if r[0]}
-    except Exception as _e:
-        logger.warning(f"AI Review allow-list fetch failed, proceeding without filter: {_e}")
-        ai_allow = set()
+    logger.info("Building call attribution...")
+    call_attribution = _get_call_attribution(days=30)
+    if call_attribution:
+        logger.info(f"Call attribution: {len(call_attribution)} campaigns, "
+                    f"{sum(c['calls'] for c in call_attribution.values())} total calls, "
+                    f"{sum(c['confirmed_appts'] for c in call_attribution.values())} confirmed appts")
 
-    if ai_allow:
-        logger.info(f"AI Review allow-list: {ai_allow}")
-        keyword_perf = [k for k in keyword_perf if k.get("campaign", "").strip().lower() in ai_allow]
-        search_terms = [s for s in search_terms if s.get("campaign", "").strip().lower() in ai_allow]
+    logger.info("Building keyword-level call attribution...")
+    keyword_call_attribution = _get_keyword_call_attribution(days=30)
+    if keyword_call_attribution:
+        kw_call_total = sum(e["calls"] for e in keyword_call_attribution.values())
+        kw_conf_total = sum(e["confirmed_appts"] for e in keyword_call_attribution.values())
+        logger.info(f"Keyword call attribution: {len(keyword_call_attribution)} keywords, "
+                    f"{kw_call_total} calls, {kw_conf_total} confirmed appts")
     else:
-        logger.info("No AI Review campaigns enabled — optimizer will run across all campaigns (legacy mode)")
+        logger.info("Keyword call attribution: 0 keywords (run gads-sync + attribute-keywords first)")
+
+    logger.info("Building OD production summary...")
+    od_production = _get_od_production_summary(days=30)
+
+    # Fetch Google's own recommendations
+    google_recs = []
+    try:
+        google_recs = _get_google_recommendations(client, customer_id)
+        # Persist to DB for UI display between runs
+        from database import upsert_google_rec
+        import json as _json
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        for gr in google_recs:
+            upsert_google_rec(
+                resource_name=gr["resource_name"],
+                rec_type=gr["rec_type"],
+                campaign_resource=gr.get("campaign_resource", ""),
+                campaign_name=gr.get("campaign_name", ""),
+                ad_group_resource=gr.get("ad_group_resource", ""),
+                title=gr["title"],
+                description=gr["description"],
+                impact_json=_json.dumps(gr.get("impact", {})),
+                details_json=_json.dumps(gr.get("details", {})),
+                fetched_at=fetched_at,
+            )
+        logger.info(f"Stored {len(google_recs)} Google recommendations")
+    except Exception as e:
+        logger.warning(f"Google recommendations fetch failed (non-fatal): {e}")
+
+    # ── Capture account-wide totals before any filtering ──────────────────────
+    total_spend_all_campaigns = round(sum(k.get("cost", 0) for k in keyword_perf), 2)
+    total_clicks_all_campaigns = sum(k.get("clicks", 0) for k in keyword_perf)
+
+    # ── Determine which campaigns to analyze ──────────────────────────────────
+    # Analyze ALL campaigns that have at least some keyword data/spend.
+    # The old ai_review_enabled allow-list is ignored — every active campaign
+    # with impressions gets Claude analysis so recommendations appear per-campaign.
+    # Paused campaigns are included if they have recent spend data (last 30d).
+    active_campaigns_with_data = {
+        k.get("campaign", "").strip()
+        for k in keyword_perf
+        if k.get("campaign", "").strip()
+    }
+    logger.info(f"Campaigns with keyword data: {active_campaigns_with_data}")
 
     # Determine the primary campaign name for memory scoping
     campaign_spend: dict = {}
@@ -774,9 +2267,20 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     # Create run record now that we have the primary campaign
     create_optimizer_run(run_id, trigger=trigger, primary_campaign=primary_campaign)
 
+    # Load outcome history once (AI learning loop — shared across all rule passes)
+    outcome_history = _load_outcome_history(days_back=90)
+    if outcome_history:
+        logger.info(f"Outcome history loaded: {len(outcome_history)} entity-operation pairs from last 90d")
+
     # Analyze
     logger.info("Analyzing and generating recommendations...")
-    actions = _analyze_keywords(keyword_perf, attribution, search_terms, campaign=primary_campaign)
+    actions = _analyze_keywords(
+        keyword_perf, attribution, search_terms,
+        call_attribution=call_attribution,
+        keyword_call_attribution=keyword_call_attribution,
+        campaign=primary_campaign,
+        outcome_history=outcome_history,
+    )
 
     # ── Phase A: Suppress recently-rejected recommendations ───────────────────
     # M6 fix: key suppression by (entity_name_lower, operation) tuple — NOT entity_name
@@ -842,13 +2346,15 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             after_state={"status": "PAUSED"},
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
+            campaign_name=kw.get("campaign", ""),
+            priority=10,  # Pausing = high priority (stops waste)
+            impact_estimate={"savings_30d_usd": round(kw.get("cost", 0), 2)},
         )
         kw["action_id"] = aid
         actions_pending += 1
 
     for kw in actions["increase_bid"]:
         current_bid = kw.get("current_bid_micros", 0)
-        # Compute new bid: +10%, clamped between MIN and MAX
         new_bid = int(current_bid * 1.10) if current_bid > 0 else 0
         aid = log_pending(
             operation="increase_bid",
@@ -866,13 +2372,14 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
+            campaign_name=kw.get("campaign", ""),
+            priority=30,
         )
         kw["action_id"] = aid
         actions_pending += 1
 
     for kw in actions["decrease_bid"]:
         current_bid = kw.get("current_bid_micros", 0)
-        # Compute new bid: -10%, clamped to minimum viable
         new_bid = int(current_bid * 0.90) if current_bid > 0 else 0
         aid = log_pending(
             operation="decrease_bid",
@@ -889,6 +2396,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
+            campaign_name=kw.get("campaign", ""),
+            priority=40,
         )
         kw["action_id"] = aid
         actions_pending += 1
@@ -912,6 +2421,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             },
             optimizer_run_id=run_id,
             reason=st.get("reason", ""),
+            campaign_name=st.get("campaign", ""),
+            priority=20,
         )
         st["action_id"] = aid
         actions_pending += 1
@@ -934,12 +2445,198 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             },
             optimizer_run_id=run_id,
             reason=st.get("reason", ""),
+            campaign_name=st.get("campaign", ""),
+            priority=15,
+            impact_estimate={"savings_30d_usd": round(st.get("cost", 0), 2)},
         )
         st["action_id"] = aid
         actions_pending += 1
 
-    # Report
+    for kw in actions["tighten_match"]:
+        aid = log_pending(
+            operation="tighten_match_type",
+            entity_type="keyword",
+            entity_id=kw["resource_name"],
+            entity_name=kw["keyword"],
+            before_state={
+                "match_type": kw["current_match_type"],
+                "resource_name": kw["resource_name"],
+            },
+            after_state={
+                "match_type": kw["proposed_match_type"],
+                "ad_group_resource": kw.get("ad_group_resource", ""),
+                "note": "Add EXACT first, then pause BROAD to avoid impression gap",
+            },
+            optimizer_run_id=run_id,
+            reason=kw.get("reason", ""),
+            campaign_name=kw.get("campaign", ""),
+            priority=25,
+        )
+        kw["action_id"] = aid
+        actions_pending += 1
+
+    # Patch summary with account-wide spend/clicks (pre-filter values).
+    # _analyze_keywords only sees allow-listed campaigns so its totals are partial.
     summary = actions["summary"]
+    summary["total_spend"] = total_spend_all_campaigns
+    summary["total_clicks"] = total_clicks_all_campaigns
+    # Recompute derived metrics using corrected spend
+    combined_acq = summary.get("total_leads", 0) + summary.get("total_booked_calls", 0)
+    summary["overall_roas"] = round(summary["total_production"] / total_spend_all_campaigns, 1) if total_spend_all_campaigns > 0 else 0
+    summary["cost_per_lead"] = round(total_spend_all_campaigns / summary["total_leads"], 2) if summary.get("total_leads", 0) > 0 else 0
+    summary["cost_per_acquisition"] = round(total_spend_all_campaigns / combined_acq, 2) if combined_acq > 0 else 0
+    # Keyword-level attribution quality metrics
+    summary["keywords_with_call_attribution"] = len(keyword_call_attribution)
+    summary["keyword_attributed_calls"] = sum(e["calls"] for e in keyword_call_attribution.values())
+
+    # Claude structured recommendations — run once per active campaign.
+    # Returns dicts with operation + exact API parameters, not plain text.
+    logger.info("Calling Claude (Opus) for structured recommendations...")
+    # Use ALL campaigns with keyword data — not just campaign_spend keys
+    # (campaign_spend only covers the allow-listed set in legacy mode; now we use all)
+    all_campaign_names = sorted(active_campaigns_with_data) or list(campaign_spend.keys()) or ([primary_campaign] if primary_campaign else [])
+    priority_counter = 30
+    advisories = []  # for report dashboard (human-readable reasons)
+
+    # Operation → (entity_type, entity_id_field, entity_name_field)
+    # entity_id_field: which key in the rec dict to use as entity_id in audit log
+    # entity_name_field: which key to use as the human-readable entity_name
+    _OP_MAP = {
+        "add_negative_keyword": ("keyword",  "campaign_resource", "keyword_text"),  # id=campaign_resource, name=term
+        "pause_keyword":        ("keyword",  "resource_name",     "keyword_text"),
+        "enable_keyword":       ("keyword",  "resource_name",     "keyword_text"),
+        "increase_bid":         ("keyword",  "resource_name",     "keyword_text"),
+        "decrease_bid":         ("keyword",  "resource_name",     "keyword_text"),
+        "add_exact_keyword":    ("keyword",  "ad_group_resource", "keyword_text"),
+        "ad_copy_suggestion":   ("ad",       "ad_resource",       "headline"),
+        "geo_exclusion":        ("campaign", "geo_target_resource", "location_name"),
+        "change_budget":        ("campaign", "campaign_resource", "campaign_resource"),
+        "change_bid_strategy":  ("campaign", "campaign_resource", "bid_strategy"),
+        "change_match_type":    ("keyword",  "resource_name",     "keyword_text"),
+        "add_asset":            ("campaign", "campaign_resource",  "asset_type"),
+    }
+
+    # Geo candidates for Grafton Dental Care (Worcester area, MA)
+    _CANDIDATE_GEOS = [
+        "Worcester, Massachusetts",
+        "Shrewsbury, Massachusetts",
+        "Northborough, Massachusetts",
+        "Westborough, Massachusetts",
+        "Grafton, Massachusetts",
+        "Millbury, Massachusetts",
+        "Auburn, Massachusetts",
+    ]
+
+    for camp_name in all_campaign_names:
+        camp_lower = camp_name.strip().lower()
+
+        camp_kw   = [k for k in keyword_perf  if k.get("campaign","").strip().lower() == camp_lower]
+        camp_st   = [s for s in search_terms   if s.get("campaign","").strip().lower() == camp_lower]
+        camp_kw_attr = {k: v for k, v in keyword_call_attribution.items()
+                        if any(kw.get("keyword","").strip().lower() == k for kw in camp_kw)}
+
+        # Get campaign resource_name for pre-fetches
+        camp_resource = ""
+        for kw in camp_kw:
+            cr = kw.get("campaign_resource", "")
+            if cr:
+                camp_resource = cr
+                break
+
+        # Pre-fetch RSA resources for this campaign (gives Claude ad_group_ad_resource for ad copy API calls)
+        camp_rsa_resources = []
+        if camp_resource:
+            try:
+                camp_rsa_resources = _get_active_rsa_resources(client, customer_id, camp_resource)
+                if camp_rsa_resources:
+                    logger.info(f"  [{camp_name}] {len(camp_rsa_resources)} RSA(s) found for Claude context")
+            except Exception as _rsa_e:
+                logger.warning(f"  [{camp_name}] RSA pre-fetch failed (non-fatal): {_rsa_e}")
+
+        # Pre-resolve geo targets for this campaign (gives Claude geo_target_resource for API execution)
+        camp_geo_resolutions: dict = {}
+        if camp_resource:
+            try:
+                for geo_name in _CANDIDATE_GEOS:
+                    rn, canonical = _resolve_geo_target_id(client, geo_name)
+                    if rn:
+                        camp_geo_resolutions[geo_name] = {
+                            "geo_target_resource": rn,
+                            "canonical_name": canonical,
+                        }
+                if camp_geo_resolutions:
+                    logger.info(f"  [{camp_name}] {len(camp_geo_resolutions)} geo targets resolved")
+            except Exception as _geo_e:
+                logger.warning(f"  [{camp_name}] Geo pre-resolve failed (non-fatal): {_geo_e}")
+
+        structured = _call_claude_advisories(
+            camp_kw, attribution, camp_st,
+            call_attribution, od_production,
+            summary=summary, campaign=camp_name,
+            keyword_call_attribution=camp_kw_attr,
+            rsa_resources=camp_rsa_resources,
+            geo_resolutions=camp_geo_resolutions,
+            google_recs=[r for r in google_recs if r.get('campaign_name','').lower() == camp_name.lower() or not r.get('campaign_name')],
+        )
+        if not structured:
+            continue
+
+        logger.info(f"Claude recommendations for '{camp_name}': {len(structured)}")
+
+        for rec in structured:
+            op = rec.get("operation", "claude_advisory")
+            reason = rec.get("reason", "")
+            advisories.append(f"[{camp_name}] {reason}")
+
+            # Build before/after state from the structured fields
+            before = {}
+            after = {k: v for k, v in rec.items() if k != "operation"}
+
+            # Determine entity fields
+            op_meta = _OP_MAP.get(op)
+            if op_meta:
+                entity_type, id_field, name_field = op_meta
+                entity_id   = str(rec.get(id_field, camp_lower.replace(" ", "_")))
+                entity_name = str(rec.get(name_field, camp_name))
+            else:
+                entity_type = "campaign"
+                entity_id   = camp_lower.replace(" ", "_")
+                entity_name = camp_name
+
+            aid = log_pending(
+                operation=op,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                entity_name=entity_name,
+                before_state=before,
+                after_state=after,
+                optimizer_run_id=run_id,
+                reason=reason,
+                campaign_name=camp_name,
+                priority=priority_counter,
+                impact_estimate={},
+            )
+            # Store google_rec_resource_name if this rec came from a Google recommendation
+            google_rec_rn = rec.get("google_rec_resource_name", "")
+            if google_rec_rn:
+                try:
+                    from database import _conn as _db_conn_opt
+                    with _db_conn_opt() as _c:
+                        _c.execute(
+                            "UPDATE gads_audit_log SET google_rec_resource_name=? WHERE action_id=?",
+                            (google_rec_rn, aid)
+                        )
+                except Exception as _grn_err:
+                    logger.warning(f"Could not store google_rec_resource_name: {_grn_err}")
+            actions_pending += 1
+            priority_counter += 1
+            logger.info(f"  [{op}] '{entity_name}' → {aid[:8]}")
+
+        actions.setdefault("memory_applied", []).extend(
+            [f"[claude:{camp_name}] {rec.get('reason','')}" for rec in structured]
+        )
+
+    # Report
     report = {
         "run_id": run_id,
         "timestamp": now,
@@ -954,6 +2651,16 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             "new_negatives": actions["new_negatives"],
         },
         "memory_applied": actions.get("memory_applied", []),
+        "call_summary": {
+            v["campaign_name"]: {
+                "calls": v["calls"],
+                "booked": v["booked_calls"],
+                "confirmed_appts": v["confirmed_appts"],
+            }
+            for v in call_attribution.values()
+        },
+        "od_production_summary": od_production,
+        "advisories": advisories,
     }
 
     # Update run record with results
@@ -971,14 +2678,19 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     logger.info(f"  Total spend (30d):    ${summary['total_spend']}")
     logger.info(f"  Total clicks:         {summary['total_clicks']}")
     logger.info(f"  Total leads:          {summary['total_leads']}")
+    logger.info(f"  Total calls:          {summary.get('total_calls', 0)}")
+    logger.info(f"  Total booked calls:   {summary.get('total_booked_calls', 0)}")
+    logger.info(f"  Total confirmed appts:{summary.get('total_confirmed_appts', 0)}")
     logger.info(f"  Total production:     ${summary['total_production']}")
     logger.info(f"  Overall ROAS:         {summary['overall_roas']}x")
     logger.info(f"  Cost per lead:        ${summary['cost_per_lead']}")
+    logger.info(f"  Cost per acquisition: ${summary.get('cost_per_acquisition', 'N/A')}")
     logger.info(f"  Keywords to pause:    {summary['keywords_to_pause']}")
     logger.info(f"  Keywords to bid up:   {summary['keywords_to_bid_up']}")
     logger.info(f"  Keywords to bid down: {summary['keywords_to_bid_down']}")
     logger.info(f"  New exact-match:      {summary['new_exact_match']}")
     logger.info(f"  New negatives:        {summary['new_negatives']}")
+    logger.info(f"  Claude advisories:    {len(advisories)}")
     logger.info(f"  Total pending actions: {actions_pending}")
 
     for kw in actions["pause"]:
