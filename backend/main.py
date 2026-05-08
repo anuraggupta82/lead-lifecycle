@@ -1022,7 +1022,7 @@ async def gads_approve_action(action_id: str, request: Request):
                 update_gads_action_result(action_id, executed=False,
                     execution_result=f"failed: {str(e)[:200]}")
                 raise HTTPException(status_code=500, detail=f"Shared list update failed: {str(e)[:300]}")
-            update_gads_action_result(action_id, executed=True, execution_result="success", api_executed=True)
+            update_gads_action_result(action_id, executed=True, execution_result="success")
             set_audit_approval(action_id, approver="admin")
             logger.info(f"Approved + added to shared list: '{keyword_text}' ({action_id[:8]})")
 
@@ -1284,6 +1284,16 @@ async def gads_approve_action(action_id: str, request: Request):
     except Exception as _snap_err:
         logger.warning(f"[phase_a] snapshot_applied_outcome failed (non-fatal): {_snap_err}")
 
+    # Update optimizer memory with approval decision
+    try:
+        from optimizer_memory import MemoryStore
+        _mem = MemoryStore()
+        run_id_for_mem = row.get("optimizer_run_id", "")
+        if run_id_for_mem:
+            _mem.update_rec_status(run_id_for_mem, action_id, "executed")
+    except Exception as _mem_err:
+        logger.debug(f"Memory update_rec_status (approve) failed (non-fatal): {_mem_err}")
+
     return {"status": "ok", "action_id": action_id, "operation": operation}
 
 
@@ -1311,6 +1321,17 @@ async def gads_reject_action(action_id: str, request: Request):
     if reject_reason:
         record_reject_reason(action_id, reject_reason)
         logger.info(f"[phase_a] Rejection recorded for {action_id[:8]}: {reject_reason[:80]}")
+
+    # Update optimizer memory with rejection decision
+    try:
+        from optimizer_memory import MemoryStore
+        _mem = MemoryStore()
+        run_id_for_mem = row.get("optimizer_run_id", "")
+        if run_id_for_mem:
+            _mem.update_rec_status(run_id_for_mem, action_id, "rejected")
+    except Exception as _mem_err:
+        logger.debug(f"Memory update_rec_status (reject) failed (non-fatal): {_mem_err}")
+
     return {"status": "ok", "action_id": action_id, "reject_reason": reject_reason}
 
 
@@ -6050,6 +6071,25 @@ def delete_memory(memory_id: int):
     deactivate_optimizer_memory(memory_id)
     logger.info(f"Optimizer memory deactivated: id={memory_id}")
     return {"status": "ok"}
+
+
+# ── Optimizer Run Memory (file-based, cross-run digest) ──────────────────────
+
+@app.get("/api/admin/optimizer/run-memory", dependencies=[Depends(_require_admin)])
+def get_optimizer_run_memory():
+    """Return the file-based optimizer run memory digest (cross-run context)."""
+    from optimizer_memory import MemoryStore
+    try:
+        mem = MemoryStore()
+        mem.load()
+        digest = mem.build_digest(max_runs=10)
+        last_run = mem.get_last_run_date()
+        return {
+            "last_run_date": str(last_run) if last_run else None,
+            "digest": digest,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Google Ads Intelligence Endpoints ────────────────────────────────────────

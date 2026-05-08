@@ -27,7 +27,7 @@ Manual trigger: POST /api/admin/optimize
 import logging
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from google.ads.googleads.client import GoogleAdsClient
@@ -72,6 +72,10 @@ _COMPETITOR_NAMES = [
     # Specific competitor dentists by name
     "dr polasky", "polasky",
     "dr. polasky",
+    "tina theroux",
+    "dr cabrera", "dr. cabrera",
+    "monica rao", "dr rao",
+    "dr ryan harrington", "ryan harrington",
 ]
 _OUR_NAMES = ["grafton dental", "grafton dental care", "gdc", "dr gupta", "dr. gupta"]
 
@@ -181,11 +185,16 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
     return results
 
 
-def _get_search_terms(client, customer_id: str, days: int = 30) -> list:
-    """Pull search terms report to find new keywords and negatives."""
+def _get_search_terms(client, customer_id: str, start_date: date | None = None, days: int = 30) -> list:
+    """Pull search terms report to find new keywords and negatives.
+
+    If start_date is provided, fetches from that date to today (used by memory system).
+    Otherwise falls back to 'days' lookback window (legacy / first-run fallback).
+    """
     service = client.get_service("GoogleAdsService")
     end_date = datetime.now(timezone.utc).date()
-    start_date = end_date - timedelta(days=days)
+    if start_date is None:
+        start_date = end_date - timedelta(days=days)
 
     query = f"""
         SELECT
@@ -702,7 +711,8 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              geo_resolutions: dict | None = None,
                              google_recs: list | None = None,
                              optimizer_run_id: str = "",
-                             existing_negatives: set | None = None) -> list:
+                             existing_negatives: set | None = None,
+                             memory_digest: dict | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -789,6 +799,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "geo_resolutions": geo_resolutions or {},
             "google_recommendations": (google_recs or [])[:20],
             "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
+            "optimizer_memory": memory_digest or {},
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -885,6 +896,7 @@ Rules:
 - Prioritize recommendations that stop wasted spend first
 - COMPETITOR SEARCHES: Any search term containing a competitor practice name (e.g. "grace dental", "simply orthodontics", "aspen dental", "gentle dental", any "[name] dental [city]" that isn't Grafton Dental Care) MUST be flagged as add_negative_keyword. These waste budget showing our ads to people searching for a competitor.
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already added as negatives in Google Ads. Do NOT suggest add_negative_keyword for any term that already appears in that list (exact or near-match). Only flag NEW terms not yet blocked.
+- OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating recommendations that were recently rejected, (2) build on patterns from past runs, (3) surface new issues not seen before. Do not re-suggest anything in "rejected_patterns".
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array""" + rsa_note + geo_note + feedback_block
 
         msg = client.messages.create(
@@ -993,6 +1005,7 @@ def _call_claude_account_level(
     google_recs: list | None = None,
     optimizer_run_id: str = "",
     existing_negatives: set | None = None,
+    memory_digest: dict | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -1072,6 +1085,7 @@ def _call_claude_account_level(
             "od_production_summary": od_production,
             "google_recommendations": (google_recs or [])[:20],
             "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
+            "optimizer_memory": memory_digest or {},
         }
 
         prompt = """You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
@@ -1102,6 +1116,7 @@ IMPORTANT:
 - Only flag competitor negatives here if they appear in multiple campaigns (single-campaign terms were already handled per-campaign)
 - Use only campaign_resource values from the "campaign_resources" field in the data
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already live as negatives in Google Ads. Do NOT recommend add_negative_keyword for any term already in that list. Only suggest NEW terms not yet blocked.
+- OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating rejected recommendations, (2) identify recurring patterns, (3) highlight new trends. Do not re-suggest anything in "rejected_patterns".
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array"""
 
         msg = client.messages.create(
@@ -1759,7 +1774,7 @@ def _execute_pause(client, customer_id: str, keywords: list) -> int:
         criterion.status = client.enums.AdGroupCriterionStatusEnum.PAUSED
         client.copy_from(
             operation.update_mask,
-            client.get_type("FieldMask")(paths=["status"])
+            field_mask_pb2.FieldMask(paths=["status"])
         )
         operations.append(operation)
 
@@ -1806,7 +1821,7 @@ def _execute_single_pause(client, customer_id: str, resource_name: str) -> bool:
     criterion.status = client.enums.AdGroupCriterionStatusEnum.PAUSED
     client.copy_from(
         operation.update_mask,
-        client.get_type("FieldMask")(paths=["status"])
+        field_mask_pb2.FieldMask(paths=["status"])
     )
     try:
         service.mutate_ad_group_criteria(
@@ -1851,7 +1866,7 @@ def _execute_bid_change(client, customer_id: str, resource_name: str,
     criterion.cpc_bid_micros = new_bid_micros
     client.copy_from(
         operation.update_mask,
-        client.get_type("FieldMask")(paths=["cpc_bid_micros"])
+        field_mask_pb2.FieldMask(paths=["cpc_bid_micros"])
     )
     try:
         service.mutate_ad_group_criteria(
@@ -2090,7 +2105,7 @@ def _execute_enable_keyword(client, customer_id: str, resource_name: str) -> boo
     criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
     client.copy_from(
         operation.update_mask,
-        client.get_type("FieldMask")(paths=["status"])
+        field_mask_pb2.FieldMask(paths=["status"])
     )
     try:
         service.mutate_ad_group_criteria(
@@ -2158,7 +2173,7 @@ def _execute_budget_change(client, customer_id: str, campaign_resource: str,
     budget.amount_micros = new_micros
     client.copy_from(
         operation.update_mask,
-        client.get_type("FieldMask")(paths=["amount_micros"])
+        field_mask_pb2.FieldMask(paths=["amount_micros"])
     )
     try:
         service.mutate_campaign_budgets(
@@ -2345,13 +2360,30 @@ def _execute_update_rsa(client, customer_id: str, ad_group_ad_resource: str,
         if text.lower() not in existing_desc_texts and len(merged_descriptions) < 4:
             merged_descriptions.append({"text": text, "pinned_field": None})
 
-    # Build the update operation
-    service = client.get_service("AdGroupAdService")
-    operation = client.get_type("AdGroupAdOperation")
-    ad_group_ad = operation.update
-    ad_group_ad.resource_name = ad_group_ad_resource
+    # Build the update operation via AdService (not AdGroupAdService).
+    # RSA headlines/descriptions are immutable on AdGroupAd — they must be
+    # updated at the Ad level using AdService.mutate_ads().
+    #
+    # ad_group_ad_resource format: customers/CID/adGroupAds/AGID~ADID
+    # ad_resource format:          customers/CID/ads/ADID
+    # Extract the ad resource name from the ad_group_ad resource.
+    try:
+        # "customers/CID/adGroupAds/AGID~ADID" → ad_id is after the ~
+        parts = ad_group_ad_resource.split("~")
+        if len(parts) != 2:
+            raise ValueError(f"Cannot parse ad_group_ad_resource: {ad_group_ad_resource}")
+        cid_part = ad_group_ad_resource.split("/adGroupAds/")[0]  # customers/CID
+        ad_id = parts[1]
+        ad_resource = f"{cid_part}/ads/{ad_id}"
+    except Exception as e:
+        raise ValueError(f"Could not derive ad resource from '{ad_group_ad_resource}': {e}")
 
-    rsa = ad_group_ad.ad.responsive_search_ad
+    service = client.get_service("AdService")
+    operation = client.get_type("AdOperation")
+    ad = operation.update
+    ad.resource_name = ad_resource
+
+    rsa = ad.responsive_search_ad
     rsa.headlines.clear()
     for h in merged_headlines:
         asset = client.get_type("AdTextAsset")
@@ -2367,21 +2399,21 @@ def _execute_update_rsa(client, customer_id: str, ad_group_ad_resource: str,
     client.copy_from(
         operation.update_mask,
         field_mask_pb2.FieldMask(
-            paths=["ad.responsive_search_ad.headlines",
-                   "ad.responsive_search_ad.descriptions"]
+            paths=["responsive_search_ad.headlines",
+                   "responsive_search_ad.descriptions"]
         )
     )
 
     try:
-        response = service.mutate_ad_group_ads(
+        response = service.mutate_ads(
             customer_id=customer_id,
             operations=[operation],
         )
-        logger.info(f"RSA updated: {ad_group_ad_resource} — "
+        logger.info(f"RSA updated via AdService: {ad_resource} — "
                     f"{len(merged_headlines)} headlines, {len(merged_descriptions)} descriptions")
         return True
     except Exception as e:
-        logger.error(f"RSA update failed for {ad_group_ad_resource}: {e}")
+        logger.error(f"RSA update failed for {ad_resource}: {e}")
         raise
 
 
@@ -2571,48 +2603,61 @@ def _negative_already_handled(keyword_text: str, campaign_name: str,
                                account_level: bool = False,
                                live_negatives: set | None = None) -> bool:
     """
-    Return True if this negative keyword is already covered by live Google Ads data.
+    Return True if this negative keyword should be skipped.
 
-    Google Ads is the source of truth — if a negative (or a broader negative that
-    covers this search term via BROAD match) is already live, there is nothing to do.
+    Two sources of truth:
+    1. Google Ads live state (live_negatives) — already blocked in the platform.
+       Checks exact match AND whether a broader BROAD negative already covers this
+       search term (e.g. "gentle dental" covers "gentle dental worcester ma").
+    2. Audit log — previously REJECTED by the user. Don't re-suggest what was
+       explicitly dismissed. (Pending/queued items are NOT suppressed — they
+       haven't been pushed yet so they should still show as recommendations.)
 
-    live_negatives: set of lowercased keyword texts from _fetch_existing_negatives().
-      Contains both campaign-level negatives and shared-list negatives.
-
-    Matching logic:
-      - Exact: "gentle dental" == "gentle dental" → covered
-      - Broader negative covers the search term: existing neg "gentle dental" is a
-        substring of search term "gentle dental worcester ma" → already blocked by
-        that BROAD negative, no new rec needed.
-
-    The audit log is NOT used as dedup — Google Ads live state is the only check.
     account_level param kept for backward-compat but no longer changes behavior.
     """
-    if live_negatives is None:
-        return False
-
     kw_lower = keyword_text.strip().lower()
 
-    # 1. Exact match — this specific text is already a negative
-    if kw_lower in live_negatives:
-        return True
-
-    # 2. Broader coverage — an existing BROAD negative covers this search term.
-    #    e.g. live negative "gentle dental" already blocks "gentle dental worcester ma".
-    #    Use word-boundary check: existing neg must match as whole words inside the term.
-    for existing_neg in live_negatives:
-        if not existing_neg:
-            continue
-        # existing_neg must appear as a whole-word sequence within kw_lower
-        # Simple approach: check it's a substring AND surrounded by word boundaries
-        idx = kw_lower.find(existing_neg)
-        if idx == -1:
-            continue
-        before_ok = (idx == 0 or not kw_lower[idx - 1].isalnum())
-        after_idx = idx + len(existing_neg)
-        after_ok = (after_idx == len(kw_lower) or not kw_lower[after_idx].isalnum())
-        if before_ok and after_ok:
+    # ── Check 1: live Google Ads negatives ──────────────────────────────────
+    if live_negatives is not None:
+        # 1a. Exact match
+        if kw_lower in live_negatives:
             return True
+
+        # 1b. Broader BROAD negative already covers this search term.
+        #     e.g. "gentle dental" in live_negatives blocks "gentle dental worcester ma".
+        for existing_neg in live_negatives:
+            if not existing_neg:
+                continue
+            idx = kw_lower.find(existing_neg)
+            if idx == -1:
+                continue
+            before_ok = (idx == 0 or not kw_lower[idx - 1].isalnum())
+            after_idx = idx + len(existing_neg)
+            after_ok = (after_idx == len(kw_lower) or not kw_lower[after_idx].isalnum())
+            if before_ok and after_ok:
+                return True
+
+    # ── Check 2: already in audit log (pending, queued, or rejected) ────────
+    # - pending_approval / queued: already recommended, sitting in queue — no need to duplicate
+    # - rejected: user hit ✕, don't re-surface ever
+    # - success: was pushed (should also be in live_negatives, but belt-and-suspenders)
+    try:
+        from database import _conn
+        with _conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM gads_audit_log
+                 WHERE entity_name = ?
+                   AND operation IN ('add_negative_keyword', 'add_to_shared_negative_list')
+                   AND execution_result IN ('pending_approval', 'queued', 'rejected', 'success')
+                 LIMIT 1
+                """,
+                (kw_lower,),
+            ).fetchone()
+            if row:
+                return True
+    except Exception as e:
+        logger.debug(f"Audit log check failed for '{keyword_text}': {e}")
 
     return False
 
@@ -2660,6 +2705,25 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     if expired:
         logger.info(f"Expired {expired} stale pending rows before this run")
 
+    # ── Load optimizer memory (cross-run context) ─────────────────────────────
+    from optimizer_memory import MemoryStore
+    memory = MemoryStore()
+    memory.load()
+    last_run_date = memory.get_last_run_date()
+    today = datetime.now(timezone.utc).date()
+    if last_run_date and last_run_date < today:
+        # Start from day after last run to avoid re-fetching already-seen data
+        search_start = last_run_date + timedelta(days=1)
+        logger.info(f"Optimizer memory: last run was {last_run_date}, fetching search terms since {search_start}")
+    else:
+        # First run OR same-day re-run: seed with last 30 days (safe to overlap on same day)
+        search_start = today - timedelta(days=30)
+        if last_run_date == today:
+            logger.info("Optimizer memory: same-day re-run, re-fetching last 30 days to catch intraday updates")
+        else:
+            logger.info("Optimizer memory: first run, seeding with last 30 days of search terms")
+    memory_digest = memory.build_digest(max_runs=10)
+
     # Fetch live negative keywords from Google Ads — used throughout run to skip already-applied negatives
     logger.info("Fetching existing negative keywords from Google Ads...")
     live_negatives = _fetch_existing_negatives(client, customer_id)
@@ -2668,8 +2732,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     logger.info("Collecting keyword performance...")
     keyword_perf = _get_keyword_performance(client, customer_id, days=30)
 
-    logger.info("Collecting search terms...")
-    search_terms = _get_search_terms(client, customer_id, days=30)
+    logger.info(f"Collecting search terms since {search_start}...")
+    search_terms = _get_search_terms(client, customer_id, start_date=search_start)
 
     logger.info("Building lead attribution...")
     attribution = _get_keyword_attribution()
@@ -3065,6 +3129,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             google_recs=[r for r in google_recs if r.get('campaign_name','').lower() == camp_name.lower() or not r.get('campaign_name')],
             optimizer_run_id=run_id,
             existing_negatives=live_negatives,
+            memory_digest=memory_digest,
         )
         if not structured:
             continue
@@ -3145,6 +3210,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         google_recs=[r for r in google_recs if not r.get("campaign_name")],
         optimizer_run_id=run_id,
         existing_negatives=live_negatives,
+        memory_digest=memory_digest,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")
@@ -3335,6 +3401,72 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         logger.info(f"  NEW NEGATIVE: '{st['search_term']}' — {st['reason']}")
 
     logger.info("=" * 60)
+
+    # ── Save run to optimizer memory ──────────────────────────────────────────
+    try:
+        # Collect top search terms for memory (highest cost, first 30)
+        top_st = sorted(search_terms, key=lambda s: -s.get("cost", 0))[:30]
+        top_st_slim = [
+            {"term": s.get("search_term",""), "cost": round(s.get("cost",0),2),
+             "clicks": s.get("clicks",0), "campaign": s.get("campaign","")}
+            for s in top_st
+        ]
+
+        # Collect negatives added this run (rule-based, for negatives_added field)
+        negatives_added = [
+            st.get("search_term", "") for st in actions.get("new_negatives", [])
+            if st.get("action_id")
+        ]
+
+        # Collect ALL recommendations from this run — rule-based + Claude per-campaign + account-level.
+        # rec_id == gads_audit_log.action_id (same UUID string, different name in memory schema).
+        # Pulling from gads_audit_log ensures we capture every operation type and every log_pending call.
+        all_recs_for_memory = []
+        try:
+            from database import _conn as _mem_db_conn
+            with _mem_db_conn() as _mc:
+                _rec_rows = _mc.execute("""
+                    SELECT action_id, operation, entity_name, reason
+                    FROM gads_audit_log
+                    WHERE optimizer_run_id = ?
+                      AND execution_result = 'pending_approval'
+                """, (run_id,)).fetchall()
+            for _r in _rec_rows:
+                all_recs_for_memory.append({
+                    "rec_id": _r["action_id"],
+                    "type": _r["operation"],
+                    "target": _r["entity_name"],
+                    "rationale": (_r["reason"] or "")[:200],
+                    "status": "pending_approval",
+                })
+        except Exception as _recs_err:
+            logger.warning(f"Could not pull recs from audit log for memory: {_recs_err}")
+
+        run_entry = {
+            "run_id": run_id,
+            "run_date": datetime.now(timezone.utc).date().isoformat(),
+            "trigger": trigger,
+            "summary": {
+                "total_spend": summary.get("total_spend", 0),
+                "total_clicks": summary.get("total_clicks", 0),
+                "total_leads": summary.get("total_leads", 0),
+                "total_calls": summary.get("total_calls", 0),
+                "total_production": summary.get("total_production", 0),
+                "overall_roas": summary.get("overall_roas", 0),
+                "cost_per_lead": summary.get("cost_per_lead", 0),
+                "actions_pending": actions_pending,
+            },
+            "top_search_terms": top_st_slim,
+            "negatives_added": negatives_added,
+            "recommendations": all_recs_for_memory,
+            "claude_notes": "\n".join(advisories[:10]) if advisories else "",
+        }
+        memory.append_run(run_entry)
+        memory.save()
+        logger.info(f"Optimizer memory updated: {len(all_recs_for_memory)} recs saved (run_id={run_id[:8]})")
+    except Exception as _mem_err:
+        logger.warning(f"Failed to save optimizer memory (non-fatal): {_mem_err}")
+
     return report
 
 
