@@ -1663,8 +1663,10 @@ const OD_REL_COLORS = {
   cold:             '#9ca3af',
 };
 
-// ── OptimizerWidget — AI optimizer summary for Dashboard ─────────────────────
-function OptimizerWidget({ onTabSwitch }) {
+// ── OptimizerWidget — REMOVED (consolidated into AI Optimizer tab) ────────────
+// Placeholder kept to avoid reference errors during transition
+function OptimizerWidget({ onTabSwitch }) { return null; }
+function _OptimizerWidget_UNUSED({ onTabSwitch }) {
   const [data, setData] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
   const [approving, setApproving] = React.useState({});
@@ -1927,8 +1929,6 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
           </div>
         </div>
 
-        {/* AI Optimizer — full width in left column */}
-        <OptimizerWidget onTabSwitch={onTabSwitch} />
       </div>
 
       <div className="dash-right">
@@ -11955,8 +11955,6 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
 
       <ODConnectionCard />
 
-      <PendingApprovalsPanel />
-
       <KeywordResearchSection />
 
       <MemorySection />
@@ -12091,85 +12089,194 @@ const AI_OP_LABELS = Object.assign({}, OP_LABELS, {
   add_asset:           { label: 'Add Asset',           color: '#27ae60', icon: '📎' },
 });
 
-const REC_TYPE_COLORS = {
-  KEYWORD:                      '#2563eb',
-  KEYWORD_MATCH_TYPE:           '#0891b2',
-  MAXIMIZE_CONVERSIONS_OPT_IN:  '#9b59b6',
-  TARGET_CPA_OPT_IN:            '#7c3aed',
-  TARGET_ROAS_OPT_IN:           '#6d28d9',
-  MARGINAL_ROI_CAMPAIGN_BUDGET: '#d97706',
-  CAMPAIGN_BUDGET:              '#d97706',
-  MOVE_UNUSED_BUDGET:           '#d97706',
-  RESPONSIVE_SEARCH_AD:         '#0891b2',
-  SITELINK_EXTENSION:           '#16a34a',
-  CALLOUT_EXTENSION:            '#16a34a',
-  CALL_EXTENSION:               '#16a34a',
-  MAXIMIZE_CLICKS_OPT_IN:       '#9b59b6',
-  ENHANCED_CPC_OPT_IN:          '#9b59b6',
-};
+// Helper: summarise after_state_json as a human-readable change string
+function fmtRecChange(json_str, op) {
+  if (!json_str) return '';
+  try {
+    const obj = JSON.parse(json_str);
+    if (op === 'pause_keyword')        return 'enabled → paused';
+    if (op === 'increase_bid' || op === 'decrease_bid') {
+      const before = obj.current_bid_micros ? `$${(obj.current_bid_micros/1e6).toFixed(2)}` : '—';
+      const after  = obj.new_bid_micros     ? `$${(obj.new_bid_micros/1e6).toFixed(2)}`     : '—';
+      return op === 'increase_bid' ? `${before} → ${after} ⬆` : `${before} → ${after} ⬇`;
+    }
+    if (op === 'add_exact_keyword')    return `[exact] "${obj.keyword_text}"`;
+    if (op === 'add_negative_keyword') return `[neg/${obj.match_type||'phrase'}] "${obj.keyword_text}"`;
+    if (op === 'change_bid_strategy')  return obj.target_strategy || JSON.stringify(obj).slice(0,60);
+    if (op === 'change_match_type')    return obj.new_match_type  || JSON.stringify(obj).slice(0,60);
+    return JSON.stringify(obj).slice(0,80);
+  } catch { return (json_str||'').slice(0,80); }
+}
 
-function GoogleRecCard({ rec, onDismiss }) {
-  const [open, setOpen] = React.useState(false);
-  const [dismissing, setDismissing] = React.useState(false);
-  const [dismissed, setDismissed] = React.useState(false);
+// A single collapsible section (Account Level or one campaign)
+function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, defaultOpen }) {
+  const [open, setOpen] = React.useState(defaultOpen || false);
+  const [selected, setSelected] = React.useState({});
+  const [bulkBusy, setBulkBusy] = React.useState(false);
 
-  if (dismissed) return null;
+  // Strip stale selections whenever recs change
+  React.useEffect(() => {
+    setSelected(prev => {
+      const ids = new Set(recs.map(r => r.action_id));
+      const next = {};
+      Object.keys(prev).forEach(k => { if (ids.has(k)) next[k] = true; });
+      return next;
+    });
+  }, [recs]);
 
-  const color = REC_TYPE_COLORS[rec.rec_type] || '#64748b';
-  const impact = rec.impact || {};
-  const clickDelta = (impact.potential_clicks || 0) - (impact.base_clicks || 0);
-  const convDelta = (impact.potential_conversions || 0) - (impact.base_conversions || 0);
+  const selectedIds = Object.keys(selected).filter(k => selected[k]);
+  const allChecked = recs.length > 0 && selectedIds.length === recs.length;
+  const someChecked = selectedIds.length > 0 && selectedIds.length < recs.length;
 
-  const verdictBadge = () => {
-    if (!rec.claude_verdict) return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#e2e8f022',color:'#94a3b8',fontWeight:600}}>⏳ Pending analysis</span>;
-    if (rec.claude_verdict === 'endorsed') return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#dcfce7',color:'#16a34a',fontWeight:600}}>✅ Endorsed</span>;
-    if (rec.claude_verdict === 'advisory') return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#fef9c3',color:'#854d0e',fontWeight:600}}>⚠️ Advisory</span>;
-    if (rec.claude_verdict === 'rejected') return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#fee2e2',color:'#dc2626',fontWeight:600}}>🚫 Not recommended</span>;
-    return <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:'#e0f2fe',color:'#0369a1',fontWeight:600}}>{rec.claude_verdict}</span>;
+  const toggle = (id) => setSelected(p => ({...p, [id]: !p[id]}));
+  const toggleAll = () => {
+    if (allChecked) setSelected({});
+    else { const n = {}; recs.forEach(r => { n[r.action_id] = true; }); setSelected(n); }
   };
 
+  const handleBulkApprove = async () => {
+    if (!selectedIds.length) return;
+    setBulkBusy(true);
+    const failed = [];
+    for (const id of selectedIds) {
+      try { await onApprove(id); }
+      catch(e) { failed.push(id); }
+    }
+    setSelected({});
+    setBulkBusy(false);
+    if (failed.length) alert(`${failed.length} item(s) failed to approve.`);
+  };
+
+  const handleBulkIgnore = async () => {
+    if (!selectedIds.length) return;
+    setBulkBusy(true);
+    const failed = [];
+    for (const id of selectedIds) {
+      try { await onIgnore(id); }
+      catch(e) { failed.push(id); }
+    }
+    setSelected({});
+    setBulkBusy(false);
+    if (failed.length) alert(`${failed.length} item(s) failed to ignore.`);
+  };
+
+  const pendingCount = recs.length;
+
   return (
-    <div style={{padding:'10px 12px',marginBottom:8,borderRadius:6,border:`1px solid ${color}33`,background:'#fff',fontSize:12}}>
-      <div style={{display:'flex',alignItems:'flex-start',gap:8}}>
-        <div style={{flex:1}}>
-          <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:4}}>
-            <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,background:color+'22',color,fontWeight:700}}>{rec.rec_type}</span>
-            <span style={{fontWeight:700,color:'var(--text-main)'}}>{rec.title}</span>
-            {verdictBadge()}
-          </div>
-          <div style={{color:'var(--text-muted)',fontSize:11,marginBottom:2}}>{rec.description}</div>
-          {rec.campaign_name && <div style={{fontSize:10,color:'#64748b'}}>Campaign: {rec.campaign_name}</div>}
-          {(clickDelta !== 0 || convDelta !== 0) && (
-            <div style={{marginTop:4,fontSize:10,display:'flex',gap:8}}>
-              {clickDelta > 0 && <span style={{color:'#16a34a',fontWeight:600}}>+{Math.round(clickDelta)} clicks</span>}
-              {clickDelta < 0 && <span style={{color:'#dc2626',fontWeight:600}}>{Math.round(clickDelta)} clicks</span>}
-              {convDelta > 0 && <span style={{color:'#16a34a',fontWeight:600}}>+{convDelta.toFixed(1)} conv</span>}
+    <div style={{border:'1px solid var(--border)',borderRadius:8,marginBottom:10,overflow:'hidden'}}>
+      {/* Section header — always visible */}
+      <button onClick={() => setOpen(o => !o)}
+        style={{width:'100%',display:'flex',alignItems:'center',gap:8,padding:'10px 14px',
+          background: open ? '#f8fafc' : '#fff',border:'none',cursor:'pointer',textAlign:'left',
+          borderBottom: open ? '1px solid var(--border)' : 'none'}}>
+        <span style={{fontSize:13,transition:'transform .2s',display:'inline-block',
+          transform: open ? 'rotate(90deg)' : 'rotate(0deg)',color:'var(--text-muted)'}}>▶</span>
+        <span style={{fontWeight:700,fontSize:13,color:'var(--text)',flex:1}}>{title}</span>
+        {pendingCount > 0 && (
+          <span style={{background:'var(--teal)',color:'#fff',borderRadius:10,
+            padding:'1px 8px',fontSize:11,fontWeight:700,flexShrink:0}}>
+            {pendingCount}
+          </span>
+        )}
+        {pendingCount === 0 && (
+          <span style={{background:'#e2e8f0',color:'#64748b',borderRadius:10,
+            padding:'1px 8px',fontSize:11,fontWeight:600,flexShrink:0}}>0</span>
+        )}
+      </button>
+
+      {open && (
+        <div style={{padding:'10px 14px'}}>
+          {loading && <div style={{color:'var(--text-muted)',fontSize:12,padding:'8px 0'}}>Loading...</div>}
+
+          {!loading && pendingCount === 0 && (
+            <div style={{color:'var(--text-muted)',fontSize:12,textAlign:'center',padding:'12px 0',fontStyle:'italic'}}>
+              No pending recommendations — looks good! ✓
             </div>
           )}
-          {rec.claude_reasoning && (
-            <div>
-              <button onClick={()=>setOpen(o=>!o)} style={{fontSize:10,color:'var(--teal)',background:'none',border:'none',cursor:'pointer',padding:'2px 0',marginTop:2}}>
-                {open ? '▲ Hide reasoning' : '▼ Show AI reasoning'}
-              </button>
-              {open && <div style={{fontSize:10,color:'#475569',marginTop:4,fontStyle:'italic',borderLeft:'2px solid var(--teal)',paddingLeft:8}}>{rec.claude_reasoning}</div>}
-            </div>
+
+          {!loading && pendingCount > 0 && (
+            <>
+              {/* Bulk action bar */}
+              <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8,
+                padding:'6px 10px',background:'#f8fafc',borderRadius:6,border:'1px solid var(--border)'}}>
+                <label style={{display:'flex',alignItems:'center',gap:5,cursor:'pointer',fontSize:12}}>
+                  <input type="checkbox"
+                    checked={allChecked}
+                    ref={el => { if (el) el.indeterminate = someChecked; }}
+                    onChange={toggleAll}
+                    style={{cursor:'pointer'}} />
+                  <span style={{color:'var(--text-muted)',fontWeight:500}}>
+                    {selectedIds.length > 0 ? `${selectedIds.length} selected` : 'Select all'}
+                  </span>
+                </label>
+                {selectedIds.length > 0 && (
+                  <>
+                    <button onClick={handleBulkApprove} disabled={bulkBusy}
+                      style={{padding:'3px 12px',fontSize:11,borderRadius:5,cursor:'pointer',
+                        background:'var(--teal)',color:'#fff',border:'none',fontWeight:600}}>
+                      {bulkBusy ? '⏳' : `✓ Approve ${selectedIds.length}`}
+                    </button>
+                    <button onClick={handleBulkIgnore} disabled={bulkBusy}
+                      style={{padding:'3px 12px',fontSize:11,borderRadius:5,cursor:'pointer',
+                        background:'#fee2e2',color:'#dc2626',border:'none',fontWeight:600}}>
+                      {bulkBusy ? '⏳' : `✕ Ignore ${selectedIds.length}`}
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {/* Rec rows */}
+              {recs.map(rec => {
+                const opMeta = AI_OP_LABELS[rec.operation] || {label:rec.operation, color:'#64748b', icon:'•'};
+                const isBusy = busy[rec.action_id];
+                const change = fmtRecChange(rec.after_state_json || rec.before_state_json, rec.operation);
+                return (
+                  <div key={rec.action_id}
+                    style={{display:'flex',alignItems:'flex-start',gap:8,padding:'8px 10px',
+                      marginBottom:6,borderRadius:6,border:'1px solid var(--border)',
+                      background: selected[rec.action_id] ? 'rgba(13,122,127,.04)' : '#fff',
+                      borderColor: selected[rec.action_id] ? 'var(--teal)' : 'var(--border)'}}>
+                    <input type="checkbox"
+                      checked={!!selected[rec.action_id]}
+                      onChange={() => toggle(rec.action_id)}
+                      style={{marginTop:3,cursor:'pointer',flexShrink:0}} />
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:3}}>
+                        <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,
+                          background:opMeta.color+'22',color:opMeta.color,fontWeight:700}}>
+                          {opMeta.icon} {opMeta.label}
+                        </span>
+                        <span style={{fontWeight:700,fontSize:12,color:'var(--text)'}}>{rec.entity_name}</span>
+                      </div>
+                      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:2,lineHeight:1.4}}>
+                        {rec.reason}
+                      </div>
+                      {change && (
+                        <div style={{fontSize:10,color:'#475569',fontFamily:'monospace',
+                          background:'#f1f5f9',borderRadius:3,padding:'1px 5px',display:'inline-block'}}>
+                          {change}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{display:'flex',gap:4,flexShrink:0}}>
+                      <button onClick={() => onApprove(rec.action_id)} disabled={!!isBusy}
+                        style={{padding:'3px 10px',fontSize:11,borderRadius:4,cursor:'pointer',
+                          background:'var(--teal)',color:'#fff',border:'none',fontWeight:600}}>
+                        {isBusy === 'approve' ? '⏳' : '✓'}
+                      </button>
+                      <button onClick={() => onIgnore(rec.action_id)} disabled={!!isBusy}
+                        style={{padding:'3px 10px',fontSize:11,borderRadius:4,cursor:'pointer',
+                          background:'#fee2e2',color:'#dc2626',border:'none',fontWeight:600}}>
+                        {isBusy === 'ignore' ? '⏳' : '✕'}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </>
           )}
         </div>
-        <button onClick={async()=>{
-          setDismissing(true);
-          try {
-            await api(`/api/admin/gads/google-recs/${rec.id}/dismiss`, {method:'POST'});
-            setDismissed(true);
-            if (onDismiss) onDismiss(rec.id);
-          } catch(e) { alert('Dismiss failed: ' + e.message); }
-          finally { setDismissing(false); }
-        }} disabled={dismissing}
-          title="Dismiss this recommendation"
-          style={{padding:'3px 8px',fontSize:11,borderRadius:4,cursor:'pointer',
-            border:'1px solid #e2e8f0',background:'#f8fafc',color:'#94a3b8',flexShrink:0}}>
-          {dismissing ? '…' : '✕'}
-        </button>
-      </div>
+      )}
     </div>
   );
 }
@@ -12177,27 +12284,22 @@ function GoogleRecCard({ rec, onDismiss }) {
 function AiOptimizerTab() {
   const [running, setRunning] = React.useState(false);
   const [lastRun, setLastRun] = React.useState('');
-  const [googleRecs, setGoogleRecs] = React.useState([]);
   const [recs, setRecs] = React.useState(null);
   const [queued, setQueued] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
-  const [googleLoading, setGoogleLoading] = React.useState(true);
   const [pushBusy, setPushBusy] = React.useState(false);
   const [pushResult, setPushResult] = React.useState(null);
-  const [activeSection, setActiveSection] = React.useState('account');
-  const [selectedCampaign, setSelectedCampaign] = React.useState('');
   const [runMsg, setRunMsg] = React.useState('');
+  const [busy, setBusy] = React.useState({});
+  const [innerTab, setInnerTab] = React.useState('recommendations');
+  const [autoExpanded, setAutoExpanded] = React.useState(false);
+  const [expandedSections, setExpandedSections] = React.useState({});
 
-  const loadGoogleRecs = React.useCallback(async () => {
-    setGoogleLoading(true);
+  const loadLastRun = React.useCallback(async () => {
     try {
-      const d = await api('/api/admin/gads/google-recs');
-      setGoogleRecs(d.recs || []);
-      if (d.recs && d.recs.length > 0) {
-        setLastRun(d.recs[0].fetched_at || '');
-      }
-    } catch(e) { console.error('Google recs load error', e); }
-    finally { setGoogleLoading(false); }
+      const d = await api('/api/admin/optimizer/dashboard-summary');
+      if (d.last_run_at) setLastRun(d.last_run_at);
+    } catch(_) {}
   }, []);
 
   const loadRecs = React.useCallback(async () => {
@@ -12217,77 +12319,28 @@ function AiOptimizerTab() {
   }, []);
 
   React.useEffect(() => {
-    loadGoogleRecs();
+    loadLastRun();
     loadRecs();
     loadQueued();
-  }, [loadGoogleRecs, loadRecs, loadQueued]);
+  }, [loadLastRun, loadRecs, loadQueued]);
 
-  const handleRunOptimizer = async () => {
-    setRunning(true); setRunMsg('Running optimizer...');
-    try {
-      await api('/api/admin/optimize', {method:'POST'});
-      setRunMsg('Optimizer triggered — fetching new Google recs...');
-      // Poll for new google recs
-      let attempts = 0;
-      const poll = setInterval(async () => {
-        attempts++;
-        try {
-          const d = await api('/api/admin/gads/google-recs');
-          setGoogleRecs(d.recs || []);
-          if (d.recs && d.recs.length > 0) setLastRun(d.recs[0].fetched_at || '');
-        } catch(_) {}
-        if (attempts >= 10) {
-          clearInterval(poll);
-          setRunMsg('Done ✓');
-          setRunning(false);
-          await loadRecs();
-          await loadQueued();
+  // Auto-expand first non-empty section after a fresh run
+  React.useEffect(() => {
+    if (!autoExpanded && recs && !loading) {
+      const allR = Object.values(recs.recommendations || {}).flat();
+      const pending = allR.filter(r => r.execution_result === 'pending_approval');
+      if (pending.length > 0) {
+        const acct = pending.filter(r => !r.campaign_name);
+        if (acct.length > 0) {
+          setExpandedSections(p => ({...p, '__account__': true}));
+        } else {
+          const firstCamp = pending[0].campaign_name;
+          if (firstCamp) setExpandedSections(p => ({...p, [firstCamp]: true}));
         }
-      }, 3000);
-    } catch(e) {
-      setRunMsg('Error: ' + (e.message || 'Optimizer failed'));
-      setRunning(false);
+        setAutoExpanded(true);
+      }
     }
-  };
-
-  const handleQueue = async (actionId) => {
-    await api(`/api/admin/gads/queue/${actionId}`, {method:'POST'});
-    await loadQueued();
-    await loadRecs();
-  };
-
-  const handleIgnore = async (actionId) => {
-    await api(`/api/admin/gads/reject/${actionId}`, {method:'POST', body:JSON.stringify({reason:''})});
-    await loadRecs();
-  };
-
-  const handleRefine = async (actionId, feedback) => {
-    await api(`/api/admin/gads/refine/${actionId}`, {method:'POST', body:JSON.stringify({feedback})});
-    await loadRecs();
-  };
-
-  const handlePushToGoogle = async () => {
-    setPushBusy(true); setPushResult(null);
-    try {
-      const r = await api('/api/admin/gads/push-queued', {method:'POST'});
-      setPushResult(r);
-      await loadQueued();
-      await loadRecs();
-    } catch(e) { setPushResult({error: e.message || 'Push failed'}); }
-    finally { setPushBusy(false); }
-  };
-
-  // Flatten recs into pending/queued/applied
-  const allRecs = recs ? Object.values(recs.recommendations || {}).flat() : [];
-  const pending = allRecs.filter(r => r.execution_result === 'pending_approval');
-  const applied = allRecs.filter(r => r.execution_result === 'success');
-
-  // Get distinct campaign names from pending
-  const campNames = [...new Set(pending.map(r => r.campaign_name || '').filter(Boolean))].sort();
-
-  const filteredPending = selectedCampaign
-    ? pending.filter(r => (r.campaign_name || '') === selectedCampaign)
-    : (activeSection === 'account' ? pending.filter(r => !r.campaign_name) : pending);
+  }, [recs, loading, autoExpanded]);
 
   const timeAgoStr = (iso) => {
     if (!iso) return 'never';
@@ -12300,13 +12353,81 @@ function AiOptimizerTab() {
     return `${Math.floor(hrs/24)}d ago`;
   };
 
+  const handleRunOptimizer = async () => {
+    setRunning(true); setRunMsg('Running optimizer...');
+    setAutoExpanded(false); // allow re-expansion after new run
+    try {
+      await api('/api/admin/optimize', {method:'POST'});
+      setRunMsg('Optimizer running — polling for results...');
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        if (attempts >= 12) {
+          clearInterval(poll);
+          setRunMsg('Done ✓');
+          setRunning(false);
+          await loadRecs();
+          await loadQueued();
+          await loadLastRun();
+        }
+      }, 3000);
+    } catch(e) {
+      setRunMsg('Error: ' + (e.message || 'Optimizer failed'));
+      setRunning(false);
+    }
+  };
+
+  const handleApprove = async (actionId) => {
+    setBusy(p => ({...p, [actionId]: 'approve'}));
+    try {
+      await api(`/api/admin/gads/approve/${actionId}`, {method:'POST'});
+      await loadRecs();
+      await loadQueued();
+    } catch(e) { alert('Approve failed: ' + (e.message || e)); }
+    finally { setBusy(p => { const n={...p}; delete n[actionId]; return n; }); }
+  };
+
+  const handleIgnore = async (actionId) => {
+    setBusy(p => ({...p, [actionId]: 'ignore'}));
+    try {
+      await api(`/api/admin/gads/reject/${actionId}`, {method:'POST', body:JSON.stringify({reason:''})});
+      await loadRecs();
+    } catch(e) { alert('Ignore failed: ' + (e.message || e)); }
+    finally { setBusy(p => { const n={...p}; delete n[actionId]; return n; }); }
+  };
+
+  const handlePushToGoogle = async () => {
+    if (!confirm(`Push ${queued.length} change${queued.length !== 1 ? 's' : ''} to Google Ads? This cannot be undone.`)) return;
+    setPushBusy(true); setPushResult(null);
+    try {
+      const r = await api('/api/admin/gads/push-queued', {method:'POST'});
+      setPushResult(r);
+      await loadQueued();
+      await loadRecs();
+    } catch(e) { setPushResult({error: e.message || 'Push failed'}); }
+    finally { setPushBusy(false); }
+  };
+
+  // Partition recs
+  const allRecs = recs ? Object.values(recs.recommendations || {}).flat() : [];
+  const pendingRecs = allRecs.filter(r => r.execution_result === 'pending_approval');
+  const historyRecs = allRecs.filter(r => r.execution_result !== 'pending_approval' && r.execution_result !== 'queued');
+
+  const accountPending = pendingRecs.filter(r => !r.campaign_name);
+  const campaignNames = [...new Set(pendingRecs.filter(r => r.campaign_name).map(r => r.campaign_name))].sort();
+
+  const totalPending = pendingRecs.length;
+  const totalHistory = historyRecs.length;
+
   return (
-    <div style={{padding:'16px 20px',maxWidth:900,margin:'0 auto'}}>
+    <div style={{padding:'16px 20px',maxWidth:960,margin:'0 auto'}}>
       {/* Header */}
       <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
         <div>
-          <div style={{fontSize:18,fontWeight:700,color:'var(--text-main)'}}>🤖 AI Optimizer</div>
-          {lastRun && <div style={{fontSize:11,color:'var(--text-muted)'}}>Last run: {timeAgoStr(lastRun)}</div>}
+          <div style={{fontSize:18,fontWeight:700,color:'var(--text)'}}>🤖 AI Optimizer</div>
+          {lastRun && (
+            <div style={{fontSize:11,color:'var(--text-muted)'}}>Last run: {timeAgoStr(lastRun)}</div>
+          )}
         </div>
         <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
           {runMsg && <span style={{fontSize:11,color:'var(--text-muted)'}}>{runMsg}</span>}
@@ -12318,127 +12439,179 @@ function AiOptimizerTab() {
         </div>
       </div>
 
-      {/* Google Recommendations Panel */}
-      <div style={{background:'#f8fafc',border:'1px solid var(--border)',borderRadius:8,padding:'14px 16px',marginBottom:16}}>
-        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
-          <span style={{fontWeight:700,fontSize:13}}>📊 Google's Recommendations</span>
-          <span style={{background:'#2563eb',color:'#fff',borderRadius:10,padding:'1px 7px',fontSize:10,fontWeight:700}}>
-            {googleRecs.length}
-          </span>
-          <button onClick={loadGoogleRecs} disabled={googleLoading}
-            style={{marginLeft:'auto',padding:'3px 10px',fontSize:11,borderRadius:4,cursor:'pointer',
-              border:'1px solid var(--border)',background:'#fff',color:'var(--text-muted)'}}>
-            {googleLoading ? '...' : '⟳ Refresh'}
-          </button>
-        </div>
-        {googleLoading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading...</div>}
-        {!googleLoading && googleRecs.length === 0 && (
-          <div style={{color:'var(--text-muted)',fontSize:12,fontStyle:'italic'}}>
-            No Google recommendations yet. Run the AI Optimizer to fetch them.
-          </div>
-        )}
-        {!googleLoading && googleRecs.map(gr => (
-          <GoogleRecCard key={gr.id} rec={gr} onDismiss={() => loadGoogleRecs()} />
-        ))}
-      </div>
-
-      {/* Section tabs */}
-      <div style={{display:'flex',gap:0,borderBottom:'2px solid var(--border)',marginBottom:12}}>
-        {[{k:'account',l:'Account Level'},{k:'campaign',l:'Campaign Level'}].map(t => (
-          <button key={t.k}
-            onClick={()=>{setActiveSection(t.k); setSelectedCampaign('');}}
-            style={{padding:'7px 18px',fontSize:12,fontWeight:600,cursor:'pointer',background:'none',border:'none',
-              borderBottom:activeSection===t.k?'2px solid var(--teal)':'2px solid transparent',
-              color:activeSection===t.k?'var(--teal)':'var(--text-muted)',marginBottom:-2}}>
+      {/* Inner tab bar */}
+      <div style={{display:'flex',borderBottom:'2px solid var(--border)',marginBottom:16}}>
+        {[
+          {k:'recommendations', l:'Recommendations', count: totalPending},
+          {k:'history',         l:'History',         count: totalHistory},
+        ].map(t => (
+          <button key={t.k} onClick={() => setInnerTab(t.k)}
+            style={{padding:'7px 18px',fontSize:13,fontWeight:600,cursor:'pointer',background:'none',border:'none',
+              borderBottom: innerTab===t.k ? '2px solid var(--teal)' : '2px solid transparent',
+              color: innerTab===t.k ? 'var(--teal)' : 'var(--text-muted)',
+              marginBottom:-2,display:'flex',alignItems:'center',gap:6}}>
             {t.l}
+            <span style={{
+              background: innerTab===t.k ? 'var(--teal)' : '#e2e8f0',
+              color: innerTab===t.k ? '#fff' : '#64748b',
+              borderRadius:10,padding:'0 7px',fontSize:11,fontWeight:700}}>
+              {t.count}
+            </span>
           </button>
         ))}
       </div>
 
-      {/* Campaign filter (campaign level only) */}
-      {activeSection === 'campaign' && (
-        <div style={{marginBottom:12,display:'flex',gap:8,alignItems:'center'}}>
-          <span style={{fontSize:12,color:'var(--text-muted)'}}>Campaign:</span>
-          <select value={selectedCampaign} onChange={e=>setSelectedCampaign(e.target.value)}
-            style={{padding:'4px 8px',fontSize:12,border:'1px solid var(--border)',borderRadius:4}}>
-            <option value="">All campaigns</option>
-            {campNames.map(n => <option key={n} value={n}>{n}</option>)}
-          </select>
-        </div>
-      )}
+      {/* ── RECOMMENDATIONS TAB ── */}
+      {innerTab === 'recommendations' && (
+        <div>
+          {loading && <div style={{color:'var(--text-muted)',fontSize:12,padding:'16px 0'}}>Loading recommendations...</div>}
 
-      {/* Pending recommendations */}
-      <div style={{marginBottom:16}}>
-        <div style={{fontSize:12,fontWeight:700,color:'var(--text-main)',marginBottom:8}}>
-          Pending Recommendations
-          <span style={{marginLeft:6,fontWeight:400,color:'var(--text-muted)'}}>({filteredPending.length})</span>
-        </div>
-        {loading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading...</div>}
-        {!loading && filteredPending.length === 0 && (
-          <div style={{padding:'16px',textAlign:'center',color:'var(--text-muted)',fontSize:12,
-            border:'1px solid var(--border)',borderRadius:6,background:'#fafafa'}}>
-            No pending recommendations{selectedCampaign ? ` for ${selectedCampaign}` : ''}.
-          </div>
-        )}
-        {filteredPending.map(rec => (
-          <RecommendationCard key={rec.action_id} rec={rec}
-            onQueue={handleQueue} onIgnore={handleIgnore} onRefine={handleRefine} />
-        ))}
-      </div>
+          {!loading && totalPending === 0 && (
+            <div style={{textAlign:'center',padding:'32px 0',color:'var(--text-muted)',fontSize:13}}>
+              <div style={{fontSize:24,marginBottom:8}}>✅</div>
+              No pending recommendations. Run the AI Optimizer to generate new ones.
+            </div>
+          )}
 
-      {/* Queue panel */}
-      {queued.length > 0 && (
-        <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,padding:'14px 16px'}}>
-          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
-            <span style={{fontWeight:700,fontSize:13,color:'#15803d'}}>🚀 Queue</span>
-            <span style={{background:'#16a34a',color:'#fff',borderRadius:10,padding:'1px 7px',fontSize:10,fontWeight:700}}>
-              {queued.length}
-            </span>
-            <button onClick={handlePushToGoogle} disabled={pushBusy}
-              style={{marginLeft:'auto',padding:'6px 16px',borderRadius:6,cursor:pushBusy?'not-allowed':'pointer',
-                background:pushBusy?'#a3e635':'#15803d',color:'#fff',border:'none',fontWeight:700,fontSize:12}}>
-              {pushBusy ? '⏳ Pushing...' : '🚀 Push All to Google Ads'}
-            </button>
-          </div>
-          {queued.map(q => {
-            const op = AI_OP_LABELS[q.operation] || {label: q.operation, color:'#64748b', icon:'•'};
-            return (
-              <div key={q.action_id} style={{padding:'8px 10px',marginBottom:6,borderRadius:6,
-                border:'1px solid #a3e635',background:'#fff',fontSize:11,
-                display:'flex',alignItems:'center',gap:8}}>
-                <span>{op.icon}</span>
-                <span style={{fontWeight:600}}>{q.entity_name}</span>
-                <span style={{color:'#64748b'}}>{q.operation}</span>
-                {q.campaign_name && <span style={{color:'#94a3b8',fontSize:10}}>({q.campaign_name})</span>}
+          {!loading && totalPending > 0 && (
+            <>
+              {/* Account Level section */}
+              <OptimizerSection
+                key="__account__"
+                title="Account Level"
+                recs={accountPending}
+                loading={loading}
+                onApprove={handleApprove}
+                onIgnore={handleIgnore}
+                busy={busy}
+                defaultOpen={expandedSections['__account__'] || false}
+              />
+
+              {/* Per-campaign sections */}
+              {campaignNames.map(name => (
+                <OptimizerSection
+                  key={name}
+                  title={name}
+                  recs={pendingRecs.filter(r => r.campaign_name === name)}
+                  loading={loading}
+                  onApprove={handleApprove}
+                  onIgnore={handleIgnore}
+                  busy={busy}
+                  defaultOpen={expandedSections[name] || false}
+                />
+              ))}
+            </>
+          )}
+
+          {/* Queue panel */}
+          {queued.length > 0 && (
+            <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,
+              padding:'14px 16px',marginTop:16}}>
+              <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+                <span style={{fontWeight:700,fontSize:13,color:'#15803d'}}>🚀 Approved — Ready to Push</span>
+                <span style={{background:'#16a34a',color:'#fff',borderRadius:10,
+                  padding:'1px 7px',fontSize:10,fontWeight:700}}>
+                  {queued.length}
+                </span>
+                <button onClick={handlePushToGoogle} disabled={pushBusy}
+                  style={{marginLeft:'auto',padding:'6px 16px',borderRadius:6,
+                    cursor:pushBusy?'not-allowed':'pointer',
+                    background:pushBusy?'#a3e635':'#15803d',color:'#fff',border:'none',
+                    fontWeight:700,fontSize:12}}>
+                  {pushBusy ? '⏳ Pushing...' : '🚀 Push All to Google Ads'}
+                </button>
               </div>
-            );
-          })}
-          {pushResult && (
-            <div style={{marginTop:8,fontSize:11,padding:'8px 12px',borderRadius:6,
-              background: pushResult.error ? '#fee2e2' : '#dcfce7',
-              color: pushResult.error ? '#dc2626' : '#15803d'}}>
-              {pushResult.error ? `Error: ${pushResult.error}` :
-                `✓ ${pushResult.summary?.pushed_to_google || 0} pushed to Google, ${pushResult.summary?.acknowledged_only || 0} acknowledged, ${pushResult.summary?.error || 0} errors`}
+              {queued.map(q => {
+                const op = AI_OP_LABELS[q.operation] || {label:q.operation, color:'#64748b', icon:'•'};
+                return (
+                  <div key={q.action_id} style={{padding:'7px 10px',marginBottom:5,borderRadius:6,
+                    border:'1px solid #bbf7d0',background:'#fff',fontSize:11,
+                    display:'flex',alignItems:'center',gap:8}}>
+                    <span>{op.icon}</span>
+                    <span style={{fontWeight:600}}>{q.entity_name}</span>
+                    <span style={{color:'#64748b'}}>{op.label}</span>
+                    {q.campaign_name && (
+                      <span style={{marginLeft:'auto',fontSize:10,background:'#f0fdf4',
+                        color:'#15803d',padding:'1px 6px',borderRadius:8,fontWeight:600}}>
+                        {q.campaign_name}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+              {pushResult && (
+                <div style={{marginTop:8,fontSize:11,padding:'8px 12px',borderRadius:6,
+                  background: pushResult.error ? '#fee2e2' : '#dcfce7',
+                  color: pushResult.error ? '#dc2626' : '#15803d'}}>
+                  {pushResult.error
+                    ? `Error: ${pushResult.error}`
+                    : `✓ ${pushResult.summary?.pushed_to_google||0} pushed to Google, ${pushResult.summary?.acknowledged_only||0} acknowledged, ${pushResult.summary?.error||0} errors`}
+                </div>
+              )}
             </div>
           )}
         </div>
       )}
 
-      {/* Applied history */}
-      {applied.length > 0 && (
-        <div style={{marginTop:16,opacity:0.7}}>
-          <div style={{fontSize:12,color:'var(--text-muted)',marginBottom:8}}>
-            Applied ({applied.length}) — recent history
-          </div>
-          {applied.slice(0, 5).map(rec => {
-            const op = AI_OP_LABELS[rec.operation] || {label: rec.operation, color:'#64748b', icon:'•'};
+      {/* ── HISTORY TAB ── */}
+      {innerTab === 'history' && (
+        <div>
+          {loading && <div style={{color:'var(--text-muted)',fontSize:12,padding:'16px 0'}}>Loading history...</div>}
+          {!loading && historyRecs.length === 0 && (
+            <div style={{textAlign:'center',padding:'32px 0',color:'var(--text-muted)',fontSize:13}}>
+              No optimization history yet.
+            </div>
+          )}
+          {!loading && historyRecs.length > 0 && historyRecs.map(rec => {
+            const opMeta = AI_OP_LABELS[rec.operation] || {label:rec.operation, color:'#64748b', icon:'•'};
+            const isSuccess = rec.execution_result === 'success';
+            const isRejected = (rec.execution_result || '').startsWith('rejected');
+            const change = fmtRecChange(rec.after_state_json || rec.before_state_json, rec.operation);
+            const statusColor = isSuccess ? '#16a34a' : isRejected ? '#dc2626' : '#d97706';
+            const statusBg    = isSuccess ? '#dcfce7' : isRejected ? '#fee2e2' : '#fef9c3';
+            const statusLabel = isSuccess ? '✓ Applied' : isRejected ? '✕ Ignored' : rec.execution_result;
             return (
-              <div key={rec.action_id} style={{padding:'6px 10px',marginBottom:4,borderRadius:6,
-                border:'1px solid #d1fae5',background:'#f0fdf4',fontSize:11,display:'flex',gap:8,alignItems:'center'}}>
-                <span style={{color:'#16a34a'}}>✓</span>
-                <span style={{fontWeight:600}}>{rec.entity_name}</span>
-                <span style={{color:'#64748b'}}>{op.label}</span>
-                {rec.campaign_name && <span style={{color:'#94a3b8',fontSize:10}}>({rec.campaign_name})</span>}
+              <div key={rec.action_id} style={{display:'flex',alignItems:'flex-start',gap:8,
+                padding:'8px 12px',marginBottom:5,borderRadius:6,
+                border:'1px solid var(--border)',
+                background: isRejected ? '#fafafa' : '#fff',
+                opacity: isRejected ? 0.7 : 1}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:2}}>
+                    <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,
+                      background:opMeta.color+'22',color:opMeta.color,fontWeight:700}}>
+                      {opMeta.icon} {opMeta.label}
+                    </span>
+                    <span style={{fontWeight:700,fontSize:12,color:'var(--text)'}}>{rec.entity_name}</span>
+                    <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,
+                      background:statusBg,color:statusColor,fontWeight:700,marginLeft:'auto'}}>
+                      {statusLabel}
+                    </span>
+                  </div>
+                  <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                    {rec.campaign_name && (
+                      <span style={{fontSize:10,background:'var(--teal-light)',color:'var(--teal)',
+                        borderRadius:8,padding:'1px 7px',fontWeight:600}}>
+                        {rec.campaign_name}
+                      </span>
+                    )}
+                    {!rec.campaign_name && (
+                      <span style={{fontSize:10,background:'#f1f5f9',color:'#64748b',
+                        borderRadius:8,padding:'1px 7px',fontWeight:600}}>
+                        Account Level
+                      </span>
+                    )}
+                    {change && (
+                      <span style={{fontSize:10,color:'#475569',fontFamily:'monospace',
+                        background:'#f1f5f9',borderRadius:3,padding:'1px 5px'}}>
+                        {change}
+                      </span>
+                    )}
+                    <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>
+                      {rec.created_at ? new Date(rec.created_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ''}
+                    </span>
+                  </div>
+                </div>
               </div>
             );
           })}
