@@ -10226,6 +10226,410 @@ function MemorySection() {
   );
 }
 
+// ── Website Intelligence Section ─────────────────────────────────────────────
+
+function WebsiteIntelligenceSection() {
+  const [domains, setDomains]           = useState([]);
+  const [loaded, setLoaded]             = useState(false);
+  // Add domain form
+  const [showAdd, setShowAdd]           = useState(false);
+  const [addUrl, setAddUrl]             = useState('');
+  const [addLabel, setAddLabel]         = useState('');
+  const [addType, setAddType]           = useState('practice');
+  const [addDepth, setAddDepth]         = useState(20);
+  const [addEnabled, setAddEnabled]     = useState(true);
+  const [addSaving, setAddSaving]       = useState(false);
+  // Pages drawer
+  const [drawerDomain, setDrawerDomain] = useState(null); // full domain obj
+  const [drawerPages, setDrawerPages]   = useState([]);
+  const [drawerLoading, setDrawerLoading] = useState(false);
+  // Context preview
+  const [contextDomain, setContextDomain] = useState(null);
+  const [contextText, setContextText]   = useState('');
+  const [contextLoading, setContextLoading] = useState(false);
+  // Crawl status polling
+  const [crawlingIds, setCrawlingIds]   = useState(new Set());
+
+  // Load domain list on mount
+  useEffect(() => {
+    loadDomains();
+  }, []);
+
+  // Poll status for any running crawls every 3 seconds
+  useEffect(() => {
+    if (crawlingIds.size === 0) return;
+    const t = setInterval(() => loadDomains(), 3000);
+    return () => clearInterval(t);
+  }, [crawlingIds.size]);
+
+  async function loadDomains() {
+    try {
+      const r = await api('/api/admin/domains');
+      const list = r.domains || [];
+      setDomains(list);
+      // Track which are running
+      const running = new Set(list.filter(d => d.crawl_status === 'running').map(d => d.id));
+      setCrawlingIds(running);
+    } catch(e) {
+      // silently fail on poll
+    } finally {
+      setLoaded(true);
+    }
+  }
+
+  async function handleAdd() {
+    if (!addUrl.trim()) { alert('Enter a domain URL'); return; }
+    setAddSaving(true);
+    try {
+      await api('/api/admin/domains', {
+        method: 'POST',
+        body: JSON.stringify({
+          domain_url: addUrl.trim(),
+          label: addLabel.trim(),
+          domain_type: addType,
+          crawl_depth: Number(addDepth),
+          crawl_enabled: addEnabled,
+        }),
+      });
+      setShowAdd(false);
+      setAddUrl(''); setAddLabel(''); setAddType('practice'); setAddDepth(20); setAddEnabled(true);
+      await loadDomains();
+    } catch(e) {
+      alert('Failed to add domain: ' + e.message);
+    }
+    setAddSaving(false);
+  }
+
+  async function handleDelete(domain) {
+    if (!confirm(`Remove "${domain.label || domain.domain_url}"?\nThis deletes all crawled page data.`)) return;
+    try {
+      await api('/api/admin/domains/' + domain.id, { method: 'DELETE' });
+      await loadDomains();
+      if (drawerDomain && drawerDomain.id === domain.id) setDrawerDomain(null);
+      if (contextDomain && contextDomain.id === domain.id) setContextDomain(null);
+    } catch(e) {
+      alert('Delete failed: ' + e.message);
+    }
+  }
+
+  async function handleCrawl(domain) {
+    try {
+      await api('/api/admin/domains/' + domain.id + '/crawl', { method: 'POST' });
+      setCrawlingIds(prev => new Set([...prev, domain.id]));
+      await loadDomains();
+    } catch(e) {
+      alert('Crawl trigger failed: ' + e.message);
+    }
+  }
+
+  async function handleViewPages(domain) {
+    setDrawerDomain(domain);
+    setDrawerPages([]);
+    setDrawerLoading(true);
+    setContextDomain(null);
+    try {
+      const r = await api('/api/admin/domains/' + domain.id + '/pages');
+      setDrawerPages(r.pages || []);
+    } catch(e) {
+      alert('Failed to load pages: ' + e.message);
+    }
+    setDrawerLoading(false);
+  }
+
+  async function handleViewContext(domain) {
+    setContextDomain(domain);
+    setContextText('');
+    setContextLoading(true);
+    setDrawerDomain(null);
+    try {
+      const r = await api('/api/admin/domains/' + domain.id + '/context');
+      setContextText(r.context || r.message || '');
+    } catch(e) {
+      alert('Failed to load context: ' + e.message);
+    }
+    setContextLoading(false);
+  }
+
+  function statusPill(domain) {
+    const s = domain.crawl_status || 'idle';
+    const colors = {
+      idle:    { bg:'#f3f4f6', color:'#6b7280' },
+      done:    { bg:'#dcfce7', color:'#16a34a' },
+      running: { bg:'#fef9c3', color:'#b45309' },
+      error:   { bg:'#fee2e2', color:'#dc2626' },
+    };
+    const c = colors[s] || colors.idle;
+    const label = s === 'running' ? '⟳ Crawling…' : s.charAt(0).toUpperCase() + s.slice(1);
+    return (
+      <span style={{
+        background: c.bg, color: c.color,
+        padding: '2px 7px', borderRadius: 10, fontSize: 10, fontWeight: 600,
+      }}>{label}</span>
+    );
+  }
+
+  function typeBadge(type) {
+    const colors = {
+      practice:   { bg:'#ede9fe', color:'#6d28d9' },
+      landing:    { bg:'#dbeafe', color:'#1d4ed8' },
+      competitor: { bg:'#fce7f3', color:'#be185d' },
+    };
+    const c = colors[type] || colors.practice;
+    return (
+      <span style={{
+        background: c.bg, color: c.color,
+        padding: '1px 6px', borderRadius: 8, fontSize: 10, fontWeight: 500,
+      }}>{type}</span>
+    );
+  }
+
+  function fmtCrawledAt(iso) {
+    if (!iso) return <span style={{color:'var(--text-muted)',fontStyle:'italic'}}>never</span>;
+    const d = new Date(iso);
+    return <span title={d.toLocaleString()}>{d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</span>;
+  }
+
+  return (
+    <div className="report-section">
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+        <div className="report-title" style={{marginBottom:0}}>🌐 Website Intelligence</div>
+        <button className="btn btn-teal btn-sm" onClick={()=>setShowAdd(v=>!v)}>
+          {showAdd ? 'Cancel' : '+ Add Domain'}
+        </button>
+      </div>
+
+      {/* Add Domain Form */}
+      {showAdd && (
+        <div style={{
+          background:'var(--gray-light)', border:'1px solid var(--border)',
+          borderRadius:6, padding:12, marginBottom:12,
+        }}>
+          <div style={{fontWeight:600,fontSize:11,marginBottom:8}}>Register New Domain</div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}>
+            <div>
+              <label style={{fontSize:10,fontWeight:500,display:'block',marginBottom:3}}>Domain URL *</label>
+              <input value={addUrl} onChange={e=>setAddUrl(e.target.value)}
+                placeholder="https://graftondentalcare.com"
+                style={{width:'100%',padding:'5px 8px',border:'1px solid var(--border)',borderRadius:4,fontSize:11,boxSizing:'border-box'}} />
+            </div>
+            <div>
+              <label style={{fontSize:10,fontWeight:500,display:'block',marginBottom:3}}>Label</label>
+              <input value={addLabel} onChange={e=>setAddLabel(e.target.value)}
+                placeholder="Main Practice Site"
+                style={{width:'100%',padding:'5px 8px',border:'1px solid var(--border)',borderRadius:4,fontSize:11,boxSizing:'border-box'}} />
+            </div>
+            <div>
+              <label style={{fontSize:10,fontWeight:500,display:'block',marginBottom:3}}>Type</label>
+              <select value={addType} onChange={e=>setAddType(e.target.value)}
+                style={{width:'100%',padding:'5px 8px',border:'1px solid var(--border)',borderRadius:4,fontSize:11}}>
+                <option value="practice">Practice Site</option>
+                <option value="landing">Landing Page</option>
+                <option value="competitor">Competitor</option>
+              </select>
+            </div>
+            <div>
+              <label style={{fontSize:10,fontWeight:500,display:'block',marginBottom:3}}>Max Pages to Crawl: {addDepth}</label>
+              <input type="range" min="5" max="100" step="5"
+                value={addDepth} onChange={e=>setAddDepth(Number(e.target.value))}
+                style={{width:'100%'}} />
+            </div>
+          </div>
+          <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:10}}>
+            <label style={{fontSize:11,display:'flex',alignItems:'center',gap:5,cursor:'pointer'}}>
+              <input type="checkbox" checked={addEnabled} onChange={e=>setAddEnabled(e.target.checked)} />
+              Enable monthly auto-crawl
+            </label>
+          </div>
+          <div style={{display:'flex',gap:8}}>
+            <button className="btn btn-teal btn-sm" onClick={handleAdd} disabled={addSaving}>
+              {addSaving ? 'Saving…' : 'Register Domain'}
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setShowAdd(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Domain List */}
+      {!loaded ? (
+        <div style={{color:'var(--text-muted)',fontSize:11}}>Loading…</div>
+      ) : domains.length === 0 ? (
+        <div style={{
+          textAlign:'center', padding:'24px 0',
+          color:'var(--text-muted)', fontSize:11,
+        }}>
+          No domains registered yet.<br/>
+          <span style={{fontSize:10}}>Add your practice website to give the AI real page data when building campaigns.</span>
+        </div>
+      ) : (
+        <table className="report-table">
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>Type</th>
+              <th className="num">Pages</th>
+              <th className="num">Last Crawled</th>
+              <th className="num">Status</th>
+              <th className="num">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {domains.map(d => (
+              <tr key={d.id}>
+                <td>
+                  <div style={{fontWeight:500,fontSize:11}}>{d.label || d.domain_url}</div>
+                  {d.label && <div style={{fontSize:9,color:'var(--text-muted)'}}>{d.domain_url}</div>}
+                </td>
+                <td>{typeBadge(d.domain_type)}</td>
+                <td className="num" style={{fontSize:11}}>{d.pages_found || 0}</td>
+                <td className="num" style={{fontSize:11}}>{fmtCrawledAt(d.last_crawled_at)}</td>
+                <td className="num">{statusPill(d)}</td>
+                <td className="num">
+                  <div style={{display:'flex',gap:4,justifyContent:'flex-end',flexWrap:'wrap'}}>
+                    <button className="btn btn-ghost btn-sm"
+                      onClick={()=>handleCrawl(d)}
+                      disabled={d.crawl_status === 'running'}
+                      title={d.last_crawled_at ? 'Re-crawl (incremental)' : 'First crawl (full)'}>
+                      {d.crawl_status === 'running' ? '⟳' : '🕷 Crawl'}
+                    </button>
+                    {(d.pages_found > 0) && (
+                      <button className="btn btn-ghost btn-sm"
+                        onClick={()=>handleViewPages(d)}
+                        title="View crawled pages">
+                        📄 Pages
+                      </button>
+                    )}
+                    {(d.pages_found > 0) && (
+                      <button className="btn btn-ghost btn-sm"
+                        onClick={()=>handleViewContext(d)}
+                        title="Preview AI context block">
+                        🤖 Context
+                      </button>
+                    )}
+                    <button className="btn btn-ghost btn-sm"
+                      onClick={()=>handleDelete(d)}
+                      style={{color:'var(--red)'}}
+                      title="Remove domain">
+                      ✕
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {/* Pages Drawer */}
+      {drawerDomain && (
+        <div style={{
+          marginTop:12, border:'1px solid var(--border)',
+          borderRadius:6, overflow:'hidden',
+        }}>
+          <div style={{
+            background:'var(--gray-light)', padding:'8px 12px',
+            display:'flex', alignItems:'center', justifyContent:'space-between',
+          }}>
+            <span style={{fontWeight:600,fontSize:11}}>
+              📄 Crawled Pages — {drawerDomain.label || drawerDomain.domain_url}
+            </span>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setDrawerDomain(null)}>✕ Close</button>
+          </div>
+          {drawerLoading ? (
+            <div style={{padding:16,fontSize:11,color:'var(--text-muted)'}}>Loading pages…</div>
+          ) : drawerPages.length === 0 ? (
+            <div style={{padding:16,fontSize:11,color:'var(--text-muted)'}}>No pages found.</div>
+          ) : (
+            <div style={{maxHeight:360,overflowY:'auto'}}>
+              {drawerPages.map((p,i) => (
+                <div key={p.id || i} style={{
+                  padding:'8px 12px',
+                  borderBottom:'1px solid var(--border)',
+                  fontSize:11,
+                }}>
+                  <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:500,marginBottom:2}}>
+                        {p.page_title || p.page_url}
+                      </div>
+                      <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:2}}>
+                        <a href={p.page_url} target="_blank" rel="noreferrer"
+                          style={{color:'var(--teal)'}}>{p.page_url}</a>
+                      </div>
+                      {p.meta_description && (
+                        <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:2}}>
+                          {p.meta_description}
+                        </div>
+                      )}
+                      {p.h1_text && (
+                        <div style={{fontSize:10,marginBottom:2}}>
+                          <strong>H1:</strong> {p.h1_text}
+                        </div>
+                      )}
+                      {p.cta_phrases && p.cta_phrases.length > 0 && (
+                        <div style={{fontSize:10,marginBottom:2}}>
+                          <strong>CTAs:</strong>{' '}
+                          {p.cta_phrases.slice(0,6).map((c,ci) => (
+                            <span key={ci} style={{
+                              background:'#ede9fe',color:'#6d28d9',
+                              padding:'1px 5px',borderRadius:8,marginRight:3,fontSize:9,
+                            }}>{c}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{textAlign:'right',flexShrink:0,fontSize:10,color:'var(--text-muted)'}}>
+                      <div>{p.word_count} words</div>
+                      {p.has_form ? <div style={{color:'#16a34a'}}>Has form</div> : null}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* AI Context Preview */}
+      {contextDomain && (
+        <div style={{
+          marginTop:12, border:'1px solid var(--border)',
+          borderRadius:6, overflow:'hidden',
+        }}>
+          <div style={{
+            background:'#f5f3ff', padding:'8px 12px',
+            display:'flex', alignItems:'center', justifyContent:'space-between',
+          }}>
+            <span style={{fontWeight:600,fontSize:11}}>
+              🤖 AI Context Preview — {contextDomain.label || contextDomain.domain_url}
+            </span>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setContextDomain(null)}>✕ Close</button>
+          </div>
+          <div style={{padding:10}}>
+            <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
+              This is the exact text block injected into campaign-building AI prompts.
+            </div>
+            {contextLoading ? (
+              <div style={{fontSize:11,color:'var(--text-muted)'}}>Loading context…</div>
+            ) : (
+              <pre style={{
+                fontSize:10, lineHeight:1.5,
+                background:'#f8f8ff', border:'1px solid #e8e8f0',
+                borderRadius:4, padding:10, margin:0,
+                whiteSpace:'pre-wrap', wordBreak:'break-word',
+                maxHeight:400, overflowY:'auto',
+              }}>{contextText || 'No context available yet.'}</pre>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div style={{fontSize:9,color:'var(--text-muted)',marginTop:8}}>
+        First crawl: full scan up to max pages. Subsequent crawls: incremental (only changed pages updated). Auto-crawl runs on the 1st of each month.
+      </div>
+    </div>
+  );
+}
+
 function KeywordResearchSection() {
   const [seeds, setSeeds] = useState('');
   const [results, setResults] = useState([]);
@@ -12636,6 +13040,8 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
       <AISpendCard />
 
       <ODConnectionCard />
+
+      <WebsiteIntelligenceSection />
 
       <KeywordResearchSection />
 
