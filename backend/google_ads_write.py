@@ -245,7 +245,28 @@ def set_campaign_daily_budget(
         raise
 
 
-# ── 5. Replace geographic targeting (PR 3) ────────────────────────────────────
+# ── 5. Set campaign status (ENABLED / PAUSED) ────────────────────────────────
+
+def set_campaign_status_gads(campaign_resource: str, new_status: str) -> bool:
+    """
+    Push ENABLED or PAUSED status to Google Ads.
+    Delegates to google_ads_create.set_campaign_status which handles
+    the kill switch and returns a result dict.
+    Raises RuntimeError on failure.
+    """
+    new_status = new_status.upper()
+    if new_status not in ("ENABLED", "PAUSED"):
+        raise ValueError(f"Invalid status '{new_status}' — must be ENABLED or PAUSED")
+
+    from google_ads_create import set_campaign_status
+    result = set_campaign_status(campaign_resource, new_status)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or "set_campaign_status_gads failed")
+    logger.info(f"Campaign {campaign_resource} status → {new_status}")
+    return True
+
+
+# ── 6. Replace geographic targeting (PR 3) ────────────────────────────────────
 
 def replace_campaign_locations(
     campaign_resource: str,

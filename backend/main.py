@@ -2982,7 +2982,14 @@ class CampaignUpdateFieldsRequest(BaseModel):
 
 @app.patch("/api/admin/campaigns/{campaign_id}", dependencies=[Depends(_require_admin)])
 def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsRequest):
-    """Update editable fields on a campaign (name, budget, service focus, dates, etc.)."""
+    """
+    Update editable fields on a campaign (name, budget, service focus, dates, etc.).
+
+    If the campaign is linked to Google Ads (has gads_campaign_resource), any of the
+    following fields are also pushed live to Google Ads:
+      - monthly_budget  → daily budget (monthly / 30.4)
+      - status          → ENABLED or PAUSED on the live campaign
+    """
     from database import update_campaign_fields, get_campaign_by_id
     camp = get_campaign_by_id(campaign_id)
     if not camp:
@@ -2990,10 +2997,58 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
     if not fields:
         raise HTTPException(status_code=400, detail="No fields to update")
+
     ok = update_campaign_fields(campaign_id, fields)
     if not ok:
         raise HTTPException(status_code=500, detail="Update failed")
-    return {"ok": True, "campaign_id": campaign_id, "updated": list(fields.keys())}
+
+    # ── Push to Google Ads if campaign is live ────────────────────────────────
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    gads_pushed: list[str] = []
+    gads_errors: list[str] = []
+
+    if gads_resource:
+        from google_ads_write import set_campaign_daily_budget, set_campaign_status_gads
+        from campaign_safety import check_budget_absolute_limits, WriteBlockedError
+
+        # Push monthly_budget → daily budget
+        if "monthly_budget" in fields:
+            new_monthly = float(fields["monthly_budget"])
+            new_daily   = round(new_monthly / 30.4, 2)
+            new_micros  = int(new_daily * 1_000_000)
+            try:
+                check_budget_absolute_limits(new_micros)
+                set_campaign_daily_budget(gads_resource, new_daily)
+                gads_pushed.append(f"budget → ${new_daily:.2f}/day")
+                logger.info(f"PATCH campaign {campaign_id}: pushed budget ${new_daily:.2f}/day to GAds")
+            except WriteBlockedError as e:
+                gads_errors.append(f"budget blocked: {e}")
+                logger.warning(f"PATCH campaign {campaign_id}: budget push blocked: {e}")
+            except Exception as e:
+                gads_errors.append(f"budget push failed: {e}")
+                logger.error(f"PATCH campaign {campaign_id}: budget push error: {e}")
+
+        # Push status → ENABLED/PAUSED
+        if "status" in fields:
+            db_status = (fields["status"] or "").upper()
+            gads_status_map = {"ACTIVE": "ENABLED", "PAUSED": "PAUSED"}
+            gads_status = gads_status_map.get(db_status)
+            if gads_status:
+                try:
+                    set_campaign_status_gads(gads_resource, gads_status)
+                    gads_pushed.append(f"status → {gads_status}")
+                    logger.info(f"PATCH campaign {campaign_id}: pushed status {gads_status} to GAds")
+                except Exception as e:
+                    gads_errors.append(f"status push failed: {e}")
+                    logger.error(f"PATCH campaign {campaign_id}: status push error: {e}")
+
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "updated": list(fields.keys()),
+        "gads_pushed": gads_pushed,
+        "gads_errors": gads_errors,
+    }
 
 
 # ─── Campaign Launch (now / schedule / queue) ────────────────────────────────
@@ -4486,15 +4541,20 @@ def admin_link_gads_campaign(body: LinkGadsCampaignRequest, background_tasks: Ba
 @app.post("/api/admin/campaigns/{campaign_id}/sync-from-gads", dependencies=[Depends(_require_admin)])
 def admin_sync_campaign_from_gads(campaign_id: str):
     """
-    On-demand sync: re-fetch keywords, ad copies, and ad groups from Google Ads
-    for a campaign that was already imported.  Stores results in
-    gads_campaign_snapshot (does NOT touch campaign_build_json, so user edits
-    in the wizard are never clobbered).
+    On-demand sync: re-fetch keywords, ad copies, ad groups AND campaign-level
+    settings (budget, status, bidding strategy) from Google Ads.
 
-    Returns the updated snapshot so the frontend can render it immediately.
+    - gads_campaign_snapshot: updated with keywords/ads/ad groups
+    - campaigns table:        monthly_budget, status synced from live Google Ads values
+      (campaign_build_json is never touched — user edits in the wizard are preserved)
+
+    Returns the updated snapshot + the fields synced into the campaigns table.
     """
-    from database import get_campaign_by_id, save_gads_campaign_snapshot, get_gads_campaign_snapshot
-    from google_ads_create import fetch_campaign_build_data
+    from database import (
+        get_campaign_by_id, save_gads_campaign_snapshot, get_gads_campaign_snapshot,
+        update_campaign_fields,
+    )
+    from google_ads_create import fetch_campaign_build_data, fetch_campaigns_from_gads
 
     camp = get_campaign_by_id(campaign_id)
     if not camp:
@@ -4507,20 +4567,50 @@ def admin_sync_campaign_from_gads(campaign_id: str):
             detail="Campaign is not linked to Google Ads — import it first"
         )
 
+    # ── 1. Snapshot: keywords / ads / ad groups ───────────────────────────────
     snapshot = fetch_campaign_build_data(resource_name)
     if snapshot.get("error"):
         raise HTTPException(
             status_code=502,
             detail=f"Google Ads API error: {snapshot['error']}"
         )
-
     save_gads_campaign_snapshot(campaign_id, snapshot)
+
+    # ── 2. Campaign-level settings: budget + status from Google Ads ───────────
+    synced_fields: dict = {}
+    try:
+        all_campaigns = fetch_campaigns_from_gads()
+        live = next(
+            (c for c in all_campaigns if c.get("resource_name") == resource_name),
+            None,
+        )
+        if live:
+            daily_usd = live.get("daily_budget_usd") or 0.0
+            if daily_usd > 0:
+                synced_fields["monthly_budget"] = round(daily_usd * 30.4, 2)
+
+            gads_status = live.get("gads_status", "")  # "ENABLED" or "PAUSED"
+            if gads_status == "ENABLED":
+                synced_fields["status"] = "ACTIVE"
+            elif gads_status == "PAUSED":
+                synced_fields["status"] = "PAUSED"
+
+            if synced_fields:
+                update_campaign_fields(campaign_id, synced_fields)
+                logger.info(
+                    f"Sync from GAds — updated campaigns table for {campaign_id}: {synced_fields}"
+                )
+    except Exception as _e:
+        # Non-fatal — snapshot was already saved; log and continue
+        logger.warning(f"sync-from-gads: could not sync campaign-level fields: {_e}")
+
     logger.info(f"Manual GAds sync complete for campaign {campaign_id}")
     return {
         "ok": True,
         "campaign_id": campaign_id,
         "snapshot": snapshot,
         "synced_at": snapshot.get("synced_from_gads_at"),
+        "synced_fields": synced_fields,
     }
 
 
@@ -4976,13 +5066,8 @@ def admin_set_campaign_budget(campaign_id: str, body: SetBudgetRequest):
     if new_usd < 1.0:
         raise HTTPException(status_code=422, detail="Daily budget must be at least $1.00")
 
-    # Budget-change safety guardrails
-    current_micros = int((body.current_daily_budget_usd or 0) * 1_000_000)
-    new_micros     = int(new_usd * 1_000_000)
-
-    if not check_budget_change_safe(current_micros, new_micros):
-        raise HTTPException(status_code=403,
-                            detail="Budget increase exceeds 25% or increases from zero — change rejected by safety guardrail")
+    # Budget-change safety guardrails (manual edits skip the 25% rate limit — only spend cap applies)
+    new_micros = int(new_usd * 1_000_000)
 
     allowed, cap_usd = check_proposed_spend_under_cap(campaign_id, new_micros)
     if not allowed:
