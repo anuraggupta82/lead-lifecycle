@@ -384,7 +384,9 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
                         # unreliable: the API may silently fail or geocode to the wrong
                         # Grafton (there are Graftons in WI, OH, NH, VT, ND, etc.).
                         city_part  = loc_value.split(",")[0].strip()
-                        state_part = loc_value.split(",")[1].strip() if "," in loc_value else "MA"
+                        # Guard against "Grafton," (trailing comma) → empty state → default MA
+                        raw_state  = loc_value.split(",")[1].strip() if "," in loc_value else ""
+                        state_part = raw_state or "MA"
                         loc_radius = max(1, min(500, float(radius)))
                         if not include:
                             log.append(f"  ⚠ Negative radius targeting not supported by Google Ads — skipping '{loc_value}'")

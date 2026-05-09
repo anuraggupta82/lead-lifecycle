@@ -345,7 +345,8 @@ def replace_campaign_locations(
 
             if loc_type == "city" and loc.get("radius") is not None:
                 # City + radius → proximity criterion (matches google_ads_create.py behavior)
-                # M8: use 'is not None' so radius=0 is handled (clamped to 1 by max())
+                # Use 'is not None' guard so radius=0 passes the check (then clamped to 1 by max()).
+                # Note: `or 15` means radius=0 becomes 15 (a safe default, since radius=0 is meaningless).
                 loc_radius = max(1, min(500, float(loc.get("radius") or 15)))
                 # Opus F7 + M9: Google Ads API does NOT support negative proximity criteria.
                 # Silently flipping to positive would add the opposite of what the user requested.
@@ -360,18 +361,18 @@ def replace_campaign_locations(
                 try:
                     # Strip state suffix if present: "Grafton, MA" → city="Grafton", state="MA"
                     city_part  = loc_value.split(",")[0].strip()
-                    state_part = loc_value.split(",")[1].strip() if "," in loc_value else "MA"
+                    # Guard against "Grafton," (trailing comma) → empty state → default MA
+                    raw_state  = loc_value.split(",")[1].strip() if "," in loc_value else ""
+                    state_part = raw_state or "MA"
+                    if not raw_state:
+                        logger.info(f"  Geo: no state in '{loc_value}', defaulting to MA")
 
                     # ProximityCriterion REQUIRES geo_point — address-only is display-only
                     # and will cause the criterion to fail or target the wrong location.
                     from google_ads_create import _resolve_city_latlng
-                    _log_buf: list = []
-                    lat, lng = _resolve_city_latlng(city_part, state_part, _log_buf)
+                    lat, lng = _resolve_city_latlng(city_part, state_part, errors)
                     if lat is None or lng is None:
-                        errors.append(
-                            f"Could not resolve lat/lng for '{loc_value}' — proximity skipped. "
-                            f"Add this city to _KNOWN_CITY_LATLNG in google_ads_create.py."
-                        )
+                        # error already appended to errors list by helper
                         continue
 
                     op = client.get_type("CampaignCriterionOperation")
@@ -432,8 +433,8 @@ def replace_campaign_locations(
         )
 
     # ── Step 2: Fetch existing LOCATION + PROXIMITY criteria ──────────────────
-    # GAQL enum values are unquoted; both LOCATION and PROXIMITY must be fetched
-    # so that the default Grafton proximity radius is also removed on edit.
+    # Both types must be fetched so the default Grafton proximity is also removed on edit.
+    # Enum values in GAQL IN-lists are quoted strings (GAQL accepts both forms; quoted is safer).
     existing_rns = []
     try:
         query = f"""

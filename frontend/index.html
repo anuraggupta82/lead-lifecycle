@@ -7,6 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <!-- v20260509-1435 -->
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -5888,8 +5889,27 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({campaign_resource: campResource, geo_json: geoEditDraft}),
       });
-      const warn = res.errors?.length ? `\n⚠️ Soft errors: ${res.errors.join(', ')}` : '';
-      alert(`✓ Locations updated (removed ${res.removed}, added ${res.added})${warn}`);
+      // Build a clear verification message
+      const lines = [];
+      lines.push(`✅ Location update sent to Google Ads`);
+      lines.push(`   Removed: ${res.removed}  |  Added: ${res.added}`);
+      if (res.live_criteria?.length) {
+        lines.push('');
+        lines.push('📍 Live in Google Ads now:');
+        res.live_criteria.forEach(c => {
+          const neg = c.negative ? ' [EXCLUDED]' : '';
+          const gp  = c.lat != null ? ` ✓ geo_point` : ` ⚠ no geo_point`;
+          lines.push(`  • ${c.summary}${gp}${neg}`);
+        });
+        if (res.verified) lines.push('');
+        lines.push(res.has_live_criteria ? '✅ Confirmed — Google Ads has active targeting criteria' : '⚠️ Could not verify — check Google Ads directly');
+      }
+      if (res.errors?.length) {
+        lines.push('');
+        lines.push('⚠️ Soft errors:');
+        res.errors.forEach(e => lines.push(`  • ${e}`));
+      }
+      alert(lines.join('\n'));
       setGeoEditOpen(false);
       setGeoEditDraft('');
       openCampaignDetail(campId, campDetailDays);
@@ -7008,7 +7028,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           style={{marginLeft:10,background:'none',border:'none',color:'#fca5a5',cursor:'pointer',fontSize:11}}>✕</button>
                       </div>
                     );
-                    const allOk = res.all_match && (!res.errors || res.errors.length === 0);
+                    const allOk  = res.all_match && (!res.errors || res.errors.length === 0);
+                    const noPush = !res.pushed?.length;
+                    const headerText = noPush
+                      ? '✅ Already in sync — nothing needed pushing'
+                      : allOk ? '✅ Changes pushed & verified'
+                              : '⚠ Pushed — review verification below';
                     return (
                       <div style={{margin:'8px 16px',padding:'12px 14px',
                         background: allOk ? 'rgba(16,185,129,.1)' : 'rgba(251,191,36,.1)',
@@ -7016,20 +7041,25 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                         borderRadius:6,fontSize:11}}>
                         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
                           <span style={{fontWeight:700,color: allOk ? '#6ee7b7' : '#fde68a'}}>
-                            {allOk ? '✅ All changes pushed & verified' : '⚠ Pushed — review verification below'}
+                            {headerText}
                           </span>
                           <button onClick={()=>setSyncToResult(s=>({...s,[camp.campaign_id]:null}))}
                             style={{background:'none',border:'none',color:'#9ca3af',cursor:'pointer',fontSize:12}}>✕</button>
                         </div>
-                        {/* What was pushed */}
-                        {res.pushed && res.pushed.length > 0 && (
-                          <div style={{marginBottom:8}}>
-                            <span style={{color:'#9ca3af'}}>Pushed: </span>
-                            {res.pushed.map((p,i)=>(
-                              <span key={i} style={{marginRight:8,color:'#d1fae5'}}>↑ {p}</span>
-                            ))}
-                          </div>
-                        )}
+                        {/* What was pushed vs skipped */}
+                        <div style={{marginBottom:8,display:'flex',flexWrap:'wrap',gap:6}}>
+                          {res.pushed && res.pushed.map((p,i)=>(
+                            <span key={i} style={{padding:'2px 8px',borderRadius:10,background:'rgba(16,185,129,.2)',
+                              color:'#6ee7b7',fontSize:10,fontWeight:600}}>↑ {p}</span>
+                          ))}
+                          {res.skipped && res.skipped.map((s,i)=>(
+                            <span key={i} style={{padding:'2px 8px',borderRadius:10,background:'rgba(156,163,175,.15)',
+                              color:'#9ca3af',fontSize:10}}>— {s}</span>
+                          ))}
+                          {(!res.pushed?.length && !res.skipped?.length) && (
+                            <span style={{color:'#9ca3af',fontSize:10}}>Nothing to push</span>
+                          )}
+                        </div>
                         {/* Verification table */}
                         {res.verification && res.verification.length > 0 && (
                           <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>

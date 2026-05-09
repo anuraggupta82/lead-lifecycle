@@ -389,7 +389,14 @@ def dashboard():
     frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html")
     if os.path.exists(frontend_path):
         with open(frontend_path) as f:
-            return HTMLResponse(f.read())
+            content = f.read()
+        return HTMLResponse(
+            content,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            }
+        )
     return HTMLResponse("<h1>Pipeline Dashboard</h1><p>Frontend not found. Run from project root.</p>")
 
 
@@ -4707,27 +4714,25 @@ def admin_accept_gads_landing_page(campaign_id: str, body: dict = Body(...)):
 @app.post("/api/admin/campaigns/{campaign_id}/sync-to-gads", dependencies=[Depends(_require_admin)])
 def admin_sync_campaign_to_gads(campaign_id: str):
     """
-    Push all dashboard values to Google Ads, then verify by reading back from the API.
+    Push ONLY changed dashboard values to Google Ads, then verify by reading back.
 
-    Fields pushed:
+    Compares each field against the live Google Ads value first.
+    Only fields that actually differ are written — unchanged fields are skipped.
+
+    Fields compared + pushed if changed:
       - monthly_budget  → daily budget (monthly / 30.4)
       - status          → ENABLED or PAUSED
-      - sitelinks       → replace all sitelink extensions on the campaign
+      - sitelinks       → always replaced if non-empty (no cheap equality check available)
 
     NOTE: landing_page (final_urls) is NOT pushed. RSA final_urls is immutable
-    after creation in the Google Ads API — changing it requires pausing ads and
-    creating new ones, which must be done intentionally.
-
-    After pushing, reads back live Google Ads values and returns a verification
-    table showing: field, what was pushed, what Google Ads now reports, and
-    whether they match.
+    after creation in the Google Ads API.
     """
     from database import get_campaign_by_id
     from google_ads_write import (
         set_campaign_daily_budget,
         set_campaign_status_gads,
     )
-    from google_ads_create import fetch_campaigns_from_gads, fetch_campaign_build_data, add_sitelinks_to_campaign
+    from google_ads_create import fetch_campaigns_from_gads, add_sitelinks_to_campaign
     from campaign_safety import check_budget_absolute_limits, WriteBlockedError
 
     camp = get_campaign_by_id(campaign_id)
@@ -4741,37 +4746,59 @@ def admin_sync_campaign_to_gads(campaign_id: str):
             detail="Campaign is not linked to Google Ads — import it first"
         )
 
-    pushed: list[dict] = []   # [{field, pushed_value, label}]
-    errors: list[str]  = []
+    pushed: list[dict]   = []   # [{field, pushed_value, label}]
+    skipped: list[str]   = []   # fields that already match — not written
+    errors: list[str]    = []
 
-    # ── 1. Push budget ────────────────────────────────────────────────────────
+    # ── Fetch live GAds values first so we can diff before writing ────────────
+    live_campaign = None
+    try:
+        all_campaigns = fetch_campaigns_from_gads()
+        live_campaign = next((c for c in all_campaigns if c.get("resource_name") == gads_resource), None)
+    except Exception as fe:
+        logger.warning(f"sync-to-gads {campaign_id}: could not fetch live values for diff — will push all: {fe}")
+
+    live_daily  = live_campaign.get("daily_budget_usd") or 0.0 if live_campaign else None
+    live_status = (live_campaign.get("gads_status") or "").upper() if live_campaign else None
+
+    # ── 1. Push budget only if it changed ────────────────────────────────────
     monthly_budget = camp.get("monthly_budget") or 0
     if monthly_budget > 0:
         new_daily  = round(monthly_budget / 30.4, 2)
         new_micros = int(new_daily * 1_000_000)
-        try:
-            check_budget_absolute_limits(new_micros)
-            set_campaign_daily_budget(gads_resource, new_daily)
-            pushed.append({"field": "budget", "pushed_value": new_daily, "label": f"${new_daily:.2f}/day"})
-            logger.info(f"sync-to-gads {campaign_id}: budget → ${new_daily:.2f}/day")
-        except WriteBlockedError as e:
-            errors.append(f"budget blocked: {e}")
-        except Exception as e:
-            errors.append(f"budget push failed: {e}")
-            logger.error(f"sync-to-gads {campaign_id} budget error: {e}")
+        budget_matches = live_daily is not None and abs(live_daily - new_daily) < 0.02
+        if budget_matches:
+            skipped.append(f"budget (already ${new_daily:.2f}/day in Google Ads)")
+            logger.info(f"sync-to-gads {campaign_id}: budget unchanged (${new_daily:.2f}) — skipping")
+        else:
+            try:
+                check_budget_absolute_limits(new_micros)
+                set_campaign_daily_budget(gads_resource, new_daily)
+                pushed.append({"field": "budget", "pushed_value": new_daily, "label": f"${new_daily:.2f}/day"})
+                logger.info(f"sync-to-gads {campaign_id}: budget → ${new_daily:.2f}/day")
+            except WriteBlockedError as e:
+                errors.append(f"budget blocked: {e}")
+            except Exception as e:
+                errors.append(f"budget push failed: {e}")
+                logger.error(f"sync-to-gads {campaign_id} budget error: {e}")
 
-    # ── 2. Push status ────────────────────────────────────────────────────────
+    # ── 2. Push status only if it changed ────────────────────────────────────
     db_status = (camp.get("status") or "").upper()
     gads_status_map = {"ACTIVE": "ENABLED", "PAUSED": "PAUSED"}
     gads_status = gads_status_map.get(db_status)
     if gads_status:
-        try:
-            set_campaign_status_gads(gads_resource, gads_status)
-            pushed.append({"field": "status", "pushed_value": gads_status, "label": gads_status})
-            logger.info(f"sync-to-gads {campaign_id}: status → {gads_status}")
-        except Exception as e:
-            errors.append(f"status push failed: {e}")
-            logger.error(f"sync-to-gads {campaign_id} status error: {e}")
+        status_matches = live_status is not None and live_status == gads_status
+        if status_matches:
+            skipped.append(f"status (already {gads_status} in Google Ads)")
+            logger.info(f"sync-to-gads {campaign_id}: status unchanged ({gads_status}) — skipping")
+        else:
+            try:
+                set_campaign_status_gads(gads_resource, gads_status)
+                pushed.append({"field": "status", "pushed_value": gads_status, "label": gads_status})
+                logger.info(f"sync-to-gads {campaign_id}: status → {gads_status}")
+            except Exception as e:
+                errors.append(f"status push failed: {e}")
+                logger.error(f"sync-to-gads {campaign_id} status error: {e}")
 
     # ── 3. Landing page — NOT pushed automatically ────────────────────────────
     # Google Ads RSA final_urls is IMMUTABLE after creation (IMMUTABLE_FIELD error).
@@ -4809,34 +4836,44 @@ def admin_sync_campaign_to_gads(campaign_id: str):
             logger.error(f"sync-to-gads {campaign_id} sitelinks error: {e}")
 
     # ── 5. Verify — read back from Google Ads ─────────────────────────────────
+    # Reuse live_campaign from the diff fetch if nothing was pushed for budget/status
+    # (no point re-fetching a campaign that we know didn't change).
+    # If budget or status WAS pushed, fetch a fresh snapshot to confirm the write.
     verification: list[dict] = []
     try:
-        all_campaigns = fetch_campaigns_from_gads()
-        live = next((c for c in all_campaigns if c.get("resource_name") == gads_resource), None)
+        budget_pushed = next((p for p in pushed if p["field"] == "budget"), None)
+        status_pushed = next((p for p in pushed if p["field"] == "status"), None)
+        need_fresh = budget_pushed or status_pushed
+
+        if need_fresh:
+            # Fields were written — re-fetch to confirm they landed
+            all_campaigns_verify = fetch_campaigns_from_gads()
+            live = next((c for c in all_campaigns_verify if c.get("resource_name") == gads_resource), None)
+        else:
+            # Nothing written for budget/status — reuse what we already fetched
+            live = live_campaign
 
         if live:
-            live_daily = live.get("daily_budget_usd") or 0.0
-            live_status = live.get("gads_status") or ""
+            live_daily_v  = live.get("daily_budget_usd") or 0.0
+            live_status_v = live.get("gads_status") or ""
 
             # Verify budget
-            budget_pushed = next((p for p in pushed if p["field"] == "budget"), None)
             if budget_pushed:
-                match = abs(live_daily - budget_pushed["pushed_value"]) < 0.02
+                match = abs(live_daily_v - budget_pushed["pushed_value"]) < 0.02
                 verification.append({
                     "field": "Daily Budget",
                     "pushed":   f"${budget_pushed['pushed_value']:.2f}/day",
-                    "live":     f"${live_daily:.2f}/day",
+                    "live":     f"${live_daily_v:.2f}/day",
                     "match":    match,
                 })
 
             # Verify status
-            status_pushed = next((p for p in pushed if p["field"] == "status"), None)
             if status_pushed:
-                match = live_status.upper() == status_pushed["pushed_value"].upper()
+                match = live_status_v.upper() == status_pushed["pushed_value"].upper()
                 verification.append({
                     "field": "Status",
                     "pushed":   status_pushed["pushed_value"],
-                    "live":     live_status,
+                    "live":     live_status_v,
                     "match":    match,
                 })
 
@@ -4889,10 +4926,11 @@ def admin_sync_campaign_to_gads(campaign_id: str):
     return {
         "ok": True,
         "campaign_id": campaign_id,
-        "pushed": [p["label"] for p in pushed],
-        "errors": errors,
+        "pushed":      [p["label"] for p in pushed],
+        "skipped":     skipped,
+        "errors":      errors,
         "verification": verification,
-        "all_match": all_match,
+        "all_match":   all_match,
     }
 
 
@@ -5519,22 +5557,89 @@ def admin_set_campaign_locations(campaign_id: str, body: SetLocationsRequest):
     try:
         result = replace_campaign_locations(campaign_resource, geo_json_str)
         added = result.get("added", 0)
+        removed = result.get("removed", 0)
         errs  = result.get("errors", [])
-        # "partial_success" if soft errors occurred (some locations failed to resolve)
         exec_result = "partial_success" if errs else "success"
         update_gads_action_result(action_id, executed=True, execution_result=exec_result)
         set_audit_approval(action_id, "admin")
         # M7: Only persist geo_json to local DB if at least one location was actually applied.
-        # If added==0, the DB would show the user's submitted JSON but Google Ads has no new criteria.
         if added > 0:
             update_campaign_fields(campaign_id, {"geographic_targeting": geo_json_str})
+
+        # ── Read back live geo criteria to verify the change went through ──────
+        live_criteria = []
+        verified = False
+        try:
+            from google_ads_create import _build_client as _gc_build
+            _cl = _gc_build()
+            _ga = _cl.get_service("GoogleAdsService")
+            from google_ads_write import _customer_id_from_resource
+            _cid = _customer_id_from_resource(campaign_resource)
+            _q = f"""
+                SELECT campaign_criterion.resource_name,
+                       campaign_criterion.type,
+                       campaign_criterion.proximity.geo_point.latitude_in_micro_degrees,
+                       campaign_criterion.proximity.geo_point.longitude_in_micro_degrees,
+                       campaign_criterion.proximity.radius,
+                       campaign_criterion.proximity.radius_units,
+                       campaign_criterion.proximity.address.city_name,
+                       campaign_criterion.proximity.address.province_code,
+                       campaign_criterion.location.geo_target_constant,
+                       campaign_criterion.negative
+                FROM campaign_criterion
+                WHERE campaign_criterion.campaign = '{campaign_resource}'
+                  AND campaign_criterion.type IN ('LOCATION', 'PROXIMITY')
+            """
+            for row in _ga.search(customer_id=_cid, query=_q):
+                cc = row.campaign_criterion
+                crit_type = cc.type_.name if hasattr(cc.type_, 'name') else str(cc.type_)
+                entry: dict = {"type": crit_type, "negative": cc.negative}
+                if crit_type == "PROXIMITY":
+                    lat_micro = cc.proximity.geo_point.latitude_in_micro_degrees
+                    lng_micro = cc.proximity.geo_point.longitude_in_micro_degrees
+                    radius    = cc.proximity.radius
+                    units_raw = cc.proximity.radius_units
+                    units_str = units_raw.name if hasattr(units_raw, 'name') else str(units_raw)
+                    city      = cc.proximity.address.city_name
+                    state     = cc.proximity.address.province_code
+                    # proto3 scalar default for int64 is 0 — treat (0,0) as "geo_point not set"
+                    # since the Google Ads API rejects explicit (0,0) proximity criteria.
+                    has_geo_point = not (lat_micro == 0 and lng_micro == 0)
+                    units_label   = "mi" if "MILE" in units_str.upper() else "km"
+                    city_str      = city or ""
+                    state_str     = state or ""
+                    loc_label     = f"{city_str}, {state_str}".strip(", ") or "Unknown"
+                    entry.update({
+                        "lat": round(lat_micro / 1_000_000, 4) if has_geo_point else None,
+                        "lng": round(lng_micro / 1_000_000, 4) if has_geo_point else None,
+                        "radius": radius,
+                        "units": "miles" if "MILE" in units_str.upper() else "km",
+                        "city": city_str,
+                        "state": state_str,
+                        "summary": f"{loc_label} · {radius} {units_label}"
+                                   + (f" ({round(lat_micro/1_000_000,4)}, {round(lng_micro/1_000_000,4)})"
+                                      if has_geo_point else " ⚠ no geo_point"),
+                    })
+                elif crit_type == "LOCATION":
+                    entry["geo_target"] = cc.location.geo_target_constant
+                    entry["summary"] = cc.location.geo_target_constant
+                live_criteria.append(entry)
+            # has_live_criteria: confirms Google Ads has criteria — not that they match exactly
+            has_live_criteria = len(live_criteria) > 0
+        except Exception as ve:
+            logger.warning(f"set-locations {campaign_id}: read-back failed: {ve}")
+            live_criteria = [{"type": "error", "summary": f"Read-back failed: {ve}"}]
+            has_live_criteria = False
+
         return {
             "ok": True,
             "action_id": action_id,
             "operation": "set_campaign_locations",
-            "removed": result.get("removed", 0),
+            "removed": removed,
             "added": added,
             "errors": errs,
+            "live_criteria": live_criteria,
+            "has_live_criteria": has_live_criteria,
         }
     except Exception as e:
         update_gads_action_result(action_id, executed=True,
