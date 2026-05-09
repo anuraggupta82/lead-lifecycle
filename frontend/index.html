@@ -2069,6 +2069,443 @@ function CampaignTrendChart({ campaignName, dailyStats }) {
   );
 }
 
+// ─── LandingPagesView ──────────────────────────────────────────────────────
+function LandingPagesView({ ga4Data }) {
+  const [lpDays, setLpDays] = React.useState(30);
+  const [activeSection, setActiveSection] = React.useState('overview'); // 'overview'|'pages'|'sources'|'campaigns'|'leads'|'trend'
+
+  if (!ga4Data) {
+    return (
+      <div className="report-section" style={{textAlign:'center',padding:32,color:'var(--text-muted)',fontSize:12}}>
+        Loading GA4 data…
+      </div>
+    );
+  }
+
+  const ov       = ga4Data.overview || {};
+  const configured = ov.configured === true && !ov.error && !ov.no_data;
+  const properties = ga4Data.properties || [];
+  const fetched  = ga4Data.fetched_at ? new Date(ga4Data.fetched_at).toLocaleString() : null;
+
+  if (!configured) {
+    return (
+      <div className="report-section" style={{padding:24,color:'var(--text-muted)',fontSize:12}}>
+        <div style={{fontWeight:600,marginBottom:6}}>GA4 not configured</div>
+        <div>Set <code>GA4_PROPERTIES</code> and <code>GA4_SERVICE_ACCOUNT_JSON</code> in .env, then restart.</div>
+      </div>
+    );
+  }
+
+  // Data slices
+  const pages       = ga4Data.top_pages        || [];
+  const sources     = ga4Data.traffic_sources  || [];
+  const campaigns   = ga4Data.campaign_metrics || [];
+  const leads       = ga4Data.leads_by_campaign|| [];
+  const trend       = ga4Data.daily_trend      || [];
+  const deviceSplit = ga4Data.device_split     || {};
+  const events      = ga4Data.events           || {};
+
+  // Colour helpers
+  const teal    = 'var(--teal)';
+  const muted   = 'var(--text-muted)';
+  const green   = '#059669';
+  const amber   = '#d97706';
+  const red     = '#dc2626';
+
+  function pct(n) { return (n||0).toFixed(1) + '%'; }
+  function num(n)  { return Math.round(n||0).toLocaleString(); }
+
+  // KPI card
+  function KpiCard({ label, value, sub, color }) {
+    return (
+      <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'12px 14px',textAlign:'center',flex:1,minWidth:100}}>
+        <div style={{fontSize:22,fontWeight:700,color:color||teal,lineHeight:1.1}}>{value}</div>
+        <div style={{fontSize:9,color:muted,textTransform:'uppercase',letterSpacing:'.4px',marginTop:3}}>{label}</div>
+        {sub && <div style={{fontSize:9,color:muted,marginTop:2}}>{sub}</div>}
+      </div>
+    );
+  }
+
+  // Section nav pill
+  function Pill({ id, label }) {
+    const active = activeSection === id;
+    return (
+      <button onClick={()=>setActiveSection(id)}
+        style={{padding:'5px 14px',fontSize:11,fontWeight:500,borderRadius:20,border:'1px solid',cursor:'pointer',
+          background: active ? teal : '#fff',
+          color:      active ? '#fff' : muted,
+          borderColor: active ? teal : 'var(--border)'}}>
+        {label}
+      </button>
+    );
+  }
+
+  // Device badge
+  function DeviceBadge({ label, data, color }) {
+    if (!data) return null;
+    return (
+      <div style={{display:'flex',flexDirection:'column',alignItems:'center',flex:1,
+                   background:'#f9fafb',border:'1px solid var(--border)',borderRadius:8,padding:'10px 8px'}}>
+        <div style={{fontSize:17,fontWeight:700,color}}>{data.pct}%</div>
+        <div style={{fontSize:10,fontWeight:600,color:'var(--text)'}}>{label}</div>
+        <div style={{fontSize:9,color:muted,marginTop:2}}>{num(data.sessions)} sessions</div>
+      </div>
+    );
+  }
+
+  // Simple bar
+  function Bar({ pct, color }) {
+    return (
+      <div style={{height:6,borderRadius:3,background:'#e5e7eb',overflow:'hidden',flex:1}}>
+        <div style={{height:'100%',width:`${Math.min(pct||0,100)}%`,background:color||teal,borderRadius:3}}/>
+      </div>
+    );
+  }
+
+  // Trend mini-chart using inline SVG
+  function TrendChart({ data }) {
+    if (!data || data.length < 2) return <div style={{fontSize:10,color:muted,fontStyle:'italic'}}>Not enough data</div>;
+    const maxSess = Math.max(...data.map(d=>d.sessions), 1);
+    const w = 700, h = 120, pad = {t:10,r:10,b:28,l:36};
+    const innerW = w - pad.l - pad.r;
+    const innerH = h - pad.t - pad.b;
+    const xStep  = innerW / (data.length - 1);
+
+    function pts(key) {
+      return data.map((d,i) => {
+        const x = pad.l + i * xStep;
+        const y = pad.t + innerH - (d[key] / maxSess) * innerH;
+        return `${x},${y}`;
+      }).join(' ');
+    }
+
+    // X axis labels — show ~6 evenly spaced dates
+    const step = Math.max(1, Math.floor(data.length / 6));
+    const labels = data.filter((_,i) => i % step === 0 || i === data.length - 1);
+
+    return (
+      <svg viewBox={`0 0 ${w} ${h}`} style={{width:'100%',height:'auto',display:'block'}}>
+        {/* Grid lines */}
+        {[0,.25,.5,.75,1].map(f => {
+          const y = pad.t + innerH * (1 - f);
+          return <g key={f}>
+            <line x1={pad.l} x2={w-pad.r} y1={y} y2={y} stroke="#f0f0f0" strokeWidth={1}/>
+            <text x={pad.l-4} y={y+3} fontSize={8} fill={muted} textAnchor="end">
+              {Math.round(maxSess * f)}
+            </text>
+          </g>;
+        })}
+        {/* Sessions area */}
+        <polyline points={pts('sessions')} fill="none" stroke={teal} strokeWidth={2}/>
+        {/* Conversions line */}
+        <polyline points={data.map((d,i)=>{
+          const x = pad.l + i * xStep;
+          const y = pad.t + innerH - (d.conversions / maxSess) * innerH;
+          return `${x},${y}`;
+        }).join(' ')} fill="none" stroke={green} strokeWidth={1.5} strokeDasharray="4 2"/>
+        {/* X axis labels */}
+        {labels.map((d,i)=>{
+          const orig_i = data.indexOf(d);
+          const x = pad.l + orig_i * xStep;
+          const label = d.date.slice(4,6)+'/'+d.date.slice(6,8);
+          return <text key={i} x={x} y={h-6} fontSize={8} fill={muted} textAnchor="middle">{label}</text>;
+        })}
+        {/* Legend */}
+        <line x1={w-110} x2={w-95} y1={12} y2={12} stroke={teal} strokeWidth={2}/>
+        <text x={w-92} y={15} fontSize={8} fill={muted}>Sessions</text>
+        <line x1={w-55} x2={w-40} y1={12} y2={12} stroke={green} strokeWidth={1.5} strokeDasharray="4 2"/>
+        <text x={w-37} y={15} fontSize={8} fill={muted}>Leads</text>
+      </svg>
+    );
+  }
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:14}}>
+
+      {/* ── Header bar ── */}
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8}}>
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <div style={{fontSize:15,fontWeight:700,color:'var(--text)'}}>Landing Page Analytics</div>
+          {properties.length > 0 && (
+            <div style={{display:'flex',gap:4}}>
+              {properties.map(p => (
+                <span key={p} style={{fontSize:9,background:'#e0f2fe',color:'#0369a1',borderRadius:10,padding:'2px 8px',fontWeight:600}}>
+                  {p}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{display:'flex',alignItems:'center',gap:6}}>
+          {fetched && <span style={{fontSize:9,color:muted}}>Updated {fetched}</span>}
+          {[7,30,90].map(d=>(
+            <button key={d}
+              style={{padding:'3px 9px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                background:lpDays===d?teal:'#fff', color:lpDays===d?'#fff':muted}}
+              onClick={()=>setLpDays(d)}>{d}d</button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── KPI row ── */}
+      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+        <KpiCard label="Sessions"       value={num(ov.sessions)}               color={teal}  />
+        <KpiCard label="New Users"      value={num(ov.newUsers)}               color="#6366f1"/>
+        <KpiCard label="Engaged"        value={pct(ov.engagement_rate)}        color={green} />
+        <KpiCard label="Bounce Rate"    value={pct(ov.bounce_rate_pct)}        color={ov.bounce_rate_pct>60?red:amber} />
+        <KpiCard label="Avg Duration"   value={ov.avg_session_duration_formatted||'—'} color={teal} />
+        <KpiCard label="Pages/Session"  value={(ov.pages_per_session||0).toFixed(1)} color="#6366f1"/>
+        <KpiCard label="Conversions"    value={num(ov.conversions)}            color={green} />
+        <KpiCard label="Form Submits"   value={num(events.form_submit)}        color={green} />
+      </div>
+
+      {/* ── Device split ── */}
+      <div style={{display:'flex',gap:8}}>
+        <DeviceBadge label="Mobile"  data={deviceSplit.mobile}  color="#6366f1"/>
+        <DeviceBadge label="Desktop" data={deviceSplit.desktop} color={teal}/>
+        <DeviceBadge label="Tablet"  data={deviceSplit.tablet}  color={amber}/>
+      </div>
+
+      {/* ── Section pills ── */}
+      <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+        <Pill id="overview"   label="Funnel Events" />
+        <Pill id="pages"      label="Top Pages" />
+        <Pill id="sources"    label="Traffic Sources" />
+        <Pill id="campaigns"  label="By Campaign" />
+        <Pill id="leads"      label="Leads by Campaign" />
+        <Pill id="trend"      label="Daily Trend" />
+      </div>
+
+      {/* ── Funnel Events ── */}
+      {activeSection==='overview' && (
+        <div className="report-section">
+          <div className="report-title">Conversion Funnel</div>
+          <div style={{display:'flex',flexDirection:'column',gap:10}}>
+            {[
+              {label:'Sessions',         val:ov.sessions,              color:teal,     pctOf:ov.sessions},
+              {label:'Engaged Sessions', val:ov.engagedSessions,       color:'#6366f1',pctOf:ov.sessions},
+              {label:'Smile Widget Clicks',val:events.smile_widget_click,color:amber,  pctOf:ov.sessions},
+              {label:'Smile Started',    val:events.smile_started,     color:amber,    pctOf:ov.sessions},
+              {label:'Smile Submitted',  val:events.smile_submitted,   color:green,    pctOf:ov.sessions},
+              {label:'Form Submits',     val:events.form_submit,       color:green,    pctOf:ov.sessions},
+              {label:'Phone Clicks',     val:events.phone_click,       color:teal,     pctOf:ov.sessions},
+              {label:'Chat Opened',      val:events.chat_opened,       color:'#8b5cf6',pctOf:ov.sessions},
+              {label:'Chat Leads',       val:events.chat_lead_captured,color:green,    pctOf:ov.sessions},
+            ].map(({label,val,color,pctOf})=>{
+              const barPct = pctOf > 0 ? Math.min((val||0)/pctOf*100, 100) : 0;
+              return (
+                <div key={label} style={{display:'flex',alignItems:'center',gap:10}}>
+                  <div style={{width:150,fontSize:11,color:'var(--text)',flexShrink:0}}>{label}</div>
+                  <Bar pct={barPct} color={color}/>
+                  <div style={{width:48,fontSize:11,fontWeight:600,color,textAlign:'right',flexShrink:0}}>{num(val)}</div>
+                  <div style={{width:38,fontSize:9,color:muted,textAlign:'right',flexShrink:0}}>{pct(barPct)}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Top Pages ── */}
+      {activeSection==='pages' && (
+        <div className="report-section">
+          <div className="report-title">Top Landing Pages</div>
+          {pages.length === 0
+            ? <div style={{fontSize:11,color:muted,fontStyle:'italic'}}>No page data available.</div>
+            : (
+            <table className="report-table">
+              <thead>
+                <tr>
+                  <th>Site</th>
+                  <th>Page</th>
+                  <th className="num">Sessions</th>
+                  <th className="num">Engagement</th>
+                  <th className="num">Avg Duration</th>
+                  <th className="num">Bounce Rate</th>
+                  <th className="num">Conversions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pages.map((p,i)=>(
+                  <tr key={i}>
+                    <td><span style={{fontSize:9,background:'#e0f2fe',color:'#0369a1',borderRadius:8,padding:'1px 7px',fontWeight:600}}>{p.property_domain}</span></td>
+                    <td style={{fontFamily:'monospace',fontSize:10,maxWidth:260,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                        title={p.page}>{p.page||'/'}</td>
+                    <td className="num">{num(p.sessions)}</td>
+                    <td className="num" style={{color:p.engagement_rate>=50?green:amber}}>{pct(p.engagement_rate)}</td>
+                    <td className="num">{p.avg_duration}</td>
+                    <td className="num" style={{color:p.bounce_rate>60?red:p.bounce_rate>40?amber:green}}>{pct(p.bounce_rate)}</td>
+                    <td className="num" style={{color:green,fontWeight:600}}>{p.conversions}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* ── Traffic Sources ── */}
+      {activeSection==='sources' && (
+        <div className="report-section">
+          <div className="report-title">Traffic Sources</div>
+          {sources.length === 0
+            ? <div style={{fontSize:11,color:muted,fontStyle:'italic'}}>No source data available.</div>
+            : (
+            <table className="report-table">
+              <thead>
+                <tr>
+                  <th>Source / Medium</th>
+                  <th className="num">Sessions</th>
+                  <th className="num">New Users</th>
+                  <th className="num">Engagement</th>
+                  <th className="num">Avg Duration</th>
+                  <th className="num">Conversions</th>
+                  <th style={{width:120}}>Share</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(() => {
+                  const total = sources.reduce((s,r)=>s+r.sessions,0)||1;
+                  return sources.map((s,i)=>(
+                    <tr key={i}>
+                      <td style={{fontWeight:500}}>{s.source_medium}</td>
+                      <td className="num">{num(s.sessions)}</td>
+                      <td className="num">{num(s.new_users)}</td>
+                      <td className="num" style={{color:s.engagement_rate>=50?green:amber}}>{pct(s.engagement_rate)}</td>
+                      <td className="num">{s.avg_duration}</td>
+                      <td className="num" style={{color:green,fontWeight:600}}>{s.conversions}</td>
+                      <td style={{paddingRight:8}}>
+                        <div style={{display:'flex',alignItems:'center',gap:5}}>
+                          <Bar pct={s.sessions/total*100} color={teal}/>
+                          <span style={{fontSize:9,color:muted,width:30,textAlign:'right'}}>{(s.sessions/total*100).toFixed(0)}%</span>
+                        </div>
+                      </td>
+                    </tr>
+                  ));
+                })()}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* ── By Campaign ── */}
+      {activeSection==='campaigns' && (
+        <div className="report-section">
+          <div className="report-title">Performance by Campaign (GA4)</div>
+          {campaigns.length === 0
+            ? <div style={{fontSize:11,color:muted,fontStyle:'italic'}}>No campaign data yet — utm_campaign tags must be set.</div>
+            : (
+            <table className="report-table">
+              <thead>
+                <tr>
+                  <th>Campaign</th>
+                  <th className="num">Sessions</th>
+                  <th className="num">New Users</th>
+                  <th className="num">Engagement</th>
+                  <th className="num">Avg Duration</th>
+                  <th className="num">Bounce Rate</th>
+                  <th className="num">Conversions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {campaigns.map((c,i)=>(
+                  <tr key={i}>
+                    <td style={{fontWeight:500,maxWidth:220,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                        title={c.campaign}>{c.campaign}</td>
+                    <td className="num">{num(c.sessions)}</td>
+                    <td className="num">{num(c.new_users)}</td>
+                    <td className="num" style={{color:c.engagement_rate>=50?green:amber}}>{pct(c.engagement_rate)}</td>
+                    <td className="num">{c.avg_duration}</td>
+                    <td className="num" style={{color:c.bounce_rate>60?red:c.bounce_rate>40?amber:green}}>{pct(c.bounce_rate)}</td>
+                    <td className="num" style={{color:green,fontWeight:600}}>{c.conversions}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* ── Leads by Campaign ── */}
+      {activeSection==='leads' && (
+        <div className="report-section">
+          <div className="report-title">Leads by Campaign (generate_lead events)</div>
+          {leads.length === 0
+            ? <div style={{fontSize:11,color:muted,fontStyle:'italic'}}>No lead events found. Make sure generate_lead is firing and utm_campaign is set.</div>
+            : (
+            <table className="report-table">
+              <thead>
+                <tr>
+                  <th>Site</th>
+                  <th>Campaign</th>
+                  <th>Ad Group</th>
+                  <th>Keyword</th>
+                  <th>Landing Page</th>
+                  <th className="num">Leads</th>
+                  <th className="num">Sessions</th>
+                  <th className="num">Lead Rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {leads.map((l,i)=>(
+                  <tr key={i}>
+                    <td><span style={{fontSize:9,background:'#e0f2fe',color:'#0369a1',borderRadius:8,padding:'1px 7px',fontWeight:600}}>{l.property_domain}</span></td>
+                    <td style={{fontWeight:500,maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                        title={l.campaign}>{l.campaign}</td>
+                    <td style={{fontSize:10,color:muted,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                        title={l.ad_group}>{l.ad_group||'—'}</td>
+                    <td style={{fontSize:10,fontStyle:'italic',maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                        title={l.keyword}>{l.keyword||'—'}</td>
+                    <td style={{fontFamily:'monospace',fontSize:10,maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                        title={l.landing_page}>{l.landing_page||'/'}</td>
+                    <td className="num" style={{color:green,fontWeight:700,fontSize:13}}>{l.leads}</td>
+                    <td className="num">{num(l.sessions)}</td>
+                    <td className="num" style={{color:l.lead_rate>=5?green:l.lead_rate>=2?amber:muted,fontWeight:600}}>{pct(l.lead_rate)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* ── Daily Trend ── */}
+      {activeSection==='trend' && (
+        <div className="report-section">
+          <div className="report-title">Daily Sessions & Leads (merged across all sites)</div>
+          <TrendChart data={trend}/>
+          {trend.length > 0 && (
+            <table className="report-table" style={{marginTop:12,fontSize:10}}>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th className="num">Sessions</th>
+                  <th className="num">Engaged</th>
+                  <th className="num">New Users</th>
+                  <th className="num">Leads</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...trend].reverse().map((d,i)=>(
+                  <tr key={i}>
+                    <td>{d.date.slice(0,4)+'-'+d.date.slice(4,6)+'-'+d.date.slice(6,8)}</td>
+                    <td className="num">{num(d.sessions)}</td>
+                    <td className="num">{num(d.engaged)}</td>
+                    <td className="num">{num(d.new_users)}</td>
+                    <td className="num" style={{color:d.conversions>0?green:muted,fontWeight:d.conversions>0?600:400}}>{d.conversions}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+    </div>
+  );
+}
+
 // ─── AdGroupsView ──────────────────────────────────────────────────────────
 function AdGroupsView({ adGroupStats, dailyStats }) {
   const [campFilter, setCampFilter] = useState('all');
@@ -2844,12 +3281,13 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, co
                     </table>
                   )}
                   <p style={{fontSize:9,color:'var(--text-muted)',marginTop:6,fontStyle:'italic'}}>
-                    Site-wide data shown · campaign-level GA4 breakdown available once utm_campaign propagates
+                    Data merged across: {(ga4Data?.properties||[]).length > 0 ? (ga4Data.properties||[]).join(' · ') : 'all configured properties'}
+                    {' · '}campaign-level GA4 breakdown available once utm_campaign propagates
                   </p>
                 </div>
               ) : (
                 <div style={{padding:12,background:'#f3f4f6',borderRadius:6,fontSize:10,color:'var(--text-muted)'}}>
-                  GA4 not configured. Set GA4_PROPERTY_ID and GA4_SERVICE_ACCOUNT_JSON in .env.
+                  GA4 not configured. Set GA4_PROPERTIES and GA4_SERVICE_ACCOUNT_JSON in .env.
                 </div>
               )}
             </div>
@@ -5895,7 +6333,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -5924,6 +6362,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
           <AdCreativesView days={adCreativesDays} />
         </div>
       )}
+
+      {/* ── Landing Pages view ── */}
+      {view==='landingpages' && <LandingPagesView ga4Data={ga4Data} />}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>

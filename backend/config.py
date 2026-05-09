@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     ga4_property_id: str = ""  # Numeric property ID (not G-xxx), e.g. "123456789"
     ga4_service_account_json: str = ""  # Path to service account JSON file
     # Multi-property map: JSON string keyed by domain → GA4 numeric property ID
-    # e.g. '{"nxtsmile.com": "531016678", "graftondentalcare.com": "536128204"}'
+    # e.g. '{"nxtsmile.com": "531016678", "graftondentalcare.com": "536128204", "visitgdc.com": "533672873"}'
     # Add new domains here as new landing pages are created.
     ga4_properties: str = "{}"
 
