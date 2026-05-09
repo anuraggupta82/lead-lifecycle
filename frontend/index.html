@@ -6353,9 +6353,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
             target_service: savedCamp.service_focus || 'Dental Implants',
             budget_hint: budgetHint,
             additional_context: `Campaign type: ${savedCamp.campaign_type}. Campaign name: ${savedCamp.campaign_name}.`,
+            source_campaign_id: wizardCopyFrom || '',
           }),
         });
         const strategy = res.strategy || null;
+        if (strategy && res.source_campaign_name) {
+          strategy._source_campaign_name = res.source_campaign_name;
+        }
         setWizardStrategy(strategy);
         // Persist strategy to the campaign record so it's never lost
         if (strategy && createdCampId) {
@@ -9811,7 +9815,11 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   <div style={{textAlign:'center',padding:'32px 0'}}>
                     <div style={{fontSize:28,marginBottom:10}}>⏳</div>
                     <div style={{fontSize:13,color:'var(--text-muted)',fontWeight:500}}>Opus is thinking…</div>
-                    <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4}}>Analyzing your campaign details, practice data, and performance history.</div>
+                    <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4}}>
+                      {wizardCopyFrom
+                        ? 'Analyzing source campaign keywords, search terms, and performance data to seed this strategy…'
+                        : 'Analyzing your campaign details, practice data, and performance history.'}
+                    </div>
                   </div>
                 )}
 
@@ -9837,6 +9845,16 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   );
                   return (
                     <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:8,padding:'14px 16px',maxHeight:400,overflowY:'auto'}}>
+                      {/* Source campaign intelligence badge */}
+                      {wizardStrategy._source_campaign_name && (
+                        <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:6,
+                          padding:'6px 12px',marginBottom:12,fontSize:11,
+                          display:'flex',alignItems:'center',gap:6,color:'#15803d'}}>
+                          <span style={{fontWeight:700}}>📊 Built from real data</span>
+                          <span>— keywords, search terms, CPL, and wasted spend from</span>
+                          <span style={{fontWeight:700}}>"{wizardStrategy._source_campaign_name}"</span>
+                        </div>
+                      )}
                       {s.campaign_name && (
                         <div style={{fontWeight:700,fontSize:14,marginBottom:12,color:'var(--text)'}}>
                           📋 {s.campaign_name}
@@ -9900,6 +9918,43 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                         <Section title="Implementation Instructions">
                           <div style={{fontSize:11,color:'var(--text)',lineHeight:1.5,padding:'6px 10px',background:'#f0fdf4',borderRadius:5,border:'1px solid #bbf7d0'}}>
                             {s.implementation_instructions}
+                          </div>
+                        </Section>
+                      )}
+
+                      {/* Keyword recommendations — only shown when cloned from source campaign */}
+                      {(s.keyword_recommendations||[]).length > 0 && (
+                        <Section title="🎯 Recommended Keywords (from source campaign)">
+                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                            {(s.keyword_recommendations||[]).map((k,i) => {
+                              const matchColor = k.match_type === 'EXACT' ? '#1d4ed8'
+                                : k.match_type === 'PHRASE' ? '#7c3aed' : '#64748b';
+                              return (
+                                <span key={i} title={k.rationale || ''}
+                                  style={{fontSize:10,padding:'2px 7px',borderRadius:4,
+                                    background: matchColor + '15', color: matchColor,
+                                    border: '1px solid ' + matchColor + '40',
+                                    cursor: 'default'}}>
+                                  [{k.match_type}] {k.keyword}
+                                </span>
+                              );
+                            })}
+                          </div>
+                          <div style={{fontSize:9,color:'var(--text-muted)',marginTop:4}}>
+                            Hover for rationale · These will be available in the Keywords build step
+                          </div>
+                        </Section>
+                      )}
+
+                      {(s.negative_keyword_recommendations||[]).length > 0 && (
+                        <Section title="🚫 Suggested Negatives (wasted spend from source)">
+                          <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                            {(s.negative_keyword_recommendations||[]).map((kw,i) => (
+                              <span key={i} style={{fontSize:10,padding:'2px 7px',borderRadius:4,
+                                background:'#fee2e215',color:'#dc2626',border:'1px solid #dc262640'}}>
+                                {kw}
+                              </span>
+                            ))}
                           </div>
                         </Section>
                       )}

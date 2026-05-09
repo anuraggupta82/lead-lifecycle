@@ -7460,6 +7460,7 @@ class CampaignStrategyRequest(BaseModel):
     target_service:     str = "All-on-4 Implants"
     budget_hint:        str = ""
     additional_context: str = ""
+    source_campaign_id: str = ""   # campaign_id to copy intelligence from (optional)
 
 
 class CampaignImplementRequest(BaseModel):
@@ -7582,6 +7583,247 @@ def _gather_performance_context(days: int = 30) -> dict:
     return ctx
 
 
+def _gather_source_campaign_context(campaign_id: str) -> dict:
+    """
+    Pull keyword performance, search terms, and lead attribution for a specific
+    campaign to use as intelligence when cloning it into a new campaign.
+
+    Returns a dict with:
+      campaign_name, top_keywords, weak_keywords, top_search_terms,
+      negative_candidates, ad_groups, lead_attribution, campaign_settings
+    """
+    ctx: dict = {"campaign_id": campaign_id}
+    try:
+        from database import _conn as _db
+        with _db() as conn:
+            # ── 1. Campaign name + settings from campaigns table ──────────────
+            camp_row = conn.execute(
+                "SELECT campaign_name, service_focus, objective, monthly_budget, "
+                "expected_cpl, landing_page, notes FROM campaigns WHERE campaign_id=? LIMIT 1",
+                (campaign_id,)
+            ).fetchone()
+            if not camp_row:
+                logger.warning(f"_gather_source_campaign_context: campaign_id={campaign_id} not found")
+                return ctx
+            ctx["campaign_name"] = camp_row["campaign_name"]
+            ctx["campaign_settings"] = {
+                "service_focus":   camp_row["service_focus"] or "",
+                "objective":       camp_row["objective"] or "",
+                "monthly_budget":  camp_row["monthly_budget"] or 0,
+                "expected_cpl":    camp_row["expected_cpl"] or 0,
+                "landing_page":    camp_row["landing_page"] or "",
+                "notes":           camp_row["notes"] or "",
+            }
+            camp_name = camp_row["campaign_name"]
+
+            # ── 2. Keyword performance from gads_keywords_cache ───────────────
+            kw_rows = conn.execute("""
+                SELECT keyword_text, match_type, ad_group_name,
+                       impressions, clicks, cost, conversions, avg_cpc,
+                       quality_score, impression_share
+                FROM gads_keywords_cache
+                WHERE LOWER(campaign_name) = LOWER(?) AND days = 30
+                ORDER BY cost DESC
+            """, (camp_name,)).fetchall()
+
+            keywords = [dict(r) for r in kw_rows]
+
+            # Top performers: most clicks + conversions relative to cost
+            top_kws = sorted(
+                [k for k in keywords if k.get("clicks", 0) > 0],
+                key=lambda k: (k.get("conversions", 0) * 10 + k.get("clicks", 0)) / max(k.get("cost", 0.01), 0.01),
+                reverse=True
+            )[:15]
+
+            # Weak performers: high cost, zero conversions, zero leads
+            weak_kws = sorted(
+                [k for k in keywords if k.get("cost", 0) > 5 and k.get("conversions", 0) == 0],
+                key=lambda k: -k.get("cost", 0)
+            )[:10]
+
+            ctx["top_keywords"] = [
+                {
+                    "keyword":     k["keyword_text"],
+                    "match_type":  k["match_type"],
+                    "ad_group":    k["ad_group_name"],
+                    "clicks":      k.get("clicks", 0),
+                    "cost":        round(k.get("cost", 0), 2),
+                    "conversions": round(k.get("conversions", 0), 2),
+                    "cpc":         round(k.get("avg_cpc", 0), 2),
+                    "qs":          k.get("quality_score", 0),
+                }
+                for k in top_kws
+            ]
+            ctx["weak_keywords"] = [
+                {
+                    "keyword":  k["keyword_text"],
+                    "cost":     round(k.get("cost", 0), 2),
+                    "clicks":   k.get("clicks", 0),
+                    "note":     "high spend, zero conversions",
+                }
+                for k in weak_kws
+            ]
+
+            # Ad groups (unique names)
+            ad_groups = list(dict.fromkeys(
+                k["ad_group_name"] for k in keywords if k.get("ad_group_name")
+            ))
+            ctx["ad_groups"] = ad_groups[:10]
+
+            # ── 3. Search terms from gads_search_terms_cache ──────────────────
+            st_rows = conn.execute("""
+                SELECT search_term, impressions, clicks, cost, conversions, cpc, status
+                FROM gads_search_terms_cache
+                WHERE LOWER(campaign_name) = LOWER(?) AND days = 30
+                ORDER BY cost DESC
+            """, (camp_name,)).fetchall()
+
+            search_terms = [dict(r) for r in st_rows]
+
+            # Best converting search terms → candidate keywords for new campaign
+            top_st = sorted(
+                [s for s in search_terms if s.get("clicks", 0) >= 2],
+                key=lambda s: (s.get("conversions", 0) * 10 + s.get("clicks", 0)),
+                reverse=True
+            )[:20]
+
+            # High-cost zero-conversion search terms → candidate negatives
+            neg_candidates = sorted(
+                [s for s in search_terms
+                 if s.get("cost", 0) > 3 and s.get("conversions", 0) == 0
+                 and s.get("status", "") != "EXCLUDED"],
+                key=lambda s: -s.get("cost", 0)
+            )[:15]
+
+            ctx["top_search_terms"] = [
+                {
+                    "term":        s["search_term"],
+                    "clicks":      s.get("clicks", 0),
+                    "cost":        round(s.get("cost", 0), 2),
+                    "conversions": round(s.get("conversions", 0), 2),
+                    "status":      s.get("status", ""),
+                }
+                for s in top_st
+            ]
+            ctx["negative_candidates"] = [
+                {
+                    "term":  s["search_term"],
+                    "cost":  round(s.get("cost", 0), 2),
+                    "clicks": s.get("clicks", 0),
+                    "note":  "wasted spend — zero conversions",
+                }
+                for s in neg_candidates
+            ]
+
+            # ── 4. Lead + production attribution ─────────────────────────────
+            lead_row = conn.execute("""
+                SELECT
+                    COUNT(*) as total_leads,
+                    SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
+                        'treatment_presented','treatment_accepted','treatment_completed')
+                        THEN 1 ELSE 0 END) as scheduled,
+                    SUM(CASE WHEN stage IN ('showed',
+                        'treatment_presented','treatment_accepted','treatment_completed')
+                        THEN 1 ELSE 0 END) as showed,
+                    SUM(CASE WHEN stage IN ('treatment_accepted','treatment_completed')
+                        THEN 1 ELSE 0 END) as accepted,
+                    SUM(attributed_production) as production,
+                    SUM(click_cost) as spend_from_leads
+                FROM leads
+                WHERE LOWER(COALESCE(NULLIF(campaign_name,''), utm_campaign)) = LOWER(?)
+            """, (camp_name,)).fetchone()
+
+            if lead_row:
+                total_leads = lead_row["total_leads"] or 0
+                # Prefer gads_keywords_cache spend total; fall back to leads.click_cost sum
+                gads_spend_row = conn.execute(
+                    "SELECT SUM(cost) as s FROM gads_keywords_cache WHERE LOWER(campaign_name)=LOWER(?) AND days=30",
+                    (camp_name,)
+                ).fetchone()
+                total_spend = float(gads_spend_row["s"] or 0) if gads_spend_row else 0.0
+                if total_spend == 0:
+                    total_spend = float(lead_row["spend_from_leads"] or 0)
+                actual_cpl = round(total_spend / total_leads, 2) if total_leads > 0 else 0
+
+                ctx["lead_attribution"] = {
+                    "total_leads":    total_leads,
+                    "scheduled":      lead_row["scheduled"] or 0,
+                    "showed":         lead_row["showed"] or 0,
+                    "accepted":       lead_row["accepted"] or 0,
+                    "production_usd": round(float(lead_row["production"] or 0), 2),
+                    "total_spend_usd": round(total_spend, 2),
+                    "actual_cpl":     actual_cpl,
+                    "roas":           round(float(lead_row["production"] or 0) / total_spend, 2) if total_spend > 0 else 0,
+                }
+            else:
+                ctx["lead_attribution"] = {}
+
+    except Exception as e:
+        logger.warning(f"_gather_source_campaign_context failed (non-fatal): {e}")
+        ctx.setdefault("campaign_name", "")
+
+    return ctx
+
+
+def _format_source_campaign_context(src: dict) -> str:
+    """Format source campaign intelligence as a readable block for the Opus prompt."""
+    lines = []
+    name = src.get("campaign_name", "source campaign")
+    lines.append(f"Source campaign being cloned: '{name}'")
+
+    la = src.get("lead_attribution", {})
+    if la:
+        lines.append(
+            f"Performance (30d): {la.get('total_leads',0)} leads, "
+            f"${la.get('total_spend_usd',0):.0f} spend, "
+            f"CPL ${la.get('actual_cpl',0):.0f}, "
+            f"ROAS {la.get('roas',0):.1f}x, "
+            f"{la.get('scheduled',0)} scheduled, {la.get('accepted',0)} treatment accepted"
+        )
+
+    top_kws = src.get("top_keywords", [])
+    if top_kws:
+        lines.append(f"\nTop performing keywords (use as starting list for new campaign):")
+        for k in top_kws[:10]:
+            lines.append(
+                f"  [{k.get('match_type','?')}] \"{k['keyword']}\" — "
+                f"{k.get('clicks',0)} clicks, ${k.get('cost',0):.2f} spend, "
+                f"{k.get('conversions',0)} conv, QS {k.get('qs',0)}"
+            )
+
+    weak_kws = src.get("weak_keywords", [])
+    if weak_kws:
+        lines.append(f"\nUnderperforming keywords (consider pausing or restructuring):")
+        for k in weak_kws[:6]:
+            lines.append(f"  \"{k['keyword']}\" — ${k.get('cost',0):.2f} spend, 0 conversions")
+
+    top_st = src.get("top_search_terms", [])
+    if top_st:
+        lines.append(f"\nHigh-value search terms (candidate exact-match keywords for new campaign):")
+        for s in top_st[:12]:
+            lines.append(
+                f"  \"{s['term']}\" — {s.get('clicks',0)} clicks, "
+                f"{s.get('conversions',0)} conv"
+                + (" [already added]" if s.get("status") == "ADDED" else "")
+            )
+
+    neg_cands = src.get("negative_candidates", [])
+    if neg_cands:
+        lines.append(f"\nWasted-spend search terms (add as negatives in new campaign):")
+        for s in neg_cands[:10]:
+            lines.append(f"  \"{s['term']}\" — ${s.get('cost',0):.2f} wasted, 0 conversions")
+
+    ad_groups = src.get("ad_groups", [])
+    if ad_groups:
+        lines.append(f"\nAd group structure: {', '.join(ad_groups)}")
+
+    cs = src.get("campaign_settings", {})
+    if cs.get("notes"):
+        lines.append(f"\nCampaign notes: {cs['notes']}")
+
+    return "\n".join(lines)
+
+
 @app.post("/api/admin/ai/campaign-strategy", dependencies=[Depends(_require_admin)])
 def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
     """Opus researches the practice + performance data and produces a campaign plan."""
@@ -7591,12 +7833,22 @@ def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
     if len(goal) > 2000:
         raise HTTPException(status_code=422, detail="campaign_goal too long (max 2000 chars)")
 
-    target_service = (body.target_service or "All-on-4 Implants").strip()
-    budget_hint    = (body.budget_hint or "").strip()
-    extra          = (body.additional_context or "").strip()
+    target_service     = (body.target_service or "All-on-4 Implants").strip()
+    budget_hint        = (body.budget_hint or "").strip()
+    extra              = (body.additional_context or "").strip()
+    source_campaign_id = (body.source_campaign_id or "").strip()
 
     practice = _build_practice_context()
     perf     = _gather_performance_context(days=30)
+
+    # Source campaign intelligence (only when copying from an existing campaign)
+    _source_ctx: dict = {}
+    if source_campaign_id:
+        _source_ctx = _gather_source_campaign_context(source_campaign_id)
+        logger.info(f"campaign-strategy: source_campaign_id={source_campaign_id} → '{_source_ctx.get('campaign_name','?')}'")
+
+    # Adjust system prompt to signal clone mode to Opus
+    _clone_mode = bool(_source_ctx.get("campaign_name"))
 
     practice_name = practice.get("name") or "this dental practice"
     practice_location = ""
@@ -7616,6 +7868,10 @@ def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
         + (f" ({practice_location})" if practice_location else "")
         + " — weekend availability, financing options, and specific clinical strengths — over "
         f"generic claims. Return ONLY a JSON object — no markdown, no commentary."
+        + (" When source campaign data is provided, you MUST anchor the new strategy to "
+           "its real performance: use its winning keywords as the starting keyword list, "
+           "its wasted search terms as the initial negative list, and its actual CPL as the "
+           "performance baseline to beat. Do NOT ignore this data." if _clone_mode else "")
     )
 
     # Site intelligence — pull crawled page context for the practice website
@@ -7637,7 +7893,10 @@ def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
         + "\n=== Practice ===\n" + _format_practice_context(practice)
         + ("\n\n=== Website Intelligence (crawled page data) ===\n" + _site_context_block
            if _site_context_block else "")
-        + "\n\n=== Performance snapshot (last 30 days) ===\n"
+        + ("\n\n=== Source Campaign Intelligence (THIS CAMPAIGN IS BEING CLONED — anchor strategy to this data) ===\n"
+           + _format_source_campaign_context(_source_ctx)
+           if _clone_mode else "")
+        + "\n\n=== Account Performance snapshot (last 30 days) ===\n"
         + json.dumps(perf, indent=2, default=str)
         + "\n\nReturn a JSON object with EXACTLY these keys:\n"
         + "  campaign_name (string)\n"
@@ -7650,6 +7909,10 @@ def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
         + "  email_sequence_brief (string — same, for email)\n"
         + "  implementation_instructions (string — explicit instructions for the implementer "
         + "    Haiku/Sonnet model, including voice, must-include details, and what to avoid)\n"
+        + ("  keyword_recommendations (array of objects: {keyword, match_type, rationale} — "
+           "pulled from source campaign winners + top search terms; 10-20 items)\n"
+           "  negative_keyword_recommendations (array of strings — from source campaign wasted search terms; 5-15 items)\n"
+           if _clone_mode else "")
         + "Return ONLY the JSON object."
     )
 
@@ -7688,7 +7951,12 @@ def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
             detail=f"AI strategy missing required fields: {sorted(missing)}",
         )
 
-    return {"strategy": result, "model_used": model_used}
+    return {
+        "strategy": result,
+        "model_used": model_used,
+        "source_campaign_name": _source_ctx.get("campaign_name", "") if _clone_mode else "",
+        "source_campaign_id":   source_campaign_id if _clone_mode else "",
+    }
 
 
 @app.post("/api/admin/ai/campaign-implement", dependencies=[Depends(_require_admin)])
