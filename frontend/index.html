@@ -2073,6 +2073,7 @@ function CampaignTrendChart({ campaignName, dailyStats }) {
 // ─── LandingPagesView ──────────────────────────────────────────────────────
 function LandingPagesView({ ga4Data }) {
   const [activeSite, setActiveSite] = React.useState(null); // null = show all sites
+  const [subTab, setSubTab]         = React.useState('perpage'); // 'perpage' | 'aggregate'
 
   if (!ga4Data) {
     return (
@@ -2096,9 +2097,19 @@ function LandingPagesView({ ga4Data }) {
     );
   }
 
-  const allPages   = ga4Data.top_pages         || [];
-  const allSources = ga4Data.traffic_sources   || [];
-  const allLeads   = ga4Data.leads_by_campaign || [];
+  const allPages       = ga4Data.top_pages              || [];
+  const allSources     = ga4Data.traffic_sources        || [];
+  const allLeads       = ga4Data.leads_by_campaign      || [];
+  const allPageSources = ga4Data.page_traffic_sources   || [];
+
+  // Build a lookup: "domain::page" → sources[]
+  const pageSourceMap = useMemo(() => {
+    const m = {};
+    allPageSources.forEach(entry => {
+      m[`${entry.property_domain}::${entry.page}`] = entry.sources || [];
+    });
+    return m;
+  }, [allPageSources]);
 
   const teal  = 'var(--teal)';
   const muted = 'var(--text-muted)';
@@ -2123,7 +2134,26 @@ function LandingPagesView({ ga4Data }) {
   function SiteCard({ domain }) {
     const sitePages  = allPages.filter(p => p.property_domain === domain);
     const siteLeads  = allLeads.filter(l => l.property_domain === domain);
-    const siteSources= allSources; // sources are merged (no per-domain split from GA4)
+
+    // Aggregate per-page sources into a single site-level source breakdown
+    const siteSrcMap = {};
+    sitePages.forEach(p => {
+      const srcs = pageSourceMap[`${domain}::${p.page||'/'}`] || [];
+      srcs.forEach(s => {
+        if (!siteSrcMap[s.source_medium]) siteSrcMap[s.source_medium] = { sessions: 0, engaged_sum: 0, conversions: 0 };
+        siteSrcMap[s.source_medium].sessions     += s.sessions;
+        siteSrcMap[s.source_medium].engaged_sum  += s.engagement_rate * s.sessions;
+        siteSrcMap[s.source_medium].conversions  += s.conversions;
+      });
+    });
+    const siteSources = Object.entries(siteSrcMap)
+      .map(([src, v]) => ({
+        source_medium:   src,
+        sessions:        v.sessions,
+        engagement_rate: v.sessions > 0 ? v.engaged_sum / v.sessions : 0,
+        conversions:     v.conversions,
+      }))
+      .sort((a,b) => b.sessions - a.sessions);
 
     // Aggregate site-level KPIs from pages
     const totalSessions   = sitePages.reduce((s,p)=>s+p.sessions,0);
@@ -2192,7 +2222,6 @@ function LandingPagesView({ ga4Data }) {
               </thead>
               <tbody>
                 {sitePages.map((p,i) => {
-                  // match leads for this exact page path
                   const pageLeads = siteLeads.filter(l=>l.landing_page===p.page||l.landing_page===(p.page||'/'));
                   const pageLead  = pageLeads.reduce((s,l)=>s+l.leads,0);
                   return (
@@ -2265,6 +2294,47 @@ function LandingPagesView({ ga4Data }) {
               </table>
             </div>
           )}
+
+          {/* ── Traffic Sources for this site ── */}
+          {siteSources.length > 0 && (
+            <div style={{marginTop:10}}>
+              <div style={{fontSize:10,fontWeight:600,color:dc.text,marginBottom:6}}>
+                Traffic Sources — {domain}
+              </div>
+              <table className="report-table" style={{background:'transparent',fontSize:10}}>
+                <thead>
+                  <tr>
+                    <th>Source / Medium</th>
+                    <th className="num">Sessions</th>
+                    <th style={{width:110}}>Share</th>
+                    <th className="num">Engagement</th>
+                    <th className="num">Conversions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const total = siteSources.reduce((s,r)=>s+r.sessions,0)||1;
+                    return siteSources.map((s,i)=>(
+                      <tr key={i}>
+                        <td style={{fontWeight:500}}>{s.source_medium||'(direct)'}</td>
+                        <td className="num" style={{fontWeight:600}}>{num(s.sessions)}</td>
+                        <td style={{padding:'6px 8px'}}>
+                          <div style={{display:'flex',alignItems:'center',gap:5}}>
+                            <div style={{height:5,borderRadius:3,background:'#e5e7eb',overflow:'hidden',flex:1}}>
+                              <div style={{height:'100%',width:`${s.sessions/total*100}%`,background:dc.badge,borderRadius:3}}/>
+                            </div>
+                            <span style={{fontSize:9,color:muted,width:28,textAlign:'right'}}>{Math.round(s.sessions/total*100)}%</span>
+                          </div>
+                        </td>
+                        <td className="num" style={{color:s.engagement_rate>=50?green:amber}}>{pct(s.engagement_rate)}</td>
+                        <td className="num" style={{color:s.conversions>0?green:muted,fontWeight:s.conversions>0?600:400}}>{s.conversions||'—'}</td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -2274,16 +2344,56 @@ function LandingPagesView({ ga4Data }) {
   const sitesWithData = properties.length > 0 ? properties
     : [...new Set(allPages.map(p=>p.property_domain).filter(Boolean))];
 
+  // ── Aggregate: cross-site page rollup ──────────────────────────────────────
+  const aggregatePages = (() => {
+    const map = {};
+    allPages.forEach(p => {
+      const k = p.page || '/';
+      if (!map[k]) map[k] = { page: k, sessions: 0, conversions: 0, _engSum: 0, _bounceSum: 0, sites: new Set() };
+      map[k].sessions    += p.sessions;
+      map[k].conversions += p.conversions;
+      map[k]._engSum     += p.engagement_rate * p.sessions;
+      map[k]._bounceSum  += p.bounce_rate     * p.sessions;
+      map[k].sites.add(p.property_domain);
+    });
+    return Object.values(map)
+      .map(r => ({
+        ...r,
+        sites:           [...r.sites].join(', '),
+        engagement_rate: r.sessions > 0 ? r._engSum    / r.sessions : 0,
+        bounce_rate:     r.sessions > 0 ? r._bounceSum / r.sessions : 0,
+      }))
+      .sort((a,b) => b.sessions - a.sessions);
+  })();
+
+  const aggMaxSessions = Math.max(...aggregatePages.map(p=>p.sessions), 1);
+
+  const subTabStyle = (k) => ({
+    fontSize: 11, padding: '4px 14px', borderRadius: 6, border: '1px solid',
+    cursor: 'pointer', fontWeight: subTab===k ? 600 : 400,
+    background:   subTab===k ? teal   : '#fff',
+    color:        subTab===k ? '#fff' : muted,
+    borderColor:  subTab===k ? teal   : 'var(--border)',
+    transition: 'all .15s',
+  });
+
   return (
     <div style={{display:'flex',flexDirection:'column',gap:10}}>
 
       {/* ── Header ── */}
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8}}>
-        <div style={{fontSize:15,fontWeight:700,color:'var(--text)'}}>Landing Page Analytics</div>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <div style={{fontSize:15,fontWeight:700,color:'var(--text)'}}>Landing Page Analytics</div>
+          {/* Sub-tab toggle */}
+          <div style={{display:'flex',gap:3}}>
+            <button style={subTabStyle('perpage')}  onClick={()=>setSubTab('perpage')}>Per Page</button>
+            <button style={subTabStyle('aggregate')} onClick={()=>setSubTab('aggregate')}>Aggregate</button>
+          </div>
+        </div>
         <div style={{display:'flex',alignItems:'center',gap:6}}>
           {fetched && <span style={{fontSize:9,color:muted}}>Updated {fetched}</span>}
-          {/* Site filter pills */}
-          {sitesWithData.length > 1 && (
+          {/* Site filter pills — only shown on Per Page tab */}
+          {subTab==='perpage' && sitesWithData.length > 1 && (
             <div style={{display:'flex',gap:4}}>
               <button onClick={()=>setActiveSite(null)}
                 style={{fontSize:10,padding:'3px 10px',borderRadius:12,border:'1px solid',cursor:'pointer',
@@ -2304,57 +2414,153 @@ function LandingPagesView({ ga4Data }) {
         </div>
       </div>
 
-      {/* ── Per-site cards ── */}
-      {sitesWithData.length === 0 ? (
-        <div className="report-section" style={{color:muted,fontSize:11,fontStyle:'italic'}}>
-          No page data yet. Click "Refresh GA4 Data" in Admin to pull fresh data.
-        </div>
-      ) : (
-        (activeSite ? [activeSite] : sitesWithData).map(domain => (
-          <SiteCard key={domain} domain={domain} />
-        ))
+      {/* ══════════ PER PAGE TAB ══════════ */}
+      {subTab==='perpage' && (
+        sitesWithData.length === 0 ? (
+          <div className="report-section" style={{color:muted,fontSize:11,fontStyle:'italic'}}>
+            No page data yet. Click "Refresh GA4 Data" in Admin to pull fresh data.
+          </div>
+        ) : (
+          (activeSite ? [activeSite] : sitesWithData).map(domain => (
+            <SiteCard key={domain} domain={domain} />
+          ))
+        )
       )}
 
-      {/* ── Traffic sources (combined, no per-site split from GA4) ── */}
-      {allSources.length > 0 && (
-        <div className="report-section" style={{marginTop:4}}>
-          <div className="report-title" style={{marginBottom:8}}>Traffic Sources (all sites combined)</div>
-          <table className="report-table">
-            <thead>
-              <tr>
-                <th>Source / Medium</th>
-                <th className="num">Sessions</th>
-                <th className="num">New Users</th>
-                <th className="num">Engagement</th>
-                <th className="num">Avg Duration</th>
-                <th className="num">Conversions</th>
-                <th style={{width:110}}>Share</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(() => {
-                const total = allSources.reduce((s,r)=>s+r.sessions,0)||1;
-                return allSources.map((s,i)=>(
-                  <tr key={i}>
-                    <td style={{fontWeight:500}}>{s.source_medium}</td>
-                    <td className="num">{num(s.sessions)}</td>
-                    <td className="num">{num(s.new_users)}</td>
-                    <td className="num" style={{color:s.engagement_rate>=50?green:amber}}>{pct(s.engagement_rate)}</td>
-                    <td className="num">{s.avg_duration}</td>
-                    <td className="num" style={{color:s.conversions>0?green:muted,fontWeight:s.conversions>0?600:400}}>{s.conversions}</td>
-                    <td style={{padding:'6px 8px'}}>
-                      <div style={{display:'flex',alignItems:'center',gap:5}}>
-                        <div style={{height:5,borderRadius:3,background:'#e5e7eb',overflow:'hidden',flex:1}}>
-                          <div style={{height:'100%',width:`${s.sessions/total*100}%`,background:teal,borderRadius:3}}/>
-                        </div>
-                        <span style={{fontSize:9,color:muted,width:28,textAlign:'right'}}>{(s.sessions/total*100).toFixed(0)}%</span>
-                      </div>
-                    </td>
+      {/* ══════════ AGGREGATE TAB ══════════ */}
+      {subTab==='aggregate' && (
+        <div style={{display:'flex',flexDirection:'column',gap:14}}>
+
+          {/* ── All-pages rollup ── */}
+          <div className="report-section">
+            <div className="report-title" style={{marginBottom:8}}>All Pages — Rolled Up</div>
+            {aggregatePages.length === 0 ? (
+              <div style={{color:muted,fontSize:11,fontStyle:'italic'}}>No page data yet.</div>
+            ) : (
+              <table className="report-table">
+                <thead>
+                  <tr>
+                    <th>Page</th>
+                    <th className="num">Sessions</th>
+                    <th style={{width:100}}>Traffic</th>
+                    <th className="num">Engagement</th>
+                    <th className="num">Bounce</th>
+                    <th className="num">Conversions</th>
+                    <th>Site(s)</th>
                   </tr>
-                ));
-              })()}
-            </tbody>
-          </table>
+                </thead>
+                <tbody>
+                  {aggregatePages.map((p,i) => (
+                    <tr key={i}>
+                      <td style={{fontFamily:'monospace',fontSize:10,maxWidth:280,overflow:'hidden',
+                                  textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={p.page}>
+                        {p.page}
+                      </td>
+                      <td className="num" style={{fontWeight:600}}>{num(p.sessions)}</td>
+                      <td style={{padding:'6px 8px'}}>
+                        <Bar val={p.sessions} maxVal={aggMaxSessions} color={teal}/>
+                      </td>
+                      <td className="num" style={{color:p.engagement_rate>=50?green:amber}}>
+                        {pct(p.engagement_rate)}
+                      </td>
+                      <td className="num" style={{color:p.bounce_rate>60?red:p.bounce_rate>40?amber:green}}>
+                        {pct(p.bounce_rate)}
+                      </td>
+                      <td className="num" style={{color:p.conversions>0?green:muted,fontWeight:p.conversions>0?600:400}}>
+                        {p.conversions}
+                      </td>
+                      <td style={{fontSize:9,color:muted}}>{p.sites}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {/* ── Traffic Sources ── */}
+          {allSources.length > 0 && (
+            <div className="report-section">
+              <div className="report-title" style={{marginBottom:8}}>Traffic Sources — All Sites Combined</div>
+              <table className="report-table">
+                <thead>
+                  <tr>
+                    <th>Source / Medium</th>
+                    <th className="num">Sessions</th>
+                    <th className="num">New Users</th>
+                    <th className="num">Engagement</th>
+                    <th className="num">Avg Duration</th>
+                    <th className="num">Conversions</th>
+                    <th style={{width:110}}>Share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const total = allSources.reduce((s,r)=>s+r.sessions,0)||1;
+                    return allSources.map((s,i)=>(
+                      <tr key={i}>
+                        <td style={{fontWeight:500}}>{s.source_medium}</td>
+                        <td className="num">{num(s.sessions)}</td>
+                        <td className="num">{num(s.new_users)}</td>
+                        <td className="num" style={{color:s.engagement_rate>=50?green:amber}}>{pct(s.engagement_rate)}</td>
+                        <td className="num">{s.avg_duration}</td>
+                        <td className="num" style={{color:s.conversions>0?green:muted,fontWeight:s.conversions>0?600:400}}>{s.conversions}</td>
+                        <td style={{padding:'6px 8px'}}>
+                          <div style={{display:'flex',alignItems:'center',gap:5}}>
+                            <div style={{height:5,borderRadius:3,background:'#e5e7eb',overflow:'hidden',flex:1}}>
+                              <div style={{height:'100%',width:`${s.sessions/total*100}%`,background:teal,borderRadius:3}}/>
+                            </div>
+                            <span style={{fontSize:9,color:muted,width:28,textAlign:'right'}}>{(s.sessions/total*100).toFixed(0)}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* ── Leads by campaign (all sites) ── */}
+          {allLeads.length > 0 && (
+            <div className="report-section">
+              <div className="report-title" style={{marginBottom:8}}>Leads by Campaign — All Sites</div>
+              <table className="report-table" style={{fontSize:10}}>
+                <thead>
+                  <tr>
+                    <th>Site</th>
+                    <th>Campaign</th>
+                    <th>Ad Group</th>
+                    <th>Keyword</th>
+                    <th>Page</th>
+                    <th className="num">Leads</th>
+                    <th className="num">Sessions</th>
+                    <th className="num">Lead Rate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {allLeads.map((l,i)=>(
+                    <tr key={i}>
+                      <td style={{fontSize:9,color:muted,whiteSpace:'nowrap'}}>{l.property_domain||'—'}</td>
+                      <td style={{fontWeight:500,maxWidth:150,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                          title={l.campaign}>{l.campaign}</td>
+                      <td style={{color:muted,maxWidth:110,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                          title={l.ad_group}>{l.ad_group||'—'}</td>
+                      <td style={{fontStyle:'italic',maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                          title={l.keyword}>{l.keyword||'—'}</td>
+                      <td style={{fontFamily:'monospace',maxWidth:110,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                          title={l.landing_page}>{l.landing_page||'/'}</td>
+                      <td className="num" style={{color:green,fontWeight:700}}>{l.leads}</td>
+                      <td className="num">{num(l.sessions)}</td>
+                      <td className="num" style={{color:l.lead_rate>=5?green:l.lead_rate>=2?amber:muted,fontWeight:600}}>
+                        {pct(l.lead_rate)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
         </div>
       )}
 
@@ -11109,7 +11315,19 @@ function slugify(str) {
 }
 
 function WorkflowsSection() {
-  const [subTab, setSubTab] = React.useState('editor'); // 'editor' | 'templates'
+  const [subTab, setSubTab] = React.useState('editor'); // 'editor' | 'templates' | 'media'
+
+  // Media library state
+  const [mediaItems, setMediaItems] = React.useState([]);
+  const [mediaLoading, setMediaLoading] = React.useState(false);
+  const [mediaError, setMediaError] = React.useState('');
+  const [mediaSuccess, setMediaSuccess] = React.useState('');
+  const [uploadLabel, setUploadLabel] = React.useState('');
+  const [uploadTags, setUploadTags] = React.useState('');
+  const [uploadFile, setUploadFile] = React.useState(null);
+  const [uploading, setUploading] = React.useState(false);
+  const [editingMedia, setEditingMedia] = React.useState(null); // {id, label, tags[]}
+  const [showLibraryPicker, setShowLibraryPicker] = React.useState(false);
 
   const [workflows, setWorkflows] = React.useState([]);
   const [selectedWfId, setSelectedWfId] = React.useState(null);
@@ -11136,6 +11354,33 @@ function WorkflowsSection() {
   const [editingStep, setEditingStep] = React.useState(null);
   const [stepDraft, setStepDraft] = React.useState({});
   const [stepTnameManual, setStepTnameManual] = React.useState(false);
+  const bodyTextareaRef = React.useRef(null);
+
+  // Insert {smile_image} placeholder at the current cursor position in the body textarea
+  function insertSmileImagePlaceholder() {
+    const ta = bodyTextareaRef.current;
+    const PLACEHOLDER = '{smile_image}';
+    if (!ta) {
+      // No ref yet — just append
+      setStepDraft(d => ({...d, body: (d.body || '') + '\n' + PLACEHOLDER}));
+      return;
+    }
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const current = ta.value || '';
+    // Don't insert a second placeholder if one already exists
+    if (current.includes(PLACEHOLDER)) return;
+    const newBody = current.slice(0, start) + PLACEHOLDER + current.slice(end);
+    setStepDraft(d => ({...d, body: newBody}));
+    // Restore cursor after the inserted text
+    requestAnimationFrame(() => {
+      if (bodyTextareaRef.current) {
+        bodyTextareaRef.current.selectionStart = start + PLACEHOLDER.length;
+        bodyTextareaRef.current.selectionEnd = start + PLACEHOLDER.length;
+        bodyTextareaRef.current.focus();
+      }
+    });
+  }
 
   // Per-step AI writer
   const [stepAiPrompt, setStepAiPrompt] = React.useState('');
@@ -11153,9 +11398,72 @@ function WorkflowsSection() {
     setStepAiGenerating(false);
     setShowStepAi(false);
     setStepTnameManual(false);
+    setShowLibraryPicker(false);
   }, [stepEditKey]);
 
-  React.useEffect(() => { loadWorkflows(); }, []);
+  React.useEffect(() => { loadWorkflows(); loadMediaLibrary(); }, []);
+
+  async function loadMediaLibrary() {
+    setMediaLoading(true);
+    try {
+      const data = await api('/api/admin/media-library');
+      setMediaItems(data.items || []);
+    } catch(e) {
+      setMediaError(e.message);
+    } finally {
+      setMediaLoading(false);
+    }
+  }
+
+  async function uploadMedia() {
+    if (!uploadFile) return;
+    setUploading(true); setMediaError(''); setMediaSuccess('');
+    try {
+      const formData = new FormData();
+      formData.append('file', uploadFile);
+      formData.append('label', uploadLabel || uploadFile.name);
+      const tagsArr = uploadTags.split(',').map(t => t.trim()).filter(Boolean);
+      formData.append('tags', JSON.stringify(tagsArr));
+      const settings = window._settings || {};
+      const pw = settings.adminPassword || localStorage.getItem('adminPw') || '';
+      const resp = await fetch('/api/admin/media-library', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': pw },
+        body: formData,
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      setUploadFile(null); setUploadLabel(''); setUploadTags('');
+      setMediaSuccess('Photo uploaded');
+      await loadMediaLibrary();
+    } catch(e) { setMediaError(e.message); }
+    finally { setUploading(false); }
+  }
+
+  async function saveMediaEdit() {
+    if (!editingMedia) return;
+    setMediaLoading(true); setMediaError(''); setMediaSuccess('');
+    try {
+      await api(`/api/admin/media-library/${editingMedia.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ label: editingMedia.label, tags: editingMedia.tags }),
+      });
+      setEditingMedia(null);
+      setMediaSuccess('Updated');
+      await loadMediaLibrary();
+    } catch(e) { setMediaError(e.message); }
+    finally { setMediaLoading(false); }
+  }
+
+  async function deleteMedia(id, label) {
+    if (!window.confirm(`Delete "${label}"? This cannot be undone.`)) return;
+    setMediaLoading(true); setMediaError(''); setMediaSuccess('');
+    try {
+      await api(`/api/admin/media-library/${id}`, { method: 'DELETE' });
+      setMediaSuccess('Deleted');
+      await loadMediaLibrary();
+    } catch(e) { setMediaError(e.message); }
+    finally { setMediaLoading(false); }
+  }
 
   async function loadWorkflows() {
     setLoading(true);
@@ -11296,7 +11604,7 @@ function WorkflowsSection() {
       id: null, workflow_id: selectedWfId,
       sequence_day: day, channel: 'email',
       template_name: `wf${selectedWfId}_d${day}_email`,
-      subject: '', body: '', terminal: false, _key: Date.now(),
+      subject: '', body: '', terminal: false, image_attachment: 'none', _key: Date.now(),
     };
     setEditingStep(blank);
     setStepDraft({ ...blank });
@@ -11331,6 +11639,7 @@ function WorkflowsSection() {
           sequence_day: parseInt(stepDraft.sequence_day) || 1,
           channel: stepDraft.channel,
           template_name: stepDraft.template_name,
+          image_attachment: stepDraft.image_attachment || 'none',
           subject: stepDraft.subject || '',
           body: stepDraft.body,
           terminal: !!stepDraft.terminal,
@@ -11391,6 +11700,14 @@ function WorkflowsSection() {
     const previewName = 'Jane';
     const body = (step.body || '').replace(/\{first_name\}/g, previewName).replace(/\{unsub_url\}/g, '#unsubscribe');
     const htmlBody = body.replace(/\n/g, '<br/>');
+    const attachment = step.image_attachment || 'none';
+    const attachmentLabels = {
+      'none': null,
+      'smile_after': { label: '✨ After Smile (AI-generated)', color: '#f3e8ff', border: '#c084fc', text: '#7e22ce', note: 'Patient\'s AI smile image will appear here' },
+      'smile_composite': { label: '🖼 Before + After Composite', color: '#f3e8ff', border: '#c084fc', text: '#7e22ce', note: 'BEFORE | nXtsmile side-by-side composite will appear here' },
+      'case_photo': { label: '📷 Case Photo (goal-matched)', color: '#fff7ed', border: '#fdba74', text: '#9a3412', note: 'Before/after case photo matched to patient goals' },
+    };
+    const attachInfo = attachmentLabels[attachment] || (attachment.startsWith('library:') ? { label: `📂 Library: ${attachment.replace('library:', '')}`, color: '#f0fdf4', border: '#86efac', text: '#15803d', note: 'Staff-uploaded case photo' } : null);
     return (
       <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
         onClick={onClose}>
@@ -11422,8 +11739,18 @@ function WorkflowsSection() {
                     {(step.subject || '').replace(/\{first_name\}/g, previewName)}
                   </div>
                 </div>
-                <div style={{ border: '1px solid #e5e7eb', borderTop: 'none', borderRadius: '0 0 8px 8px', padding: '20px 24px' }}
-                  dangerouslySetInnerHTML={{ __html: htmlBody }} />
+                <div style={{ border: '1px solid #e5e7eb', borderTop: 'none', borderRadius: '0 0 8px 8px', padding: '20px 24px' }}>
+                  {attachInfo && (
+                    <div style={{ background: attachInfo.color, border: `1px solid ${attachInfo.border}`, borderRadius: 8, padding: '12px 16px', marginBottom: 16, textAlign: 'center' }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: attachInfo.text, marginBottom: 4 }}>{attachInfo.label}</div>
+                      <div style={{ fontSize: 11, color: attachInfo.text, opacity: 0.8 }}>{attachInfo.note}</div>
+                      {(attachment === 'smile_after' || attachment === 'smile_composite') && (
+                        <div style={{ fontSize: 10, color: '#0d7a7f', marginTop: 6 }}>🔒 Delete image link will be included</div>
+                      )}
+                    </div>
+                  )}
+                  <div dangerouslySetInnerHTML={{ __html: htmlBody }} />
+                </div>
                 <div style={{ marginTop: 12, fontSize: 11, color: '#999', borderTop: '1px solid #eee', paddingTop: 10 }}>
                   From: info@nxtsmile.com · To: jane@example.com
                 </div>
@@ -11448,7 +11775,7 @@ function WorkflowsSection() {
 
       {/* Sub-tab bar */}
       <div style={{ display: 'flex', borderBottom: '2px solid var(--border)', background: '#fff', marginBottom: 12, flexShrink: 0 }}>
-        {[['editor','📋 Workflow Editor'],['templates','✨ AI Templates']].map(([key, label]) => (
+        {[['editor','📋 Workflow Editor'],['templates','✨ AI Templates'],['media','📸 Media Library']].map(([key, label]) => (
           <button key={key} onClick={() => setSubTab(key)}
             style={{
               padding: '7px 18px', fontSize: 12, fontWeight: subTab === key ? 700 : 500,
@@ -11461,6 +11788,92 @@ function WorkflowsSection() {
       </div>
 
       {subTab === 'templates' && <AITemplatesTab />}
+
+      {subTab === 'media' && (
+        <div style={{ flex: 1, overflowY: 'auto', padding: 4 }}>
+          {mediaError && <div style={{ background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#dc2626', marginBottom: 8 }}>{mediaError}<button onClick={() => setMediaError('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: '#dc2626' }}>✕</button></div>}
+          {mediaSuccess && <div style={{ background: '#dcfce7', border: '1px solid #86efac', borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#15803d', marginBottom: 8 }}>{mediaSuccess}<button onClick={() => setMediaSuccess('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: '#15803d' }}>✕</button></div>}
+
+          {/* Upload zone */}
+          <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 14, marginBottom: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 12, color: 'var(--teal-dark)', marginBottom: 10 }}>📤 Upload New Case Photo</div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+              <div style={{ flex: 2, minWidth: 180 }}>
+                <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>Photo File</label>
+                <input type="file" accept="image/*"
+                  onChange={e => setUploadFile(e.target.files[0] || null)}
+                  style={{ fontSize: 11, width: '100%' }} />
+              </div>
+              <div style={{ flex: 2, minWidth: 140 }}>
+                <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>Label</label>
+                <input value={uploadLabel} onChange={e => setUploadLabel(e.target.value)}
+                  placeholder="e.g. Implant Full Arch Case"
+                  style={{ width: '100%', padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 11 }} />
+              </div>
+              <div style={{ flex: 2, minWidth: 140 }}>
+                <label style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>Tags <span style={{ fontWeight: 400, color: '#aaa' }}>(comma-separated)</span></label>
+                <input value={uploadTags} onChange={e => setUploadTags(e.target.value)}
+                  placeholder="implants, cosmetic, full arch"
+                  style={{ width: '100%', padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 11 }} />
+              </div>
+              <button className="btn btn-teal btn-sm" onClick={uploadMedia} disabled={uploading || !uploadFile}>
+                {uploading ? 'Uploading…' : '+ Upload'}
+              </button>
+            </div>
+          </div>
+
+          {/* Photo grid */}
+          {mediaLoading && <div style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>Loading…</div>}
+          {!mediaLoading && mediaItems.length === 0 && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', padding: 32 }}>
+              No photos yet. Upload your first case photo above.
+            </div>
+          )}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10 }}>
+            {mediaItems.map(item => (
+              <div key={item.id} style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                <div style={{ height: 140, background: 'var(--gray-light)', overflow: 'hidden', position: 'relative' }}>
+                  <img src={item.url} alt={item.label}
+                    style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                    onError={e => { e.target.style.display = 'none'; }} />
+                </div>
+                <div style={{ padding: 8 }}>
+                  {editingMedia && editingMedia.id === item.id ? (
+                    <>
+                      <input value={editingMedia.label}
+                        onChange={e => setEditingMedia(m => ({...m, label: e.target.value}))}
+                        style={{ width: '100%', padding: '3px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 4 }} />
+                      <input value={(editingMedia.tags || []).join(', ')}
+                        onChange={e => setEditingMedia(m => ({...m, tags: e.target.value.split(',').map(t => t.trim()).filter(Boolean)}))}
+                        placeholder="tag1, tag2"
+                        style={{ width: '100%', padding: '3px 6px', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11, marginBottom: 6 }} />
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button className="btn btn-teal btn-sm" onClick={saveMediaEdit}>Save</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setEditingMedia(null)}>Cancel</button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text)', marginBottom: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.label || item.filename}</div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginBottom: 6 }}>
+                        {(item.tags || []).map(tag => (
+                          <span key={tag} style={{ fontSize: 9, background: 'var(--teal-light)', color: 'var(--teal-dark)', padding: '1px 5px', borderRadius: 8, fontWeight: 600 }}>{tag}</span>
+                        ))}
+                        {(!item.tags || item.tags.length === 0) && <span style={{ fontSize: 9, color: '#aaa' }}>no tags</span>}
+                      </div>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setEditingMedia({ id: item.id, label: item.label, tags: item.tags || [] })}>✏️ Edit</button>
+                        <button className="btn btn-sm" style={{ background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                          onClick={() => deleteMedia(item.id, item.label)}>🗑</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {subTab === 'editor' && (
         <div style={{ display: 'flex', gap: 16, flex: 1, overflow: 'hidden' }}>
@@ -11709,8 +12122,8 @@ function WorkflowsSection() {
                               </div>
                             )}
 
-                            <textarea value={stepDraft.body || ''} rows={10}
-                              placeholder={'Message body…\n\nAvailable placeholders:\n{first_name} — patient name\n{unsub_url} — unsubscribe link (email only)'}
+                            <textarea ref={bodyTextareaRef} value={stepDraft.body || ''} rows={10}
+                              placeholder={'Message body…\n\nAvailable placeholders:\n{first_name} — patient name\n{unsub_url} — unsubscribe link (email only)\n{smile_image} — image position (auto-inserted when you pick an image)'}
                               onChange={e => setStepDraft(d => ({...d, body: e.target.value}))}
                               style={{ display: 'block', width: '100%', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 12, resize: 'vertical', fontFamily: 'inherit' }} />
                             {stepDraft.channel === 'sms' && (
@@ -11719,6 +12132,84 @@ function WorkflowsSection() {
                               </div>
                             )}
                           </div>
+
+                          {/* Image Attachment (email only) */}
+                          {stepDraft.channel === 'email' && (
+                            <div style={{ marginBottom: 10, background: '#f8fafa', border: '1px solid var(--border)', borderRadius: 7, padding: '10px 12px' }}>
+                              <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--teal-dark)', marginBottom: 8 }}>📸 Attach Image</div>
+                              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 6 }}>
+                                {[
+                                  ['none',            '🚫 None'],
+                                  ['smile_after',     '✨ After Smile'],
+                                  ['smile_composite', '🖼 Before + After'],
+                                  ['case_photo',      '📷 Case Photo (auto)'],
+                                ].map(([val, lbl]) => (
+                                  <button key={val}
+                                    onClick={() => {
+                                      setStepDraft(d => ({...d, image_attachment: val}));
+                                      setShowLibraryPicker(false);
+                                      if (val !== 'none') insertSmileImagePlaceholder();
+                                    }}
+                                    style={{
+                                      padding: '4px 10px', fontSize: 11, fontWeight: 600, borderRadius: 5, cursor: 'pointer',
+                                      border: '1px solid ' + ((stepDraft.image_attachment || 'none') === val ? 'var(--teal)' : 'var(--border)'),
+                                      background: (stepDraft.image_attachment || 'none') === val ? 'var(--teal)' : '#fff',
+                                      color: (stepDraft.image_attachment || 'none') === val ? '#fff' : 'var(--text-muted)',
+                                    }}>
+                                    {lbl}
+                                  </button>
+                                ))}
+                                {/* Library picker button */}
+                                <button
+                                  onClick={() => setShowLibraryPicker(v => !v)}
+                                  style={{
+                                    padding: '4px 10px', fontSize: 11, fontWeight: 600, borderRadius: 5, cursor: 'pointer',
+                                    border: '1px solid ' + ((stepDraft.image_attachment || 'none').startsWith('library:') || showLibraryPicker ? 'var(--teal)' : 'var(--border)'),
+                                    background: (stepDraft.image_attachment || 'none').startsWith('library:') ? 'var(--teal)' : '#fff',
+                                    color: (stepDraft.image_attachment || 'none').startsWith('library:') ? '#fff' : 'var(--text-muted)',
+                                  }}>
+                                  {(stepDraft.image_attachment || 'none').startsWith('library:')
+                                    ? '📂 ' + (stepDraft.image_attachment || '').replace('library:', '')
+                                    : '📂 Library…'}
+                                </button>
+                              </div>
+
+                              {/* Library image picker dropdown */}
+                              {showLibraryPicker && (
+                                <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 6, padding: 8, marginBottom: 6 }}>
+                                  {mediaItems.length === 0
+                                    ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No library photos yet — upload in the 📸 Media Library tab.</div>
+                                    : <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: 6 }}>
+                                        {mediaItems.map(item => (
+                                          <div key={item.id}
+                                            onClick={() => { setStepDraft(d => ({...d, image_attachment: `library:${item.filename}`})); setShowLibraryPicker(false); insertSmileImagePlaceholder(); }}
+                                            style={{
+                                              cursor: 'pointer', borderRadius: 5, overflow: 'hidden', border: '2px solid ' +
+                                                ((stepDraft.image_attachment || '') === `library:${item.filename}` ? 'var(--teal)' : 'var(--border)'),
+                                            }}>
+                                            <img src={item.url} alt={item.label}
+                                              style={{ width: '100%', height: 70, objectFit: 'cover', display: 'block' }} />
+                                            <div style={{ fontSize: 9, padding: '2px 4px', color: 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.label}</div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                  }
+                                </div>
+                              )}
+
+                              {/* Info notes for smile options */}
+                              {(stepDraft.image_attachment === 'smile_after' || stepDraft.image_attachment === 'smile_composite') && (
+                                <div style={{ fontSize: 10, color: '#0d7a7f', background: 'var(--teal-light)', borderRadius: 5, padding: '5px 8px' }}>
+                                  🔒 A "delete my image" link will automatically be included in this email so the patient can remove their photo at any time.
+                                </div>
+                              )}
+                              {stepDraft.image_attachment === 'case_photo' && (
+                                <div style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--gray-light)', borderRadius: 5, padding: '5px 8px' }}>
+                                  Photo is auto-selected based on the patient's stated goals (implants, cosmetic, etc.).
+                                </div>
+                              )}
+                            </div>
+                          )}
 
                           {/* Template name */}
                           <div style={{ marginBottom: 8 }}>
@@ -11762,6 +12253,16 @@ function WorkflowsSection() {
                               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{desc}</div>
                             </div>
                           ))}
+                          {stepDraft.channel === 'email' && (stepDraft.image_attachment || 'none') !== 'none' && (
+                            <div style={{ marginBottom: 8 }}>
+                              <code style={{ fontSize: 10, background: '#f3e8ff', color: '#7e22ce', padding: '2px 5px', borderRadius: 3, display: 'block', marginBottom: 2 }}>{'{smile_image}'}</code>
+                              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Image position — click to insert at cursor</div>
+                              <button onClick={insertSmileImagePlaceholder}
+                                style={{ marginTop: 3, fontSize: 9, padding: '2px 6px', border: '1px solid #c084fc', borderRadius: 3, background: '#faf5ff', color: '#7e22ce', cursor: 'pointer' }}>
+                                Insert {'{smile_image}'}
+                              </button>
+                            </div>
+                          )}
                           <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8, marginTop: 4 }}>
                             <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 6 }}>Baked in by AI</div>
                             {['Practice name','Doctor name','Phone number','Booking link','Address'].map(item => (

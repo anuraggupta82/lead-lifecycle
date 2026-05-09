@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,6 +61,9 @@ from database import (
     # Domain registry
     list_domains, get_domain, create_domain, update_domain, delete_domain,
     list_domain_pages,
+    # Media library
+    list_media_library, get_media_library_item, create_media_library_item,
+    update_media_library_item, delete_media_library_item,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -376,6 +379,11 @@ _frontend_dir = os.path.join(os.path.dirname(__file__), "..", "frontend")
 if os.path.isdir(_frontend_dir):
     app.mount("/static", StaticFiles(directory=_frontend_dir), name="static")
 
+# Serve case photos (media library) so the dashboard can show thumbnails
+_case_photos_dir = os.path.join(os.path.dirname(__file__), "case_photos")
+os.makedirs(_case_photos_dir, exist_ok=True)
+app.mount("/media/case-photos", StaticFiles(directory=_case_photos_dir), name="case_photos")
+
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -650,40 +658,49 @@ def delete_smile_image(lead_id: str):
         """)
 
     blob_name = lead.get("smile_blob_name", "")
+    composite_blob_name = lead.get("smile_composite_blob_name", "")
     image_url = lead.get("smile_image_url", "")
-    deleted_from_gcs = False
 
-    # Delete from GCS using blob name (preferred) or parse from URL (legacy)
-    gcs_blob_name = blob_name
-    if not gcs_blob_name and image_url and "storage.googleapis.com" in image_url:
+    # Parse after-blob name from URL if not stored directly (legacy fallback)
+    gcs_after_blob = blob_name
+    if not gcs_after_blob and image_url and "storage.googleapis.com" in image_url:
         try:
             path = image_url.split("storage.googleapis.com/")[1].split("?")[0]
-            _, gcs_blob_name = path.split("/", 1)
+            _, gcs_after_blob = path.split("/", 1)
         except Exception:
             pass
 
-    if gcs_blob_name:
-        try:
-            from google.cloud import storage as gcs_storage
-            from config import get_settings as _gs
-            client = gcs_storage.Client()
-            client.bucket(_gs().gcs_bucket).blob(gcs_blob_name).delete()
-            deleted_from_gcs = True
-            logger.info(f"Deleted GCS smile image for lead {lead_id}: {gcs_blob_name}")
-        except Exception as e:
-            logger.warning(f"Could not delete GCS image for lead {lead_id}: {e}")
+    # Delete both after-only and composite blobs from GCS
+    deleted_count = 0
+    blobs_to_delete = [(gcs_after_blob, "after"), (composite_blob_name, "composite")]
+    try:
+        from google.cloud import storage as gcs_storage
+        from config import get_settings as _gs
+        client = gcs_storage.Client()
+        bucket = client.bucket(_gs().gcs_bucket)
+        for bname, label in blobs_to_delete:
+            if bname:
+                try:
+                    bucket.blob(bname).delete()
+                    deleted_count += 1
+                    logger.info(f"Deleted GCS {label} blob for lead {lead_id}: {bname}")
+                except Exception as e:
+                    logger.warning(f"Could not delete GCS {label} blob for lead {lead_id}: {e}")
+    except Exception as e:
+        logger.warning(f"GCS client init failed for image delete (lead {lead_id}): {e}")
 
-    # Clear both URL and blob name from the database
+    # Clear all smile fields from the database
     from database import _conn
     with _conn() as conn:
         conn.execute(
-            "UPDATE leads SET smile_image_url = '', smile_blob_name = '', updated_at = ? WHERE id = ?",
+            "UPDATE leads SET smile_image_url = '', smile_blob_name = '', "
+            "smile_composite_blob_name = '', updated_at = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), lead_id)
         )
 
     # Log the event
     add_event(lead_id, "image_deleted", source="patient_request",
-              detail=json.dumps({"gcs_deleted": deleted_from_gcs}))
+              detail=json.dumps({"gcs_blobs_deleted": deleted_count}))
 
     name = lead.get("first_name") or "there"
     return HTMLResponse(f"""
@@ -2551,6 +2568,7 @@ def admin_delete_lead(lead_id: str):
 
     # Delete smile image from GCS using blob name (preferred) or parse from URL (legacy)
     gcs_blob_name = lead.get("smile_blob_name", "")
+    gcs_composite_blob_name = lead.get("smile_composite_blob_name", "")
     image_url = lead.get("smile_image_url", "")
     if not gcs_blob_name and image_url and "storage.googleapis.com" in image_url:
         try:
@@ -2558,14 +2576,18 @@ def admin_delete_lead(lead_id: str):
             _, gcs_blob_name = path.split("/", 1)
         except Exception:
             pass
-    if gcs_blob_name:
-        try:
-            from google.cloud import storage as gcs_storage
-            client = gcs_storage.Client()
-            client.bucket(settings.gcs_bucket).blob(gcs_blob_name).delete()
-            logger.info(f"Deleted GCS smile image for lead {lead_id}: {gcs_blob_name}")
-        except Exception as e:
-            logger.warning(f"Could not delete GCS image for lead {lead_id}: {e}")
+    try:
+        from google.cloud import storage as gcs_storage
+        client = gcs_storage.Client()
+        for bname in [gcs_blob_name, gcs_composite_blob_name]:
+            if bname:
+                try:
+                    client.bucket(settings.gcs_bucket).blob(bname).delete()
+                    logger.info(f"Deleted GCS smile blob for lead {lead_id}: {bname}")
+                except Exception as e:
+                    logger.warning(f"Could not delete GCS blob {bname} for lead {lead_id}: {e}")
+    except Exception as e:
+        logger.warning(f"GCS client init failed during lead delete ({lead_id}): {e}")
 
     # Delete from Firestore via nxtsmile API
     # Pass email in X-Lead-Email header so old docs (no 'id' field) can be found by email.
@@ -6949,6 +6971,7 @@ class WorkflowStepCreate(BaseModel):
     subject: str = ""
     body: str
     terminal: bool = False
+    image_attachment: str = "none"  # 'none'|'smile_after'|'smile_composite'|'case_photo'|'library:<file>'
 
 
 class WorkflowStepUpdate(BaseModel):
@@ -6959,6 +6982,7 @@ class WorkflowStepUpdate(BaseModel):
     subject: Optional[str] = None
     body: Optional[str] = None
     terminal: Optional[bool] = None
+    image_attachment: Optional[str] = None  # 'none'|'smile_after'|'smile_composite'|'case_photo'|'library:<file>'
 
 
 class AIGenerateRequest(BaseModel):
@@ -7187,7 +7211,8 @@ def admin_create_workflow_step(body: WorkflowStepCreate):
         raise HTTPException(status_code=404, detail="Workflow not found")
     step = upsert_workflow_step(
         None, body.workflow_id, body.sequence_day, body.channel,
-        body.template_name, body.subject, body.body, body.terminal
+        body.template_name, body.subject, body.body, body.terminal,
+        image_attachment=body.image_attachment,
     )
     return step
 
@@ -7206,10 +7231,12 @@ def admin_update_workflow_step(step_id: int, body: WorkflowStepUpdate):
         "subject": body.subject if body.subject is not None else existing["subject"],
         "body": body.body if body.body is not None else existing["body"],
         "terminal": body.terminal if body.terminal is not None else bool(existing["terminal"]),
+        "image_attachment": body.image_attachment if body.image_attachment is not None else existing.get("image_attachment", "none"),
     }
     return upsert_workflow_step(
         step_id, merged["workflow_id"], merged["sequence_day"], merged["channel"],
-        merged["template_name"], merged["subject"], merged["body"], merged["terminal"]
+        merged["template_name"], merged["subject"], merged["body"], merged["terminal"],
+        image_attachment=merged["image_attachment"],
     )
 
 
@@ -7220,6 +7247,112 @@ def admin_delete_workflow_step(step_id: int):
         raise HTTPException(status_code=404, detail="Workflow step not found")
     delete_workflow_step(step_id)
     return {"ok": True}
+
+
+# ─── Media Library ────────────────────────────────────────────────────────────
+
+@app.get("/api/admin/media-library", dependencies=[Depends(_require_admin)])
+def admin_list_media_library():
+    """List all media library entries (staff-uploaded case photos with tags)."""
+    import json as _json
+    items = list_media_library()
+    for item in items:
+        try:
+            item["tags"] = _json.loads(item.get("tags") or "[]")
+        except Exception:
+            item["tags"] = []
+        item["url"] = f"/media/case-photos/{item['filename']}"
+    return {"items": items}
+
+
+@app.post("/api/admin/media-library", dependencies=[Depends(_require_admin)])
+async def admin_upload_media_library(
+    file: UploadFile = File(...),
+    label: str = Form(""),
+    tags: str = Form("[]"),   # JSON-encoded list e.g. '["implants","cosmetic"]'
+):
+    """Upload a new case photo to the media library."""
+    import json as _json
+    import uuid as _uuid
+    import shutil
+
+    # Validate file type — allow-list only safe raster types (no SVG/html)
+    _ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    _ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    ct = (file.content_type or "").lower().split(";")[0].strip()
+    if ct not in _ALLOWED_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, or GIF images are allowed")
+
+    # Parse tags
+    try:
+        tags_list = _json.loads(tags) if tags else []
+        if not isinstance(tags_list, list):
+            tags_list = []
+    except Exception:
+        tags_list = []
+
+    # Generate unique filename — derive extension from content-type, not user filename
+    _ct_to_ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+    ext = _ct_to_ext.get(ct, os.path.splitext(file.filename or "photo.jpg")[1].lower() or ".jpg")
+    if ext not in _ALLOWED_EXTENSIONS:
+        ext = ".jpg"
+    unique_name = f"lib_{_uuid.uuid4().hex[:12]}{ext}"
+    case_dir = os.path.join(os.path.dirname(__file__), "case_photos")
+    dest_path = os.path.join(case_dir, unique_name)
+
+    try:
+        with open(dest_path, "wb") as f_out:
+            shutil.copyfileobj(file.file, f_out)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File save failed: {e}")
+
+    display_label = label.strip() or file.filename or unique_name
+    item = create_media_library_item(unique_name, display_label, tags_list)
+    item["tags"] = tags_list
+    item["url"] = f"/media/case-photos/{unique_name}"
+    return item
+
+
+@app.put("/api/admin/media-library/{item_id}", dependencies=[Depends(_require_admin)])
+def admin_update_media_library(item_id: int, body: dict = Body(...)):
+    """Update label and/or tags for a media library item."""
+    existing = get_media_library_item(item_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Media library item not found")
+    import json as _json
+    label = body.get("label", existing.get("label", ""))
+    # Fall back to existing tags if "tags" key not provided — prevents accidental wipe
+    existing_tags = existing.get("tags") or []
+    if isinstance(existing_tags, str):
+        try:
+            existing_tags = _json.loads(existing_tags)
+        except Exception:
+            existing_tags = []
+    raw_tags = body.get("tags", existing_tags)
+    tags_list = raw_tags if isinstance(raw_tags, list) else existing_tags
+    item = update_media_library_item(item_id, label, tags_list)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found after update")
+    item["tags"] = tags_list
+    item["url"] = f"/media/case-photos/{item['filename']}"
+    return item
+
+
+@app.delete("/api/admin/media-library/{item_id}", dependencies=[Depends(_require_admin)])
+def admin_delete_media_library(item_id: int):
+    """Delete a media library item and remove the file from disk."""
+    filename = delete_media_library_item(item_id)
+    if not filename:
+        raise HTTPException(status_code=404, detail="Media library item not found")
+    case_dir = os.path.join(os.path.dirname(__file__), "case_photos")
+    file_path = os.path.join(case_dir, filename)
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"Deleted media library file: {filename}")
+    except Exception as e:
+        logger.warning(f"Could not delete media library file {filename}: {e}")
+    return {"ok": True, "filename": filename}
 
 
 @app.post("/api/admin/workflow/ai-generate", dependencies=[Depends(_require_admin)])

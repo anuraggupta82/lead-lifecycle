@@ -382,6 +382,64 @@ def fetch_traffic_sources(days: int = 30, limit: int = 10) -> list:
         return []
 
 
+def fetch_page_traffic_sources(days: int = 30, limit_per_page: int = 8) -> list:
+    """
+    Traffic source/medium breakdown PER landing page, across all properties.
+    Returns a list of dicts keyed by (property_domain, page, source_medium).
+    """
+    try:
+        all_rows = _run_report_all_properties(
+            dimensions=["sessionSourceMedium", "landingPagePlusQueryString"],
+            metrics=["sessions", "engagedSessions", "averageSessionDuration", "conversions"],
+            date_range_days=days,
+        )
+
+        # Group by (domain, page) → list of sources
+        page_map: dict = {}
+        for row in all_rows:
+            domain  = row.get("property_domain", "")
+            page    = row.get("landingPagePlusQueryString", "") or "/"
+            source  = row.get("sessionSourceMedium", "")
+            key     = f"{domain}::{page}"
+            sessions = row.get("sessions", 0)
+
+            if key not in page_map:
+                page_map[key] = {"property_domain": domain, "page": page, "sources": {}}
+
+            src = page_map[key]["sources"]
+            if source not in src:
+                src[source] = {"sessions": 0, "engaged": 0, "_dur_sum": 0.0, "conversions": 0}
+            src[source]["sessions"]    += sessions
+            src[source]["engaged"]     += row.get("engagedSessions", 0)
+            src[source]["_dur_sum"]    += row.get("averageSessionDuration", 0) * sessions
+            src[source]["conversions"] += row.get("conversions", 0)
+
+        result = []
+        for entry in page_map.values():
+            sources_list = []
+            for src_name, v in sorted(entry["sources"].items(),
+                                      key=lambda x: x[1]["sessions"], reverse=True)[:limit_per_page]:
+                s = v["sessions"]
+                sources_list.append({
+                    "source_medium":   src_name,
+                    "sessions":        int(s),
+                    "engagement_rate": round((v["engaged"] / s * 100) if s > 0 else 0, 1),
+                    "avg_duration":    _format_duration(v["_dur_sum"] / s if s else 0),
+                    "conversions":     int(v["conversions"]),
+                })
+            result.append({
+                "property_domain": entry["property_domain"],
+                "page":            entry["page"],
+                "sources":         sources_list,
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"GA4 page traffic sources failed: {e}")
+        return []
+
+
 def fetch_event_counts(days: int = 30) -> dict:
     """Key event counts summed across all properties."""
     try:
@@ -595,6 +653,7 @@ def fetch_all_ga4_data(days: int = 30) -> dict:
         "overview":         fetch_site_overview(days),
         "device_split":     fetch_device_split(days),
         "top_pages":        fetch_top_landing_pages(days),
+        "page_traffic_sources": fetch_page_traffic_sources(days),
         "traffic_sources":  fetch_traffic_sources(days),
         "events":           fetch_event_counts(days),
         "daily_trend":      fetch_daily_trend(days),

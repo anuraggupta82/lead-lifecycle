@@ -2002,6 +2002,30 @@ GROUP BY a.campaign_id, c.campaign_name;
         pass
 
 
+    # ── Image Attachments: smile_composite_blob_name on leads ────────────────
+    leads_img_cols = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
+    if "smile_composite_blob_name" not in leads_img_cols:
+        conn.execute("ALTER TABLE leads ADD COLUMN smile_composite_blob_name TEXT DEFAULT ''")
+
+    # ── Image Attachments: image_attachment on workflow_steps ─────────────────
+    ws_cols = {row[1] for row in conn.execute("PRAGMA table_info(workflow_steps)").fetchall()}
+    if "image_attachment" not in ws_cols:
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN image_attachment TEXT NOT NULL DEFAULT 'none'")
+
+    # ── Media Library: staff-uploaded case photos with tags ───────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS media_library (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename   TEXT NOT NULL UNIQUE,       -- actual file name in case_photos/
+            label      TEXT NOT NULL DEFAULT '',   -- display name
+            tags       TEXT NOT NULL DEFAULT '[]', -- JSON array e.g. ["implants","cosmetic"]
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_media_library_filename ON media_library(filename)")
+
+
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
     now = datetime.now(timezone.utc).isoformat()
@@ -2147,7 +2171,8 @@ def upsert_lead(data: dict) -> dict:
             for col in ["first_name","last_name","email","phone","goals","gclid",
                         "fbclid","msclkid","utm_source","utm_medium","utm_campaign",
                         "utm_term","utm_content","landing_url",
-                        "smile_image_url","smile_blob_name","smile_generated_at","source","notes",
+                        "smile_image_url","smile_blob_name","smile_composite_blob_name",
+                        "smile_generated_at","source","notes",
                         "booking_id","od_patient_num","attributed_production",
                         "treatment_plan_value","attributed_income",
                         "appointment_date","appointment_status","no_show_count",
@@ -2173,8 +2198,8 @@ def upsert_lead(data: dict) -> dict:
                     first_name, last_name, email, phone, phone_hash, email_hash,
                     goals, gclid, fbclid, msclkid, utm_source, utm_medium,
                     utm_campaign, utm_term, utm_content, landing_url,
-                    smile_image_url, smile_blob_name, notes, tags)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    smile_image_url, smile_blob_name, smile_composite_blob_name, notes, tags)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
                 data.get("source") or "unknown", data.get("stage", "new"),
@@ -2188,6 +2213,7 @@ def upsert_lead(data: dict) -> dict:
                 data.get("utm_campaign", ""), data.get("utm_term", ""),
                 data.get("utm_content", ""), data.get("landing_url") or "",
                 data.get("smile_image_url", ""), data.get("smile_blob_name", ""),
+                data.get("smile_composite_blob_name", ""),
                 data.get("notes", ""),
                 data.get("tags", "[]"),
             ))
@@ -2431,23 +2457,28 @@ def upsert_workflow(workflow_id: Optional[int], name: str, campaign_tag: str,
 
 def upsert_workflow_step(step_id: Optional[int], workflow_id: int, sequence_day: int,
                          channel: str, template_name: str, subject: str, body: str,
-                         terminal: bool = False) -> dict:
+                         terminal: bool = False,
+                         image_attachment: str = "none") -> dict:
     now = _now()
+    # Validate image_attachment — must be one of the known options or 'library:<filename>'
+    _valid_attachments = {"none", "smile_after", "smile_composite", "case_photo"}
+    if image_attachment not in _valid_attachments and not image_attachment.startswith("library:"):
+        image_attachment = "none"
     with _conn() as conn:
         if step_id:
             conn.execute(
                 "UPDATE workflow_steps SET workflow_id=?, sequence_day=?, channel=?, template_name=?, "
-                "subject=?, body=?, terminal=?, updated_at=? WHERE id=?",
+                "subject=?, body=?, terminal=?, image_attachment=?, updated_at=? WHERE id=?",
                 (workflow_id, sequence_day, channel, template_name, subject, body,
-                 1 if terminal else 0, now, step_id)
+                 1 if terminal else 0, image_attachment, now, step_id)
             )
             return dict(conn.execute("SELECT * FROM workflow_steps WHERE id=?", (step_id,)).fetchone())
         else:
             cur = conn.execute(
                 "INSERT INTO workflow_steps (workflow_id, sequence_day, channel, template_name, subject, body, "
-                "terminal, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,1,?,?)",
+                "terminal, image_attachment, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,1,?,?)",
                 (workflow_id, sequence_day, channel, template_name, subject, body,
-                 1 if terminal else 0, now, now)
+                 1 if terminal else 0, image_attachment, now, now)
             )
             return dict(conn.execute("SELECT * FROM workflow_steps WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -2456,6 +2487,63 @@ def delete_workflow_step(step_id: int) -> bool:
     with _conn() as conn:
         conn.execute("DELETE FROM workflow_steps WHERE id=?", (step_id,))
         return True
+
+
+# ─── Media Library ────────────────────────────────────────────────────────────
+
+def list_media_library() -> list:
+    """Return all media library entries ordered by label."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM media_library ORDER BY label COLLATE NOCASE, filename"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_media_library_item(item_id: int) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM media_library WHERE id=?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_media_library_item_by_filename(filename: str) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM media_library WHERE filename=?", (filename,)).fetchone()
+        return dict(row) if row else None
+
+
+def create_media_library_item(filename: str, label: str, tags: list) -> dict:
+    import json as _json
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO media_library (filename, label, tags, created_at, updated_at) VALUES (?,?,?,?,?)",
+            (filename, label, _json.dumps(tags), now, now)
+        )
+        return dict(conn.execute("SELECT * FROM media_library WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+def update_media_library_item(item_id: int, label: str, tags: list) -> Optional[dict]:
+    import json as _json
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE media_library SET label=?, tags=?, updated_at=? WHERE id=?",
+            (label, _json.dumps(tags), now, item_id)
+        )
+        row = conn.execute("SELECT * FROM media_library WHERE id=?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def delete_media_library_item(item_id: int) -> Optional[str]:
+    """Delete DB record; returns filename so caller can delete the file on disk."""
+    with _conn() as conn:
+        row = conn.execute("SELECT filename FROM media_library WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            return None
+        filename = row["filename"]
+        conn.execute("DELETE FROM media_library WHERE id=?", (item_id,))
+        return filename
 
 
 # ─── App Settings (persistent key/value store) ───────────────────────────────

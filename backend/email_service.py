@@ -283,6 +283,251 @@ def _get_smile_bytes(lead: dict) -> bytes:
     return b""
 
 
+def _get_composite_bytes(lead: dict) -> bytes:
+    """
+    Get the before+after composite image bytes for a lead.
+    Mirrors _get_smile_bytes() but reads smile_composite_blob_name.
+    Falls back to the after-only image if composite blob is missing.
+    """
+    blob_name = lead.get("smile_composite_blob_name", "")
+
+    if blob_name:
+        try:
+            from google.cloud import storage as gcs_storage
+            settings = get_settings()
+            client = gcs_storage.Client()
+            blob = client.bucket(settings.gcs_bucket).blob(blob_name)
+            data = blob.download_as_bytes()
+            if len(data) > 1000:
+                logger.info(f"Composite image downloaded from GCS: {blob_name} ({len(data)} bytes)")
+                return data
+            logger.warning(f"Composite GCS blob too small ({len(data)} bytes): {blob_name}")
+        except Exception as e:
+            if "404" in str(e) or "No such object" in str(e):
+                logger.info(f"Composite GCS blob gone, clearing for lead: {blob_name}")
+                try:
+                    from database import _conn
+                    lead_id = lead.get("lead_id") or lead.get("id", "")
+                    if lead_id:
+                        with _conn() as conn:
+                            conn.execute(
+                                "UPDATE leads SET smile_composite_blob_name='' WHERE id=?",
+                                (lead_id,)
+                            )
+                except Exception as db_err:
+                    logger.warning(f"Could not clear smile_composite_blob_name: {db_err}")
+                return b""
+            logger.warning(f"Composite GCS download failed for {blob_name}: {e}")
+
+    # Fall back to after-only image if no composite blob
+    return _get_smile_bytes(lead)
+
+
+def _build_smile_delete_block(lead_id: str, settings) -> str:
+    """Return the HTML block with the 30-day privacy notice and delete link."""
+    return f"""
+        <div style="background:#f8fafa;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
+          <p style="color:#666;font-size:12px;line-height:1.5;margin:0;">
+            🔒 Your photo is securely stored and will be automatically deleted after 30 days.
+            If you'd like it removed now,
+            <a href="{settings.nxtsmile_api}/delete-image/{lead_id}" style="color:#0d7a7f;">
+              click here to delete immediately
+            </a>.
+          </p>
+        </div>"""
+
+
+def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
+    """
+    Send a workflow step email with optional image embedding.
+
+    Reads step["image_attachment"]:
+      "none"            — plain HTML email, no image (uses _send)
+      "smile_after"     — embeds lead's AI-generated after smile (CID: smile_after)
+      "smile_composite" — embeds before+after composite (CID: smile_composite)
+      "case_photo"      — embeds goal-matched case photo (CID: case_photo)
+      "library:<file>"  — embeds a named file from case_photos/ dir (CID: library_photo)
+
+    For smile_after and smile_composite: appends a delete-image link to the email body
+    so the patient can remove their images, matching the behaviour of the hardcoded
+    Day 1 / Day 14 / Day 30 templates.
+    """
+    import html as _html
+    from pathlib import Path
+
+    settings = get_settings()
+    attachment = (step.get("image_attachment") or "none").strip()
+    channel = step.get("channel", "email")
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+    name = (lead.get("first_name") or "there").title()
+
+    body_template = step.get("body") or ""
+    subject_template = step.get("subject") or ""
+
+    # Simple placeholder substitution
+    replacements = {
+        "{first_name}": name,
+        "{last_name}": (lead.get("last_name") or "").title(),
+        "{email}": lead.get("email") or "",
+        "{phone}": lead.get("phone") or "",
+        "{unsub_url}": unsub_url,
+    }
+    rendered_body = body_template
+    rendered_subject = subject_template
+    for k, v in replacements.items():
+        rendered_body = rendered_body.replace(k, v)
+        rendered_subject = rendered_subject.replace(k, v)
+
+    # ── No image path — simple plain send ──────────────────────────────────────
+    if attachment == "none" or channel != "email":
+        escaped = _html.escape(rendered_body).replace("\n", "<br>")
+        html_body = (
+            "<html><body style='margin:0;padding:0;background:#ffffff;'>"
+            "<div style='font-family:Arial,sans-serif;color:#333;max-width:600px;"
+            "margin:0;padding:16px;text-align:left;'>"
+            f"{escaped}"
+            f"<div style='font-size:12px;color:#999;margin-top:24px;border-top:1px solid #eee;"
+            f"padding-top:12px;'>You received this because you expressed interest in dental implants "
+            f"at {settings.practice_name}. | "
+            f"<a href='{unsub_url}' style='color:#999;'>Unsubscribe</a></div>"
+            "</div></body></html>"
+        )
+        return _send(lead.get("email", ""), rendered_subject, html_body, plain=rendered_body)
+
+    # ── Image path — build MIMEMultipart("related") ───────────────────────────
+    img_bytes = b""
+    cid = "attached_image"
+    img_subtype = "jpeg"
+    img_filename = "image.jpg"
+    delete_block = ""
+
+    if attachment == "smile_after":
+        img_bytes = _get_smile_bytes(lead)
+        cid = "smile_after"
+        img_subtype = "png"
+        img_filename = "smile-after.png"
+        if img_bytes and lead_id:
+            delete_block = _build_smile_delete_block(lead_id, settings)
+
+    elif attachment == "smile_composite":
+        img_bytes = _get_composite_bytes(lead)
+        cid = "smile_composite"
+        img_subtype = "png"
+        img_filename = "smile-composite.png"
+        if img_bytes and lead_id:
+            delete_block = _build_smile_delete_block(lead_id, settings)
+
+    elif attachment == "case_photo":
+        img_bytes = _get_case_photo(lead.get("goals", ""))
+        cid = "case_photo"
+        img_subtype = "jpeg"
+        img_filename = "case-photo.jpg"
+
+    elif attachment.startswith("library:"):
+        filename = attachment[len("library:"):]
+        case_dir = (Path(__file__).parent / "case_photos").resolve()
+        lib_path = (case_dir / filename).resolve()
+        # Path traversal guard — resolved path must stay inside case_photos/
+        if not str(lib_path).startswith(str(case_dir) + "/"):
+            logger.warning(f"Rejected library path traversal attempt: {filename}")
+        elif lib_path.exists():
+            img_bytes = lib_path.read_bytes()
+            cid = "library_photo"
+            ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+            img_subtype = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "webp": "webp"}.get(ext, "jpeg")
+            img_filename = filename
+        else:
+            logger.warning(f"Media library file not found: {filename}")
+
+    # Build image block HTML
+    if img_bytes:
+        image_block = f"""
+        <img src="cid:{cid}"
+             style="width:100%;max-height:480px;object-fit:contain;border-radius:12px;
+                    border:1px solid #e5e7eb;display:block;margin:0 auto 16px;"
+             alt="Smile preview" />"""
+        if attachment in ("smile_after", "smile_composite"):
+            image_block += """
+        <p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">
+          *AI generated image. Actual results will vary.
+        </p>"""
+        elif attachment in ("case_photo",) or attachment.startswith("library:"):
+            image_block += """
+        <p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">
+          *Actual patient results. Individual results may vary.
+        </p>"""
+    else:
+        # Image missing — degrade to plain send so email still goes out
+        logger.warning(f"Image attachment '{attachment}' yielded no bytes for lead {lead_id} — sending without image")
+        escaped = _html.escape(rendered_body).replace("\n", "<br>")
+        html_body = (
+            "<html><body style='margin:0;padding:0;background:#ffffff;'>"
+            "<div style='font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0;padding:16px;'>"
+            f"{escaped}"
+            f"<div style='font-size:12px;color:#999;margin-top:24px;border-top:1px solid #eee;padding-top:12px;'>"
+            f"You received this because you expressed interest in dental implants at {settings.practice_name}. | "
+            f"<a href='{unsub_url}' style='color:#999;'>Unsubscribe</a></div>"
+            "</div></body></html>"
+        )
+        return _send(lead.get("email", ""), rendered_subject, html_body, plain=rendered_body)
+
+    # ── {smile_image} placeholder support ────────────────────────────────────
+    # If the author placed {smile_image} in the body, inject the image there.
+    # Otherwise fall back to prepending it above the body (backward compat).
+    PLACEHOLDER = "{smile_image}"
+    if PLACEHOLDER in rendered_body:
+        # Replace placeholder with image_block inline; no top-level image_block needed
+        body_with_image = rendered_body.replace(PLACEHOLDER, f"\x00IMAGE_BLOCK\x00")
+        escaped_parts = [_html.escape(p).replace("\n", "<br>") for p in body_with_image.split("\x00IMAGE_BLOCK\x00")]
+        escaped_body = image_block.join(escaped_parts)
+        top_image_block = ""  # already injected inline
+    else:
+        # Legacy / no placeholder: prepend image above body text
+        escaped_body = _html.escape(rendered_body).replace("\n", "<br>")
+        top_image_block = image_block
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = rendered_subject
+    msg["From"] = settings.email_from
+    msg["To"] = lead.get("email", "")
+
+    html = f"""<!DOCTYPE html>
+<html><body style="font-family:Arial,sans-serif;color:#333;max-width:560px;margin:0 auto;padding:0;">
+  <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0;">
+    <h2 style="color:#fff;margin:0;font-size:22px;">{_html.escape(rendered_subject)}</h2>
+  </div>
+  <div style="padding:28px 32px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px;">
+
+    {top_image_block}
+
+    <div style="color:#333;font-size:15px;line-height:1.7;">
+      {escaped_body}
+    </div>
+
+    {delete_block}
+
+    <div style="font-size:12px;color:#999;border-top:1px solid #eee;padding-top:16px;margin-top:20px;">
+      You received this because you expressed interest in dental implants at {settings.practice_name}.
+      &nbsp;|&nbsp; <a href="{unsub_url}" style="color:#0d7a7f;">Unsubscribe</a>
+      &nbsp;|&nbsp; {settings.practice_name}, Grafton, MA
+    </div>
+  </div>
+</body></html>"""
+
+    msg.attach(MIMEText(html, "html"))
+
+    # Attach the image
+    try:
+        img_mime = MIMEImage(img_bytes, _subtype=img_subtype)
+        img_mime.add_header("Content-ID", f"<{cid}>")
+        img_mime.add_header("Content-Disposition", "inline", filename=img_filename)
+        msg.attach(img_mime)
+    except Exception as e:
+        logger.warning(f"Could not attach image for step email: {e}")
+
+    return _send_msg(msg)
+
+
 def send_manual_email(to_email: str, subject: str, body: str) -> bool:
     """Send a freeform manual email (no template). Respects kill switch + dev redirect."""
     import html as _html

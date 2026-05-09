@@ -10,7 +10,6 @@ New rows have workflow_step_id set and use dynamic body from DB.
 import logging
 import json
 import re
-import html as _html_module
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -23,7 +22,7 @@ from database import (
 from datetime import timezone as _tz
 from email_service import (
     send_day1_email, send_day7_email, send_day14_email,
-    send_day30_cold_email, _send,
+    send_day30_cold_email, _send, send_workflow_step_email,
 )
 from sms_service import send_day3_sms, send_day21_sms, _send_sms
 from config import get_settings
@@ -61,26 +60,17 @@ def _render_template(template: str, lead: dict, unsub_url: str) -> str:
 
 def _dispatch_dynamic(item: dict, step: dict, unsub_url: str) -> bool:
     """Send a message described by a workflow_steps row."""
-    lead_id = item["lead_id"]
     channel = step["channel"]
-    body_template = step.get("body") or ""
-    subject_template = step.get("subject") or ""
-
-    rendered_body = _render_template(body_template, item, unsub_url)
-    rendered_subject = _render_template(subject_template, item, unsub_url)
+    attachment = (step.get("image_attachment") or "none").strip()
 
     if channel == "sms":
+        body_template = step.get("body") or ""
+        rendered_body = _render_template(body_template, item, unsub_url)
         return _send_sms(item.get("phone", ""), rendered_body)
     elif channel == "email":
-        escaped = _html_module.escape(rendered_body).replace("\n", "<br>")
-        html_body = (
-            "<html><body style='margin:0;padding:0;background:#ffffff;'>"
-            "<div style='font-family:Arial,sans-serif;color:#333;max-width:600px;"
-            "margin:0;padding:16px;text-align:left;'>"
-            f"{escaped}"
-            "</div></body></html>"
-        )
-        return _send(item.get("email", ""), rendered_subject, html_body, plain=rendered_body)
+        # Route through send_workflow_step_email for all email steps — it handles
+        # both plain (attachment="none") and image-embedded cases in one place.
+        return send_workflow_step_email(item, step, unsub_url)
     else:
         logger.warning(f"Unknown channel '{channel}' for step {step.get('id')}")
         return False
@@ -239,7 +229,7 @@ def _process_queue():
                 success = _dispatch_dynamic(item, step, unsub_url)
                 is_terminal = bool(step.get("terminal"))
 
-                if success and template.endswith("day1_email") or (step.get("sequence_day") == 1 and step.get("channel") == "email"):
+                if success and (template.endswith("day1_email") or (step.get("sequence_day") == 1 and step.get("channel") == "email")):
                     update_stage(lead_id, "auto_nurture", source="follow_up_engine")
 
             # ── Terminal side-effects ─────────────────────────────────────────
@@ -268,21 +258,46 @@ def _process_queue():
 
 
 def _delete_smile_image(lead: dict):
-    """Delete smile image from GCS when lead goes cold."""
-    url = lead.get("smile_image_url", "")
-    if not url or "storage.googleapis.com" not in url:
+    """Delete both after and composite smile images from GCS when lead goes cold."""
+    from config import get_settings
+    settings = get_settings()
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+
+    blobs_to_delete = []
+
+    # After-only blob (preferred) or parsed from legacy URL
+    after_blob = lead.get("smile_blob_name", "")
+    if not after_blob:
+        url = lead.get("smile_image_url", "")
+        if url and "storage.googleapis.com" in url:
+            try:
+                path = url.split("storage.googleapis.com/")[1].split("?")[0]
+                _, after_blob = path.split("/", 1)
+            except Exception:
+                pass
+    if after_blob:
+        blobs_to_delete.append(after_blob)
+
+    # Composite blob
+    composite_blob = lead.get("smile_composite_blob_name", "")
+    if composite_blob:
+        blobs_to_delete.append(composite_blob)
+
+    if not blobs_to_delete:
         return
+
     try:
         from google.cloud import storage
-        path = url.split("storage.googleapis.com/")[1].split("?")[0]
-        bucket_name, blob_name = path.split("/", 1)
         client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        blob.delete()
-        logger.info(f"Deleted GCS smile image for lead {lead.get('lead_id')}")
+        bucket = client.bucket(settings.gcs_bucket)
+        for bname in blobs_to_delete:
+            try:
+                bucket.blob(bname).delete()
+                logger.info(f"Deleted GCS blob for cold lead {lead_id}: {bname}")
+            except Exception as e:
+                logger.warning(f"Could not delete GCS blob {bname} for lead {lead_id}: {e}")
     except Exception as e:
-        logger.warning(f"Could not delete GCS smile image: {e}")
+        logger.warning(f"GCS client init failed during smile image delete (lead {lead_id}): {e}")
 
 
 def start_scheduler():
