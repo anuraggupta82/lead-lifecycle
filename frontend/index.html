@@ -11411,27 +11411,27 @@ function WorkflowsSection() {
   const [stepTnameManual, setStepTnameManual] = React.useState(false);
   const bodyTextareaRef = React.useRef(null);
 
-  // Insert {smile_image} placeholder at the current cursor position in the body textarea
-  function insertSmileImagePlaceholder() {
+  // Insert a placeholder tag at the current cursor position in the body textarea.
+  // If the same tag already exists, does nothing (prevents duplicates).
+  function insertPlaceholder(tag) {
     const ta = bodyTextareaRef.current;
-    const PLACEHOLDER = '{smile_image}';
     if (!ta) {
-      // No ref yet — just append
-      setStepDraft(d => ({...d, body: (d.body || '') + '\n' + PLACEHOLDER}));
+      setStepDraft(d => {
+        if ((d.body || '').includes(tag)) return d;
+        return {...d, body: (d.body || '') + '\n' + tag};
+      });
       return;
     }
+    const current = ta.value || '';
+    if (current.includes(tag)) return; // already present
     const start = ta.selectionStart;
     const end = ta.selectionEnd;
-    const current = ta.value || '';
-    // Don't insert a second placeholder if one already exists
-    if (current.includes(PLACEHOLDER)) return;
-    const newBody = current.slice(0, start) + PLACEHOLDER + current.slice(end);
+    const newBody = current.slice(0, start) + tag + current.slice(end);
     setStepDraft(d => ({...d, body: newBody}));
-    // Restore cursor after the inserted text
     requestAnimationFrame(() => {
       if (bodyTextareaRef.current) {
-        bodyTextareaRef.current.selectionStart = start + PLACEHOLDER.length;
-        bodyTextareaRef.current.selectionEnd = start + PLACEHOLDER.length;
+        bodyTextareaRef.current.selectionStart = start + tag.length;
+        bodyTextareaRef.current.selectionEnd = start + tag.length;
         bodyTextareaRef.current.focus();
       }
     });
@@ -11659,7 +11659,7 @@ function WorkflowsSection() {
       id: null, workflow_id: selectedWfId,
       sequence_day: day, channel: 'email',
       template_name: `wf${selectedWfId}_d${day}_email`,
-      subject: '', body: '', terminal: false, image_attachment: 'none', _key: Date.now(),
+      subject: '', body: '', terminal: false, image_attachment: 'none', book_now_url: '', _key: Date.now(),
     };
     setEditingStep(blank);
     setStepDraft({ ...blank });
@@ -11695,6 +11695,7 @@ function WorkflowsSection() {
           channel: stepDraft.channel,
           template_name: stepDraft.template_name,
           image_attachment: stepDraft.image_attachment || 'none',
+          book_now_url: stepDraft.book_now_url || '',
           subject: stepDraft.subject || '',
           body: stepDraft.body,
           terminal: !!stepDraft.terminal,
@@ -11760,9 +11761,10 @@ function WorkflowsSection() {
       'none': null,
       'smile_after': { label: '✨ After Smile (AI-generated)', color: '#f3e8ff', border: '#c084fc', text: '#7e22ce', note: 'Patient\'s AI smile image will appear here' },
       'smile_composite': { label: '🖼 Before + After Composite', color: '#f3e8ff', border: '#c084fc', text: '#7e22ce', note: 'BEFORE | nXtsmile side-by-side composite will appear here' },
-      'case_photo': { label: '📷 Case Photo (goal-matched)', color: '#fff7ed', border: '#fdba74', text: '#9a3412', note: 'Before/after case photo matched to patient goals' },
+      'case_photo_tagged': { label: '🏷 Case Photo (tag-matched)', color: '#fff7ed', border: '#fdba74', text: '#9a3412', note: 'Photo auto-selected from Media Library based on patient goals' },
     };
-    const attachInfo = attachmentLabels[attachment] || (attachment.startsWith('library:') ? { label: `📂 Library: ${attachment.replace('library:', '')}`, color: '#f0fdf4', border: '#86efac', text: '#15803d', note: 'Staff-uploaded case photo' } : null);
+    const attachInfo = attachmentLabels[attachment] || (attachment.startsWith('library:') ? { label: `📂 Library: ${attachment.replace('library:', '')}`, color: '#f0fdf4', border: '#86efac', text: '#15803d', note: 'Staff-uploaded static photo — same for every patient' } : null);
+    const hasBookNow = (step.body || '').includes('{book_now_button}') && (step.book_now_url || '');
     return (
       <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
         onClick={onClose}>
@@ -11805,6 +11807,12 @@ function WorkflowsSection() {
                     </div>
                   )}
                   <div dangerouslySetInnerHTML={{ __html: htmlBody }} />
+                  {hasBookNow && (
+                    <div style={{ textAlign: 'center', margin: '16px 0' }}>
+                      <span style={{ display: 'inline-block', background: '#0d7a7f', color: '#fff', fontWeight: 700, fontSize: 14, padding: '12px 28px', borderRadius: 8 }}>Book Now</span>
+                      <div style={{ fontSize: 10, color: '#999', marginTop: 4 }}>→ {step.book_now_url}</div>
+                    </div>
+                  )}
                 </div>
                 <div style={{ marginTop: 12, fontSize: 11, color: '#999', borderTop: '1px solid #eee', paddingTop: 10 }}>
                   From: info@nxtsmile.com · To: jane@example.com
@@ -12178,7 +12186,7 @@ function WorkflowsSection() {
                             )}
 
                             <textarea ref={bodyTextareaRef} value={stepDraft.body || ''} rows={10}
-                              placeholder={'Message body…\n\nAvailable placeholders:\n{first_name} — patient name\n{unsub_url} — unsubscribe link (email only)\n{smile_image} — image position (auto-inserted when you pick an image)'}
+                              placeholder={'Message body…\n\nPlaceholders:\n{first_name} — patient name\n{unsub_url} — unsubscribe link\n{book_now_button} — Book Now button\n{smile_after} / {smile_composite} — AI smile image position\n{case_photo} — tag-matched case photo position\n{library_image} — static library photo position'}
                               onChange={e => setStepDraft(d => ({...d, body: e.target.value}))}
                               style={{ display: 'block', width: '100%', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 5, fontSize: 12, resize: 'vertical', fontFamily: 'inherit' }} />
                             {stepDraft.channel === 'sms' && (
@@ -12189,47 +12197,78 @@ function WorkflowsSection() {
                           </div>
 
                           {/* Image Attachment (email only) */}
-                          {stepDraft.channel === 'email' && (
+                          {stepDraft.channel === 'email' && (() => {
+                            const att = stepDraft.image_attachment || 'none';
+                            // Map attachment type → placeholder tag inserted into body
+                            const placeholderFor = {
+                              'smile_after':       '{smile_after}',
+                              'smile_composite':   '{smile_composite}',
+                              'case_photo_tagged': '{case_photo}',
+                            };
+                            return (
                             <div style={{ marginBottom: 10, background: '#f8fafa', border: '1px solid var(--border)', borderRadius: 7, padding: '10px 12px' }}>
                               <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--teal-dark)', marginBottom: 8 }}>📸 Attach Image</div>
-                              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 6 }}>
+
+                              {/* Row 1: Smile images */}
+                              <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 4 }}>Patient's AI Smile</div>
+                              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
                                 {[
                                   ['none',            '🚫 None'],
                                   ['smile_after',     '✨ After Smile'],
                                   ['smile_composite', '🖼 Before + After'],
-                                  ['case_photo',      '📷 Case Photo (auto)'],
                                 ].map(([val, lbl]) => (
                                   <button key={val}
                                     onClick={() => {
                                       setStepDraft(d => ({...d, image_attachment: val}));
                                       setShowLibraryPicker(false);
-                                      if (val !== 'none') insertSmileImagePlaceholder();
+                                      if (val !== 'none') insertPlaceholder(placeholderFor[val] || '{smile_after}');
                                     }}
                                     style={{
                                       padding: '4px 10px', fontSize: 11, fontWeight: 600, borderRadius: 5, cursor: 'pointer',
-                                      border: '1px solid ' + ((stepDraft.image_attachment || 'none') === val ? 'var(--teal)' : 'var(--border)'),
-                                      background: (stepDraft.image_attachment || 'none') === val ? 'var(--teal)' : '#fff',
-                                      color: (stepDraft.image_attachment || 'none') === val ? '#fff' : 'var(--text-muted)',
+                                      border: '1px solid ' + (att === val ? 'var(--teal)' : 'var(--border)'),
+                                      background: att === val ? 'var(--teal)' : '#fff',
+                                      color: att === val ? '#fff' : 'var(--text-muted)',
                                     }}>
                                     {lbl}
                                   </button>
                                 ))}
-                                {/* Library picker button */}
+                              </div>
+
+                              {/* Row 2: Case photos */}
+                              <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 4 }}>Case Photo</div>
+                              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 6 }}>
+                                {/* By Tag (auto-matched from media library based on patient goals) */}
+                                <button
+                                  onClick={() => {
+                                    setStepDraft(d => ({...d, image_attachment: 'case_photo_tagged'}));
+                                    setShowLibraryPicker(false);
+                                    insertPlaceholder('{case_photo}');
+                                  }}
+                                  style={{
+                                    padding: '4px 10px', fontSize: 11, fontWeight: 600, borderRadius: 5, cursor: 'pointer',
+                                    border: '1px solid ' + (att === 'case_photo_tagged' ? 'var(--teal)' : 'var(--border)'),
+                                    background: att === 'case_photo_tagged' ? 'var(--teal)' : '#fff',
+                                    color: att === 'case_photo_tagged' ? '#fff' : 'var(--text-muted)',
+                                  }}>
+                                  🏷 By Patient Tag
+                                </button>
+
+                                {/* Static — pick from library */}
                                 <button
                                   onClick={() => setShowLibraryPicker(v => !v)}
                                   style={{
                                     padding: '4px 10px', fontSize: 11, fontWeight: 600, borderRadius: 5, cursor: 'pointer',
-                                    border: '1px solid ' + ((stepDraft.image_attachment || 'none').startsWith('library:') || showLibraryPicker ? 'var(--teal)' : 'var(--border)'),
-                                    background: (stepDraft.image_attachment || 'none').startsWith('library:') ? 'var(--teal)' : '#fff',
-                                    color: (stepDraft.image_attachment || 'none').startsWith('library:') ? '#fff' : 'var(--text-muted)',
+                                    border: '1px solid ' + (att.startsWith('library:') || showLibraryPicker ? 'var(--teal)' : 'var(--border)'),
+                                    background: att.startsWith('library:') ? 'var(--teal)' : '#fff',
+                                    color: att.startsWith('library:') ? '#fff' : 'var(--text-muted)',
                                   }}>
-                                  {(stepDraft.image_attachment || 'none').startsWith('library:')
-                                    ? '📂 ' + (stepDraft.image_attachment || '').replace('library:', '')
-                                    : '📂 Library…'}
+                                  {att.startsWith('library:')
+                                    ? '📂 ' + att.replace('library:', '')
+                                    : '📂 Static (pick photo)'}
                                 </button>
                               </div>
 
-                              {/* Library image picker dropdown */}
+                              {/* Library image picker dropdown (for static selection) */}
                               {showLibraryPicker && (
                                 <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 6, padding: 8, marginBottom: 6 }}>
                                   {mediaItems.length === 0
@@ -12237,10 +12276,14 @@ function WorkflowsSection() {
                                     : <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: 6 }}>
                                         {mediaItems.map(item => (
                                           <div key={item.id}
-                                            onClick={() => { setStepDraft(d => ({...d, image_attachment: `library:${item.filename}`})); setShowLibraryPicker(false); insertSmileImagePlaceholder(); }}
+                                            onClick={() => {
+                                              setStepDraft(d => ({...d, image_attachment: `library:${item.filename}`}));
+                                              setShowLibraryPicker(false);
+                                              insertPlaceholder('{library_image}');
+                                            }}
                                             style={{
                                               cursor: 'pointer', borderRadius: 5, overflow: 'hidden', border: '2px solid ' +
-                                                ((stepDraft.image_attachment || '') === `library:${item.filename}` ? 'var(--teal)' : 'var(--border)'),
+                                                (att === `library:${item.filename}` ? 'var(--teal)' : 'var(--border)'),
                                             }}>
                                             <img src={item.url} alt={item.label}
                                               style={{ width: '100%', height: 70, objectFit: 'cover', display: 'block' }} />
@@ -12252,17 +12295,39 @@ function WorkflowsSection() {
                                 </div>
                               )}
 
-                              {/* Info notes for smile options */}
-                              {(stepDraft.image_attachment === 'smile_after' || stepDraft.image_attachment === 'smile_composite') && (
-                                <div style={{ fontSize: 10, color: '#0d7a7f', background: 'var(--teal-light)', borderRadius: 5, padding: '5px 8px' }}>
-                                  🔒 A "delete my image" link will automatically be included in this email so the patient can remove their photo at any time.
+                              {/* Info notes */}
+                              {(att === 'smile_after' || att === 'smile_composite') && (
+                                <div style={{ fontSize: 10, color: '#0d7a7f', background: 'var(--teal-light)', borderRadius: 5, padding: '5px 8px', marginTop: 4 }}>
+                                  🔒 A "delete my image" link will automatically be included so the patient can remove their photo at any time.
                                 </div>
                               )}
-                              {stepDraft.image_attachment === 'case_photo' && (
-                                <div style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--gray-light)', borderRadius: 5, padding: '5px 8px' }}>
-                                  Photo is auto-selected based on the patient's stated goals (implants, cosmetic, etc.).
+                              {att === 'case_photo_tagged' && (
+                                <div style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--gray-light)', borderRadius: 5, padding: '5px 8px', marginTop: 4 }}>
+                                  🏷 The system will automatically pick the best matching photo from your Media Library based on the patient's goals (implants, cosmetic, etc.). Tag your photos in the 📸 Media Library tab.
                                 </div>
                               )}
+                              {att.startsWith('library:') && (
+                                <div style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--gray-light)', borderRadius: 5, padding: '5px 8px', marginTop: 4 }}>
+                                  📂 This specific photo will be sent to every patient regardless of their goals.
+                                </div>
+                              )}
+                            </div>
+                            );
+                          })()}
+
+                          {/* Book Now URL — shown when {book_now_button} placeholder is in body */}
+                          {stepDraft.channel === 'email' && (stepDraft.body || '').includes('{book_now_button}') && (
+                            <div style={{ marginBottom: 10, background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: 7, padding: '10px 12px' }}>
+                              <div style={{ fontSize: 10, fontWeight: 700, color: '#92400e', marginBottom: 6 }}>🔗 Book Now Button URL</div>
+                              <input
+                                value={stepDraft.book_now_url || ''}
+                                placeholder="https://patient.rocks/Dashboard/… or https://graftondentalcare.com/book"
+                                onChange={e => setStepDraft(d => ({...d, book_now_url: e.target.value}))}
+                                style={{ width: '100%', padding: '5px 8px', border: '1px solid #fcd34d', borderRadius: 5, fontSize: 11, fontFamily: 'inherit' }}
+                              />
+                              <div style={{ fontSize: 10, color: '#92400e', marginTop: 4 }}>
+                                This link will be used for the "Book Now" button in the email.
+                              </div>
                             </div>
                           )}
 
@@ -12308,13 +12373,36 @@ function WorkflowsSection() {
                               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{desc}</div>
                             </div>
                           ))}
-                          {stepDraft.channel === 'email' && (stepDraft.image_attachment || 'none') !== 'none' && (
+                          {stepDraft.channel === 'email' && (() => {
+                            const att = stepDraft.image_attachment || 'none';
+                            const imgTags = {
+                              'smile_after':       ['{smile_after}',     'AI after smile position'],
+                              'smile_composite':   ['{smile_composite}', 'Before+After composite position'],
+                              'case_photo_tagged': ['{case_photo}',      'Tag-matched case photo position'],
+                            };
+                            const isLibrary = att.startsWith('library:');
+                            const entry = imgTags[att];
+                            const showImg = entry || isLibrary;
+                            const imgTag = isLibrary ? '{library_image}' : (entry ? entry[0] : null);
+                            const imgDesc = isLibrary ? 'Static library photo position' : (entry ? entry[1] : null);
+                            return showImg ? (
+                              <div style={{ marginBottom: 8 }}>
+                                <code style={{ fontSize: 10, background: '#f3e8ff', color: '#7e22ce', padding: '2px 5px', borderRadius: 3, display: 'block', marginBottom: 2 }}>{imgTag}</code>
+                                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 3 }}>{imgDesc}</div>
+                                <button onClick={() => insertPlaceholder(imgTag)}
+                                  style={{ fontSize: 9, padding: '2px 6px', border: '1px solid #c084fc', borderRadius: 3, background: '#faf5ff', color: '#7e22ce', cursor: 'pointer' }}>
+                                  Insert
+                                </button>
+                              </div>
+                            ) : null;
+                          })()}
+                          {stepDraft.channel === 'email' && (
                             <div style={{ marginBottom: 8 }}>
-                              <code style={{ fontSize: 10, background: '#f3e8ff', color: '#7e22ce', padding: '2px 5px', borderRadius: 3, display: 'block', marginBottom: 2 }}>{'{smile_image}'}</code>
-                              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Image position — click to insert at cursor</div>
-                              <button onClick={insertSmileImagePlaceholder}
-                                style={{ marginTop: 3, fontSize: 9, padding: '2px 6px', border: '1px solid #c084fc', borderRadius: 3, background: '#faf5ff', color: '#7e22ce', cursor: 'pointer' }}>
-                                Insert {'{smile_image}'}
+                              <code style={{ fontSize: 10, background: '#fffbeb', color: '#92400e', padding: '2px 5px', borderRadius: 3, display: 'block', marginBottom: 2 }}>{'{book_now_button}'}</code>
+                              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 3 }}>Styled Book Now button</div>
+                              <button onClick={() => insertPlaceholder('{book_now_button}')}
+                                style={{ fontSize: 9, padding: '2px 6px', border: '1px solid #fcd34d', borderRadius: 3, background: '#fffbeb', color: '#92400e', cursor: 'pointer' }}>
+                                Insert
                               </button>
                             </div>
                           )}

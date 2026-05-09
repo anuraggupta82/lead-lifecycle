@@ -2011,6 +2011,10 @@ GROUP BY a.campaign_id, c.campaign_name;
     ws_cols = {row[1] for row in conn.execute("PRAGMA table_info(workflow_steps)").fetchall()}
     if "image_attachment" not in ws_cols:
         conn.execute("ALTER TABLE workflow_steps ADD COLUMN image_attachment TEXT NOT NULL DEFAULT 'none'")
+    if "book_now_url" not in ws_cols:
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN book_now_url TEXT NOT NULL DEFAULT ''")
+    # Migrate old 'case_photo' value → 'case_photo_tagged' (renamed in Step 11)
+    conn.execute("UPDATE workflow_steps SET image_attachment='case_photo_tagged' WHERE image_attachment='case_photo'")
 
     # ── Media Library: staff-uploaded case photos with tags ───────────────────
     conn.execute("""
@@ -2458,27 +2462,29 @@ def upsert_workflow(workflow_id: Optional[int], name: str, campaign_tag: str,
 def upsert_workflow_step(step_id: Optional[int], workflow_id: int, sequence_day: int,
                          channel: str, template_name: str, subject: str, body: str,
                          terminal: bool = False,
-                         image_attachment: str = "none") -> dict:
+                         image_attachment: str = "none",
+                         book_now_url: str = "") -> dict:
     now = _now()
     # Validate image_attachment — must be one of the known options or 'library:<filename>'
-    _valid_attachments = {"none", "smile_after", "smile_composite", "case_photo"}
+    _valid_attachments = {"none", "smile_after", "smile_composite", "case_photo_tagged"}
     if image_attachment not in _valid_attachments and not image_attachment.startswith("library:"):
         image_attachment = "none"
+    book_now_url = (book_now_url or "").strip()
     with _conn() as conn:
         if step_id:
             conn.execute(
                 "UPDATE workflow_steps SET workflow_id=?, sequence_day=?, channel=?, template_name=?, "
-                "subject=?, body=?, terminal=?, image_attachment=?, updated_at=? WHERE id=?",
+                "subject=?, body=?, terminal=?, image_attachment=?, book_now_url=?, updated_at=? WHERE id=?",
                 (workflow_id, sequence_day, channel, template_name, subject, body,
-                 1 if terminal else 0, image_attachment, now, step_id)
+                 1 if terminal else 0, image_attachment, book_now_url, now, step_id)
             )
             return dict(conn.execute("SELECT * FROM workflow_steps WHERE id=?", (step_id,)).fetchone())
         else:
             cur = conn.execute(
                 "INSERT INTO workflow_steps (workflow_id, sequence_day, channel, template_name, subject, body, "
-                "terminal, image_attachment, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,1,?,?)",
+                "terminal, image_attachment, book_now_url, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?)",
                 (workflow_id, sequence_day, channel, template_name, subject, body,
-                 1 if terminal else 0, image_attachment, now, now)
+                 1 if terminal else 0, image_attachment, book_now_url, now, now)
             )
             return dict(conn.execute("SELECT * FROM workflow_steps WHERE id=?", (cur.lastrowid,)).fetchone())
 

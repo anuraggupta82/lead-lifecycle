@@ -337,20 +337,83 @@ def _build_smile_delete_block(lead_id: str, settings) -> str:
         </div>"""
 
 
+def _get_case_photo_from_library(goals: str) -> bytes:
+    """
+    Tag-matched case photo from media_library.
+    Splits lead goals string into keywords, looks for library items whose tags
+    overlap with the keywords. Falls back to _get_case_photo (static tag_map) if
+    no library match found.
+    """
+    from pathlib import Path
+    try:
+        from database import list_media_library
+        import json as _json
+        items = list_media_library()
+        # goals may be a JSON array string e.g. '["Missing Teeth","Cosmetic"]' — parse it
+        goals_raw = goals or ""
+        try:
+            parsed = _json.loads(goals_raw)
+            if isinstance(parsed, list):
+                goals_words = {str(w).lower() for item in parsed for w in str(item).lower().split()}
+            else:
+                goals_words = set(goals_raw.lower().split())
+        except Exception:
+            goals_words = set(goals_raw.lower().split())
+        best = None
+        best_score = 0
+        for item in items:
+            raw_tags = item.get("tags") or []
+            if isinstance(raw_tags, str):
+                try:
+                    raw_tags = _json.loads(raw_tags)
+                except Exception:
+                    raw_tags = []
+            item_tags = {t.lower() for t in raw_tags}
+            score = len(goals_words & item_tags)
+            if score > best_score:
+                best_score = score
+                best = item
+        if best:
+            case_dir = (Path(__file__).parent / "case_photos").resolve()
+            lib_path = (case_dir / best["filename"]).resolve()
+            if str(lib_path).startswith(str(case_dir) + "/") and lib_path.exists():
+                return lib_path.read_bytes()
+    except Exception as e:
+        logger.warning(f"Tag-matched case photo lookup failed: {e}")
+    # Fallback to static tag_map
+    return _get_case_photo(goals)
+
+
+# Map image_attachment value → placeholder tag used in body text
+_ATTACHMENT_PLACEHOLDER = {
+    "smile_after":       "{smile_after}",
+    "smile_composite":   "{smile_composite}",
+    "case_photo_tagged": "{case_photo}",
+    # library:<filename> → {library_image}  (handled separately)
+}
+
+# Legacy placeholder from v1 (before per-type tags) — treated same as the typed one
+_LEGACY_PLACEHOLDER = "{smile_image}"
+
+
 def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
     """
     Send a workflow step email with optional image embedding.
 
     Reads step["image_attachment"]:
-      "none"            — plain HTML email, no image (uses _send)
-      "smile_after"     — embeds lead's AI-generated after smile (CID: smile_after)
-      "smile_composite" — embeds before+after composite (CID: smile_composite)
-      "case_photo"      — embeds goal-matched case photo (CID: case_photo)
-      "library:<file>"  — embeds a named file from case_photos/ dir (CID: library_photo)
+      "none"              — plain HTML email, no image (uses _send)
+      "smile_after"       — embeds lead's AI-generated after smile; placeholder {smile_after}
+      "smile_composite"   — embeds before+after composite; placeholder {smile_composite}
+      "case_photo_tagged" — tag-matched library photo (patient goals); placeholder {case_photo}
+      "library:<file>"    — specific staff-uploaded photo; placeholder {library_image}
 
-    For smile_after and smile_composite: appends a delete-image link to the email body
-    so the patient can remove their images, matching the behaviour of the hardcoded
-    Day 1 / Day 14 / Day 30 templates.
+    Placeholders in the body text mark where the image will be injected in the email.
+    If no placeholder is found, image is prepended above the body (backward compat).
+
+    book_now_url: if step["book_now_url"] is set and body contains {book_now_button},
+    renders a styled CTA button at that position.
+
+    For smile_after and smile_composite: appends a delete-image link to the email body.
     """
     import html as _html
     from pathlib import Path
@@ -360,11 +423,12 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
     channel = step.get("channel", "email")
     lead_id = lead.get("lead_id") or lead.get("id", "")
     name = (lead.get("first_name") or "there").title()
+    book_now_url = (step.get("book_now_url") or "").strip()
 
     body_template = step.get("body") or ""
     subject_template = step.get("subject") or ""
 
-    # Simple placeholder substitution
+    # ── Basic placeholder substitution ───────────────────────────────────────
     replacements = {
         "{first_name}": name,
         "{last_name}": (lead.get("last_name") or "").title(),
@@ -378,9 +442,41 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
         rendered_body = rendered_body.replace(k, v)
         rendered_subject = rendered_subject.replace(k, v)
 
-    # ── No image path — simple plain send ──────────────────────────────────────
+    # ── {book_now_button} substitution ───────────────────────────────────────
+    if "{book_now_button}" in rendered_body:
+        if book_now_url:
+            btn_html = (
+                f'<div style="text-align:center;margin:20px 0;">'
+                f'<a href="{_html.escape(book_now_url)}" '
+                f'style="display:inline-block;background:#0d7a7f;color:#ffffff;font-family:Arial,sans-serif;'
+                f'font-size:16px;font-weight:700;text-decoration:none;padding:14px 32px;border-radius:8px;">'
+                f'Book Now</a></div>'
+            )
+            rendered_body = rendered_body.replace("{book_now_button}", "\x00BOOK_NOW\x00")
+        else:
+            # URL not set — strip the token so it doesn't appear as raw text (Bug 3)
+            rendered_body = rendered_body.replace("{book_now_button}", "")
+            btn_html = ""
+    else:
+        btn_html = ""
+
+    # ── Strip any known image placeholder tokens from rendered_body ──────────
+    # These will be re-injected as actual images below; if the send degrades to
+    # plain text (image missing / attachment=none), we strip them rather than
+    # letting them appear as literal {tag} text in the patient's email. (Bug 1)
+    _ALL_IMG_PLACEHOLDERS = [
+        "{smile_after}", "{smile_composite}", "{case_photo}",
+        "{library_image}", "{smile_image}",  # legacy
+    ]
+
+    # ── No image path — simple plain send ────────────────────────────────────
     if attachment == "none" or channel != "email":
-        escaped = _html.escape(rendered_body).replace("\n", "<br>")
+        clean_body = rendered_body
+        for ph in _ALL_IMG_PLACEHOLDERS:
+            clean_body = clean_body.replace(ph, "")
+        escaped = _html.escape(clean_body).replace("\n", "<br>")
+        if btn_html:
+            escaped = escaped.replace("\x00BOOK_NOW\x00", btn_html)
         html_body = (
             "<html><body style='margin:0;padding:0;background:#ffffff;'>"
             "<div style='font-family:Arial,sans-serif;color:#333;max-width:600px;"
@@ -394,7 +490,7 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
         )
         return _send(lead.get("email", ""), rendered_subject, html_body, plain=rendered_body)
 
-    # ── Image path — build MIMEMultipart("related") ───────────────────────────
+    # ── Fetch image bytes ─────────────────────────────────────────────────────
     img_bytes = b""
     cid = "attached_image"
     img_subtype = "jpeg"
@@ -417,8 +513,8 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
         if img_bytes and lead_id:
             delete_block = _build_smile_delete_block(lead_id, settings)
 
-    elif attachment == "case_photo":
-        img_bytes = _get_case_photo(lead.get("goals", ""))
+    elif attachment == "case_photo_tagged":
+        img_bytes = _get_case_photo_from_library(lead.get("goals", ""))
         cid = "case_photo"
         img_subtype = "jpeg"
         img_filename = "case-photo.jpg"
@@ -439,27 +535,27 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
         else:
             logger.warning(f"Media library file not found: {filename}")
 
-    # Build image block HTML
+    # ── Build image block HTML ────────────────────────────────────────────────
     if img_bytes:
-        image_block = f"""
-        <img src="cid:{cid}"
-             style="width:100%;max-height:480px;object-fit:contain;border-radius:12px;
-                    border:1px solid #e5e7eb;display:block;margin:0 auto 16px;"
-             alt="Smile preview" />"""
+        image_block = (
+            f'<img src="cid:{cid}" '
+            f'style="width:100%;max-height:480px;object-fit:contain;border-radius:12px;'
+            f'border:1px solid #e5e7eb;display:block;margin:0 auto 16px;" '
+            f'alt="Smile preview" />'
+        )
         if attachment in ("smile_after", "smile_composite"):
-            image_block += """
-        <p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">
-          *AI generated image. Actual results will vary.
-        </p>"""
-        elif attachment in ("case_photo",) or attachment.startswith("library:"):
-            image_block += """
-        <p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">
-          *Actual patient results. Individual results may vary.
-        </p>"""
+            image_block += '<p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">*AI generated image. Actual results will vary.</p>'
+        else:
+            image_block += '<p style="color:#999;font-size:11px;margin:0 0 20px;text-align:center;">*Actual patient results. Individual results may vary.</p>'
     else:
         # Image missing — degrade to plain send so email still goes out
         logger.warning(f"Image attachment '{attachment}' yielded no bytes for lead {lead_id} — sending without image")
-        escaped = _html.escape(rendered_body).replace("\n", "<br>")
+        clean_body = rendered_body
+        for ph in _ALL_IMG_PLACEHOLDERS:
+            clean_body = clean_body.replace(ph, "")
+        escaped = _html.escape(clean_body).replace("\n", "<br>")
+        if btn_html:
+            escaped = escaped.replace("\x00BOOK_NOW\x00", btn_html)
         html_body = (
             "<html><body style='margin:0;padding:0;background:#ffffff;'>"
             "<div style='font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0;padding:16px;'>"
@@ -471,27 +567,41 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
         )
         return _send(lead.get("email", ""), rendered_subject, html_body, plain=rendered_body)
 
-    # ── {smile_image} placeholder support ────────────────────────────────────
-    # If the author placed {smile_image} in the body, inject the image there.
-    # Otherwise fall back to prepending it above the body (backward compat).
-    PLACEHOLDER = "{smile_image}"
-    if PLACEHOLDER in rendered_body:
-        # Replace placeholder with image_block inline; no top-level image_block needed
-        body_with_image = rendered_body.replace(PLACEHOLDER, f"\x00IMAGE_BLOCK\x00")
-        escaped_parts = [_html.escape(p).replace("\n", "<br>") for p in body_with_image.split("\x00IMAGE_BLOCK\x00")]
-        escaped_body = image_block.join(escaped_parts)
-        top_image_block = ""  # already injected inline
+    # ── Resolve which placeholder tag to look for ─────────────────────────────
+    if attachment.startswith("library:"):
+        img_placeholder = "{library_image}"
     else:
-        # Legacy / no placeholder: prepend image above body text
+        img_placeholder = _ATTACHMENT_PLACEHOLDER.get(attachment, "{smile_image}")
+
+    # ── Inject image at placeholder position (or prepend if none found) ───────
+    # Check per-type placeholder first, then legacy {smile_image}
+    if img_placeholder in rendered_body:
+        marker_body = rendered_body.replace(img_placeholder, "\x00IMAGE_BLOCK\x00")
+    elif _LEGACY_PLACEHOLDER in rendered_body:
+        marker_body = rendered_body.replace(_LEGACY_PLACEHOLDER, "\x00IMAGE_BLOCK\x00")
+    else:
+        marker_body = None  # no placeholder — prepend
+
+    if marker_body is not None:
+        parts = marker_body.split("\x00IMAGE_BLOCK\x00")
+        escaped_parts = [_html.escape(p).replace("\n", "<br>") for p in parts]
+        if btn_html:
+            escaped_parts = [p.replace("\x00BOOK_NOW\x00", btn_html) for p in escaped_parts]
+        escaped_body = image_block.join(escaped_parts)
+        top_image_block = ""
+    else:
         escaped_body = _html.escape(rendered_body).replace("\n", "<br>")
+        if btn_html:
+            escaped_body = escaped_body.replace("\x00BOOK_NOW\x00", btn_html)
         top_image_block = image_block
 
+    # ── Build MIME message ────────────────────────────────────────────────────
     msg = MIMEMultipart("related")
     msg["Subject"] = rendered_subject
     msg["From"] = settings.email_from
     msg["To"] = lead.get("email", "")
 
-    html = f"""<!DOCTYPE html>
+    html_out = f"""<!DOCTYPE html>
 <html><body style="font-family:Arial,sans-serif;color:#333;max-width:560px;margin:0 auto;padding:0;">
   <div style="background:#0d7a7f;padding:28px 32px;border-radius:12px 12px 0 0;">
     <h2 style="color:#fff;margin:0;font-size:22px;">{_html.escape(rendered_subject)}</h2>
@@ -514,7 +624,7 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
   </div>
 </body></html>"""
 
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(html_out, "html"))
 
     # Attach the image
     try:

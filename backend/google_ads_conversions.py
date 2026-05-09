@@ -123,7 +123,8 @@ def upload_offline_conversions() -> dict:
     # Get all leads with a gclid
     db = _get_db()
     leads = db.execute("""
-        SELECT id, gclid, stage, created_at, attributed_production, email, first_name, od_patient_num
+        SELECT id, gclid, stage, created_at, attributed_production, email, first_name,
+               od_patient_num, od_relationship, od_matched_at
         FROM leads
         WHERE gclid != '' AND gclid IS NOT NULL
         ORDER BY updated_at DESC
@@ -143,15 +144,43 @@ def upload_offline_conversions() -> dict:
         stage = lead["stage"]
         created_at = lead["created_at"]
 
-        # Skip existing OD patients — their gclid came from a recall/existing-patient search,
-        # not a new patient acquisition. Uploading their conversion would inflate our
-        # "new patient from ads" metrics and waste our conversion attribution budget.
-        if lead.get("od_patient_num"):
-            logger.debug(
-                f"Lead {lead_id} skipped: existing OD patient (PatNum={lead['od_patient_num']})"
-            )
-            skipped += 1
-            continue
+        # Skip pre-existing OD patients only — their gclid came from a recall/existing-patient
+        # search, not a new patient acquisition. Uploading their conversion would inflate our
+        # "new patient from ads" metrics and waste conversion attribution budget.
+        #
+        # PR 1 fix: previously gated on od_patient_num != '' which incorrectly skipped
+        # brand-new patients who received a chart number after their first appointment.
+        # Now we gate on od_relationship, which reflects the patient's status at first OD match:
+        #   active_patient   → had completed appointments before this lead existed → skip*
+        #   reactivation     → lapsed patient returning via ad                    → skip*
+        #   new_patient      → no prior OD history at time of match               → allow
+        #   implant_prospect → matched, has implant TP, no completed apts yet     → allow
+        #   cold             → schema default; not yet matched to OD              → allow
+        #   '' / NULL        → legacy rows pre-migration                          → allow
+        #
+        # *Carve-out (Option B): if od_matched_at > created_at, the lead existed before
+        # OD matching ran, meaning the patient was newly acquired via this ad click and
+        # subsequently got a chart number. Allow their treatment-stage conversions through
+        # even if od_relationship has since evolved to active_patient.
+        od_rel = lead["od_relationship"] or ""
+        if od_rel in ("active_patient", "reactivation"):
+            # Carve-out: new acquisition whose OD relationship evolved after the lead was created
+            od_matched_at = lead["od_matched_at"] or ""
+            lead_created_at = lead["created_at"] or ""
+            if od_matched_at and lead_created_at and od_matched_at > lead_created_at:
+                # OD match happened after lead creation → patient was new at acquisition time.
+                # Allow treatment-stage conversions to upload so Smart Bidding sees revenue.
+                logger.debug(
+                    f"Lead {lead_id} allowed: od_relationship={od_rel} but matched after "
+                    f"lead creation (matched={od_matched_at[:10]}, created={lead_created_at[:10]})"
+                )
+            else:
+                logger.debug(
+                    f"Lead {lead_id} skipped: pre-existing OD patient "
+                    f"(od_relationship={od_rel}, PatNum={lead['od_patient_num']})"
+                )
+                skipped += 1
+                continue
 
         # Determine which conversion to upload based on current stage
         conversion_name = STAGE_TO_CONVERSION.get(stage)

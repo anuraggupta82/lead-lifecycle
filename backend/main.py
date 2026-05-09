@@ -314,6 +314,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Keyword intelligence rebuild failed: {e}")
 
+    # 10:30 PM — Link phone-call patients to keyword production log (runs after OD sync at 10PM)
+    def _call_production_job():
+        _stamp("call_production")
+        try:
+            from call_production_log import link_calls_to_keyword_production
+            result = link_calls_to_keyword_production(days=7)
+            logger.info(f"Scheduled call production log: {result}")
+        except Exception as e:
+            logger.error(f"Scheduled call production log failed: {e}")
+
     # 11 PM — Upload offline conversions
     def _conversion_upload_job():
         _stamp("conversion_upload")
@@ -340,6 +350,8 @@ async def lifespan(app: FastAPI):
                           id="ai_optimizer", name="AI Campaign Optimizer", replace_existing=True)
     ads_scheduler.add_job(_od_sync_job, CronTrigger(hour=22, minute=0),
                           id="od_sync", name="OpenDental Patient Match + Treatment Stages", replace_existing=True)
+    ads_scheduler.add_job(_call_production_job, CronTrigger(hour=22, minute=30),
+                          id="call_production", name="Call→Keyword Production Attribution", replace_existing=True)
     ads_scheduler.add_job(_conversion_upload_job, CronTrigger(hour=23, minute=0),
                           id="conversion_upload", name="Google Ads Conversion Upload", replace_existing=True)
 
@@ -351,7 +363,7 @@ async def lifespan(app: FastAPI):
                           id="domain_crawl", name="Domain Crawler (monthly)", replace_existing=True)
 
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 11PM conversions)")
+    logger.info("Scheduled jobs started (1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
 
     yield
 
@@ -772,6 +784,21 @@ def admin_upload_conversions():
         raise HTTPException(status_code=503, detail=f"Google Ads library not installed: {e}")
     except Exception as e:
         logger.error(f"Conversion upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/sync-call-production", dependencies=[Depends(_require_admin)])
+def admin_sync_call_production(days: int = 7):
+    """
+    On-demand: link resolved Mango calls to keyword_production_log.
+    Pass ?days=60 for a 60-day backfill covering closed campaigns.
+    """
+    try:
+        from call_production_log import link_calls_to_keyword_production
+        result = link_calls_to_keyword_production(days=days)
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"Call production sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -6971,7 +6998,8 @@ class WorkflowStepCreate(BaseModel):
     subject: str = ""
     body: str
     terminal: bool = False
-    image_attachment: str = "none"  # 'none'|'smile_after'|'smile_composite'|'case_photo'|'library:<file>'
+    image_attachment: str = "none"  # 'none'|'smile_after'|'smile_composite'|'case_photo_tagged'|'library:<file>'
+    book_now_url: str = ""          # URL for {book_now_button} placeholder
 
 
 class WorkflowStepUpdate(BaseModel):
@@ -6982,7 +7010,8 @@ class WorkflowStepUpdate(BaseModel):
     subject: Optional[str] = None
     body: Optional[str] = None
     terminal: Optional[bool] = None
-    image_attachment: Optional[str] = None  # 'none'|'smile_after'|'smile_composite'|'case_photo'|'library:<file>'
+    image_attachment: Optional[str] = None  # 'none'|'smile_after'|'smile_composite'|'case_photo_tagged'|'library:<file>'
+    book_now_url: Optional[str] = None      # URL for {book_now_button} placeholder
 
 
 class AIGenerateRequest(BaseModel):
@@ -7213,6 +7242,7 @@ def admin_create_workflow_step(body: WorkflowStepCreate):
         None, body.workflow_id, body.sequence_day, body.channel,
         body.template_name, body.subject, body.body, body.terminal,
         image_attachment=body.image_attachment,
+        book_now_url=body.book_now_url,
     )
     return step
 
@@ -7232,11 +7262,13 @@ def admin_update_workflow_step(step_id: int, body: WorkflowStepUpdate):
         "body": body.body if body.body is not None else existing["body"],
         "terminal": body.terminal if body.terminal is not None else bool(existing["terminal"]),
         "image_attachment": body.image_attachment if body.image_attachment is not None else existing.get("image_attachment", "none"),
+        "book_now_url": body.book_now_url if body.book_now_url is not None else existing.get("book_now_url", ""),
     }
     return upsert_workflow_step(
         step_id, merged["workflow_id"], merged["sequence_day"], merged["channel"],
         merged["template_name"], merged["subject"], merged["body"], merged["terminal"],
         image_attachment=merged["image_attachment"],
+        book_now_url=merged["book_now_url"],
     )
 
 
