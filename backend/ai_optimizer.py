@@ -936,7 +936,19 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                 + json.dumps(geo_resolutions, default=str)
             )
 
-        prompt = """You are a Google Ads specialist optimizing a dental practice's campaigns.
+        prompt = """DENTAL PPC BENCHMARKS (from GDC Excellence Report — use these when sizing impact):
+- CTR: industry avg 5.44%, top quartile 8-12%, GDC target >7%
+- CPL: industry avg $83.93, top quartile $50-75, GDC target <$100
+- Conversion rate (click→lead): industry avg 9.08%, top quartile 12-18%
+- Search Impression Share: industry avg 40-60%, top quartile 70-85%, GDC target >65%
+- Negative keywords: comprehensive list recovers 20-42% of wasted spend
+- Landing page (service-specific vs homepage): lifts conversion rate 30-50%
+- All RSA slots filled: 10-15% more clicks; short headlines (<20 chars) CPA $9.35 vs $18.27 for long
+- Ad assets (sitelinks/callouts): 10-25% CTR improvement at zero extra cost
+- Target CPA by service: emergency $75-125, general $100-175, Invisalign $150-300, implants $200-400
+- Bidding phases: Manual CPC (0-15 conv/mo) → Maximize Conversions (15-30) → Target CPA (30-50) → Target ROAS (50+)
+
+You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
 
 CAMPAIGN SETTINGS (use these to inform every recommendation):
@@ -959,6 +971,11 @@ Use this to:
 Each recommendation MUST be a JSON object with these fields:
 - "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset
 - "reason": 1-2 sentence explanation with specific numbers from the data
+- "estimated_monthly_impact": object with keys:
+    "savings_usd": estimated monthly dollar savings (0 if not applicable),
+    "impact_type": one of "waste_reduction"|"conversion_lift"|"bid_efficiency"|"coverage_gain",
+    "confidence": "high"|"medium"|"low",
+    "benchmark_gap": brief string describing which benchmark this closes (e.g. "CTR below 7% target" or "negative keywords missing — est. 20-42% waste")
 - Operation-specific fields:
 
 For add_negative_keyword:
@@ -1033,7 +1050,8 @@ Rules:
 - COMPETITOR SEARCHES: Any search term containing a competitor practice name (e.g. "grace dental", "simply orthodontics", "aspen dental", "gentle dental", any "[name] dental [city]" that isn't Grafton Dental Care) MUST be flagged as add_negative_keyword. These waste budget showing our ads to people searching for a competitor.
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already added as negatives in Google Ads. Do NOT suggest add_negative_keyword for any term that already appears in that list (exact or near-match). Only flag NEW terms not yet blocked.
 - OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating recommendations that were recently rejected, (2) build on patterns from past runs, (3) surface new issues not seen before. Do not re-suggest anything in "rejected_patterns".
-- Return ONLY a valid JSON array, no markdown, no explanation outside the array""" + rsa_note + geo_note + feedback_block
+- Return ONLY a valid JSON array, no markdown, no explanation outside the array
+- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.""" + rsa_note + geo_note + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -1224,13 +1242,30 @@ def _call_claude_account_level(
             "optimizer_memory": memory_digest or {},
         }
 
-        prompt = """You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
+        prompt = """DENTAL PPC BENCHMARKS (from GDC Excellence Report — use these when sizing impact):
+- CTR: industry avg 5.44%, top quartile 8-12%, GDC target >7%
+- CPL: industry avg $83.93, top quartile $50-75, GDC target <$100
+- Conversion rate (click→lead): industry avg 9.08%, top quartile 12-18%
+- Search Impression Share: industry avg 40-60%, top quartile 70-85%, GDC target >65%
+- Negative keywords: comprehensive list recovers 20-42% of wasted spend
+- Landing page (service-specific vs homepage): lifts conversion rate 30-50%
+- All RSA slots filled: 10-15% more clicks; short headlines (<20 chars) CPA $9.35 vs $18.27 for long
+- Ad assets (sitelinks/callouts): 10-25% CTR improvement at zero extra cost
+- Target CPA by service: emergency $75-125, general $100-175, Invisalign $150-300, implants $200-400
+- Bidding phases: Manual CPC (0-15 conv/mo) → Maximize Conversions (15-30) → Target CPA (30-50) → Target ROAS (50+)
+
+You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
 
 You have already reviewed individual campaigns. Now identify issues and opportunities that span the whole account or cannot be attributed to one campaign.
 
 Return up to 6 ACCOUNT-LEVEL recommendations as a JSON array. Each must have:
 - "operation": one of: add_negative_keyword | change_bid_strategy | change_budget | add_asset | claude_advisory
 - "reason": 1-2 sentences with specific numbers. For cross-campaign negatives, cite which campaigns the term appeared in.
+- "estimated_monthly_impact": object with keys:
+    "savings_usd": estimated monthly dollar savings (0 if not applicable),
+    "impact_type": one of "waste_reduction"|"conversion_lift"|"bid_efficiency"|"coverage_gain",
+    "confidence": "high"|"medium"|"low",
+    "benchmark_gap": brief string describing which benchmark this closes (e.g. "CTR below 7% target" or "negative keywords missing — est. 20-42% waste")
 - "campaign_name": MUST be "" (empty string) — these are account-level recs
 
 Operation-specific fields (same spec as campaign-level):
@@ -1253,7 +1288,8 @@ IMPORTANT:
 - Use only campaign_resource values from the "campaign_resources" field in the data
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already live as negatives in Google Ads. Do NOT recommend add_negative_keyword for any term already in that list. Only suggest NEW terms not yet blocked.
 - OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating rejected recommendations, (2) identify recurring patterns, (3) highlight new trends. Do not re-suggest anything in "rejected_patterns".
-- Return ONLY a valid JSON array, no markdown, no explanation outside the array"""
+- Return ONLY a valid JSON array, no markdown, no explanation outside the array
+- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown."""
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -3323,7 +3359,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 reason=reason,
                 campaign_name=camp_name,
                 priority=priority_counter,
-                impact_estimate={},
+                impact_estimate=rec.get("estimated_monthly_impact", {}),
             )
             # Store google_rec_resource_name if this rec came from a Google recommendation
             google_rec_rn = rec.get("google_rec_resource_name", "")
@@ -3411,7 +3447,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             reason=reason,
             campaign_name="",   # ← account-level: no campaign
             priority=priority_counter,
-            impact_estimate={},
+            impact_estimate=rec.get("estimated_monthly_impact", {}),
         )
         actions_pending += 1
         priority_counter += 1
@@ -3623,6 +3659,53 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         logger.info(f"Optimizer memory updated: {len(all_recs_for_memory)} recs saved (run_id={run_id[:8]})")
     except Exception as _mem_err:
         logger.warning(f"Failed to save optimizer memory (non-fatal): {_mem_err}")
+
+    # ── Save batch impact history ─────────────────────────────────────────────
+    try:
+        from database import _conn as _ih_conn
+        from database import save_impact_history as _save_impact
+        import json as _json
+        # Aggregate impact estimates from all recs in this run
+        _waste_usd = 0.0
+        _impact_by_type: dict = {}
+        _total_recs = 0
+        with _ih_conn() as _ihc:
+            _rows = _ihc.execute(
+                "SELECT impact_estimate_json FROM gads_audit_log WHERE optimizer_run_id=?",
+                (run_id,)
+            ).fetchall()
+        for _row in _rows:
+            _total_recs += 1
+            try:
+                _ie = _json.loads(_row[0] or "{}")
+                _s = float(_ie.get("savings_usd", 0) or _ie.get("savings_30d_usd", 0) or 0)
+                _t = _ie.get("impact_type", "other")
+                _impact_by_type[_t] = round(_impact_by_type.get(_t, 0) + _s, 2)
+                if _ie.get("impact_type") == "waste_reduction" or "savings" in _ie:
+                    _waste_usd += _s
+            except Exception:
+                pass
+
+        # Build benchmark gap summary from current run's summary dict
+        _gaps: dict = {}
+        _cpl = summary.get("cost_per_lead", 0)
+        if _cpl and float(_cpl) > 100:
+            _gaps["cpl"] = {"current": _cpl, "target": 100, "gap": round(float(_cpl) - 100, 2), "unit": "usd"}
+        _roas = summary.get("overall_roas", 0)
+        if _roas and float(_roas) < 4:
+            _gaps["roas"] = {"current": _roas, "target": 4.0, "gap": round(4.0 - float(_roas), 2), "unit": "multiple"}
+
+        _save_impact(
+            run_id=run_id,
+            run_date=datetime.now(timezone.utc).date().isoformat(),
+            estimated_waste_saved_usd=round(_waste_usd, 2),
+            total_recs=_total_recs,
+            benchmark_gaps_json=_json.dumps(_gaps),
+            impact_by_type_json=_json.dumps(_impact_by_type),
+        )
+        logger.info(f"Impact history saved: waste_usd=${_waste_usd:.2f}, {_total_recs} recs")
+    except Exception as _ih_err:
+        logger.warning(f"Failed to save impact history (non-fatal): {_ih_err}")
 
     return report
 

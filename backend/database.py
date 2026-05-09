@@ -367,6 +367,32 @@ CREATE TABLE IF NOT EXISTS gads_optimizer_runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_started ON gads_optimizer_runs(started_at DESC);
 
+CREATE TABLE IF NOT EXISTS gads_impact_history (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                  TEXT NOT NULL,                   -- FK to gads_optimizer_runs.run_id
+    run_date                TEXT NOT NULL,                   -- YYYY-MM-DD
+    -- Batch-level estimated impact (sum of all recs in this run)
+    estimated_waste_saved_usd  REAL DEFAULT 0.0,            -- sum of waste_reduction recs
+    estimated_cpl_improvement  REAL DEFAULT 0.0,            -- weighted avg CPL delta
+    estimated_coverage_gain    REAL DEFAULT 0.0,            -- impression share gain estimate
+    total_recs              INTEGER DEFAULT 0,
+    approved_recs           INTEGER DEFAULT 0,
+    rejected_recs           INTEGER DEFAULT 0,
+    -- Cumulative tracking (running totals)
+    cum_estimated_savings   REAL DEFAULT 0.0,               -- cumulative approved savings to date
+    -- Gap analysis vs Excellence Report benchmarks (JSON: {metric: {current, target, gap}})
+    benchmark_gaps_json     TEXT DEFAULT '{}',
+    -- Breakdown by impact type (JSON: {waste_reduction: usd, conversion_lift: usd, ...})
+    impact_by_type_json     TEXT DEFAULT '{}',
+    -- Actual measured impact after execution (filled in by a future measurement pass)
+    actual_impact_json      TEXT DEFAULT '{}',
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_impact_history_run ON gads_impact_history(run_id);
+CREATE INDEX IF NOT EXISTS idx_impact_history_date ON gads_impact_history(run_date DESC);
+
 CREATE TABLE IF NOT EXISTS gads_audit_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     action_id         TEXT UNIQUE NOT NULL,          -- UUID
@@ -707,6 +733,55 @@ CREATE TABLE IF NOT EXISTS gads_google_recs (
 
 CREATE INDEX IF NOT EXISTS idx_google_recs_fetched ON gads_google_recs(fetched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_google_recs_dismissed ON gads_google_recs(dismissed);
+
+-- ─── Domain Registry + Crawler ───────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS domain_registry (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_url      TEXT NOT NULL UNIQUE,   -- e.g. https://graftondentalcare.com
+    label           TEXT DEFAULT '',        -- friendly name, e.g. "Main Practice Site"
+    domain_type     TEXT DEFAULT 'practice',-- 'practice' | 'landing' | 'competitor'
+    crawl_enabled   INTEGER DEFAULT 1,      -- 0 = disabled (skip scheduler)
+    crawl_depth     INTEGER DEFAULT 20,     -- max pages to crawl per run
+    last_crawled_at TEXT DEFAULT '',        -- ISO timestamp of last successful crawl
+    crawl_status    TEXT DEFAULT 'idle',    -- 'idle' | 'running' | 'error' | 'done'
+    pages_found     INTEGER DEFAULT 0,      -- pages stored from last crawl
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS domain_pages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_id       INTEGER NOT NULL REFERENCES domain_registry(id) ON DELETE CASCADE,
+    page_url        TEXT NOT NULL,
+    page_title      TEXT DEFAULT '',
+    meta_description TEXT DEFAULT '',
+    h1_text         TEXT DEFAULT '',        -- first H1 on the page
+    body_excerpt    TEXT DEFAULT '',        -- first ~2000 chars of cleaned body text
+    word_count      INTEGER DEFAULT 0,
+    has_form        INTEGER DEFAULT 0,      -- 1 if a <form> element was found
+    cta_phrases     TEXT DEFAULT '[]',      -- JSON array of CTA button/link texts
+    internal_links  TEXT DEFAULT '[]',      -- JSON array of internal hrefs found
+    content_hash    TEXT DEFAULT '',        -- SHA-256 of raw HTML — used for incremental diff
+    crawled_at      TEXT NOT NULL,
+    UNIQUE(domain_id, page_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_pages_domain ON domain_pages(domain_id);
+CREATE INDEX IF NOT EXISTS idx_domain_pages_crawled ON domain_pages(crawled_at DESC);
+
+CREATE TABLE IF NOT EXISTS domain_crawl_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_id       INTEGER NOT NULL REFERENCES domain_registry(id) ON DELETE CASCADE,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT DEFAULT '',
+    pages_crawled   INTEGER DEFAULT 0,
+    pages_failed    INTEGER DEFAULT 0,
+    status          TEXT DEFAULT 'running', -- 'running' | 'done' | 'error'
+    error_msg       TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_crawl_log_domain ON domain_crawl_log(domain_id, started_at DESC);
 """
 
 LIFECYCLE_STAGES = [
@@ -1899,6 +1974,32 @@ GROUP BY a.campaign_id, c.campaign_name;
         )
         if cur.rowcount:
             print(f"[db] Cleared tombstone for test email: {_te} ({cur.rowcount} row(s))")
+
+    # Create gads_impact_history table (migration for existing DBs)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gads_impact_history (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id                  TEXT NOT NULL,
+                run_date                TEXT NOT NULL,
+                estimated_waste_saved_usd  REAL DEFAULT 0.0,
+                estimated_cpl_improvement  REAL DEFAULT 0.0,
+                estimated_coverage_gain    REAL DEFAULT 0.0,
+                total_recs              INTEGER DEFAULT 0,
+                approved_recs           INTEGER DEFAULT 0,
+                rejected_recs           INTEGER DEFAULT 0,
+                cum_estimated_savings   REAL DEFAULT 0.0,
+                benchmark_gaps_json     TEXT DEFAULT '{}',
+                impact_by_type_json     TEXT DEFAULT '{}',
+                actual_impact_json      TEXT DEFAULT '{}',
+                created_at              TEXT NOT NULL,
+                updated_at              TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_impact_history_run ON gads_impact_history(run_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_impact_history_date ON gads_impact_history(run_date DESC)")
+    except Exception:
+        pass
 
 
 def _seed_call_grading_criteria(conn):
@@ -6284,3 +6385,242 @@ def get_google_recs(dismissed: bool = False) -> list:
 def dismiss_google_rec(resource_name: str):
     with _conn() as conn:
         conn.execute("UPDATE gads_google_recs SET dismissed=1 WHERE resource_name=?", (resource_name,))
+
+
+def save_impact_history(
+    run_id: str,
+    run_date: str,
+    estimated_waste_saved_usd: float = 0.0,
+    estimated_cpl_improvement: float = 0.0,
+    estimated_coverage_gain: float = 0.0,
+    total_recs: int = 0,
+    approved_recs: int = 0,
+    rejected_recs: int = 0,
+    benchmark_gaps_json: str = "{}",
+    impact_by_type_json: str = "{}",
+) -> None:
+    """Insert or replace an impact history record for an optimizer run.
+    Computes cumulative savings by summing all prior approved savings."""
+    now = _now()
+    with _conn() as conn:
+        # Compute running cumulative savings
+        row = conn.execute(
+            "SELECT COALESCE(MAX(cum_estimated_savings), 0) FROM gads_impact_history"
+        ).fetchone()
+        prior_cum = float(row[0]) if row else 0.0
+        cum_savings = round(prior_cum + estimated_waste_saved_usd, 2)
+
+        conn.execute("""
+            INSERT INTO gads_impact_history
+                (run_id, run_date, estimated_waste_saved_usd, estimated_cpl_improvement,
+                 estimated_coverage_gain, total_recs, approved_recs, rejected_recs,
+                 cum_estimated_savings, benchmark_gaps_json, impact_by_type_json,
+                 actual_impact_json, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,'{}',?,?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                estimated_waste_saved_usd=excluded.estimated_waste_saved_usd,
+                estimated_cpl_improvement=excluded.estimated_cpl_improvement,
+                estimated_coverage_gain=excluded.estimated_coverage_gain,
+                total_recs=excluded.total_recs,
+                approved_recs=excluded.approved_recs,
+                rejected_recs=excluded.rejected_recs,
+                cum_estimated_savings=excluded.cum_estimated_savings,
+                benchmark_gaps_json=excluded.benchmark_gaps_json,
+                impact_by_type_json=excluded.impact_by_type_json,
+                updated_at=excluded.updated_at
+        """, (
+            run_id, run_date, estimated_waste_saved_usd, estimated_cpl_improvement,
+            estimated_coverage_gain, total_recs, approved_recs, rejected_recs,
+            cum_savings, benchmark_gaps_json, impact_by_type_json, now, now,
+        ))
+
+
+def get_impact_history(limit: int = 30) -> list:
+    """Return impact history records newest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM gads_impact_history ORDER BY run_date DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            for jf in ("benchmark_gaps_json", "impact_by_type_json", "actual_impact_json"):
+                try:
+                    d[jf.replace("_json", "")] = json.loads(d.get(jf) or "{}")
+                except Exception:
+                    d[jf.replace("_json", "")] = {}
+            result.append(d)
+        return result
+
+
+# ─── Domain Registry helpers ─────────────────────────────────────────────────
+
+def list_domains() -> list:
+    """Return all registered domains ordered by created_at."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM domain_registry ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_domain(domain_id: int) -> Optional[dict]:
+    """Return a single domain record or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM domain_registry WHERE id=?", (domain_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_domain_by_url(domain_url: str) -> Optional[dict]:
+    """Return domain record matching url (case-insensitive) or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM domain_registry WHERE LOWER(domain_url)=LOWER(?)", (domain_url,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_domain(
+    domain_url: str,
+    label: str = "",
+    domain_type: str = "practice",
+    crawl_enabled: bool = True,
+    crawl_depth: int = 20,
+) -> int:
+    """Insert a new domain and return its id."""
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO domain_registry
+               (domain_url, label, domain_type, crawl_enabled, crawl_depth,
+                crawl_status, created_at, updated_at)
+               VALUES (?,?,?,?,?,'idle',?,?)""",
+            (domain_url, label, domain_type, int(crawl_enabled), crawl_depth, now, now),
+        )
+        return cur.lastrowid
+
+
+def update_domain(domain_id: int, **fields) -> None:
+    """Update arbitrary fields on a domain_registry row."""
+    allowed = {
+        "label", "domain_type", "crawl_enabled", "crawl_depth",
+        "last_crawled_at", "crawl_status", "pages_found", "updated_at",
+    }
+    cols = {k: v for k, v in fields.items() if k in allowed}
+    if not cols:
+        return
+    cols["updated_at"] = _now()
+    set_clause = ", ".join(f"{k}=?" for k in cols)
+    with _conn() as conn:
+        conn.execute(
+            f"UPDATE domain_registry SET {set_clause} WHERE id=?",
+            (*cols.values(), domain_id),
+        )
+
+
+def delete_domain(domain_id: int) -> None:
+    """Delete a domain and cascade-delete its pages + crawl logs."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM domain_registry WHERE id=?", (domain_id,))
+
+
+def upsert_domain_page(
+    domain_id: int,
+    page_url: str,
+    page_title: str = "",
+    meta_description: str = "",
+    h1_text: str = "",
+    body_excerpt: str = "",
+    word_count: int = 0,
+    has_form: bool = False,
+    cta_phrases: list = None,
+    internal_links: list = None,
+    content_hash: str = "",
+) -> None:
+    """Insert or replace a crawled page record."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO domain_pages
+               (domain_id, page_url, page_title, meta_description, h1_text,
+                body_excerpt, word_count, has_form, cta_phrases, internal_links,
+                content_hash, crawled_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(domain_id, page_url) DO UPDATE SET
+                   page_title=excluded.page_title,
+                   meta_description=excluded.meta_description,
+                   h1_text=excluded.h1_text,
+                   body_excerpt=excluded.body_excerpt,
+                   word_count=excluded.word_count,
+                   has_form=excluded.has_form,
+                   cta_phrases=excluded.cta_phrases,
+                   internal_links=excluded.internal_links,
+                   content_hash=excluded.content_hash,
+                   crawled_at=excluded.crawled_at""",
+            (
+                domain_id, page_url, page_title, meta_description, h1_text,
+                body_excerpt, word_count, int(has_form),
+                json.dumps(cta_phrases or []),
+                json.dumps(internal_links or []),
+                content_hash,
+                now,
+            ),
+        )
+
+
+def list_domain_pages(domain_id: int) -> list:
+    """Return all crawled pages for a domain."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM domain_pages WHERE domain_id=? ORDER BY crawled_at DESC",
+            (domain_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            for jf in ("cta_phrases", "internal_links"):
+                try:
+                    d[jf] = json.loads(d.get(jf) or "[]")
+                except Exception:
+                    d[jf] = []
+            result.append(d)
+        return result
+
+
+def delete_domain_pages(domain_id: int) -> None:
+    """Remove all cached pages for a domain (before a fresh crawl)."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM domain_pages WHERE domain_id=?", (domain_id,))
+
+
+def insert_crawl_log(domain_id: int) -> int:
+    """Start a crawl log entry and return its id."""
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO domain_crawl_log
+               (domain_id, started_at, status) VALUES (?,?,'running')""",
+            (domain_id, now),
+        )
+        return cur.lastrowid
+
+
+def finish_crawl_log(
+    log_id: int,
+    pages_crawled: int = 0,
+    pages_failed: int = 0,
+    status: str = "done",
+    error_msg: str = "",
+) -> None:
+    """Mark a crawl log entry as finished."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE domain_crawl_log
+               SET finished_at=?, pages_crawled=?, pages_failed=?, status=?, error_msg=?
+               WHERE id=?""",
+            (now, pages_crawled, pages_failed, status, error_msg, log_id),
+        )

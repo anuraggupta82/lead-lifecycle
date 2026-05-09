@@ -12979,6 +12979,8 @@ function AiOptimizerTab() {
   const [innerTab, setInnerTab] = React.useState('recommendations');
   const [autoExpanded, setAutoExpanded] = React.useState(false);
   const [expandedSections, setExpandedSections] = React.useState({});
+  const [impactHistory, setImpactHistory] = React.useState([]);
+  const [impactLoading, setImpactLoading] = React.useState(false);
 
   const loadLastRun = React.useCallback(async () => {
     try {
@@ -13003,11 +13005,27 @@ function AiOptimizerTab() {
     } catch(e) { console.error('Queued load error', e); }
   }, []);
 
+  const loadImpactHistory = React.useCallback(async () => {
+    setImpactLoading(true);
+    try {
+      const d = await api('/api/admin/optimizer/impact-history?limit=30');
+      setImpactHistory(d.impact_history || []);
+    } catch(e) { console.error('Impact history load error', e); }
+    finally { setImpactLoading(false); }
+  }, []);
+
   React.useEffect(() => {
     loadLastRun();
     loadRecs();
     loadQueued();
   }, [loadLastRun, loadRecs, loadQueued]);
+
+  // Load impact history when switching to Impact tab
+  React.useEffect(() => {
+    if (innerTab === 'impact' && impactHistory.length === 0) {
+      loadImpactHistory();
+    }
+  }, [innerTab, impactHistory.length, loadImpactHistory]);
 
   // Auto-expand first non-empty section after a fresh run
   React.useEffect(() => {
@@ -13132,8 +13150,9 @@ function AiOptimizerTab() {
       {/* Inner tab bar */}
       <div style={{display:'flex',borderBottom:'2px solid var(--border)',marginBottom:16}}>
         {[
-          {k:'recommendations', l:'Recommendations', count: totalPending},
-          {k:'history',         l:'History',         count: totalHistory},
+          {k:'recommendations', l:'Recommendations', count: totalPending, showCount: true},
+          {k:'history',         l:'History',         count: totalHistory, showCount: true},
+          {k:'impact',          l:'📈 Impact',        count: impactHistory.length, showCount: false},
         ].map(t => (
           <button key={t.k} onClick={() => setInnerTab(t.k)}
             style={{padding:'7px 18px',fontSize:13,fontWeight:600,cursor:'pointer',background:'none',border:'none',
@@ -13141,12 +13160,14 @@ function AiOptimizerTab() {
               color: innerTab===t.k ? 'var(--teal)' : 'var(--text-muted)',
               marginBottom:-2,display:'flex',alignItems:'center',gap:6}}>
             {t.l}
-            <span style={{
-              background: innerTab===t.k ? 'var(--teal)' : '#e2e8f0',
-              color: innerTab===t.k ? '#fff' : '#64748b',
-              borderRadius:10,padding:'0 7px',fontSize:11,fontWeight:700}}>
-              {t.count}
-            </span>
+            {t.showCount && (
+              <span style={{
+                background: innerTab===t.k ? 'var(--teal)' : '#e2e8f0',
+                color: innerTab===t.k ? '#fff' : '#64748b',
+                borderRadius:10,padding:'0 7px',fontSize:11,fontWeight:700}}>
+                {t.count}
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -13163,8 +13184,65 @@ function AiOptimizerTab() {
             </div>
           )}
 
-          {!loading && totalPending > 0 && (
-            <>
+          {!loading && totalPending > 0 && (() => {
+            // Compute batch impact banner from pending recs' impact_estimate fields
+            let batchWaste = 0, batchLift = 0, batchBid = 0, batchCoverage = 0;
+            pendingRecs.forEach(r => {
+              try {
+                const ie = typeof r.impact_estimate === 'object' ? r.impact_estimate
+                  : JSON.parse(r.impact_estimate_json || '{}');
+                const usd = parseFloat(ie.savings_usd || ie.savings_30d_usd || 0);
+                const t = ie.impact_type || '';
+                if (t === 'waste_reduction') batchWaste += usd;
+                else if (t === 'conversion_lift') batchLift += usd;
+                else if (t === 'bid_efficiency') batchBid += usd;
+                else if (t === 'coverage_gain') batchCoverage += usd;
+                else batchWaste += usd; // default to waste
+              } catch(_) {}
+            });
+            const totalBatchImpact = batchWaste + batchLift + batchBid + batchCoverage;
+            return (
+              <>
+                {/* Batch impact banner */}
+                {totalBatchImpact > 0 && (
+                  <div style={{background:'linear-gradient(135deg,#fff7ed,#fff)',
+                    border:'1px solid #fed7aa',borderRadius:10,padding:'12px 16px',
+                    marginBottom:14,display:'flex',alignItems:'center',gap:16,flexWrap:'wrap'}}>
+                    <div style={{fontSize:13,fontWeight:700,color:'#9a3412'}}>
+                      💰 This batch could save ~<strong>${Math.round(totalBatchImpact).toLocaleString()}/mo</strong>
+                    </div>
+                    <div style={{display:'flex',gap:8,flexWrap:'wrap',marginLeft:'auto'}}>
+                      {batchWaste > 0 && (
+                        <span style={{fontSize:10,background:'#fee2e2',color:'#dc2626',
+                          borderRadius:8,padding:'2px 8px',fontWeight:700}}>
+                          🗑️ ${Math.round(batchWaste).toLocaleString()} waste
+                        </span>
+                      )}
+                      {batchLift > 0 && (
+                        <span style={{fontSize:10,background:'#dcfce7',color:'#15803d',
+                          borderRadius:8,padding:'2px 8px',fontWeight:700}}>
+                          📈 ${Math.round(batchLift).toLocaleString()} conv. lift
+                        </span>
+                      )}
+                      {batchBid > 0 && (
+                        <span style={{fontSize:10,background:'#eff6ff',color:'#1d4ed8',
+                          borderRadius:8,padding:'2px 8px',fontWeight:700}}>
+                          💡 ${Math.round(batchBid).toLocaleString()} bid eff.
+                        </span>
+                      )}
+                      {batchCoverage > 0 && (
+                        <span style={{fontSize:10,background:'#f5f3ff',color:'#7c3aed',
+                          borderRadius:8,padding:'2px 8px',fontWeight:700}}>
+                          🎯 ${Math.round(batchCoverage).toLocaleString()} coverage
+                        </span>
+                      )}
+                    </div>
+                    <div style={{fontSize:9,color:'#c2410c',width:'100%',marginTop:2}}>
+                      Estimates based on Claude's analysis of your campaign data · See Impact tab for full history
+                    </div>
+                  </div>
+                )}
+
               {/* Account Level section */}
               <OptimizerSection
                 key="__account__"
@@ -13193,7 +13271,8 @@ function AiOptimizerTab() {
                 />
               ))}
             </>
-          )}
+          );
+          })()}
 
           {/* Queue panel */}
           {queued.length > 0 && (
@@ -13242,6 +13321,233 @@ function AiOptimizerTab() {
               )}
             </div>
           )}
+        </div>
+      )}
+
+      {/* ── IMPACT TAB ── */}
+      {innerTab === 'impact' && (
+        <div>
+          {impactLoading && (
+            <div style={{color:'var(--text-muted)',fontSize:12,padding:'16px 0'}}>Loading impact data...</div>
+          )}
+          {!impactLoading && impactHistory.length === 0 && (
+            <div style={{textAlign:'center',padding:'32px 0',color:'var(--text-muted)',fontSize:13}}>
+              <div style={{fontSize:24,marginBottom:8}}>📊</div>
+              No impact data yet. Run the optimizer to start tracking impact.
+            </div>
+          )}
+          {!impactLoading && impactHistory.length > 0 && (() => {
+            // Compute totals from history
+            const totalWasteSaved = impactHistory.reduce((s, r) => s + (r.estimated_waste_saved_usd || 0), 0);
+            const latestCumSavings = impactHistory[0]?.cum_estimated_savings || 0;
+            const totalApproved = impactHistory.reduce((s, r) => s + (r.approved_recs || 0), 0);
+            const totalRecs = impactHistory.reduce((s, r) => s + (r.total_recs || 0), 0);
+            const approvalRate = totalRecs > 0 ? Math.round(totalApproved / totalRecs * 100) : 0;
+
+            // Aggregate impact_by_type across all runs
+            const byType = {};
+            impactHistory.forEach(r => {
+              const ibt = r.impact_by_type || {};
+              Object.entries(ibt).forEach(([k, v]) => {
+                byType[k] = (byType[k] || 0) + v;
+              });
+            });
+
+            // Collect all benchmark gaps (latest run has freshest gaps)
+            const latestGaps = impactHistory[0]?.benchmark_gaps || {};
+
+            const typeLabels = {
+              waste_reduction: {label:'Waste Reduction', color:'#dc2626', icon:'🗑️'},
+              conversion_lift: {label:'Conversion Lift', color:'#16a34a', icon:'📈'},
+              bid_efficiency:  {label:'Bid Efficiency',  color:'#2563eb', icon:'💡'},
+              coverage_gain:   {label:'Coverage Gain',   color:'#7c3aed', icon:'🎯'},
+              data_quality:    {label:'Data Quality',    color:'#d97706', icon:'🔍'},
+            };
+
+            return (
+              <div>
+                {/* Summary cards */}
+                <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12,marginBottom:20}}>
+                  {/* Estimated Waste Saved */}
+                  <div style={{background:'#fff7ed',border:'1px solid #fed7aa',borderRadius:10,padding:'14px 16px'}}>
+                    <div style={{fontSize:11,fontWeight:700,color:'#c2410c',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:4}}>
+                      💰 Est. Waste Recoverable
+                    </div>
+                    <div style={{fontSize:26,fontWeight:800,color:'#9a3412'}}>
+                      ${totalWasteSaved.toLocaleString('en-US',{maximumFractionDigits:0})}<span style={{fontSize:13,fontWeight:500,color:'#c2410c'}}>/mo</span>
+                    </div>
+                    <div style={{fontSize:10,color:'#c2410c',marginTop:2}}>
+                      Sum of all waste-reduction recs this period
+                    </div>
+                  </div>
+
+                  {/* Cumulative Approved Savings */}
+                  <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:10,padding:'14px 16px'}}>
+                    <div style={{fontSize:11,fontWeight:700,color:'#15803d',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:4}}>
+                      ✅ Cumulative Approved Savings
+                    </div>
+                    <div style={{fontSize:26,fontWeight:800,color:'#14532d'}}>
+                      ${latestCumSavings.toLocaleString('en-US',{maximumFractionDigits:0})}
+                    </div>
+                    <div style={{fontSize:10,color:'#15803d',marginTop:2}}>
+                      From approved recs across {impactHistory.length} optimizer runs
+                    </div>
+                  </div>
+
+                  {/* Approval Rate */}
+                  <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:10,padding:'14px 16px'}}>
+                    <div style={{fontSize:11,fontWeight:700,color:'#1d4ed8',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:4}}>
+                      👍 Approval Rate
+                    </div>
+                    <div style={{fontSize:26,fontWeight:800,color:'#1e3a8a'}}>
+                      {approvalRate}%
+                    </div>
+                    <div style={{fontSize:10,color:'#1d4ed8',marginTop:2}}>
+                      {totalApproved} approved of {totalRecs} recs across all runs
+                    </div>
+                  </div>
+                </div>
+
+                {/* Impact by type breakdown */}
+                {Object.keys(byType).length > 0 && (
+                  <div style={{background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:10,padding:'14px 16px',marginBottom:16}}>
+                    <div style={{fontSize:12,fontWeight:700,color:'var(--text)',marginBottom:10}}>
+                      Impact Breakdown by Type
+                    </div>
+                    <div style={{display:'flex',flexWrap:'wrap',gap:10}}>
+                      {Object.entries(byType).sort((a,b)=>b[1]-a[1]).map(([type, usd]) => {
+                        const meta = typeLabels[type] || {label:type, color:'#64748b', icon:'•'};
+                        return (
+                          <div key={type} style={{background:meta.color+'11',border:'1px solid '+meta.color+'33',
+                            borderRadius:8,padding:'8px 14px',minWidth:140}}>
+                            <div style={{fontSize:10,fontWeight:700,color:meta.color,marginBottom:3}}>
+                              {meta.icon} {meta.label}
+                            </div>
+                            <div style={{fontSize:18,fontWeight:800,color:meta.color}}>
+                              ${usd.toLocaleString('en-US',{maximumFractionDigits:0})}
+                              <span style={{fontSize:10,fontWeight:500}}>/mo est.</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Benchmark Gap Analysis */}
+                {Object.keys(latestGaps).length > 0 && (
+                  <div style={{background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:10,padding:'14px 16px',marginBottom:16}}>
+                    <div style={{fontSize:12,fontWeight:700,color:'var(--text)',marginBottom:10}}>
+                      📏 Benchmark Gaps (vs Excellence Report targets)
+                    </div>
+                    {Object.entries(latestGaps).map(([metric, gap]) => {
+                      const pct = gap.current && gap.target
+                        ? Math.round(Math.abs((gap.current - gap.target) / gap.target) * 100)
+                        : 0;
+                      const isBehind = gap.current < gap.target;
+                      const metricLabels = {
+                        cpl: {label:'Cost Per Lead', good: 'below', unit:'$', fmt: v => '$'+Number(v).toFixed(0)},
+                        roas: {label:'ROAS', good: 'above', unit:'x', fmt: v => Number(v).toFixed(1)+'x'},
+                        ctr: {label:'Click-Through Rate', good: 'above', unit:'%', fmt: v => Number(v).toFixed(1)+'%'},
+                      };
+                      const m = metricLabels[metric] || {label: metric, good:'above', unit:'', fmt: v => v};
+                      return (
+                        <div key={metric} style={{display:'flex',alignItems:'center',gap:12,
+                          padding:'8px 0',borderBottom:'1px solid var(--border)',fontSize:12}}>
+                          <div style={{minWidth:120,fontWeight:600,color:'var(--text)'}}>{m.label}</div>
+                          <div style={{display:'flex',alignItems:'center',gap:6}}>
+                            <span style={{fontWeight:700,color: isBehind?'#dc2626':'#16a34a'}}>
+                              {m.fmt(gap.current)}
+                            </span>
+                            <span style={{color:'var(--text-muted)'}}>→ target</span>
+                            <span style={{fontWeight:600,color:'var(--text-muted)'}}>{m.fmt(gap.target)}</span>
+                          </div>
+                          <div style={{marginLeft:'auto',fontSize:10,padding:'2px 8px',borderRadius:8,
+                            background: isBehind ? '#fee2e2' : '#dcfce7',
+                            color: isBehind ? '#dc2626' : '#15803d',fontWeight:700}}>
+                            {isBehind ? '▼' : '▲'} {pct}% {isBehind ? 'below' : 'above'} target
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Per-run history table */}
+                <div style={{background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:10,padding:'14px 16px'}}>
+                  <div style={{fontSize:12,fontWeight:700,color:'var(--text)',marginBottom:10}}>
+                    Run-by-Run Impact History
+                  </div>
+                  <div style={{overflowX:'auto'}}>
+                    <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                      <thead>
+                        <tr style={{borderBottom:'1px solid var(--border)'}}>
+                          {['Date','Recs','Approved','Est. Waste Saved','Impact Types','Cumulative Savings'].map(h => (
+                            <th key={h} style={{textAlign:'left',padding:'5px 8px',
+                              color:'var(--text-muted)',fontWeight:700,fontSize:10,
+                              textTransform:'uppercase',letterSpacing:'0.04em',whiteSpace:'nowrap'}}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {impactHistory.map((run, idx) => {
+                          const ibt = run.impact_by_type || {};
+                          const typeChips = Object.entries(ibt)
+                            .filter(([,v]) => v > 0)
+                            .sort((a,b)=>b[1]-a[1])
+                            .slice(0, 3);
+                          return (
+                            <tr key={run.run_id || idx}
+                              style={{borderBottom:'1px solid var(--border)',background: idx%2===0?'transparent':'#fafafa'}}>
+                              <td style={{padding:'6px 8px',whiteSpace:'nowrap',fontWeight:600,color:'var(--text)'}}>
+                                {run.run_date ? new Date(run.run_date).toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '—'}
+                              </td>
+                              <td style={{padding:'6px 8px',textAlign:'center'}}>
+                                <span style={{background:'#f1f5f9',borderRadius:8,padding:'1px 7px',fontWeight:700}}>
+                                  {run.total_recs || 0}
+                                </span>
+                              </td>
+                              <td style={{padding:'6px 8px',textAlign:'center'}}>
+                                <span style={{background:'#dcfce7',color:'#15803d',borderRadius:8,padding:'1px 7px',fontWeight:700}}>
+                                  {run.approved_recs || 0}
+                                </span>
+                              </td>
+                              <td style={{padding:'6px 8px',fontWeight:700,
+                                color: (run.estimated_waste_saved_usd||0) > 0 ? '#dc2626' : 'var(--text-muted)'}}>
+                                {(run.estimated_waste_saved_usd||0) > 0
+                                  ? `$${Number(run.estimated_waste_saved_usd).toLocaleString('en-US',{maximumFractionDigits:0})}/mo`
+                                  : '—'}
+                              </td>
+                              <td style={{padding:'6px 8px'}}>
+                                <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+                                  {typeChips.map(([type, usd]) => {
+                                    const meta = typeLabels[type] || {label:type, color:'#64748b', icon:'•'};
+                                    return (
+                                      <span key={type} style={{fontSize:9,background:meta.color+'18',
+                                        color:meta.color,borderRadius:6,padding:'1px 5px',fontWeight:700,whiteSpace:'nowrap'}}>
+                                        {meta.icon} ${Number(usd).toLocaleString('en-US',{maximumFractionDigits:0})}
+                                      </span>
+                                    );
+                                  })}
+                                  {typeChips.length === 0 && <span style={{color:'var(--text-muted)'}}>—</span>}
+                                </div>
+                              </td>
+                              <td style={{padding:'6px 8px',fontWeight:700,color:'#15803d',whiteSpace:'nowrap'}}>
+                                ${Number(run.cum_estimated_savings||0).toLocaleString('en-US',{maximumFractionDigits:0})}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:8,fontStyle:'italic'}}>
+                    * Savings are estimates based on Claude's analysis. Actual impact tracked once recs are approved and executed.
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
 

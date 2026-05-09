@@ -58,6 +58,9 @@ from database import (
     log_call, get_calls, set_next_action, clear_next_action,
     # Lead tags
     get_lead_tags, set_lead_tags,
+    # Domain registry
+    list_domains, get_domain, create_domain, update_domain, delete_domain,
+    list_domain_pages,
 )
 from email_service import send_office_new_lead
 from follow_up_engine import start_scheduler, stop_scheduler, run_now
@@ -337,8 +340,15 @@ async def lifespan(app: FastAPI):
     ads_scheduler.add_job(_conversion_upload_job, CronTrigger(hour=23, minute=0),
                           id="conversion_upload", name="Google Ads Conversion Upload", replace_existing=True)
 
+    # Domain crawler — runs on the 1st of every month at 2 AM.
+    # Incremental: only re-crawls pages whose HTML has changed (hash diff).
+    # First crawl of a new domain is always full regardless of schedule.
+    from domain_crawler import domain_crawl_scheduled_job as _domain_crawl_job
+    ads_scheduler.add_job(_domain_crawl_job, CronTrigger(day=1, hour=2, minute=0),
+                          id="domain_crawl", name="Domain Crawler (monthly)", replace_existing=True)
+
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 11PM conversions)")
+    logger.info("Scheduled jobs started (1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 11PM conversions)")
 
     yield
 
@@ -2171,6 +2181,17 @@ def gads_optimizer_runs(limit: int = 20):
     from database import get_optimizer_runs
     runs = get_optimizer_runs(limit=limit)
     return {"runs": runs, "total": len(runs)}
+
+
+@app.get("/api/admin/optimizer/impact-history")
+def get_optimizer_impact_history(limit: int = 30):
+    """Return per-run impact history for the AI Optimizer Impact tab."""
+    try:
+        from database import get_impact_history
+        return {"impact_history": get_impact_history(limit=limit)}
+    except Exception as e:
+        logger.error(f"Impact history error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Step 10: TCPA Stop Conditions ──────────────────────────────────────────
@@ -8046,6 +8067,139 @@ def admin_test_od_connection():
         return {"ok": True, "message": f"Connected ✓  MySQL {version}"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ─── Domain Registry endpoints ────────────────────────────────────────────────
+
+class DomainCreateRequest(BaseModel):
+    domain_url:   str
+    label:        str  = ""
+    domain_type:  str  = "practice"   # practice | landing | competitor
+    crawl_enabled: bool = True
+    crawl_depth:  int  = 20
+
+    @validator("domain_url")
+    def _validate_url(cls, v):
+        v = v.strip().rstrip("/")
+        if not v.startswith("http://") and not v.startswith("https://"):
+            v = "https://" + v
+        return v
+
+    @validator("domain_type")
+    def _validate_type(cls, v):
+        if v not in ("practice", "landing", "competitor"):
+            raise ValueError("domain_type must be practice, landing, or competitor")
+        return v
+
+    @validator("crawl_depth")
+    def _validate_depth(cls, v):
+        if not (1 <= v <= 100):
+            raise ValueError("crawl_depth must be between 1 and 100")
+        return v
+
+
+class DomainUpdateRequest(BaseModel):
+    label:         Optional[str]  = None
+    domain_type:   Optional[str]  = None
+    crawl_enabled: Optional[bool] = None
+    crawl_depth:   Optional[int]  = None
+
+
+@app.get("/api/admin/domains", dependencies=[Depends(_require_admin)])
+def admin_list_domains():
+    """Return all registered domains with crawl status."""
+    return {"domains": list_domains()}
+
+
+@app.post("/api/admin/domains", dependencies=[Depends(_require_admin)])
+def admin_create_domain(body: DomainCreateRequest):
+    """Register a new domain for crawling."""
+    from database import get_domain_by_url
+    existing = get_domain_by_url(body.domain_url)
+    if existing:
+        raise HTTPException(status_code=409, detail="Domain already registered")
+    domain_id = create_domain(
+        domain_url=body.domain_url,
+        label=body.label,
+        domain_type=body.domain_type,
+        crawl_enabled=body.crawl_enabled,
+        crawl_depth=body.crawl_depth,
+    )
+    return {"ok": True, "domain_id": domain_id, "domain": get_domain(domain_id)}
+
+
+@app.patch("/api/admin/domains/{domain_id}", dependencies=[Depends(_require_admin)])
+def admin_update_domain(domain_id: int, body: DomainUpdateRequest):
+    """Update label, type, crawl settings."""
+    d = get_domain(domain_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    fields = {k: v for k, v in body.dict().items() if v is not None}
+    if fields:
+        update_domain(domain_id, **fields)
+    return {"ok": True, "domain": get_domain(domain_id)}
+
+
+@app.delete("/api/admin/domains/{domain_id}", dependencies=[Depends(_require_admin)])
+def admin_delete_domain(domain_id: int):
+    """Remove a domain and all its crawled page data."""
+    d = get_domain(domain_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    delete_domain(domain_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/domains/{domain_id}/crawl", dependencies=[Depends(_require_admin)])
+def admin_trigger_crawl(domain_id: int):
+    """
+    Trigger an immediate crawl of the domain.
+    Runs in a background thread so the endpoint returns instantly.
+    Returns 409 if a crawl is already running for this domain.
+    """
+    import threading
+    from domain_crawler import crawl_domain
+
+    d = get_domain(domain_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    if d.get("crawl_status") == "running":
+        raise HTTPException(status_code=409, detail="Crawl already in progress for this domain")
+
+    thread = threading.Thread(
+        target=crawl_domain,
+        args=(domain_id,),
+        daemon=True,
+        name=f"crawl-domain-{domain_id}",
+    )
+    thread.start()
+    return {"ok": True, "message": f"Crawl started for {d['domain_url']}"}
+
+
+@app.get("/api/admin/domains/{domain_id}/pages", dependencies=[Depends(_require_admin)])
+def admin_domain_pages(domain_id: int):
+    """Return crawled pages for a domain."""
+    d = get_domain(domain_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    pages = list_domain_pages(domain_id)
+    return {"domain": d, "pages": pages, "total": len(pages)}
+
+
+@app.get("/api/admin/domains/{domain_id}/context", dependencies=[Depends(_require_admin)])
+def admin_domain_context(domain_id: int, max_pages: int = 10):
+    """
+    Preview the AI context block that will be injected into campaign prompts.
+    Returns the raw markdown string.
+    """
+    from domain_crawler import build_site_context
+    d = get_domain(domain_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    context = build_site_context(domain_id, max_pages=max_pages)
+    if not context:
+        return {"context": "", "message": "No crawled pages yet. Trigger a crawl first."}
+    return {"context": context, "char_count": len(context)}
 
 
 if __name__ == "__main__":
