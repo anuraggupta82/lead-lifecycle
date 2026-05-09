@@ -2647,7 +2647,7 @@ def _negative_already_handled(keyword_text: str, campaign_name: str,
             row = conn.execute(
                 """
                 SELECT 1 FROM gads_audit_log
-                 WHERE entity_name = ?
+                 WHERE LOWER(entity_name) = ?
                    AND operation IN ('add_negative_keyword', 'add_to_shared_negative_list')
                    AND execution_result IN ('pending_approval', 'queued', 'rejected', 'success')
                  LIMIT 1
@@ -3139,6 +3139,14 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         for rec in structured:
             op = rec.get("operation", "claude_advisory")
             reason = rec.get("reason", "")
+
+            # Dedup check for Claude negative keyword recs — same as rule-based negatives
+            if op in ("add_negative_keyword", "add_to_shared_negative_list"):
+                kw_text = rec.get("keyword_text", "").strip().lower()
+                if kw_text and _negative_already_handled(kw_text, camp_name, live_negatives=live_negatives):
+                    logger.info(f"  [{camp_name}] SKIPPED Claude negative '{kw_text}' — already covered")
+                    continue
+
             advisories.append(f"[{camp_name}] {reason}")
 
             # Build before/after state from the structured fields
@@ -3218,7 +3226,6 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     for rec in acct_structured:
         op = rec.get("operation", "claude_advisory")
         reason = rec.get("reason", rec.get("insight", ""))
-        advisories.append(f"[Account Level] {reason}")
 
         op_meta = _OP_MAP.get(op)
         if op_meta:
@@ -3242,6 +3249,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 logger.info(f"  SKIPPED account-level Claude negative '{kw}' — already covered by live Google Ads negative")
                 continue
             _acct_negatives_logged.add(kw)
+
+        advisories.append(f"[Account Level] {reason}")
 
         aid = log_pending(
             operation=op,

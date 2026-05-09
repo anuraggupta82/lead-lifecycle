@@ -18,7 +18,10 @@ class Settings(BaseSettings):
     base_url: str = "http://localhost:7070"
 
     # Database
-    db_path: str = os.path.expanduser("~/grafton_pipeline/pipeline.db")
+    # Default: same folder as this file (backend/pipeline.db).
+    # Override in .env with DB_PATH=/full/path/to/pipeline.db
+    # On a new machine: just copy pipeline.db here and set DB_PATH accordingly.
+    db_path: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline.db")
 
     # Kill switch — set EMAILS_DISABLED=true in .env to block all outbound email
     emails_disabled: bool = True
@@ -80,7 +83,7 @@ class Settings(BaseSettings):
     # Practice
     office_phone: str = "508-318-4477"
     practice_name: str = "Grafton Dental Care"
-    practice_url: str = "https://nxtsmile.com"
+    practice_url: str = "https://graftondentalcare.com"
     booking_url: str = "https://patient.rocks/Dashboard/PatientDashboard/N2NiNzM4ZGUtM2IxYS00YjZhLWJjMGItMjAxZjBl"
 
     # GA4 Measurement Protocol

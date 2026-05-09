@@ -218,6 +218,8 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         campaign_name    = campaign.get("campaign_name", "New Campaign")
         monthly_budget   = float(campaign.get("monthly_budget") or 0)
         daily_budget_usd = round(monthly_budget / 30.4, 2) if monthly_budget else 10.0
+        # Fall back to practice_url (graftondentalcare.com) if no campaign-specific landing page is set.
+        # NOTE: settings.practice_url must always be set to https://graftondentalcare.com in config.py.
         landing_page     = campaign.get("landing_page") or settings.practice_url or "https://graftondentalcare.com"
         call_phone       = campaign.get("call_extension_phone") or settings.office_phone or ""
         geo_json         = campaign.get("geographic_targeting") or ""
@@ -693,6 +695,37 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         else:
             log.append(f"  ⚠ Enable failed: {enable_result['error']} — campaign remains PAUSED in Google Ads. Enable manually.")
 
+        # ── Step 10: Post-launch URL verification ─────────────────────────────
+        # Read back live ad final_urls from Google Ads and compare against intended landing_page.
+        # A mismatch means the wrong page went live — flag it loudly so it can be caught immediately.
+        url_warnings = []
+        log.append("Step 10: Verifying ad final URLs in Google Ads...")
+        try:
+            live_ads = fetch_ads_for_campaign(camp_numeric)
+            for live_ad in live_ads:
+                live_urls = live_ad.get("final_urls", [])
+                live_url_str = live_urls[0] if live_urls else ""
+                # Normalise for comparison: strip trailing slash, lowercase
+                intended_norm = landing_page.rstrip("/").lower()
+                live_norm     = live_url_str.rstrip("/").lower()
+                if live_norm and live_norm != intended_norm:
+                    msg = (
+                        f"⚠ URL MISMATCH on ad group '{live_ad.get('ad_group_name', '?')}': "
+                        f"intended '{landing_page}' but Google Ads has '{live_url_str}'"
+                    )
+                    log.append(f"  {msg}")
+                    url_warnings.append(msg)
+                    logger.error(f"POST-LAUNCH URL MISMATCH [{campaign_name}]: {msg}")
+                elif live_norm == intended_norm:
+                    log.append(f"  ✓ '{live_ad.get('ad_group_name','?')}' → {live_url_str}")
+                else:
+                    log.append(f"  ? '{live_ad.get('ad_group_name','?')}' — no final URL found in live ad")
+            if not live_ads:
+                log.append("  ? No live ads returned yet — may take a moment to propagate")
+        except Exception as _ve:
+            log.append(f"  ? URL verification skipped (non-fatal): {_ve}")
+            logger.warning(f"Post-launch URL verification failed (non-fatal): {_ve}")
+
         logger.info(
             f"create_campaign_in_gads: '{campaign_name}' created. "
             f"resource={camp_resource} kw={keywords_added} ads={ads_created}"
@@ -707,6 +740,7 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
             "keywords_added":         keywords_added,
             "ads_created":            ads_created,
             "enabled":                enable_result["ok"],
+            "url_warnings":           url_warnings,         # non-empty = landing page mismatch detected
             "error":                  None if enable_result["ok"] else f"Created but not enabled: {enable_result['error']}",
             "log":                    log,
         }

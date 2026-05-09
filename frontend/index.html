@@ -11227,7 +11227,7 @@ function LaunchButtonGroup({campaignId, canLaunch, onLaunched}) {
       });
       // Show creation log if a new campaign was pushed to Google Ads
       if (r.gads_action === 'created' && r.log) {
-        setLaunchLog({log: r.log, keywords: r.keywords_added, ads: r.ads_created, resource: r.resource_name, enabled: r.enabled});
+        setLaunchLog({log: r.log, keywords: r.keywords_added, ads: r.ads_created, resource: r.resource_name, enabled: r.enabled, urlWarnings: r.url_warnings || []});
       }
       if (typeof onLaunched === 'function') onLaunched(r.status, r.launch_date || '');
     } catch(e) {
@@ -11242,17 +11242,34 @@ function LaunchButtonGroup({campaignId, canLaunch, onLaunched}) {
     <div style={{position:'relative'}}>
       {err && <div style={{color:'#dc2626',fontSize:12,marginBottom:6}}>{err}</div>}
       {launchLog && (
-        <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,padding:'12px 14px',marginBottom:12,fontSize:11}}>
-          <div style={{fontWeight:700,color:'#15803d',marginBottom:6}}>
-            ✅ Campaign live in Google Ads! {launchLog.keywords} keywords · {launchLog.ads} RSA ad(s)
-          </div>
-          <div style={{fontFamily:'monospace',fontSize:10,color:'#374151',lineHeight:1.6,maxHeight:140,overflowY:'auto'}}>
-            {(launchLog.log||[]).map((line,i)=><div key={i}>{line}</div>)}
-          </div>
-          {!launchLog.enabled && (
-            <div style={{color:'#d97706',marginTop:6,fontSize:11}}>⚠ Campaign created but not auto-enabled — please enable manually in Google Ads.</div>
+        <div style={{marginBottom:12}}>
+          {/* ── URL mismatch warning — shown above everything else ── */}
+          {(launchLog.urlWarnings||[]).length > 0 && (
+            <div style={{background:'#fef2f2',border:'2px solid #dc2626',borderRadius:8,padding:'12px 14px',marginBottom:8}}>
+              <div style={{fontWeight:700,color:'#dc2626',fontSize:13,marginBottom:6}}>
+                🚨 LANDING PAGE MISMATCH DETECTED
+              </div>
+              <div style={{fontSize:11,color:'#7f1d1d',marginBottom:6}}>
+                The ad(s) live in Google Ads are pointing to a <strong>different URL</strong> than your campaign's landing page setting. Fix this immediately in Google Ads → Ads to avoid wasted spend.
+              </div>
+              {(launchLog.urlWarnings||[]).map((w,i)=>(
+                <div key={i} style={{fontFamily:'monospace',fontSize:10,color:'#991b1b',background:'#fee2e2',borderRadius:4,padding:'4px 8px',marginBottom:4}}>{w}</div>
+              ))}
+            </div>
           )}
-          <button onClick={()=>setLaunchLog(null)} style={{marginTop:8,fontSize:10,color:'#6b7280',background:'none',border:'none',cursor:'pointer'}}>Dismiss</button>
+          {/* ── Normal success log ── */}
+          <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,padding:'12px 14px',fontSize:11}}>
+            <div style={{fontWeight:700,color:'#15803d',marginBottom:6}}>
+              ✅ Campaign live in Google Ads! {launchLog.keywords} keywords · {launchLog.ads} RSA ad(s)
+            </div>
+            <div style={{fontFamily:'monospace',fontSize:10,color:'#374151',lineHeight:1.6,maxHeight:140,overflowY:'auto'}}>
+              {(launchLog.log||[]).map((line,i)=><div key={i}>{line}</div>)}
+            </div>
+            {!launchLog.enabled && (
+              <div style={{color:'#d97706',marginTop:6,fontSize:11}}>⚠ Campaign created but not auto-enabled — please enable manually in Google Ads.</div>
+            )}
+            <button onClick={()=>setLaunchLog(null)} style={{marginTop:8,fontSize:10,color:'#6b7280',background:'none',border:'none',cursor:'pointer'}}>Dismiss</button>
+          </div>
         </div>
       )}
       <div style={{display:'flex',borderRadius:8,overflow:'hidden'}}>
@@ -12244,8 +12261,7 @@ function fmtRecChange(json_str, op) {
 }
 
 // A single collapsible section (Account Level or one campaign)
-function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, defaultOpen }) {
-  const [open, setOpen] = React.useState(defaultOpen || false);
+function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, open, onToggle }) {
   const [selected, setSelected] = React.useState({});
   const [bulkBusy, setBulkBusy] = React.useState(false);
 
@@ -12300,7 +12316,7 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, def
   return (
     <div style={{border:'1px solid var(--border)',borderRadius:8,marginBottom:10,overflow:'hidden'}}>
       {/* Section header — always visible */}
-      <button onClick={() => setOpen(o => !o)}
+      <button onClick={() => onToggle(title)}
         style={{width:'100%',display:'flex',alignItems:'center',gap:8,padding:'10px 14px',
           background: open ? '#f8fafc' : '#fff',border:'none',cursor:'pointer',textAlign:'left',
           borderBottom: open ? '1px solid var(--border)' : 'none'}}>
@@ -12549,7 +12565,12 @@ function AiOptimizerTab() {
   const historyRecs = allRecs.filter(r => r.execution_result !== 'pending_approval' && r.execution_result !== 'queued');
 
   const accountPending = pendingRecs.filter(r => !r.campaign_name);
-  const campaignNames = [...new Set(pendingRecs.filter(r => r.campaign_name).map(r => r.campaign_name))].sort();
+  // Use ALL recs (not just pending) to determine campaign sections — so sections don't vanish after ignoring
+  const campaignNames = [...new Set(allRecs.filter(r => r.campaign_name).map(r => r.campaign_name))].sort();
+
+  const handleToggleSection = React.useCallback((key) => {
+    setExpandedSections(p => ({...p, [key]: !p[key]}));
+  }, []);
 
   const totalPending = pendingRecs.length;
   const totalHistory = historyRecs.length;
@@ -12619,7 +12640,8 @@ function AiOptimizerTab() {
                 onApprove={handleApprove}
                 onIgnore={handleIgnore}
                 busy={busy}
-                defaultOpen={expandedSections['__account__'] || false}
+                open={expandedSections['__account__'] || false}
+                onToggle={() => handleToggleSection('__account__')}
               />
 
               {/* Per-campaign sections */}
@@ -12632,7 +12654,8 @@ function AiOptimizerTab() {
                   onApprove={handleApprove}
                   onIgnore={handleIgnore}
                   busy={busy}
-                  defaultOpen={expandedSections[name] || false}
+                  open={expandedSections[name] || false}
+                  onToggle={() => handleToggleSection(name)}
                 />
               ))}
             </>

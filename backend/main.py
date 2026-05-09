@@ -3085,6 +3085,7 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
                 launch_date=_dt.datetime.utcnow().isoformat() + "Z",
             )
 
+            url_warnings = result.get("url_warnings", [])
             return {
                 "ok": True,
                 "status": "ACTIVE",
@@ -3095,6 +3096,7 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
                 "keywords_added": result["keywords_added"],
                 "ads_created": result["ads_created"],
                 "enabled": result.get("enabled", False),
+                "url_warnings": url_warnings,
                 "launch_date": _dt.datetime.utcnow().isoformat() + "Z",
                 "log": result["log"],
             }
