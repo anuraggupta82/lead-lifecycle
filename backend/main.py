@@ -3008,7 +3008,11 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
     gads_errors: list[str] = []
 
     if gads_resource:
-        from google_ads_write import set_campaign_daily_budget, set_campaign_status_gads
+        from google_ads_write import (
+            set_campaign_daily_budget,
+            set_campaign_status_gads,
+            update_campaign_ad_final_urls,
+        )
         from campaign_safety import check_budget_absolute_limits, WriteBlockedError
 
         # Push monthly_budget → daily budget
@@ -3041,6 +3045,27 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
                 except Exception as e:
                     gads_errors.append(f"status push failed: {e}")
                     logger.error(f"PATCH campaign {campaign_id}: status push error: {e}")
+
+        # Push landing_page → final_urls on all RSA ads
+        if "landing_page" in fields:
+            new_url = (fields["landing_page"] or "").strip()
+            if new_url.startswith("http"):
+                try:
+                    result = update_campaign_ad_final_urls(gads_resource, new_url)
+                    n = result.get("updated", 0)
+                    errs = result.get("errors", [])
+                    if n > 0:
+                        gads_pushed.append(f"landing page → {new_url} ({n} ad{'s' if n != 1 else ''} updated)")
+                        logger.info(f"PATCH campaign {campaign_id}: pushed landing_page to {n} ads")
+                    if errs:
+                        for err in errs:
+                            gads_errors.append(f"landing page partial error: {err}")
+                        logger.warning(f"PATCH campaign {campaign_id}: landing page push errors: {errs}")
+                except Exception as e:
+                    gads_errors.append(f"landing page push failed: {e}")
+                    logger.error(f"PATCH campaign {campaign_id}: landing page push error: {e}")
+            else:
+                logger.info(f"PATCH campaign {campaign_id}: landing_page skipped (not a valid URL: {new_url!r})")
 
     return {
         "ok": True,
@@ -5358,6 +5383,41 @@ def admin_get_calls(
     }
 
 
+@app.get("/api/admin/calls/campaign-attribution", dependencies=[Depends(_require_admin)])
+def admin_calls_campaign_attribution_early(days: int = 30):
+    """
+    Return per-campaign call counts and OD appointment counts.
+    Used by the campaign performance table to show Calls and Appts from Calls columns.
+    NOTE: Must be registered BEFORE the {uuid} wildcard route below.
+    """
+    from database import _conn
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT
+                 COALESCE(NULLIF(gcv.campaign_name,''), NULLIF(l.campaign_name,'')) AS campaign_name,
+                 COALESCE(NULLIF(gcv.campaign_id,''),   NULLIF(l.campaign_id,''))   AS campaign_id,
+                 COUNT(*) AS total_calls,
+                 SUM(CASE WHEN mc.booked_outcome='booked' THEN 1 ELSE 0 END) AS booked_calls,
+                 SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
+                           AND mc.od_appointment_id != '' THEN 1 ELSE 0 END) AS confirmed_appts
+               FROM mango_calls mc
+               LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+               LEFT JOIN leads l ON l.id = mc.lead_id
+               WHERE mc.started_at >= ?
+                 AND mc.direction = 'inbound'
+                 AND (
+                   (gcv.campaign_name IS NOT NULL AND gcv.campaign_name != '')
+                   OR (l.campaign_name IS NOT NULL AND l.campaign_name != '')
+                 )
+               GROUP BY campaign_name, campaign_id
+               ORDER BY total_calls DESC""",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 @app.get("/api/admin/calls/{uuid}", dependencies=[Depends(_require_admin)])
 def admin_get_call(uuid: str):
     """Return a single Mango call record by UUID."""
@@ -5467,40 +5527,6 @@ def admin_match_single_call_to_od(uuid: str):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/admin/calls/campaign-attribution", dependencies=[Depends(_require_admin)])
-def admin_calls_campaign_attribution(days: int = 30):
-    """
-    Return per-campaign call counts and OD appointment counts.
-    Used by the campaign performance table to show Calls and Appts from Calls columns.
-    """
-    from database import _conn
-    from datetime import timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    with _conn() as conn:
-        rows = conn.execute(
-            """SELECT
-                 COALESCE(NULLIF(gcv.campaign_name,''), NULLIF(l.campaign_name,'')) AS campaign_name,
-                 COALESCE(NULLIF(gcv.campaign_id,''),   NULLIF(l.campaign_id,''))   AS campaign_id,
-                 COUNT(*) AS total_calls,
-                 SUM(CASE WHEN mc.booked_outcome='booked' THEN 1 ELSE 0 END) AS booked_calls,
-                 SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
-                           AND mc.od_appointment_id != '' THEN 1 ELSE 0 END) AS confirmed_appts
-               FROM mango_calls mc
-               LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
-               LEFT JOIN leads l ON l.id = mc.lead_id
-               WHERE mc.started_at >= ?
-                 AND mc.direction = 'inbound'
-                 AND (
-                   (gcv.campaign_name IS NOT NULL AND gcv.campaign_name != '')
-                   OR (l.campaign_name IS NOT NULL AND l.campaign_name != '')
-                 )
-               GROUP BY campaign_name, campaign_id
-               ORDER BY total_calls DESC""",
-            (cutoff,),
-        ).fetchall()
-    return [dict(r) for r in rows]
 
 
 @app.post("/api/admin/gads/{call_id}/match-and-transcribe", dependencies=[Depends(_require_admin)])

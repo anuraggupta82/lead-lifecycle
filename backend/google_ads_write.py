@@ -266,7 +266,81 @@ def set_campaign_status_gads(campaign_resource: str, new_status: str) -> bool:
     return True
 
 
-# ── 6. Replace geographic targeting (PR 3) ────────────────────────────────────
+# ── 6. Update final_urls on all RSA ads in a campaign ────────────────────────
+
+def update_campaign_ad_final_urls(campaign_resource: str, new_url: str) -> dict:
+    """
+    Replace final_urls on every enabled/paused RSA ad in the given campaign.
+
+    Returns:
+        {"updated": N, "skipped": M, "errors": [...]}
+
+    Why a campaign-level operation: landing page changes apply to all ads in the
+    campaign uniformly. Targeting individual ad resource names would require an
+    extra lookup pass before this call, adding complexity for no benefit.
+    """
+    if not new_url or not new_url.startswith("http"):
+        raise ValueError(f"Invalid URL '{new_url}' — must start with http:// or https://")
+
+    client = _build_client()
+    customer_id = _customer_id_from_resource(campaign_resource)
+    ga_service = client.get_service("GoogleAdsService")
+    ad_service = client.get_service("AdGroupAdService")
+
+    # Step 1 — fetch all enabled/paused RSA ads for the campaign
+    query = f"""
+        SELECT
+            ad_group_ad.resource_name,
+            ad_group_ad.ad.final_urls
+        FROM ad_group_ad
+        WHERE campaign.resource_name = '{campaign_resource}'
+          AND ad_group_ad.status IN (ENABLED, PAUSED)
+          AND ad_group_ad.ad.type = RESPONSIVE_SEARCH_AD
+    """
+
+    ad_resources = []
+    for row in ga_service.search(customer_id=customer_id, query=query):
+        ad_resources.append(row.ad_group_ad.resource_name)
+
+    if not ad_resources:
+        return {"updated": 0, "skipped": 0, "errors": ["No RSA ads found for this campaign"]}
+
+    # Step 2 — build one mutate operation per ad
+    ops = []
+    for res in ad_resources:
+        op = client.get_type("AdGroupAdOperation")
+        ad_group_ad = op.update
+        ad_group_ad.resource_name = res
+        # Clear existing final_urls and set the new one
+        ad_group_ad.ad.final_urls[:] = [new_url]
+        op.update_mask.CopyFrom(
+            client.get_type("FieldMask")
+        )
+        op.update_mask.paths.append("ad.final_urls")
+        ops.append(op)
+
+    # Step 3 — mutate in batches of 50 (safe API limit)
+    updated = 0
+    errors = []
+    BATCH = 50
+    for i in range(0, len(ops), BATCH):
+        batch = ops[i : i + BATCH]
+        try:
+            ad_service.mutate_ad_group_ads(customer_id=customer_id, operations=batch)
+            updated += len(batch)
+        except Exception as e:
+            err_msg = str(e)
+            logger.error(f"update_campaign_ad_final_urls batch {i//BATCH}: {err_msg}")
+            errors.append(err_msg[:200])
+
+    logger.info(
+        f"update_campaign_ad_final_urls: campaign={campaign_resource} "
+        f"url={new_url!r} updated={updated} errors={len(errors)}"
+    )
+    return {"updated": updated, "skipped": 0, "errors": errors}
+
+
+# ── 7. Replace geographic targeting (PR 3) ────────────────────────────────────
 
 def replace_campaign_locations(
     campaign_resource: str,

@@ -6771,6 +6771,16 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                   color:'#fff',borderRadius:4,padding:'3px 7px',width:110}}
                                 placeholder="End date"/>
                             </div>
+                            <div style={{display:'flex',gap:6,alignItems:'center',marginTop:2}}>
+                              <input value={campEditFields.landing_page ?? (camp.landing_page||'')}
+                                onChange={e=>setCampEditFields(f=>({...f,landing_page:e.target.value}))}
+                                style={{fontSize:11,background:'rgba(255,255,255,.1)',border:'1px solid rgba(255,255,255,.3)',
+                                  color:'#fff',borderRadius:4,padding:'3px 7px',flex:1,minWidth:0}}
+                                placeholder="Landing page URL (https://...)"/>
+                              <span style={{fontSize:10,color:'rgba(255,255,255,.55)',whiteSpace:'nowrap'}}>
+                                {camp.gads_campaign_resource ? '↗ pushes to Google Ads ads' : 'local only'}
+                              </span>
+                            </div>
                           </div>
                         ) : (
                           <>

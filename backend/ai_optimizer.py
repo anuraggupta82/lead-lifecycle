@@ -185,6 +185,123 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
     return results
 
 
+def _get_campaign_settings(client, customer_id: str, days: int = 30) -> dict:
+    """
+    Pull campaign-level settings and impression share metrics for each active campaign.
+    Returns dict keyed by campaign resource_name.
+
+    Fields per campaign:
+      campaign_name, daily_budget_usd, bidding_strategy_type,
+      target_cpa_micros, target_roas,
+      search_impression_share, search_budget_lost_impression_share,
+      search_rank_lost_impression_share
+    """
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    # Pass 1: campaign settings (budget, bidding strategy)
+    settings_query = """
+        SELECT
+            campaign.resource_name,
+            campaign.name,
+            campaign.status,
+            campaign.bidding_strategy_type,
+            campaign.target_cpa.target_cpa_micros,
+            campaign.target_roas.target_roas,
+            campaign.maximize_conversions.target_cpa_micros,
+            campaign.campaign_budget
+        FROM campaign
+        WHERE campaign.status IN (ENABLED, PAUSED)
+    """
+
+    campaign_settings: dict = {}
+    budget_resources: set = set()
+    try:
+        for row in service.search(customer_id=customer_id, query=settings_query):
+            rn = row.campaign.resource_name
+            budget_rn = row.campaign.campaign_budget or ""
+            if budget_rn:
+                budget_resources.add(budget_rn)
+
+            # Bidding strategy
+            strategy_type = str(row.campaign.bidding_strategy_type).replace("BiddingStrategyType.", "")
+            target_cpa = (
+                row.campaign.target_cpa.target_cpa_micros
+                or row.campaign.maximize_conversions.target_cpa_micros
+                or 0
+            )
+            target_roas = row.campaign.target_roas.target_roas or 0.0
+
+            campaign_settings[rn] = {
+                "campaign_name": row.campaign.name,
+                "bidding_strategy_type": strategy_type,
+                "target_cpa_usd": round(target_cpa / 1_000_000, 2) if target_cpa else None,
+                "target_roas": round(target_roas, 3) if target_roas else None,
+                "daily_budget_usd": 0.0,
+                "_budget_resource": budget_rn,
+                # impression share filled in pass 2
+                "search_impression_share": None,
+                "search_budget_lost_is": None,
+                "search_rank_lost_is": None,
+            }
+    except Exception as e:
+        logger.warning(f"_get_campaign_settings pass 1 failed: {e}")
+
+    # Pass 2: resolve budget amounts
+    if budget_resources:
+        in_list = ", ".join(f"'{rn}'" for rn in budget_resources)
+        try:
+            budget_query = f"""
+                SELECT campaign_budget.resource_name, campaign_budget.amount_micros
+                FROM campaign_budget
+                WHERE campaign_budget.resource_name IN ({in_list})
+            """
+            budget_map = {}
+            for row in service.search(customer_id=customer_id, query=budget_query):
+                budget_map[row.campaign_budget.resource_name] = row.campaign_budget.amount_micros or 0
+            for s in campaign_settings.values():
+                brn = s.pop("_budget_resource", "")
+                s["daily_budget_usd"] = round(budget_map.get(brn, 0) / 1_000_000, 2)
+        except Exception as e:
+            logger.warning(f"_get_campaign_settings budget pass failed: {e}")
+            for s in campaign_settings.values():
+                s.pop("_budget_resource", None)
+
+    # Pass 3: impression share (requires date range segment)
+    try:
+        is_query = f"""
+            SELECT
+                campaign.resource_name,
+                metrics.search_impression_share,
+                metrics.search_budget_lost_impression_share,
+                metrics.search_rank_lost_impression_share
+            FROM campaign
+            WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+              AND campaign.status IN (ENABLED, PAUSED)
+        """
+        is_totals: dict = {}
+        is_counts: dict = {}
+        for row in service.search(customer_id=customer_id, query=is_query):
+            rn = row.campaign.resource_name
+            is_totals.setdefault(rn, {"is": 0.0, "budget_lost": 0.0, "rank_lost": 0.0})
+            is_counts.setdefault(rn, 0)
+            is_totals[rn]["is"] += row.metrics.search_impression_share or 0
+            is_totals[rn]["budget_lost"] += row.metrics.search_budget_lost_impression_share or 0
+            is_totals[rn]["rank_lost"] += row.metrics.search_rank_lost_impression_share or 0
+            is_counts[rn] += 1
+        for rn, totals in is_totals.items():
+            n = is_counts[rn] or 1
+            if rn in campaign_settings:
+                campaign_settings[rn]["search_impression_share"] = round(totals["is"] / n, 3)
+                campaign_settings[rn]["search_budget_lost_is"] = round(totals["budget_lost"] / n, 3)
+                campaign_settings[rn]["search_rank_lost_is"] = round(totals["rank_lost"] / n, 3)
+    except Exception as e:
+        logger.warning(f"_get_campaign_settings impression share pass failed: {e}")
+
+    return campaign_settings
+
+
 def _get_search_terms(client, customer_id: str, start_date: date | None = None, days: int = 30) -> list:
     """Pull search terms report to find new keywords and negatives.
 
@@ -712,7 +829,8 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              google_recs: list | None = None,
                              optimizer_run_id: str = "",
                              existing_negatives: set | None = None,
-                             memory_digest: dict | None = None) -> list:
+                             memory_digest: dict | None = None,
+                             camp_settings: dict | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -784,6 +902,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
         context = {
             "campaign_name": campaign,
             "campaign_resource": campaign_resource,
+            "campaign_settings": camp_settings or {},   # budget, bidding strategy, impression share
             "summary": summary,
             "keyword_performance": [
                 {**k, **kw_resource_map.get(k.get("keyword","").lower(), {})}
@@ -819,6 +938,23 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
 
         prompt = """You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
+
+CAMPAIGN SETTINGS (use these to inform every recommendation):
+The field "campaign_settings" in the data contains the live configuration from Google Ads:
+- daily_budget_usd: the actual daily budget currently set in Google Ads
+- bidding_strategy_type: e.g. MANUAL_CPC, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS
+- target_cpa_usd: target cost-per-acquisition (for Target CPA campaigns; null if not set)
+- target_roas: target return on ad spend (for Target ROAS campaigns; null if not set)
+- search_impression_share: fraction of eligible impressions we're capturing (0–1.0)
+- search_budget_lost_is: impression share lost due to budget being too low (0–1.0)
+- search_rank_lost_is: impression share lost due to ad rank / bid too low (0–1.0)
+
+Use this to:
+- If search_budget_lost_is > 0.2: the campaign is budget-constrained — increasing bids will not help, suggest change_budget instead
+- If search_rank_lost_is > 0.3: the campaign is losing due to low bids/quality — bid increases or quality improvements are warranted
+- If bidding_strategy_type is MANUAL_CPC and the campaign has 30+ conversions in 30 days: consider recommending change_bid_strategy to MAXIMIZE_CONVERSIONS or TARGET_CPA
+- If bidding_strategy_type is MAXIMIZE_CONVERSIONS or TARGET_CPA: do NOT suggest manual bid adjustments (increase_bid / decrease_bid) — the smart bidding algorithm manages bids automatically
+- Always reference the current daily_budget_usd when recommending a change_budget — state the specific dollar increase and the % change
 
 Each recommendation MUST be a JSON object with these fields:
 - "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset
@@ -2729,6 +2865,14 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     live_negatives = _fetch_existing_negatives(client, customer_id)
 
     # Collect data
+    logger.info("Collecting campaign settings (budget, bidding strategy, impression share)...")
+    campaign_settings = {}
+    try:
+        campaign_settings = _get_campaign_settings(client, customer_id, days=30)
+        logger.info(f"Campaign settings fetched for {len(campaign_settings)} campaigns")
+    except Exception as _cs_e:
+        logger.warning(f"Campaign settings fetch failed (non-fatal): {_cs_e}")
+
     logger.info("Collecting keyword performance...")
     keyword_perf = _get_keyword_performance(client, customer_id, days=30)
 
@@ -3119,6 +3263,9 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             except Exception as _geo_e:
                 logger.warning(f"  [{camp_name}] Geo pre-resolve failed (non-fatal): {_geo_e}")
 
+        # Resolve campaign settings for this campaign by resource name
+        camp_settings = campaign_settings.get(camp_resource, {}) if camp_resource else {}
+
         structured = _call_claude_advisories(
             camp_kw, attribution, camp_st,
             call_attribution, od_production,
@@ -3130,6 +3277,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             optimizer_run_id=run_id,
             existing_negatives=live_negatives,
             memory_digest=memory_digest,
+            camp_settings=camp_settings,
         )
         if not structured:
             continue
