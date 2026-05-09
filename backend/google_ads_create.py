@@ -16,6 +16,61 @@ from config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# ── Proximity targeting: hardcoded lat/lng table ──────────────────────────────
+# Google Ads ProximityCriterion REQUIRES geo_point (lat/lng in micro-degrees).
+# Sending only city_name is unreliable: the API may fail or silently geocode to
+# a different city (there are Graftons in WI, OH, NH, VT, ND...).
+# The address sub-message is display-only and does NOT drive ad serving.
+_KNOWN_CITY_LATLNG: dict[tuple[str, str], tuple[float, float]] = {
+    # Grafton MA + surrounding towns within 20 miles
+    ("grafton",       "MA"): (42.2012, -71.6870),
+    ("worcester",     "MA"): (42.2626, -71.8023),
+    ("shrewsbury",    "MA"): (42.2959, -71.7128),
+    ("westborough",   "MA"): (42.2695, -71.6162),
+    ("northborough",  "MA"): (42.3195, -71.6412),
+    ("southborough",  "MA"): (42.3048, -71.5220),
+    ("upton",         "MA"): (42.1737, -71.6034),
+    ("hopkinton",     "MA"): (42.2287, -71.5226),
+    ("milford",       "MA"): (42.1395, -71.5161),
+    ("sutton",        "MA"): (42.1498, -71.7659),
+    ("millbury",      "MA"): (42.1953, -71.7603),
+    ("auburn",        "MA"): (42.1948, -71.8356),
+    ("leicester",     "MA"): (42.2473, -71.9070),
+    ("spencer",       "MA"): (42.2456, -71.9923),
+    ("holden",        "MA"): (42.3537, -71.8620),
+    ("boylston",      "MA"): (42.3501, -71.7173),
+    ("berlin",        "MA"): (42.3812, -71.6384),
+    ("hudson",        "MA"): (42.3918, -71.5662),
+}
+
+
+def _resolve_city_latlng(
+    city: str,
+    state: str,
+    log: list,
+) -> tuple[float | None, float | None]:
+    """
+    Return (lat, lng) for a city/state pair.
+
+    Tries the hardcoded _KNOWN_CITY_LATLNG table first (exact match after
+    normalisation). Returns (None, None) when the city is unknown so the
+    caller can surface a clear error rather than letting the API silently
+    drop the criterion.
+
+    To add a new city: look up coordinates on Google Maps, add an entry to
+    _KNOWN_CITY_LATLNG above (key is (city.lower(), state.upper())).
+    """
+    key = (city.strip().lower(), (state or "MA").strip().upper())
+    coords = _KNOWN_CITY_LATLNG.get(key)
+    if coords:
+        return coords
+    log.append(
+        f"  ⚠ City '{city}, {state}' not in lat/lng table — cannot create proximity criterion. "
+        f"Add it to _KNOWN_CITY_LATLNG in google_ads_create.py."
+    )
+    return (None, None)
+
+
 # Google Ads prohibits phone numbers in ad text (PHONE_NUMBER_IN_AD_TEXT policy).
 # This regex catches common US formats: 508-318-4477, (508) 318-4477, 508.318.4477, 5083184477
 _PHONE_RE = re.compile(r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}|\b\d{10}\b')
@@ -312,34 +367,66 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
                 pass
 
         if geo_locs:
-            # Use GeoTargetConstant lookup for postal codes and named places
             geo_target_service = client.get_service("GeoTargetConstantService")
+            geo_unit = parsed.get("unit", "miles") if isinstance(parsed, dict) else "miles"
             for loc in geo_locs:
-                loc_type  = loc.get("type", "postal")
+                loc_type  = (loc.get("type") or "postal").lower()
                 loc_value = str(loc.get("value", "")).strip()
                 include   = loc.get("include", True)
+                radius    = loc.get("radius")
                 if not loc_value:
                     continue
                 try:
-                    # Suggest geo targets by name/postal code
-                    suggest_req = client.get_type("SuggestGeoTargetConstantsRequest")
-                    suggest_req.locale = "en"
-                    suggest_req.country_code = "US"
-                    # SuggestGeoTargetConstantsRequest uses location_names.names
-                    # (not geo_targets.names — that proto path does not exist)
-                    suggest_req.location_names.names.append(loc_value)
-
-                    suggest_resp = geo_target_service.suggest_geo_target_constants(request=suggest_req)
-                    for suggestion in (suggest_resp.geo_target_constant_suggestions or []):
-                        geo_const = suggestion.geo_target_constant
-                        crit_op   = client.get_type("CampaignCriterionOperation")
-                        crit      = crit_op.create
-                        crit.campaign = camp_resource
-                        crit.location.geo_target_constant = geo_const.resource_name
+                    if loc_type == "city" and radius is not None:
+                        # Proximity (radius) targeting — REQUIRES geo_point (lat/lng).
+                        # The ProximityCriterion.address is display-only and does NOT
+                        # drive ad serving. Sending only city_name without geo_point is
+                        # unreliable: the API may silently fail or geocode to the wrong
+                        # Grafton (there are Graftons in WI, OH, NH, VT, ND, etc.).
+                        city_part  = loc_value.split(",")[0].strip()
+                        state_part = loc_value.split(",")[1].strip() if "," in loc_value else "MA"
+                        loc_radius = max(1, min(500, float(radius)))
                         if not include:
-                            crit.negative = True
+                            log.append(f"  ⚠ Negative radius targeting not supported by Google Ads — skipping '{loc_value}'")
+                            continue
+                        lat, lng = _resolve_city_latlng(city_part, state_part, log)
+                        if lat is None or lng is None:
+                            continue  # error already appended to log by helper
+                        crit_op = client.get_type("CampaignCriterionOperation")
+                        crit    = crit_op.create
+                        crit.campaign = camp_resource
+                        # geo_point is what Google Ads uses for the radius circle
+                        crit.proximity.geo_point.latitude_in_micro_degrees  = int(round(lat  * 1_000_000))
+                        crit.proximity.geo_point.longitude_in_micro_degrees = int(round(lng  * 1_000_000))
+                        # address is display-only (shows in UI) — still useful
+                        crit.proximity.address.city_name     = city_part
+                        crit.proximity.address.province_code = state_part
+                        crit.proximity.address.country_code  = "US"
+                        crit.proximity.radius       = loc_radius
+                        crit.proximity.radius_units = (
+                            client.enums.ProximityRadiusUnitsEnum.MILES
+                            if geo_unit == "miles"
+                            else client.enums.ProximityRadiusUnitsEnum.KILOMETERS
+                        )
                         geo_ops.append(crit_op)
-                        break  # take first match only
+                        log.append(f"  ✓ Proximity: {city_part}, {state_part} ({lat:.4f},{lng:.4f}) · {loc_radius} {geo_unit}")
+                    else:
+                        # GeoTargetConstant lookup for postal codes and named places
+                        suggest_req = client.get_type("SuggestGeoTargetConstantsRequest")
+                        suggest_req.locale = "en"
+                        suggest_req.country_code = "US"
+                        suggest_req.location_names.names.append(loc_value)
+                        suggest_resp = geo_target_service.suggest_geo_target_constants(request=suggest_req)
+                        for suggestion in (suggest_resp.geo_target_constant_suggestions or []):
+                            geo_const = suggestion.geo_target_constant
+                            crit_op   = client.get_type("CampaignCriterionOperation")
+                            crit      = crit_op.create
+                            crit.campaign = camp_resource
+                            crit.location.geo_target_constant = geo_const.resource_name
+                            if not include:
+                                crit.negative = True
+                            geo_ops.append(crit_op)
+                            break  # take first match only
                 except Exception as ge:
                     log.append(f"  ⚠ Geo lookup failed for '{loc_value}': {ge}")
         else:
@@ -348,12 +435,24 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
             crit_op = client.get_type("CampaignCriterionOperation")
             crit    = crit_op.create
             crit.campaign = camp_resource
+            # geo_point is required for reliable proximity targeting (address-only is display-only)
+            crit.proximity.geo_point.latitude_in_micro_degrees  = 42_201_200
+            crit.proximity.geo_point.longitude_in_micro_degrees = -71_687_000
             crit.proximity.address.city_name     = "Grafton"
             crit.proximity.address.province_code = "MA"
             crit.proximity.address.country_code  = "US"
             crit.proximity.radius               = 15
             crit.proximity.radius_units         = client.enums.ProximityRadiusUnitsEnum.MILES
             geo_ops.append(crit_op)
+
+        # SAFETY: if geo_locs was specified but every lookup failed, geo_ops will be
+        # empty — launching without it would target the entire world.  Abort here.
+        if geo_locs and not geo_ops:
+            raise RuntimeError(
+                "Geographic targeting was requested but all geo lookups failed — "
+                "campaign creation aborted to avoid worldwide targeting. "
+                "Check geo location names and API connectivity."
+            )
 
         if geo_ops:
             geo_response = geo_criterion_service.mutate_campaign_criteria(
@@ -904,7 +1003,7 @@ def add_sitelinks_to_campaign(campaign_resource_name: str, sitelinks: list, cust
             asset    = asset_op.create
             asset.name = f"Camp {camp_id_suffix} Sitelink — {title}"
             asset.sitelink_asset.link_text = title
-            asset.sitelink_asset.final_urls.append(url)
+            asset.final_urls.append(url)  # final_urls is on Asset, not SitelinkAsset
 
             # descriptions: must be both-present or both-absent (Google policy)
             if desc1 and desc2:
@@ -923,19 +1022,13 @@ def add_sitelinks_to_campaign(campaign_resource_name: str, sitelinks: list, cust
         asset_response = asset_service.mutate_assets(
             customer_id=customer_id,
             operations=asset_ops,
-            partial_failure=True,
         )
 
-        # Collect successfully created asset resource names, log partial failures
+        # Collect successfully created asset resource names
         asset_resources = []
-        if hasattr(asset_response, "partial_failure_error") and asset_response.partial_failure_error.code:
-            pf_error = asset_response.partial_failure_error
-            logger.warning(f"add_sitelinks_to_campaign: partial_failure during asset create: {pf_error}")
-            errors.append(f"Some assets failed: {pf_error.message}")
-
         for i, result in enumerate(asset_response.results):
             rn = result.resource_name
-            if rn:  # empty resource_name indicates that slot failed in partial-failure mode
+            if rn:
                 asset_resources.append(rn)
             else:
                 label = valid_sitelinks[i]["title"] if i < len(valid_sitelinks) else f"index {i}"
@@ -957,15 +1050,10 @@ def add_sitelinks_to_campaign(campaign_resource_name: str, sitelinks: list, cust
         link_response = camp_asset_service.mutate_campaign_assets(
             customer_id=customer_id,
             operations=link_ops,
-            partial_failure=True,
         )
 
-        # Count actually linked (non-empty resource_name) and surface link-level partial failures
+        # Count actually linked
         linked_count = sum(1 for r in link_response.results if r.resource_name)
-        if hasattr(link_response, "partial_failure_error") and link_response.partial_failure_error.code:
-            pf_link_error = link_response.partial_failure_error
-            logger.warning(f"add_sitelinks_to_campaign: partial_failure during link: {pf_link_error}")
-            errors.append(f"Some links failed: {pf_link_error.message}")
 
         logger.info(f"add_sitelinks_to_campaign: {linked_count} sitelink(s) linked to {campaign_resource_name}")
         return {"ok": True, "count": linked_count, "errors": errors}
@@ -1025,7 +1113,7 @@ def fetch_campaigns_from_gads() -> list:
             "resource_name":    row.campaign.resource_name,
             "campaign_id":      str(row.campaign.id),
             "campaign_name":    row.campaign.name or "",
-            "gads_status":      str(row.campaign.status),   # "ENABLED" or "PAUSED"
+            "gads_status":      str(row.campaign.status.name),  # "ENABLED" or "PAUSED" (use .name not str() — str gives integer)
             "channel_type":     str(row.campaign.advertising_channel_type),
             "start_date":       "",
             "end_date":         "",

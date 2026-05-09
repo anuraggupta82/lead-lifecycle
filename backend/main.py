@@ -3011,7 +3011,6 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
         from google_ads_write import (
             set_campaign_daily_budget,
             set_campaign_status_gads,
-            update_campaign_ad_final_urls,
         )
         from campaign_safety import check_budget_absolute_limits, WriteBlockedError
 
@@ -3046,26 +3045,8 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
                     gads_errors.append(f"status push failed: {e}")
                     logger.error(f"PATCH campaign {campaign_id}: status push error: {e}")
 
-        # Push landing_page → final_urls on all RSA ads
-        if "landing_page" in fields:
-            new_url = (fields["landing_page"] or "").strip()
-            if new_url.startswith("http"):
-                try:
-                    result = update_campaign_ad_final_urls(gads_resource, new_url)
-                    n = result.get("updated", 0)
-                    errs = result.get("errors", [])
-                    if n > 0:
-                        gads_pushed.append(f"landing page → {new_url} ({n} ad{'s' if n != 1 else ''} updated)")
-                        logger.info(f"PATCH campaign {campaign_id}: pushed landing_page to {n} ads")
-                    if errs:
-                        for err in errs:
-                            gads_errors.append(f"landing page partial error: {err}")
-                        logger.warning(f"PATCH campaign {campaign_id}: landing page push errors: {errs}")
-                except Exception as e:
-                    gads_errors.append(f"landing page push failed: {e}")
-                    logger.error(f"PATCH campaign {campaign_id}: landing page push error: {e}")
-            else:
-                logger.info(f"PATCH campaign {campaign_id}: landing_page skipped (not a valid URL: {new_url!r})")
+        # Note: landing_page is saved to DB only — RSA final_urls is immutable in GAds API.
+        # Discrepancy is surfaced via the sync-from-gads endpoint instead.
 
     return {
         "ok": True,
@@ -3390,6 +3371,13 @@ def admin_campaign_set_ai_max(campaign_id: str, body: CampaignAiMaxRequest):
 
 class CampaignSitelinksRequest(BaseModel):
     sitelinks: list  # [{title, url, description1?, description2?}]
+
+
+@app.get("/api/admin/sitelink-library", dependencies=[Depends(_require_admin)])
+def admin_sitelink_library():
+    """Return all sitelinks from the shared library, most-used first."""
+    from database import get_sitelink_library
+    return {"sitelinks": get_sitelink_library()}
 
 
 @app.post("/api/admin/campaigns/{campaign_id}/sitelinks", dependencies=[Depends(_require_admin)])
@@ -4603,6 +4591,7 @@ def admin_sync_campaign_from_gads(campaign_id: str):
 
     # ── 2. Campaign-level settings: budget + status from Google Ads ───────────
     synced_fields: dict = {}
+    landing_page_discrepancy: dict | None = None
     try:
         all_campaigns = fetch_campaigns_from_gads()
         live = next(
@@ -4629,6 +4618,48 @@ def admin_sync_campaign_from_gads(campaign_id: str):
         # Non-fatal — snapshot was already saved; log and continue
         logger.warning(f"sync-from-gads: could not sync campaign-level fields: {_e}")
 
+    # ── 3. Landing page discrepancy check ─────────────────────────────────────
+    # Compare DB landing_page against live final_urls in the snapshot.
+    # If they differ, return a discrepancy object so the frontend can offer
+    # "Update Dashboard" (write live URL to DB) or "Update in Google Ads" (deep link).
+    try:
+        db_lp = (camp.get("landing_page") or "").rstrip("/").lower()
+        live_ads = snapshot.get("ad_copy") or []
+        raw_live_urls = []   # original URLs from API (preserve casing)
+        norm_live_urls = []  # lowercased+stripped for comparison
+        for ad in live_ads:
+            for url in (ad.get("final_urls") or []):
+                norm = url.rstrip("/").lower()
+                if norm and norm not in norm_live_urls:
+                    norm_live_urls.append(norm)
+                    raw_live_urls.append(url.rstrip("/"))
+
+        if db_lp and norm_live_urls and db_lp not in norm_live_urls:
+            # Parse numeric campaign ID from resource name for direct GAds link
+            gads_numeric = resource_name.split("/campaigns/")[-1] if "/campaigns/" in resource_name else ""
+            # Google Ads deep link to the Ads tab of this campaign
+            gads_edit_url = (
+                f"https://ads.google.com/aw/ads?campaignId={gads_numeric}"
+                if gads_numeric else "https://ads.google.com"
+            )
+            landing_page_discrepancy = {
+                "db_url":        camp.get("landing_page") or "",
+                "live_url":      raw_live_urls[0] if raw_live_urls else "",
+                "all_live_urls": norm_live_urls,  # normalized list used for validation
+                "gads_edit_url": gads_edit_url,
+            }
+            logger.info(
+                f"sync-from-gads {campaign_id}: landing page discrepancy — "
+                f"db={db_lp!r} live={raw_live_urls}"
+            )
+        elif not db_lp and raw_live_urls:
+            # DB has no landing page recorded but GAds has one — write it silently
+            update_campaign_fields(campaign_id, {"landing_page": raw_live_urls[0]})
+            synced_fields["landing_page"] = raw_live_urls[0]
+            logger.info(f"sync-from-gads {campaign_id}: seeded missing landing_page from GAds: {raw_live_urls[0]}")
+    except Exception as _lpe:
+        logger.warning(f"sync-from-gads: landing page check failed: {_lpe}")
+
     logger.info(f"Manual GAds sync complete for campaign {campaign_id}")
     return {
         "ok": True,
@@ -4636,6 +4667,232 @@ def admin_sync_campaign_from_gads(campaign_id: str):
         "snapshot": snapshot,
         "synced_at": snapshot.get("synced_from_gads_at"),
         "synced_fields": synced_fields,
+        "landing_page_discrepancy": landing_page_discrepancy,
+    }
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/accept-gads-landing-page", dependencies=[Depends(_require_admin)])
+def admin_accept_gads_landing_page(campaign_id: str, body: dict = Body(...)):
+    """
+    Accept the live Google Ads landing page URL as the source of truth.
+    Writes the provided URL into campaigns.landing_page in the DB.
+    Called when user clicks "Update Dashboard" on a landing page discrepancy banner.
+
+    Body:
+      url            — the URL to store (must match one of all_live_urls, if provided)
+      all_live_urls  — optional list of valid GAds URLs for server-side validation
+    """
+    from database import get_campaign_by_id, update_campaign_fields
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    url = (body.get("url") or "").strip()
+    if not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    # Validate against the list of known live URLs when the caller supplies it
+    all_live_urls = body.get("all_live_urls")
+    if all_live_urls and isinstance(all_live_urls, list):
+        norm_url = url.rstrip("/").lower()
+        norm_live = [u.rstrip("/").lower() for u in all_live_urls if isinstance(u, str)]
+        if norm_url not in norm_live:
+            raise HTTPException(
+                status_code=400,
+                detail="URL is not one of the live Google Ads landing pages"
+            )
+    update_campaign_fields(campaign_id, {"landing_page": url})
+    logger.info(f"accept-gads-landing-page {campaign_id}: DB updated to {url!r}")
+    return {"ok": True, "landing_page": url}
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/sync-to-gads", dependencies=[Depends(_require_admin)])
+def admin_sync_campaign_to_gads(campaign_id: str):
+    """
+    Push all dashboard values to Google Ads, then verify by reading back from the API.
+
+    Fields pushed:
+      - monthly_budget  → daily budget (monthly / 30.4)
+      - status          → ENABLED or PAUSED
+      - sitelinks       → replace all sitelink extensions on the campaign
+
+    NOTE: landing_page (final_urls) is NOT pushed. RSA final_urls is immutable
+    after creation in the Google Ads API — changing it requires pausing ads and
+    creating new ones, which must be done intentionally.
+
+    After pushing, reads back live Google Ads values and returns a verification
+    table showing: field, what was pushed, what Google Ads now reports, and
+    whether they match.
+    """
+    from database import get_campaign_by_id
+    from google_ads_write import (
+        set_campaign_daily_budget,
+        set_campaign_status_gads,
+    )
+    from google_ads_create import fetch_campaigns_from_gads, fetch_campaign_build_data, add_sitelinks_to_campaign
+    from campaign_safety import check_budget_absolute_limits, WriteBlockedError
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(
+            status_code=400,
+            detail="Campaign is not linked to Google Ads — import it first"
+        )
+
+    pushed: list[dict] = []   # [{field, pushed_value, label}]
+    errors: list[str]  = []
+
+    # ── 1. Push budget ────────────────────────────────────────────────────────
+    monthly_budget = camp.get("monthly_budget") or 0
+    if monthly_budget > 0:
+        new_daily  = round(monthly_budget / 30.4, 2)
+        new_micros = int(new_daily * 1_000_000)
+        try:
+            check_budget_absolute_limits(new_micros)
+            set_campaign_daily_budget(gads_resource, new_daily)
+            pushed.append({"field": "budget", "pushed_value": new_daily, "label": f"${new_daily:.2f}/day"})
+            logger.info(f"sync-to-gads {campaign_id}: budget → ${new_daily:.2f}/day")
+        except WriteBlockedError as e:
+            errors.append(f"budget blocked: {e}")
+        except Exception as e:
+            errors.append(f"budget push failed: {e}")
+            logger.error(f"sync-to-gads {campaign_id} budget error: {e}")
+
+    # ── 2. Push status ────────────────────────────────────────────────────────
+    db_status = (camp.get("status") or "").upper()
+    gads_status_map = {"ACTIVE": "ENABLED", "PAUSED": "PAUSED"}
+    gads_status = gads_status_map.get(db_status)
+    if gads_status:
+        try:
+            set_campaign_status_gads(gads_resource, gads_status)
+            pushed.append({"field": "status", "pushed_value": gads_status, "label": gads_status})
+            logger.info(f"sync-to-gads {campaign_id}: status → {gads_status}")
+        except Exception as e:
+            errors.append(f"status push failed: {e}")
+            logger.error(f"sync-to-gads {campaign_id} status error: {e}")
+
+    # ── 3. Landing page — NOT pushed automatically ────────────────────────────
+    # Google Ads RSA final_urls is IMMUTABLE after creation (IMMUTABLE_FIELD error).
+    # AdGroup.final_urls does not exist as a field in the API.
+    # Changing landing page requires pausing existing ads and creating new ones —
+    # too destructive to do silently. Landing page edits must be done manually in
+    # the Google Ads UI or via a dedicated "replace ads" workflow.
+    # The landing_page field in our DB is stored for reference / new campaign creation.
+
+    # ── 4. Push sitelinks ─────────────────────────────────────────────────────
+    sitelinks_raw = camp.get("sitelinks") or ""
+    sitelinks_list = []
+    if sitelinks_raw:
+        try:
+            sitelinks_list = json.loads(sitelinks_raw) if isinstance(sitelinks_raw, str) else sitelinks_raw
+        except Exception:
+            pass
+    if sitelinks_list:
+        try:
+            sl_result = add_sitelinks_to_campaign(gads_resource, sitelinks_list, replace=True)
+            n = sl_result.get("count", 0)
+            sl_errors = sl_result.get("errors") or []
+            if n > 0:
+                pushed.append({
+                    "field": "sitelinks",
+                    "pushed_value": n,
+                    "label": f"{n} sitelink{'s' if n != 1 else ''} pushed",
+                })
+                logger.info(f"sync-to-gads {campaign_id}: sitelinks → {n} pushed")
+                # Library upsert deferred to after verification confirms count match
+            for se in sl_errors:
+                errors.append(f"sitelinks: {se}")
+        except Exception as e:
+            errors.append(f"sitelinks push failed: {e}")
+            logger.error(f"sync-to-gads {campaign_id} sitelinks error: {e}")
+
+    # ── 5. Verify — read back from Google Ads ─────────────────────────────────
+    verification: list[dict] = []
+    try:
+        all_campaigns = fetch_campaigns_from_gads()
+        live = next((c for c in all_campaigns if c.get("resource_name") == gads_resource), None)
+
+        if live:
+            live_daily = live.get("daily_budget_usd") or 0.0
+            live_status = live.get("gads_status") or ""
+
+            # Verify budget
+            budget_pushed = next((p for p in pushed if p["field"] == "budget"), None)
+            if budget_pushed:
+                match = abs(live_daily - budget_pushed["pushed_value"]) < 0.02
+                verification.append({
+                    "field": "Daily Budget",
+                    "pushed":   f"${budget_pushed['pushed_value']:.2f}/day",
+                    "live":     f"${live_daily:.2f}/day",
+                    "match":    match,
+                })
+
+            # Verify status
+            status_pushed = next((p for p in pushed if p["field"] == "status"), None)
+            if status_pushed:
+                match = live_status.upper() == status_pushed["pushed_value"].upper()
+                verification.append({
+                    "field": "Status",
+                    "pushed":   status_pushed["pushed_value"],
+                    "live":     live_status,
+                    "match":    match,
+                })
+
+        # Verify sitelinks — count live sitelink assets on campaign
+        sl_pushed = next((p for p in pushed if p["field"] == "sitelinks"), None)
+        if sl_pushed:
+            try:
+                from google_ads_create import _build_client as _gc_build
+                _sl_cl = _gc_build()
+                _sl_ga = _sl_cl.get_service("GoogleAdsService")
+                _sl_query = f"""
+                    SELECT campaign_asset.asset, campaign_asset.status
+                    FROM campaign_asset
+                    WHERE campaign_asset.campaign = '{gads_resource}'
+                      AND campaign_asset.field_type = SITELINK
+                      AND campaign_asset.status != REMOVED
+                """
+                from google_ads_write import _customer_id_from_resource as _cid_from_res2
+                _sl_cid = _cid_from_res2(gads_resource)
+                live_sl_count = sum(1 for _ in _sl_ga.search(customer_id=_sl_cid, query=_sl_query))
+                match = live_sl_count == sl_pushed["pushed_value"]
+                verification.append({
+                    "field": "Sitelinks",
+                    "pushed":   f"{sl_pushed['pushed_value']} sitelink{'s' if sl_pushed['pushed_value'] != 1 else ''}",
+                    "live":     f"{live_sl_count} sitelink{'s' if live_sl_count != 1 else ''} in Google Ads",
+                    "match":    match,
+                })
+                # ── Save to sitelink library only after verified ──────────────
+                if match and sitelinks_list:
+                    try:
+                        from database import upsert_sitelink_library
+                        upsert_sitelink_library(sitelinks_list)
+                        logger.info(f"sync-to-gads {campaign_id}: {len(sitelinks_list)} sitelinks saved to library (verified)")
+                    except Exception as lib_e:
+                        logger.warning(f"sync-to-gads: sitelink library upsert failed (non-fatal): {lib_e}")
+            except Exception as ve:
+                verification.append({
+                    "field": "Sitelinks",
+                    "pushed":   f"{sl_pushed['pushed_value']} sitelinks",
+                    "live":     f"(verification failed: {ve})",
+                    "match":    None,
+                })
+
+    except Exception as ve:
+        logger.warning(f"sync-to-gads {campaign_id}: verification read-back failed: {ve}")
+        verification = [{"field": "Verification", "pushed": "", "live": f"Read-back failed: {ve}", "match": None}]
+
+    all_match = all(v.get("match") is True for v in verification) if verification else True
+
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "pushed": [p["label"] for p in pushed],
+        "errors": errors,
+        "verification": verification,
+        "all_match": all_match,
     }
 
 
@@ -5411,7 +5668,7 @@ def admin_calls_campaign_attribution_early(days: int = 30):
                    (gcv.campaign_name IS NOT NULL AND gcv.campaign_name != '')
                    OR (l.campaign_name IS NOT NULL AND l.campaign_name != '')
                  )
-               GROUP BY campaign_name, campaign_id
+               GROUP BY 1, 2
                ORDER BY total_calls DESC""",
             (cutoff,),
         ).fetchall()

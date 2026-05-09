@@ -1153,6 +1153,20 @@ def _migrate(conn):
     if "sitelinks" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN sitelinks TEXT DEFAULT ''")
 
+    # Sitelink library — shared pool of sitelinks that have been pushed to Google Ads
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sitelink_library (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            title         TEXT NOT NULL,
+            url           TEXT NOT NULL,
+            description1  TEXT NOT NULL DEFAULT '',
+            description2  TEXT NOT NULL DEFAULT '',
+            use_count     INTEGER NOT NULL DEFAULT 1,
+            last_used_at  TEXT NOT NULL,
+            UNIQUE(title, url)
+        )
+    """)
+
     # Add UNIQUE(lead_id, template) to follow_up_queue if not present
     # SQLite doesn't support adding UNIQUE constraints via ALTER TABLE — create a new index instead
     conn.execute("""
@@ -3008,6 +3022,54 @@ def get_gads_campaign_snapshot(campaign_id: str) -> dict:
         return snap
     except Exception:
         return {}
+
+
+def upsert_sitelink_library(sitelinks: list) -> int:
+    """
+    Upsert a list of {title, url, description1?, description2?} into sitelink_library.
+    On conflict (same title+url), increment use_count and update last_used_at.
+    Returns number of rows upserted.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    with _conn() as conn:
+        for sl in sitelinks:
+            title = (sl.get("title") or "").strip()
+            url   = (sl.get("url") or "").strip()
+            if not title or not url:
+                continue
+            desc1 = (sl.get("description1") or "").strip()
+            desc2 = (sl.get("description2") or "").strip()
+            conn.execute("""
+                INSERT INTO sitelink_library (title, url, description1, description2, use_count, last_used_at)
+                VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(title, url) DO UPDATE SET
+                    use_count    = use_count + 1,
+                    description1 = excluded.description1,
+                    description2 = excluded.description2,
+                    last_used_at = excluded.last_used_at
+            """, (title, url, desc1, desc2, now))
+            count += 1
+    return count
+
+
+def get_sitelink_library() -> list:
+    """Return all sitelinks from the library, most-used first."""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT id, title, url, description1, description2, use_count, last_used_at
+            FROM sitelink_library
+            ORDER BY use_count DESC, last_used_at DESC
+        """).fetchall()
+    return [
+        {
+            "id": r[0], "title": r[1], "url": r[2],
+            "description1": r[3], "description2": r[4],
+            "use_count": r[5], "last_used_at": r[6],
+        }
+        for r in rows
+    ]
 
 
 def get_search_term_type_breakdown(campaign_id: str, days: int = 30) -> dict:

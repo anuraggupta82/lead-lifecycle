@@ -5598,7 +5598,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts}}
   const [aiReviewSaving, setAiReviewSaving] = useState({});
   const [aiMaxSaving, setAiMaxSaving] = useState({});
-  const [syncingFromGads, setSyncingFromGads] = useState({});  // {campaign_id: bool}
+  const [syncingFromGads, setSyncingFromGads] = useState({});   // {campaign_id: bool}
+  const [syncingToGads, setSyncingToGads]     = useState({});   // {campaign_id: bool}
+  const [syncToResult, setSyncToResult]       = useState({});   // {campaign_id: result}
+  const [lpDiscrepancy, setLpDiscrepancy]     = useState({});   // {campaign_id: {db_url,live_url,gads_edit_url}}
   const [expandedStrategy, setExpandedStrategy] = useState(null);
   const [campActionLoading, setCampActionLoading] = useState({});
   const [detailTab, setDetailTab] = useState('strategy');
@@ -5627,6 +5630,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [sitelinkSuggestInstruction, setSitelinkSuggestInstruction] = useState('');
   const [sitelinkSuggestError, setSitelinkSuggestError] = useState(null);
   const [sitelinkRetryCount, setSitelinkRetryCount] = useState(0); // cap AI Fix & Retry at 2
+  const [sitelinkLibrary, setSitelinkLibrary] = useState([]); // [{title,url,use_count,...}]
 
   const [stopConfirm, setStopConfirm] = useState(null);
   const [gadsImportOpen, setGadsImportOpen] = useState(false);
@@ -6876,9 +6880,11 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           {loading==='stop'?'…':'⏹ Stop'}
                         </button>
                       )}
-                      {/* Sync from Google Ads — only for GAds-linked campaigns */}
-                      {camp.gads_campaign_resource && (
+                      {/* Sync buttons — only for GAds-linked campaigns */}
+                      {camp.gads_campaign_resource && (<>
+                        {/* ↓ Sync FROM Google Ads → app */}
                         <button className="btn btn-sm" disabled={!!syncingFromGads[camp.campaign_id]}
+                          title="Pull latest budget, status, keywords and ads from Google Ads into the dashboard"
                           style={{fontSize:10,background:'rgba(255,255,255,.15)',color:'#fff',
                             border:'1px solid rgba(255,255,255,.35)',display:'flex',alignItems:'center',gap:4}}
                           onClick={async()=>{
@@ -6886,12 +6892,18 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             try {
                               const r = await api(`/api/admin/campaigns/${camp.campaign_id}/sync-from-gads`,{method:'POST'});
                               await openCampaignDetail(camp.campaign_id, campDetailDays);
-                              // Show what was synced from Google Ads
                               const synced = r?.synced_fields || {};
+                              // Show landing page discrepancy banner if detected
+                              if (r?.landing_page_discrepancy) {
+                                setLpDiscrepancy(s=>({...s,[camp.campaign_id]: r.landing_page_discrepancy}));
+                              } else {
+                                setLpDiscrepancy(s=>({...s,[camp.campaign_id]: null}));
+                              }
                               const parts = [];
                               if (synced.monthly_budget != null) parts.push(`Budget → $${(synced.monthly_budget/30.4).toFixed(2)}/day`);
                               if (synced.status) parts.push(`Status → ${synced.status}`);
-                              if (parts.length) alert('↓ Synced from Google Ads:\n' + parts.join('\n'));
+                              if (synced.landing_page) parts.push(`Landing page seeded from Google Ads`);
+                              if (parts.length) alert('↓ Pulled from Google Ads:\n' + parts.join('\n'));
                             } catch(e){
                               alert('Sync failed: '+(e?.detail||e?.message));
                             } finally {
@@ -6899,11 +6911,34 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             }
                           }}>
                           {syncingFromGads[camp.campaign_id]
-                            ? <><span className="spinner" style={{width:10,height:10,borderWidth:1.5,display:'inline-block'}}/> Syncing…</>
-                            : '↻ Sync from Google Ads'
+                            ? <><span className="spinner" style={{width:10,height:10,borderWidth:1.5,display:'inline-block'}}/> Pulling…</>
+                            : '↓ Pull from GAds'
                           }
                         </button>
-                      )}
+
+                        {/* ↑ Sync TO Google Ads ← app */}
+                        <button className="btn btn-sm" disabled={!!syncingToGads[camp.campaign_id]}
+                          title="Push budget, status, and landing page from the dashboard to Google Ads, then verify"
+                          style={{fontSize:10,background:'rgba(16,185,129,.25)',color:'#6ee7b7',
+                            border:'1px solid rgba(16,185,129,.5)',display:'flex',alignItems:'center',gap:4}}
+                          onClick={async()=>{
+                            setSyncingToGads(s=>({...s,[camp.campaign_id]:true}));
+                            setSyncToResult(s=>({...s,[camp.campaign_id]:null}));
+                            try {
+                              const r = await api(`/api/admin/campaigns/${camp.campaign_id}/sync-to-gads`,{method:'POST'});
+                              setSyncToResult(s=>({...s,[camp.campaign_id]:r}));
+                            } catch(e){
+                              setSyncToResult(s=>({...s,[camp.campaign_id]:{error: e?.detail||e?.message||'Push failed'}}));
+                            } finally {
+                              setSyncingToGads(s=>({...s,[camp.campaign_id]:false}));
+                            }
+                          }}>
+                          {syncingToGads[camp.campaign_id]
+                            ? <><span className="spinner" style={{width:10,height:10,borderWidth:1.5,display:'inline-block'}}/> Pushing…</>
+                            : '↑ Push to GAds'
+                          }
+                        </button>
+                      </>)}
                       {/* Days filter */}
                       <div style={{marginLeft:'auto',display:'flex',gap:4}}>
                         {[7,30,90].map(d=>(
@@ -6917,6 +6952,119 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       </div>
                     </div>
                   </div>
+
+                  {/* ── Landing Page Discrepancy Banner ── */}
+                  {lpDiscrepancy[camp.campaign_id] && (() => {
+                    const lp = lpDiscrepancy[camp.campaign_id];
+                    const cid = camp.campaign_id;
+                    return (
+                      <div style={{margin:'8px 16px',padding:'12px 14px',
+                        background:'rgba(251,191,36,.08)',border:'1px solid rgba(251,191,36,.4)',
+                        borderRadius:6,fontSize:11}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
+                          <span style={{fontWeight:700,color:'#fde68a',fontSize:12}}>⚠ Landing Page Mismatch Detected</span>
+                          <button onClick={()=>setLpDiscrepancy(s=>({...s,[cid]:null}))}
+                            style={{background:'none',border:'none',color:'#9ca3af',cursor:'pointer',fontSize:12}}>✕</button>
+                        </div>
+                        <div style={{color:'#d1d5db',marginBottom:10,lineHeight:1.5}}>
+                          <div><span style={{color:'#9ca3af'}}>Dashboard:</span> <span style={{color:'#fca5a5'}}>{lp.db_url}</span></div>
+                          <div><span style={{color:'#9ca3af'}}>Google Ads:</span> <span style={{color:'#6ee7b7'}}>{lp.live_url}</span></div>
+                        </div>
+                        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                          <button className="btn btn-sm"
+                            style={{fontSize:10,background:'rgba(16,185,129,.2)',color:'#6ee7b7',border:'1px solid rgba(16,185,129,.4)'}}
+                            onClick={async()=>{
+                              try {
+                                await api(`/api/admin/campaigns/${cid}/accept-gads-landing-page`,{
+                                  method:'POST', body: JSON.stringify({url: lp.live_url, all_live_urls: lp.all_live_urls||[]})
+                                });
+                                setLpDiscrepancy(s=>({...s,[cid]:null}));
+                                await openCampaignDetail(cid, campDetailDays);
+                                alert('✅ Dashboard updated to: ' + lp.live_url);
+                              } catch(e) { alert('Failed: '+(e?.detail||e?.message)); }
+                            }}>
+                            ✅ Update Dashboard → {lp.live_url}
+                          </button>
+                          <a href={lp.gads_edit_url} target="_blank" rel="noopener noreferrer"
+                            style={{fontSize:10,padding:'4px 10px',borderRadius:4,
+                              background:'rgba(99,102,241,.2)',color:'#a5b4fc',
+                              border:'1px solid rgba(99,102,241,.4)',textDecoration:'none',
+                              display:'flex',alignItems:'center',gap:4}}>
+                            ✏️ Update in Google Ads ↗
+                          </a>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* ── Sync-To Verification Panel ── */}
+                  {syncToResult[camp.campaign_id] && (() => {
+                    const res = syncToResult[camp.campaign_id];
+                    if (res.error) return (
+                      <div style={{margin:'8px 16px',padding:'10px 14px',background:'rgba(239,68,68,.12)',
+                        border:'1px solid rgba(239,68,68,.4)',borderRadius:6,fontSize:11,color:'#fca5a5'}}>
+                        ✗ Push failed: {res.error}
+                        <button onClick={()=>setSyncToResult(s=>({...s,[camp.campaign_id]:null}))}
+                          style={{marginLeft:10,background:'none',border:'none',color:'#fca5a5',cursor:'pointer',fontSize:11}}>✕</button>
+                      </div>
+                    );
+                    const allOk = res.all_match && (!res.errors || res.errors.length === 0);
+                    return (
+                      <div style={{margin:'8px 16px',padding:'12px 14px',
+                        background: allOk ? 'rgba(16,185,129,.1)' : 'rgba(251,191,36,.1)',
+                        border: `1px solid ${allOk ? 'rgba(16,185,129,.4)' : 'rgba(251,191,36,.4)'}`,
+                        borderRadius:6,fontSize:11}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                          <span style={{fontWeight:700,color: allOk ? '#6ee7b7' : '#fde68a'}}>
+                            {allOk ? '✅ All changes pushed & verified' : '⚠ Pushed — review verification below'}
+                          </span>
+                          <button onClick={()=>setSyncToResult(s=>({...s,[camp.campaign_id]:null}))}
+                            style={{background:'none',border:'none',color:'#9ca3af',cursor:'pointer',fontSize:12}}>✕</button>
+                        </div>
+                        {/* What was pushed */}
+                        {res.pushed && res.pushed.length > 0 && (
+                          <div style={{marginBottom:8}}>
+                            <span style={{color:'#9ca3af'}}>Pushed: </span>
+                            {res.pushed.map((p,i)=>(
+                              <span key={i} style={{marginRight:8,color:'#d1fae5'}}>↑ {p}</span>
+                            ))}
+                          </div>
+                        )}
+                        {/* Verification table */}
+                        {res.verification && res.verification.length > 0 && (
+                          <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                            <thead>
+                              <tr style={{color:'#9ca3af',textAlign:'left'}}>
+                                <th style={{paddingBottom:4,paddingRight:12,fontWeight:600}}>Field</th>
+                                <th style={{paddingBottom:4,paddingRight:12,fontWeight:600}}>Pushed</th>
+                                <th style={{paddingBottom:4,paddingRight:12,fontWeight:600}}>Live in Google Ads</th>
+                                <th style={{paddingBottom:4,fontWeight:600}}>Match</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {res.verification.map((v,i)=>(
+                                <tr key={i} style={{borderTop:'1px solid rgba(255,255,255,.08)'}}>
+                                  <td style={{padding:'4px 12px 4px 0',color:'#e5e7eb'}}>{v.field}</td>
+                                  <td style={{padding:'4px 12px 4px 0',color:'#d1fae5',fontFamily:'monospace'}}>{v.pushed}</td>
+                                  <td style={{padding:'4px 12px 4px 0',color:'#bfdbfe',fontFamily:'monospace',maxWidth:260,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                                    title={v.live}>{v.live}</td>
+                                  <td style={{padding:'4px 0',textAlign:'center'}}>
+                                    {v.match === true ? '✅' : v.match === false ? '❌' : '⏳'}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                        {/* Errors */}
+                        {res.errors && res.errors.length > 0 && (
+                          <div style={{marginTop:8,color:'#fca5a5'}}>
+                            {res.errors.map((e,i)=><div key={i}>✗ {e}</div>)}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
                   {/* ── Body ── */}
                   {(() => {
@@ -7900,6 +8048,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     setSitelinkSuggestError(null);
                                     setSitelinkRetryCount(0);
                                     setSitelinkEditorOpen(true);
+                                    // Load sitelink library (non-blocking)
+                                    api('/api/admin/sitelink-library').then(r => {
+                                      setSitelinkLibrary(r?.sitelinks || []);
+                                    }).catch(()=>{});
                                   }
 
                                   // AI suggest — accepts optional overrides for error-retry loop
@@ -8109,6 +8261,37 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       {/* Editor */}
                                       {sitelinkEditorOpen && (
                                         <div style={{padding:'10px 14px 14px'}}>
+
+                                          {/* Library chips — sitelinks previously pushed to GAds */}
+                                          {sitelinkLibrary.length > 0 && (
+                                            <div style={{marginBottom:10,padding:'8px 10px',
+                                              background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:6}}>
+                                              <div style={{fontSize:11,fontWeight:600,color:'#166534',marginBottom:6}}>
+                                                📚 From your library — click to add
+                                              </div>
+                                              <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                                                {sitelinkLibrary.map((sl,i) => {
+                                                  const alreadyIn = sitelinkDraft.some(d =>
+                                                    d.title.toLowerCase() === sl.title.toLowerCase()
+                                                  );
+                                                  return (
+                                                    <button key={i}
+                                                      onClick={() => !alreadyIn && addSuggestionToDraft(sl)}
+                                                      title={sl.url}
+                                                      style={{fontSize:10,padding:'3px 9px',borderRadius:10,cursor: alreadyIn ? 'default' : 'pointer',
+                                                        background: alreadyIn ? '#dcfce7' : 'white',
+                                                        color: alreadyIn ? '#166534' : '#15803d',
+                                                        border: `1px solid ${alreadyIn ? '#86efac' : '#86efac'}`,
+                                                        opacity: alreadyIn ? 0.6 : 1,
+                                                        fontWeight:600}}>
+                                                      {alreadyIn ? '✓ ' : '+ '}{sl.title}
+                                                      {sl.use_count > 1 && <span style={{fontWeight:400,opacity:.7}}> ×{sl.use_count}</span>}
+                                                    </button>
+                                                  );
+                                                })}
+                                              </div>
+                                            </div>
+                                          )}
 
                                           {/* AI Suggest row */}
                                           <div style={{display:'flex',gap:6,alignItems:'center',marginBottom:10,
