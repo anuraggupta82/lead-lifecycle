@@ -3257,6 +3257,19 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
         except Exception:
             strategy = {}
 
+    # Site intelligence for refinement context
+    _refine_landing = camp.get("landing_page") or ""
+    _refine_site = get_setting("practice_website") or ""
+    _refine_url = _refine_landing or _refine_site
+    _refine_site_block = ""
+    if _refine_url:
+        try:
+            from domain_crawler import build_site_context_for_url
+            _refine_site_block = build_site_context_for_url(_refine_url)
+        except Exception as _sce:
+            logger.warning(f"build-step-refine site context fetch failed: {_sce}")
+    _refine_site_section = ("\n\n=== Website Intelligence ===\n" + _refine_site_block) if _refine_site_block else ""
+
     _api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
     ai_client = _anthropic.Anthropic(api_key=_api_key)
 
@@ -3265,7 +3278,7 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
 
 Campaign: {camp.get("campaign_name", "")}
 Service Focus: {camp.get("service_focus", "")}
-
+{_refine_site_section}
 Current strategy:
 {_json.dumps(current, indent=2)}
 
@@ -3289,7 +3302,7 @@ Return ONLY the JSON object, no explanation."""
 Campaign: {camp.get("campaign_name", "")}
 Service Focus: {camp.get("service_focus", "")}
 Objective: {strategy.get("objective", "")}
-
+{_refine_site_section}
 Current {body.step} content:
 {_json.dumps(current, indent=2)}
 
@@ -4094,6 +4107,19 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
     key_messages = strategy.get("key_messages", [])
     impl_notes = strategy.get("implementation_instructions", "")
 
+    # Site intelligence — use campaign landing_page first, fall back to practice website
+    _camp_landing = camp.get("landing_page") or ""
+    _practice_site = get_setting("practice_website") or ""
+    _site_url_for_context = _camp_landing or _practice_site
+    _site_context_block = ""
+    if _site_url_for_context:
+        try:
+            from domain_crawler import build_site_context_for_url
+            _site_context_block = build_site_context_for_url(_site_url_for_context)
+        except Exception as _sce:
+            logger.warning(f"build-step site context fetch failed ({step}): {_sce}")
+    _site_section = ("\n\n=== Website Intelligence ===\n" + _site_context_block) if _site_context_block else ""
+
     if step == "keywords":
         prompt = f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
 
@@ -4103,7 +4129,7 @@ Monthly Budget: ${budget}
 Objective: {objective}
 Target Audience: {target_audience}
 Key Messages: {', '.join(key_messages)}
-Implementation Notes: {impl_notes}
+Implementation Notes: {impl_notes}{_site_section}
 
 Return a JSON object with this exact structure:
 {{
@@ -4136,7 +4162,7 @@ Target Audience: {target_audience}
 {kw_context}
 Strategy Headlines: {', '.join(headlines_from_strategy)}
 Strategy Descriptions: {'; '.join(descs_from_strategy)}
-Implementation Notes: {impl_notes}
+Implementation Notes: {impl_notes}{_site_section}
 
 Return a JSON object with this exact structure:
 {{
@@ -4172,7 +4198,7 @@ Service Focus: {service_focus}
 Monthly Budget: ${budget}
 {kw_context}
 {groups_context}
-Implementation Notes: {impl_notes}
+Implementation Notes: {impl_notes}{_site_section}
 
 Return a JSON object with this exact structure:
 {{
@@ -7459,12 +7485,25 @@ def admin_ai_campaign_strategy(body: CampaignStrategyRequest):
         f"generic claims. Return ONLY a JSON object — no markdown, no commentary."
     )
 
+    # Site intelligence — pull crawled page context for the practice website
+    # Returns empty string if the domain hasn't been registered or crawled yet (graceful no-op)
+    _practice_website = practice.get("website") or get_setting("practice_website") or ""
+    _site_context_block = ""
+    if _practice_website:
+        try:
+            from domain_crawler import build_site_context_for_url
+            _site_context_block = build_site_context_for_url(_practice_website)
+        except Exception as _sce:
+            logger.warning(f"AI campaign-strategy: site context fetch failed: {_sce}")
+
     user_prompt = (
         f"Campaign goal: {goal}\n"
         f"Target service: {target_service}\n"
         + (f"Budget context: {budget_hint}\n" if budget_hint else "")
         + (f"Additional context: {extra}\n" if extra else "")
         + "\n=== Practice ===\n" + _format_practice_context(practice)
+        + ("\n\n=== Website Intelligence (crawled page data) ===\n" + _site_context_block
+           if _site_context_block else "")
         + "\n\n=== Performance snapshot (last 30 days) ===\n"
         + json.dumps(perf, indent=2, default=str)
         + "\n\nReturn a JSON object with EXACTLY these keys:\n"
