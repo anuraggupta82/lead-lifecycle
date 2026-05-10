@@ -3510,9 +3510,45 @@ def get_keyword_stats() -> list:
     Return keyword performance joined with lead/revenue attribution.
     Shows ALL keywords from Google Ads cache (even with zero leads),
     plus any keywords that came in via gclid attribution on leads.
+
+    Revenue sources:
+      - lead_revenue:  production from leads.attributed_production (web-form path)
+      - call_revenue:  production from keyword_production_log WHERE lead_id LIKE 'call::%'
+                       (phone-call path via call_production_log.py)
+      - revenue:       lead_revenue + call_revenue (total for ROAS calculation)
+
+    Double-counting guard: keyword_production_log.py already skips call rows when a
+    lead-path row exists for the same od_patient_num, so summing both is safe.
     """
     with _conn() as conn:
         rows = conn.execute("""
+            -- call_prod: pre-aggregate phone-call production per keyword.
+            -- Only rows with lead_id LIKE 'call::%%' (call path).
+            -- Used to add call revenue alongside lead revenue without double-counting:
+            -- leads whose od_patient_num already has a call-path row are excluded from
+            -- lead_revenue below (same patient can't appear in both).
+            WITH call_prod AS (
+                SELECT
+                    LOWER(TRIM(keyword_text))      AS kw,
+                    SUM(production_amount)         AS call_revenue,
+                    COUNT(DISTINCT od_patient_num) AS call_patients
+                FROM keyword_production_log
+                WHERE lead_id LIKE 'call::%'
+                  AND keyword_text != ''
+                  AND keyword_text IS NOT NULL
+                GROUP BY LOWER(TRIM(keyword_text))
+            ),
+            -- call_attributed_patients: patients already attributed via the call path.
+            -- Leads for these patients are excluded from lead_revenue to prevent
+            -- double-counting the same production in both paths.
+            call_attributed_patients AS (
+                SELECT DISTINCT od_patient_num
+                FROM keyword_production_log
+                WHERE lead_id LIKE 'call::%'
+                  AND od_patient_num IS NOT NULL
+                  AND od_patient_num != ''
+            )
+
             SELECT
                 COALESCE(k.keyword_text, l.keyword_text)  AS keyword,
                 COALESCE(k.ad_group_name, l.ad_group_name) AS ad_group_name,
@@ -3533,30 +3569,54 @@ def get_keyword_stats() -> list:
                 COALESCE(k.abs_top_impression_pct, 0.0) AS abs_top_impression_pct,
                 COALESCE(k.budget_lost_is, 0.0)     AS budget_lost_is,
                 COALESCE(k.rank_lost_is, 0.0)       AS rank_lost_is,
-                -- Lead attribution (from leads table)
+                -- Lead attribution (web-form path).
+                -- Excludes leads whose patient is already attributed via the call path.
                 COUNT(l.id)  AS lead_count,
                 SUM(CASE WHEN l.stage IN ('scheduled','showed','no_show',
                     'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS scheduled_count,
                 SUM(CASE WHEN l.stage = 'no_show' THEN 1 ELSE 0 END) AS no_show_count,
                 SUM(CASE WHEN l.stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS treated_count,
-                COALESCE(SUM(l.attributed_production), 0) AS revenue,
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN l.attributed_production ELSE 0 END
+                ), 0) AS lead_revenue,
+                -- Call attribution (phone-call path)
+                COALESCE(cp.call_revenue, 0.0)                 AS call_revenue,
+                COALESCE(cp.call_patients, 0)                  AS call_patients,
+                -- Combined revenue (deduped by od_patient_num across paths)
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN l.attributed_production ELSE 0 END
+                ), 0) + COALESCE(cp.call_revenue, 0.0)         AS revenue,
                 -- Calculated metrics
                 CASE WHEN COUNT(l.id) > 0
                     THEN ROUND(COALESCE(k.cost, SUM(l.click_cost)) / COUNT(l.id), 2)
                     ELSE 0 END AS cpl,
                 CASE WHEN COALESCE(k.cost, 0) > 0
-                    THEN ROUND(COALESCE(SUM(l.attributed_production), 0) / k.cost, 2)
+                    THEN ROUND(
+                        (COALESCE(SUM(
+                            CASE WHEN l.od_patient_num IS NULL
+                                      OR l.od_patient_num = ''
+                                      OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                                 THEN l.attributed_production ELSE 0 END
+                        ), 0) + COALESCE(cp.call_revenue, 0.0))
+                        / k.cost, 2)
                     ELSE 0 END AS roas,
                 CASE WHEN COUNT(l.id) > 0
                     THEN ROUND(CAST(SUM(CASE WHEN l.stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS REAL) / COUNT(l.id) * 100, 1)
                     ELSE 0 END AS conversion_rate,
                 k.synced_at
             FROM gads_keywords_cache k
-            LEFT JOIN leads l ON LOWER(l.keyword_text) = LOWER(k.keyword_text)
+            LEFT JOIN leads l    ON LOWER(l.keyword_text) = LOWER(k.keyword_text)
+            LEFT JOIN call_prod cp ON cp.kw = LOWER(TRIM(k.keyword_text))
             WHERE k.days = 30
-            GROUP BY k.keyword_text
+            GROUP BY LOWER(k.keyword_text)
 
-            UNION
+            UNION ALL
 
             -- Also include leads whose keyword isn't in the cache yet
             SELECT
@@ -3568,7 +3628,6 @@ def get_keyword_stats() -> list:
                 0                       AS gads_clicks,
                 SUM(l.click_cost)       AS total_cost,
                 AVG(NULLIF(l.click_cost,0)) AS avg_cpc,
-                -- Quality & competitive signals (not available for non-cached keywords)
                 0                       AS quality_score,
                 ''                      AS creative_quality_score,
                 ''                      AS post_click_quality,
@@ -3583,21 +3642,42 @@ def get_keyword_stats() -> list:
                     'treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS scheduled_count,
                 SUM(CASE WHEN l.stage = 'no_show' THEN 1 ELSE 0 END) AS no_show_count,
                 SUM(CASE WHEN l.stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS treated_count,
-                COALESCE(SUM(l.attributed_production), 0) AS revenue,
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN l.attributed_production ELSE 0 END
+                ), 0) AS lead_revenue,
+                COALESCE(cp2.call_revenue, 0.0)                AS call_revenue,
+                COALESCE(cp2.call_patients, 0)                 AS call_patients,
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN l.attributed_production ELSE 0 END
+                ), 0) + COALESCE(cp2.call_revenue, 0.0)        AS revenue,
                 CASE WHEN COUNT(l.id) > 0 THEN ROUND(SUM(l.click_cost) / COUNT(l.id), 2) ELSE 0 END AS cpl,
                 CASE WHEN SUM(l.click_cost) > 0
-                    THEN ROUND(SUM(l.attributed_production) / SUM(l.click_cost), 2)
+                    THEN ROUND(
+                        (COALESCE(SUM(
+                            CASE WHEN l.od_patient_num IS NULL
+                                      OR l.od_patient_num = ''
+                                      OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                                 THEN l.attributed_production ELSE 0 END
+                        ), 0) + COALESCE(cp2.call_revenue, 0.0))
+                        / SUM(l.click_cost), 2)
                     ELSE 0 END AS roas,
                 CASE WHEN COUNT(l.id) > 0
                     THEN ROUND(CAST(SUM(CASE WHEN l.stage IN ('treatment_presented','treatment_accepted','treatment_completed') THEN 1 ELSE 0 END) AS REAL) / COUNT(l.id) * 100, 1)
                     ELSE 0 END AS conversion_rate,
                 NULL AS synced_at
             FROM leads l
+            LEFT JOIN call_prod cp2 ON cp2.kw = LOWER(TRIM(l.keyword_text))
             WHERE l.keyword_text != ''
-              AND LOWER(l.keyword_text) NOT IN (
-                  SELECT LOWER(keyword_text) FROM gads_keywords_cache WHERE days = 30
+              AND LOWER(TRIM(l.keyword_text)) NOT IN (
+                  SELECT LOWER(TRIM(keyword_text)) FROM gads_keywords_cache WHERE days = 30
               )
-            GROUP BY l.keyword_text
+            GROUP BY LOWER(TRIM(l.keyword_text))
 
             ORDER BY gads_clicks DESC, lead_count DESC
         """).fetchall()
@@ -5739,7 +5819,12 @@ def update_mango_call_od_appointment(uuid: str, od_appointment_id: str) -> None:
 
 
 def get_booked_calls_needing_od_match(days: int = 90) -> list:
-    """Return calls graded as booked but not yet matched to an OD appointment."""
+    """
+    Return inbound calls that have an OD patient match but no OD appointment yet.
+    booked_outcome was never written by the pipeline (the grading prompt never returned
+    it), so we gate on od_patient_num instead — any call where we know the patient
+    is a candidate for appointment matching.
+    """
     cutoff = (datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     ) - __import__("datetime").timedelta(days=days)).isoformat()
@@ -5748,7 +5833,9 @@ def get_booked_calls_needing_od_match(days: int = 90) -> list:
             """SELECT mc.uuid, mc.started_at, mc.from_number, mc.caller_id_number,
                       mc.booked_outcome, mc.od_appointment_id, mc.lead_id
                FROM mango_calls mc
-               WHERE mc.booked_outcome = 'booked'
+               WHERE mc.direction = 'inbound'
+                 AND mc.od_patient_num IS NOT NULL
+                 AND mc.od_patient_num != ''
                  AND (mc.od_appointment_id IS NULL OR mc.od_appointment_id = '')
                  AND mc.started_at >= ?
                ORDER BY mc.started_at DESC""",
@@ -6165,6 +6252,8 @@ def update_mango_call_analysis(uuid: str, **kwargs) -> None:
         "grade_recommendations_json", "grade_gradeable", "grade_reason",
         "graded_at", "summarized_at", "is_empty", "pipeline_error", "pipeline_attempts",
         "lead_id", "gads_resource_name", "transcription_status",
+        # Call classification fields (set after OD match / grading)
+        "booked_outcome", "lead_quality", "handling_grade", "call_category",
         # Phase 3: AI next-action columns
         "call_next_action", "call_next_action_type", "call_next_action_due",
         "call_next_action_completed", "call_next_action_completed_at",

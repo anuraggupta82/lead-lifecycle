@@ -762,10 +762,12 @@ async def admin_od_match():
 
 
 @app.post("/api/admin/gads-sync", dependencies=[Depends(_require_admin)])
-def admin_gads_sync():
+def admin_gads_sync(days_back: int = 7):
+    """Sync Google Ads click_view + keywords. Use days_back=90 for initial backfill."""
     try:
         from google_ads_sync import sync_gclids_to_keywords
-        result = sync_gclids_to_keywords()
+        days_back = max(1, min(int(days_back), 90))
+        result = sync_gclids_to_keywords(days_back=days_back)
         return {"status": "ok", "result": result}
     except ImportError as e:
         raise HTTPException(status_code=503, detail=f"Google Ads library not installed: {e}")
@@ -799,6 +801,22 @@ def admin_sync_call_production(days: int = 7):
         return {"status": "ok", "result": result}
     except Exception as e:
         logger.error(f"Call production sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/backfill-booked-outcome", dependencies=[Depends(_require_admin)])
+def admin_backfill_booked_outcome():
+    """
+    One-shot: set booked_outcome='booked' for all existing inbound calls that have
+    od_appointment_id set but booked_outcome still NULL. Run this once before the
+    first call production backfill to unlock historical records.
+    """
+    try:
+        from mango_pipeline import backfill_booked_outcome
+        result = backfill_booked_outcome()
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"booked_outcome backfill failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -933,11 +951,20 @@ async def gads_approve_action(action_id: str, request: Request):
     row = get_audit_row(action_id)
     if not row:
         raise HTTPException(status_code=404, detail="Action not found")
-    if row["execution_result"] != "pending_approval":
+    if row["execution_result"] not in ("pending_approval", "error"):
         raise HTTPException(
             status_code=409,
             detail=f"Action already in state '{row['execution_result']}' — cannot re-apply"
         )
+    # Reset error state back to pending so the execution path proceeds cleanly
+    if row["execution_result"] == "error":
+        from database import _conn as _db_conn
+        with _db_conn() as _c:
+            _c.execute(
+                "UPDATE gads_audit_log SET execution_result='pending_approval', error_detail='' WHERE action_id=?",
+                (action_id,)
+            )
+        row = get_audit_row(action_id)  # re-fetch with fresh state
 
     # Kill switch check
     try:
@@ -1365,7 +1392,7 @@ async def gads_reject_action(action_id: str, request: Request):
     row = get_audit_row(action_id)
     if not row:
         raise HTTPException(status_code=404, detail="Action not found")
-    if row["execution_result"] != "pending_approval":
+    if row["execution_result"] not in ("pending_approval", "error"):
         raise HTTPException(
             status_code=409,
             detail=f"Action already in state '{row['execution_result']}'"
@@ -1659,9 +1686,18 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
             if not row:
                 results[aid] = {"status": "error", "detail": "Action not found"}
                 continue
-            if row["execution_result"] != "pending_approval":
+            if row["execution_result"] not in ("pending_approval", "error"):
                 results[aid] = {"status": "skipped", "detail": f"Already {row['execution_result']}"}
                 continue
+            # Reset error state so execution proceeds cleanly
+            if row["execution_result"] == "error":
+                from database import _conn as _db_conn
+                with _db_conn() as _c:
+                    _c.execute(
+                        "UPDATE gads_audit_log SET execution_result='pending_approval', error_detail='' WHERE action_id=?",
+                        (aid,)
+                    )
+                row = get_audit_row(aid)
 
             try:
                 check_writes_enabled()
@@ -3206,16 +3242,21 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
                     detail=f"Google Ads creation failed: {result['error']}"
                 )
 
-            # Save the Google Ads resource name + numeric ID back to the campaign row
-            # (campaign_id is not in ALLOWED set so update_campaign_fields would be a no-op;
-            #  the direct SQL two lines below is the actual save path)
-            # Also store gads_campaign_resource for future pause/resume
+            # Save the Google Ads resource name + numeric ID back to the campaign row.
+            # Also write back geographic_targeting if it was empty — the fallback 15-mile
+            # Grafton radius is applied in google_ads_create.py but never persisted to DB,
+            # causing the Performance tab to show "Not set" even though Google Ads has it.
             from database import _conn
+            _default_geo = json.dumps({
+                "unit": "miles",
+                "locations": [{"type": "city", "value": "Grafton, MA", "radius": 15, "include": True}]
+            })
+            _geo_to_save = camp.get("geographic_targeting") or _default_geo
             with _conn() as conn:
                 conn.execute(
-                    "UPDATE campaigns SET campaign_name=?, gads_campaign_resource=?, gads_campaign_numeric_id=?, updated_at=? WHERE campaign_id=?",
+                    "UPDATE campaigns SET campaign_name=?, gads_campaign_resource=?, gads_campaign_numeric_id=?, geographic_targeting=?, updated_at=? WHERE campaign_id=?",
                     (result["gads_campaign_name"], result["campaign_resource_name"], result["campaign_numeric_id"],
-                     _dt.datetime.utcnow().isoformat(), campaign_id)
+                     _geo_to_save, _dt.datetime.utcnow().isoformat(), campaign_id)
                 )
 
             update_campaign_status(
@@ -4084,12 +4125,12 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
             {
                 "key":      "ad_schedule",
                 "item":     "Ad schedule",
-                "value":    practice_hours,
-                "done":     bool(practice_hours),
+                "value":    "",
+                "done":     False,
                 "skippable": True,
                 "category": "optional",
                 "action":   "auto",
-                "note":     "Limits ads to your office hours so calls come when you can answer. Pulled from Practice Info.",
+                "note":     "Set when ads run for this campaign (e.g. 'Mon-Thu 7am-11pm', 'Weekdays 9am-6pm', '24/7'). Leave blank to run ads at all times.",
             },
             {
                 "key":      "utm_tagging",
@@ -4170,6 +4211,122 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
     _site_section = ("\n\n=== Website Intelligence ===\n" + _site_context_block) if _site_context_block else ""
 
     if step == "keywords":
+        # Pull negatives from source campaign if this is a clone
+        _source_neg_block = ""
+        _source_kw_block = ""
+        _source_camp_name = strategy.get("_source_campaign_name", "")
+        if _source_camp_name:
+            try:
+                from database import _conn as _db
+                with _db() as _c:
+                    _neg_rows = _c.execute(
+                        "SELECT keyword_text, match_type FROM gads_negative_keywords "
+                        "WHERE LOWER(campaign_name) = LOWER(?) ORDER BY keyword_text",
+                        (_source_camp_name,)
+                    ).fetchall()
+                    if _neg_rows:
+                        _neg_list = ", ".join(f'"{r["keyword_text"]}"' for r in _neg_rows)
+                        _source_neg_block = (
+                            f"\n\nSource campaign negatives (MUST include ALL of these in negative_keywords — "
+                            f"they were validated as wasted spend on '{_source_camp_name}'):\n{_neg_list}"
+                        )
+                    _kw_rows = _c.execute(
+                        "SELECT keyword_text, match_type, conversions, clicks FROM gads_keywords_cache "
+                        "WHERE LOWER(campaign_name) = LOWER(?) AND days = 30 "
+                        "ORDER BY conversions DESC, clicks DESC LIMIT 20",
+                        (_source_camp_name,)
+                    ).fetchall()
+                    if _kw_rows:
+                        _kw_list = "\n".join(
+                            f'  [{r["match_type"]}] "{r["keyword_text"]}" '
+                            f'({r["conversions"] or 0} conv, {r["clicks"] or 0} clicks)'
+                            for r in _kw_rows
+                        )
+                        _source_kw_block = (
+                            f"\n\nSource campaign top keywords (use as starting point, adapt for new service):\n{_kw_list}"
+                        )
+            except Exception as _e:
+                logger.warning(f"build-step keywords: source campaign lookup failed: {_e}")
+
+        # Pull optimizer memory (DB table + JSON file) for learned intelligence
+        # Only inject campaign-specific rules — never bleed implant/service rules into unrelated campaigns.
+        _optimizer_memory_block = ""
+        try:
+            import re as _re, json as _json, os as _os
+            from database import _conn as _db
+
+            _cn = (campaign_name or "").strip().lower()
+
+            def _camp_match(tag: str) -> bool:
+                """Token-set match: tag tokens must all appear in campaign name tokens."""
+                if not tag or not _cn:
+                    return False
+                t_tokens = set(_re.findall(r"[a-z0-9]+", tag.strip().lower()))
+                c_tokens = set(_re.findall(r"[a-z0-9]+", _cn))
+                return bool(t_tokens) and t_tokens.issubset(c_tokens)
+
+            _mem_lines = []
+            with _db() as _mc:
+                _mem_rows = _mc.execute(
+                    "SELECT category, key, value, reason, campaign FROM optimizer_memory WHERE active=1 ORDER BY category, key"
+                ).fetchall()
+
+            # keyword_override (never_pause): campaign tag required — empty campaign = not injected globally
+            _never_pause = [
+                r for r in _mem_rows
+                if r["category"] == "keyword_override" and r["value"] == "never_pause"
+                and r["campaign"] and _camp_match(r["campaign"])
+            ]
+            if _never_pause:
+                _mem_lines.append("Always include these as positive keywords (never remove — proven core terms for this campaign):")
+                for r in _never_pause:
+                    _mem_lines.append(f'  - "{r["key"]}" ({r["reason"] or "no reason recorded"})')
+
+            # term_classification (irrelevant → negative): campaign tag required
+            _irrelevant = [
+                r for r in _mem_rows
+                if r["category"] == "term_classification" and r["value"] == "irrelevant"
+                and r["campaign"] and _camp_match(r["campaign"])
+            ]
+            if _irrelevant:
+                _mem_lines.append("Irrelevant search terms for this campaign (add ALL as negatives — confirmed wasted spend):")
+                for r in _irrelevant:
+                    _mem_lines.append(f'  - "{r["key"]}" ({r["reason"] or "no reason recorded"})')
+
+            # general: always inject (account-level context / attribution notes)
+            _general = [r for r in _mem_rows if r["category"] == "general"]
+            if _general:
+                _mem_lines.append("General optimizer context:")
+                for r in _general:
+                    _mem_lines.append(f'  - {r["key"]}: {r["value"] or r["reason"] or ""}')
+
+            # JSON file: negatives added by optimizer — only from runs that match this campaign (or unscoped runs)
+            # Unscoped runs are treated as account-level competitor negatives only if they look like competitor names
+            _COMPETITOR_RE = _re.compile(r"\b(dds|dmd|dental|dr |doctor|orthodont|periodont|endodont|implant|smile|clinic|care|practice|office)\b", _re.I)
+            try:
+                _mem_json_path = _os.path.join(_os.path.dirname(__file__), "optimizer_memory.json")
+                if _os.path.exists(_mem_json_path):
+                    with open(_mem_json_path, encoding="utf-8") as _mf:
+                        _mem_data = _json.load(_mf)
+                    _all_json_negs = []
+                    for _run in _mem_data.get("runs", []):
+                        _run_camp = (_run.get("campaign") or "").strip()
+                        # include if: no campaign tag (account-level), or campaign matches current
+                        if not _run_camp or _camp_match(_run_camp):
+                            _all_json_negs.extend(_run.get("negatives_added", []))
+                    # For unscoped runs, only keep entries that look like competitor/practice names
+                    _all_json_negs = sorted(set(_all_json_negs))
+                    if _all_json_negs:
+                        _mem_lines.append("Competitor negatives validated by past optimizer runs (include ALL in negative_keywords):")
+                        _mem_lines.append("  " + ", ".join(f'"{n}"' for n in _all_json_negs))
+            except Exception as _je:
+                logger.warning(f"build-step keywords: optimizer_memory.json read failed: {_je}")
+
+            if _mem_lines:
+                _optimizer_memory_block = "\n\n=== Optimizer Memory (apply these learned rules) ===\n" + "\n".join(_mem_lines)
+        except Exception as _ome:
+            logger.warning(f"build-step keywords: optimizer memory read failed: {_ome}")
+
         prompt = f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
 
 Campaign: {campaign_name}
@@ -4178,7 +4335,7 @@ Monthly Budget: ${budget}
 Objective: {objective}
 Target Audience: {target_audience}
 Key Messages: {', '.join(key_messages)}
-Implementation Notes: {impl_notes}{_site_section}
+Implementation Notes: {impl_notes}{_site_section}{_source_kw_block}{_source_neg_block}{_optimizer_memory_block}
 
 Return a JSON object with this exact structure:
 {{
@@ -4192,7 +4349,7 @@ Rules:
 - exact_match: 8-12 high-intent, specific keywords (e.g. "emergency dentist near me")
 - phrase_match: 10-15 moderate-intent phrases
 - broad_match_modifier: 5-8 broader terms to capture volume
-- negative_keywords: 15-20 terms to exclude (jobs, DIY, insurance-only, etc.)
+- negative_keywords: Include ALL source campaign negatives above PLUS all optimizer memory negatives PLUS any additional terms relevant to this service (jobs, DIY, insurance-only, etc.)
 - All keywords should be relevant to the dental service and local search intent
 - Return ONLY the JSON object, no explanation."""
 
@@ -5740,6 +5897,111 @@ def admin_set_campaign_locations(campaign_id: str, body: SetLocationsRequest):
     except Exception as e:
         update_gads_action_result(action_id, executed=True,
                                   execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+# ─── Set ad schedule on existing campaign ────────────────────────────────────
+
+class SetScheduleRequest(BaseModel):
+    campaign_resource: str
+    schedule_text: str   # free text or JSON list, same format as parse_ad_schedule()
+
+@app.post("/api/admin/campaigns/{campaign_id}/set-schedule",
+          dependencies=[Depends(_require_admin)])
+def admin_set_campaign_schedule(campaign_id: str, body: SetScheduleRequest):
+    """
+    Replace the ad schedule on an existing live campaign.
+    Accepts free text (e.g. 'Mon-Thu 7am-11pm') or structured JSON.
+    Also saves the value back to the launch_checklist for the campaign.
+    """
+    import datetime as _dt
+    from google_ads_create import parse_ad_schedule, push_ad_schedule, _build_client
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import _conn, log_admin_manual_action, update_gads_action_result, set_audit_approval
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    if not body.campaign_resource:
+        raise HTTPException(status_code=422, detail="campaign_resource is required")
+
+    slots = parse_ad_schedule(body.schedule_text)
+    if not slots:
+        raise HTTPException(status_code=422,
+                            detail=f"Could not parse schedule: '{body.schedule_text}'. "
+                                   "Use format like 'Mon-Thu 7am-11pm' or 'Weekdays 9am-6pm'.")
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+
+    days_summary = ", ".join(sorted(set(s["day"] for s in slots)))
+    action_id = None
+    try:
+        action_id = log_admin_manual_action(
+            operation="set_ad_schedule",
+            entity_type="campaign",
+            entity_id=body.campaign_resource,
+            entity_name=campaign_id,
+            before={"schedule_text": ""},
+            after={"schedule_text": body.schedule_text, "slots": slots, "days": days_summary},
+            reason=f"Set ad schedule: {body.schedule_text}",
+        )
+
+        client = _build_client()
+        result = push_ad_schedule(client, customer_id, body.campaign_resource, slots, replace=True)
+        if not result["ok"]:
+            if action_id:
+                update_gads_action_result(action_id, executed=True,
+                                          execution_result="error", error_detail=result["error"])
+            raise HTTPException(status_code=502, detail=f"Google Ads error: {result['error']}")
+
+        if action_id:
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, "admin")
+
+        # Persist back to launch_checklist in campaign_build_json
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT campaign_build_json FROM campaigns WHERE campaign_id=?", (campaign_id,)
+            ).fetchone()
+            if row:
+                build = json.loads(row["campaign_build_json"] or "{}") if row["campaign_build_json"] else {}
+                checklist = build.get("launch_checklist", [])
+                updated = False
+                for item in checklist:
+                    if isinstance(item, dict) and item.get("key") == "ad_schedule":
+                        item["value"] = body.schedule_text
+                        item["done"] = True
+                        updated = True
+                        break
+                if not updated:
+                    checklist.append({
+                        "key": "ad_schedule", "item": "Ad schedule",
+                        "value": body.schedule_text, "done": True,
+                        "skippable": True, "category": "optional", "action": "auto",
+                    })
+                build["launch_checklist"] = checklist
+                conn.execute(
+                    "UPDATE campaigns SET campaign_build_json=?, updated_at=? WHERE campaign_id=?",
+                    (json.dumps(build), _dt.datetime.utcnow().isoformat(), campaign_id)
+                )
+
+        logger.info(f"Ad schedule set for {campaign_id}: {body.schedule_text} → {len(slots)} slots")
+        return {
+            "ok": True,
+            "pushed": result["pushed"],
+            "removed": result["removed"],
+            "slots": slots,
+            "days_summary": days_summary,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        if action_id:
+            update_gads_action_result(action_id, executed=True,
+                                      execution_result="error", error_detail=str(e))
         raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
 
 
@@ -7747,7 +8009,19 @@ def _gather_source_campaign_context(campaign_id: str) -> dict:
                 for s in neg_candidates
             ]
 
-            # ── 4. Lead + production attribution ─────────────────────────────
+            # ── 4. Existing negative keywords (applied over time by optimizer) ─
+            neg_rows = conn.execute("""
+                SELECT keyword_text, match_type
+                FROM gads_negative_keywords
+                WHERE LOWER(campaign_name) = LOWER(?)
+                ORDER BY keyword_text
+            """, (camp_name,)).fetchall()
+            ctx["existing_negatives"] = [
+                {"keyword": r["keyword_text"], "match_type": r["match_type"]}
+                for r in neg_rows
+            ]
+
+            # ── 5. Lead + production attribution ─────────────────────────────
             lead_row = conn.execute("""
                 SELECT
                     COUNT(*) as total_leads,
@@ -7839,9 +8113,15 @@ def _format_source_campaign_context(src: dict) -> str:
                 + (" [already added]" if s.get("status") == "ADDED" else "")
             )
 
+    existing_negs = src.get("existing_negatives", [])
+    if existing_negs:
+        lines.append(f"\nNegative keywords already applied to this campaign ({len(existing_negs)} total — COPY ALL of these to the new campaign):")
+        for n in existing_negs:
+            lines.append(f"  [{n.get('match_type','BROAD')}] \"{n['keyword']}\"")
+
     neg_cands = src.get("negative_candidates", [])
     if neg_cands:
-        lines.append(f"\nWasted-spend search terms (add as negatives in new campaign):")
+        lines.append(f"\nAdditional wasted-spend search terms (also add as negatives):")
         for s in neg_cands[:10]:
             lines.append(f"  \"{s['term']}\" — ${s.get('cost',0):.2f} wasted, 0 conversions")
 
@@ -8177,6 +8457,84 @@ def admin_ai_performance_analysis(body: PerformanceAnalysisRequest):
             item["priority"] = str(item["priority"]).lower()
 
     return {"analysis": result, "model_used": model_used, "time_range_days": days, "focus": focus}
+
+
+# ─── Campaign AI Refine ───────────────────────────────────────────────────────
+
+class CampaignRefineRequest(BaseModel):
+    campaign_id:       str
+    instruction:       str          # free-text from user, e.g. "raise budget to $80, weekdays only"
+    campaign_context:  dict = {}    # current campaign state passed from frontend
+
+
+@app.post("/api/admin/ai/campaign-refine", dependencies=[Depends(_require_admin)])
+def admin_ai_campaign_refine(body: CampaignRefineRequest):
+    """
+    Sonnet interprets a free-text instruction in the context of the campaign's
+    current state and returns a structured list of proposed changes the user
+    can review and apply individually.
+
+    Supported change types returned:
+      budget   — { type, new_daily_budget_usd, rationale }
+      geo      — { type, locations, rationale }
+      status   — { type, action: 'pause'|'resume', rationale }
+      note     — { type, message }  (advisory only, nothing to apply)
+    """
+    instruction = (body.instruction or "").strip()
+    if not instruction:
+        raise HTTPException(status_code=422, detail="instruction is required")
+
+    ctx = body.campaign_context or {}
+    campaign_name = ctx.get("campaign_name") or ctx.get("name") or body.campaign_id
+
+    system_prompt = (
+        "You are a Google Ads campaign manager for a dental practice. "
+        "The user will describe a change they want to make to their campaign in plain English. "
+        "Interpret their intent and return a structured list of proposed changes. "
+        "Be conservative — only suggest changes explicitly implied by the instruction. "
+        "Return ONLY a valid JSON object, no prose."
+    )
+
+    user_prompt = (
+        f"Campaign: {campaign_name}\n"
+        f"Current state:\n{json.dumps(ctx, indent=2, default=str)}\n\n"
+        f"User instruction: {instruction}\n\n"
+        "Return a JSON object with:\n"
+        "  summary (string — one sentence describing what you understood)\n"
+        "  changes (array of change objects). Each change object must have:\n"
+        "    type: one of 'budget' | 'geo' | 'status' | 'schedule' | 'note'\n"
+        "    rationale: string explaining why\n"
+        "    For 'budget': also include new_daily_budget_usd (number)\n"
+        "    For 'geo': also include locations (string, comma-separated city/region list)\n"
+        "    For 'status': also include action ('pause' or 'resume')\n"
+        "    For 'schedule': also include schedule_text (string describing the schedule, "
+        "e.g. 'Mon-Thu 7am-11pm' or 'Weekdays 9am-6pm' or '24/7'). "
+        "Use this when the user asks to change when ads run, set hours, or limit days.\n"
+        "    For 'note': also include message (string — advisory, nothing to apply)\n"
+        "If the instruction is unclear or unsupported, return a single 'note' change explaining why.\n"
+        "Return ONLY the JSON object."
+    )
+
+    try:
+        client = _get_anthropic_client()
+        message = client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+        )
+        raw_text = message.content[0].text if message.content else ""
+    except Exception as e:
+        logger.error(f"AI campaign-refine failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI request failed: {e}")
+
+    json_text = _extract_json_from_ai_response(raw_text)
+    try:
+        result = json.loads(json_text)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
+
+    return {"summary": result.get("summary", ""), "changes": result.get("changes", [])}
 
 
 # ─── OD Connection Settings ──────────────────────────────────────────────────

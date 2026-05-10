@@ -2057,6 +2057,9 @@ def _execute_add_keyword(client, customer_id: str, ad_group_resource: str,
     Add a new keyword to an ad group.
     Does NOT check kill switch — caller must check first.
     Handles ALREADY_EXISTS gracefully (returns True, caller marks as duplicate).
+    Always sends HEALTH_IN_PERSONALIZED_ADS exemption key — Google applies this
+    policy to all dental/health advertisers and it is always exemptible. Sending
+    it upfront avoids the rejection entirely.
     Returns True on success or duplicate.
     """
     match_type = (match_type or "EXACT").upper()
@@ -2069,6 +2072,12 @@ def _execute_add_keyword(client, customer_id: str, ad_group_resource: str,
     criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
     criterion.keyword.text = keyword_text
     criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+    # Always exempt HEALTH_IN_PERSONALIZED_ADS — applies to all dental keywords,
+    # always exemptible, no downside to sending proactively.
+    exempt_key = client.get_type("PolicyViolationKey")
+    exempt_key.policy_name = "HEALTH_IN_PERSONALIZED_ADS"
+    exempt_key.violating_text = keyword_text
+    operation.exempt_policy_violation_keys.append(exempt_key)
     try:
         service.mutate_ad_group_criteria(
             customer_id=customer_id,
@@ -2078,7 +2087,6 @@ def _execute_add_keyword(client, customer_id: str, ad_group_resource: str,
         return True
     except Exception as e:
         err_str = str(e)
-        # Idempotent: keyword already exists is not a hard failure
         if "KEYWORD_ALREADY_EXISTS" in err_str or "already exists" in err_str.lower():
             logger.info(f"Keyword '{keyword_text}' already exists in {ad_group_resource} — treating as success")
             return True
@@ -2638,6 +2646,22 @@ def _execute_geo_exclusion(client, customer_id: str, campaign_resource: str,
             return True
         logger.error(f"Geo exclusion failed: {geo_target_resource} on {campaign_resource}: {e}")
         raise
+
+
+def _execute_update_ad_schedule(client, customer_id: str, campaign_resource: str,
+                                schedule_value) -> dict:
+    """
+    Replace the ad schedule on an existing campaign.
+    Accepts the same formats as parse_ad_schedule() in google_ads_create.py.
+    Does NOT check kill switch — caller must check first.
+    Returns {"ok": bool, "pushed": int, "removed": int, "error": str|None}
+    """
+    from google_ads_create import parse_ad_schedule, push_ad_schedule
+    slots = parse_ad_schedule(schedule_value)
+    if not slots:
+        return {"ok": False, "pushed": 0, "removed": 0,
+                "error": f"Could not parse schedule: {schedule_value!r}"}
+    return push_ad_schedule(client, customer_id, campaign_resource, slots, replace=True)
 
 
 def _get_active_rsa_resources(client, customer_id: str, campaign_resource: str) -> list:

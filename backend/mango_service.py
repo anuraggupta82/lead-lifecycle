@@ -564,6 +564,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                 match_method=best_method,
             )
             attributed += 1
+            _queue_process_if_needed(mc)
             continue
 
         # ── Try lead phone match ──────────────────────────────────────────────
@@ -578,6 +579,40 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                     match_method="phone_exact",
                 )
                 attributed += 1
+                _queue_process_if_needed(mc)
 
     logger.info(f"Mango reconcile: attributed {attributed}/{len(unmatched)} calls")
     return attributed
+
+
+def _queue_process_if_needed(mc: dict) -> None:
+    """
+    If a newly-matched call hasn't been transcribed yet, queue it for full
+    pipeline processing (transcription → summary → grading) in a background
+    thread. Skips calls that are already done, in-progress, or too short to
+    be worth transcribing (<15s).
+    """
+    status = mc.get("transcription_status") or ""
+    duration = int(mc.get("duration_sec") or 0)
+    uuid = mc.get("uuid") or ""
+
+    if status in ("done", "in_progress"):
+        return
+    if duration < 15:
+        logger.debug(f"[reconcile] Skipping auto-process for {uuid[:8]} — too short ({duration}s)")
+        return
+
+    logger.info(f"[reconcile] Queuing auto-process for newly matched call {uuid[:8]} ({duration}s)")
+
+    def _run():
+        try:
+            from mango_pipeline import process_call
+            from database import get_mango_call
+            call_row = get_mango_call(uuid)
+            if call_row:
+                process_call(call_row)
+        except Exception as e:
+            logger.warning(f"[reconcile] Auto-process failed for {uuid[:8]}: {e}")
+
+    t = threading.Thread(target=_run, daemon=True, name=f"auto-process-{uuid[:8]}")
+    t.start()

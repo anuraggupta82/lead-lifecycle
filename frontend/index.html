@@ -3373,10 +3373,11 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, co
                       <th className="num">Clicks</th>
                       <th className="num">Cost</th>
                       <th className="num">Leads</th>
+                      <th className="num" title="Phone calls attributed to this keyword that booked and completed implant treatment">Calls</th>
                       <th className="num">CPL</th>
                       <th className="num">Scheduled</th>
                       <th className="num">Treated</th>
-                      <th className="num">Revenue</th>
+                      <th className="num" title="Total revenue: web form leads + phone call patients (deduped by patient)">Revenue</th>
                       <th className="num">ROAS</th>
                     </tr>
                   </thead>
@@ -3387,8 +3388,12 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, co
                       const isRaw = k.impression_share || 0;
                       const isPct = isRaw > 0 ? Math.round(isRaw * 100) : 0;
                       const isColor = isPct === 0 ? '#94a3b8' : isPct >= 60 ? '#16a34a' : isPct >= 30 ? '#d97706' : '#dc2626';
+                      const hasCallRevenue = (k.call_revenue || 0) > 0;
+                      const revenueTitle = hasCallRevenue
+                        ? `Web leads: ${fmtMoney(k.lead_revenue||0)} + Calls: ${fmtMoney(k.call_revenue||0)}`
+                        : undefined;
                       return (
-                      <tr key={i} style={{opacity:(!k.lead_count&&!k.total_cost)?0.55:1}}>
+                      <tr key={i} style={{opacity:(!k.lead_count&&!k.total_cost&&!k.call_patients)?0.55:1}}>
                         <td style={{fontStyle:'italic'}}>{k.keyword}</td>
                         <td className="num">
                           {qs > 0 ? (
@@ -3404,10 +3409,18 @@ function CampaignExpandedPanel({ campaign, keywordStats, ga4Data, dailyStats, co
                         <td className="num">{(k.gads_clicks||0).toLocaleString()}</td>
                         <td className="num">{fmtMoney(k.total_cost||0)}</td>
                         <td className="num">{k.lead_count||0}</td>
+                        <td className="num">
+                          {(k.call_patients||0) > 0
+                            ? <span style={{color:'#0891b2',fontWeight:700}} title={`${k.call_patients} call patient(s) — ${fmtMoney(k.call_revenue||0)} production`}>📞{k.call_patients}</span>
+                            : <span style={{color:'#94a3b8'}}>—</span>}
+                        </td>
                         <td className="num">{k.cpl ? '$'+Number(k.cpl).toFixed(0) : '—'}</td>
                         <td className="num">{k.scheduled_count||0}</td>
                         <td className="num">{k.treated_count||0}</td>
-                        <td className="num money">{fmtMoney(k.revenue||0)}</td>
+                        <td className="num money" title={revenueTitle}>
+                          {fmtMoney(k.revenue||0)}
+                          {hasCallRevenue && <span style={{fontSize:8,color:'#0891b2',marginLeft:2}}>📞</span>}
+                        </td>
                         <td className="num">{k.roas ? k.roas.toFixed(1)+'x' : '—'}</td>
                       </tr>
                       );
@@ -4251,17 +4264,14 @@ function CallsSubView() {
   async function handleSyncAll() {
     setConvSyncMsg('');
     try {
-      // Step 1: sync Mango calls
-      setConvSyncState('syncing-mango');
-      const m = await api('/api/admin/calls/sync', { method: 'POST' });
-      // Step 2: sync GAds call_view
+      // Step 1: sync GAds call_view (Mango calls already sync every 5 min via scheduler)
       setConvSyncState('syncing-gads');
       const g = await api('/api/admin/gads/sync-call-view', { method: 'POST' });
-      // Step 3: reconcile (match GAds rows to Mango rows)
+      // Step 2: reconcile (match GAds rows to Mango rows)
       setConvSyncState('reconciling');
       const r = await api('/api/admin/calls/reconcile', { method: 'POST' });
       setConvSyncState('done');
-      setConvSyncMsg(`✓ Mango: ${m.synced} calls · GAds: ${g.synced} rows · Matched: ${r.attributed}`);
+      setConvSyncMsg(`✓ GAds: ${g.synced} rows · Matched: ${r.attributed}`);
       await loadCalls();
       await loadConversions();
     } catch(e) {
@@ -5871,6 +5881,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [geoEditOpen, setGeoEditOpen]         = useState(false);
   const [geoEditDraft, setGeoEditDraft]       = useState('');   // geo_json string being edited
   const [geoSaving, setGeoSaving]             = useState(false);
+
+  // AI Refine box (Performance tab)
+  const [aiRefineInput, setAiRefineInput]     = useState('');
+  const [aiRefineLoading, setAiRefineLoading] = useState(false);
+  const [aiRefineResult, setAiRefineResult]   = useState(null); // {summary, changes}
+  const [aiRefineError, setAiRefineError]     = useState('');
+  const [aiRefineApplying, setAiRefineApplying] = useState({});
 
   async function loadUnifiedCamps() {
     setUnifiedLoading(true);
@@ -9457,7 +9474,173 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             </div>
                           )}
 
-                          {/* Optimization moved to AI Optimizer tab */}
+                          {/* ── AI Refine Box ─────────────────────────────── */}
+                          {(() => {
+                            const camp = cd.campaign;
+                            const campCtx = {
+                              campaign_name: camp.campaign_name,
+                              status: camp.status,
+                              daily_budget_usd: camp.daily_budget_usd || (camp.monthly_budget ? (camp.monthly_budget/30.4).toFixed(2) : null),
+                              locations: camp.geo_json || camp.locations || '',
+                              ad_schedule: camp.ad_schedule || '',
+                              impressions: camp.impressions,
+                              clicks: camp.clicks,
+                              cost: camp.cost,
+                              ctr: camp.ctr,
+                              leads: camp.leads,
+                            };
+
+                            async function submitRefine() {
+                              if (!aiRefineInput.trim()) return;
+                              setAiRefineLoading(true);
+                              setAiRefineResult(null);
+                              setAiRefineError('');
+                              try {
+                                const res = await api('/api/admin/ai/campaign-refine', {
+                                  method: 'POST',
+                                  body: JSON.stringify({
+                                    campaign_id: camp.campaign_id,
+                                    instruction: aiRefineInput,
+                                    campaign_context: campCtx,
+                                  }),
+                                });
+                                setAiRefineResult(res);
+                              } catch(e) {
+                                setAiRefineError(e?.detail || e?.message || 'AI request failed');
+                              } finally {
+                                setAiRefineLoading(false);
+                              }
+                            }
+
+                            async function applyChange(change, idx) {
+                              setAiRefineApplying(s => ({...s, [idx]: true}));
+                              try {
+                                if (change.type === 'budget') {
+                                  await api(`/api/admin/campaigns/${camp.campaign_id}/set-budget`, {
+                                    method: 'POST',
+                                    body: JSON.stringify({
+                                      campaign_resource: camp.gads_campaign_resource,
+                                      new_daily_budget_usd: change.new_daily_budget_usd,
+                                      current_daily_budget_usd: campCtx.daily_budget_usd,
+                                    }),
+                                  });
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
+                                } else if (change.type === 'geo') {
+                                  await api(`/api/admin/campaigns/${camp.campaign_id}/set-locations`, {
+                                    method: 'POST',
+                                    body: JSON.stringify({ locations: change.locations }),
+                                  });
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
+                                } else if (change.type === 'status') {
+                                  await campaignAction(camp.campaign_id, change.action);
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
+                                } else if (change.type === 'schedule') {
+                                  await api(`/api/admin/campaigns/${camp.campaign_id}/set-schedule`, {
+                                    method: 'POST',
+                                    body: JSON.stringify({
+                                      campaign_resource: camp.gads_campaign_resource,
+                                      schedule_text: change.schedule_text,
+                                    }),
+                                  });
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
+                                }
+                                // Mark applied
+                                setAiRefineResult(r => ({
+                                  ...r,
+                                  changes: r.changes.map((c,i) => i===idx ? {...c, _applied:true} : c)
+                                }));
+                              } catch(e) {
+                                setAiRefineError(`Apply failed: ${e?.detail || e?.message || 'error'}`);
+                              } finally {
+                                setAiRefineApplying(s => ({...s, [idx]: false}));
+                              }
+                            }
+
+                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡'};
+                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note'};
+
+                            return (
+                              <div style={{marginTop:24, borderTop:'1px solid var(--border)', paddingTop:16}}>
+                                <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:'var(--text)',display:'flex',alignItems:'center',gap:6}}>
+                                  🤖 AI Refine
+                                  <span style={{fontSize:10,fontWeight:400,color:'var(--text-muted)'}}>Tell Claude what to change</span>
+                                </div>
+                                <div style={{display:'flex',gap:6}}>
+                                  <textarea
+                                    value={aiRefineInput}
+                                    onChange={e=>setAiRefineInput(e.target.value)}
+                                    onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submitRefine();}}}
+                                    placeholder={'e.g. "Increase budget to $80/day" · "Pause on weekends" · "Add Worcester to locations"'}
+                                    rows={2}
+                                    style={{flex:1,fontSize:12,padding:'6px 8px',borderRadius:6,
+                                      border:'1px solid var(--border)',background:'var(--surface)',
+                                      color:'var(--text)',resize:'vertical',fontFamily:'inherit'}}
+                                  />
+                                  <button
+                                    onClick={submitRefine}
+                                    disabled={aiRefineLoading || !aiRefineInput.trim()}
+                                    style={{alignSelf:'flex-end',padding:'6px 14px',borderRadius:6,
+                                      background:'var(--teal)',color:'#fff',border:'none',
+                                      fontSize:12,fontWeight:600,cursor:'pointer',whiteSpace:'nowrap'}}>
+                                    {aiRefineLoading ? '⏳ Thinking…' : 'Ask AI →'}
+                                  </button>
+                                </div>
+
+                                {aiRefineError && (
+                                  <div style={{marginTop:8,fontSize:11,color:'#dc2626',padding:'6px 8px',
+                                    background:'#fee2e2',borderRadius:6,border:'1px solid #fca5a5'}}>
+                                    {aiRefineError}
+                                  </div>
+                                )}
+
+                                {aiRefineResult && (
+                                  <div style={{marginTop:10}}>
+                                    <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:8,fontStyle:'italic'}}>
+                                      {aiRefineResult.summary}
+                                    </div>
+                                    {(aiRefineResult.changes||[]).map((change, idx) => (
+                                      <div key={idx} style={{display:'flex',alignItems:'flex-start',gap:8,
+                                        padding:'8px 10px',marginBottom:6,borderRadius:6,
+                                        background: change._applied ? '#f0fdf4' : 'var(--surface)',
+                                        border:`1px solid ${change._applied ? '#86efac' : 'var(--border)'}`,
+                                        opacity: change._applied ? 0.7 : 1}}>
+                                        <span style={{fontSize:16,flexShrink:0}}>{typeIcon[change.type]||'•'}</span>
+                                        <div style={{flex:1,minWidth:0}}>
+                                          <div style={{fontSize:11,fontWeight:700,color:'var(--text)',marginBottom:2}}>
+                                            {typeLabel[change.type]||change.type}
+                                            {change.type==='budget' && ` → $${change.new_daily_budget_usd}/day`}
+                                            {change.type==='geo' && ` → ${change.locations}`}
+                                            {change.type==='status' && ` → ${change.action}`}
+                                            {change.type==='schedule' && ` → ${change.schedule_text}`}
+                                          </div>
+                                          <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.4}}>
+                                            {change.rationale || change.message}
+                                          </div>
+                                        </div>
+                                        {change._applied ? (
+                                          <span style={{fontSize:11,color:'#16a34a',fontWeight:600,flexShrink:0}}>✓ Applied</span>
+                                        ) : change.type !== 'note' ? (
+                                          <button
+                                            onClick={()=>applyChange(change,idx)}
+                                            disabled={!!aiRefineApplying[idx]}
+                                            style={{flexShrink:0,padding:'4px 10px',borderRadius:5,
+                                              background:'var(--teal)',color:'#fff',border:'none',
+                                              fontSize:11,fontWeight:600,cursor:'pointer'}}>
+                                            {aiRefineApplying[idx] ? '…' : 'Apply'}
+                                          </button>
+                                        ) : null}
+                                      </div>
+                                    ))}
+                                    <button onClick={()=>{setAiRefineResult(null);setAiRefineInput('');}}
+                                      style={{marginTop:4,fontSize:11,color:'var(--text-muted)',
+                                        background:'none',border:'none',cursor:'pointer',padding:0}}>
+                                      ✕ Clear
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
 
                         </div>
                       </div>
@@ -13637,7 +13820,7 @@ function PendingApprovalsPanel() {
   );
 }
 
-function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOptimize, onTabSwitch }) {
+function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCallProduction, onCallProductionBackfill, onGA4Refresh, onOptimize, onTabSwitch }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
 
@@ -13662,11 +13845,31 @@ function AdminTab({ onSync, onMatch, onGAds, onConversions, onGA4Refresh, onOpti
           <button className="btn btn-teal" onClick={()=>handleAction('match', onMatch)} disabled={loading.match}>
             {loading.match?'Matching...':'Match OpenDental'}
           </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('gads', onGAds)} disabled={loading.gads}>
+          <button className="btn btn-teal" onClick={()=>handleAction('gads', onGAds)} disabled={loading.gads || loading.gadsbackfill}>
             {loading.gads?'Syncing...':'Google Ads Sync'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>{
+            if (!confirm('Backfill 90 days of GAds clicks, then re-run keyword attribution + call production? This may take 1–2 minutes.')) return;
+            handleAction('gadsbackfill', onGAdsBackfill);
+          }} disabled={loading.gadsbackfill || loading.gads}
+            style={{background:'#0e7490'}}>
+            {loading.gadsbackfill?'Backfilling...':'🔄 Backfill Clicks (90d)'}
           </button>
           <button className="btn btn-teal" onClick={()=>handleAction('ga4', onGA4Refresh)} disabled={loading.ga4}>
             {loading.ga4?'Pulling...':'Refresh GA4 Data'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>handleAction('conversions', onConversions)} disabled={loading.conversions}>
+            {loading.conversions?'Uploading...':'Upload Conversions'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>handleAction('callprod', onCallProduction)} disabled={loading.callprod || loading.callprodbackfill}>
+            {loading.callprod?'Syncing...':'Sync Call Production'}
+          </button>
+          <button className="btn btn-teal" onClick={()=>{
+            if (!confirm('Run 60-day call production backfill? This may take a moment.')) return;
+            handleAction('callprodbackfill', onCallProductionBackfill);
+          }} disabled={loading.callprodbackfill || loading.callprod}
+            style={{background:'#b45309'}}>
+            {loading.callprodbackfill?'Backfilling...':'📞 Backfill Calls (60d)'}
           </button>
           <button className="btn btn-teal" onClick={()=>onTabSwitch && onTabSwitch('ai_optimizer')}
             style={{background:'#7c3aed'}}>
@@ -14614,15 +14817,16 @@ function AiOptimizerTab() {
             const opMeta = AI_OP_LABELS[rec.operation] || {label:rec.operation, color:'#64748b', icon:'•'};
             const isSuccess = rec.execution_result === 'success';
             const isRejected = (rec.execution_result || '').startsWith('rejected');
+            const isError = rec.execution_result === 'error';
             const change = fmtRecChange(rec.after_state_json || rec.before_state_json, rec.operation);
-            const statusColor = isSuccess ? '#16a34a' : isRejected ? '#dc2626' : '#d97706';
-            const statusBg    = isSuccess ? '#dcfce7' : isRejected ? '#fee2e2' : '#fef9c3';
-            const statusLabel = isSuccess ? '✓ Applied' : isRejected ? '✕ Ignored' : rec.execution_result;
+            const statusColor = isSuccess ? '#16a34a' : isRejected ? '#dc2626' : isError ? '#b45309' : '#d97706';
+            const statusBg    = isSuccess ? '#dcfce7' : isRejected ? '#fee2e2' : isError ? '#fef3c7' : '#fef9c3';
+            const statusLabel = isSuccess ? '✓ Applied' : isRejected ? '✕ Ignored' : isError ? '⚠ Error' : rec.execution_result;
             return (
               <div key={rec.action_id} style={{display:'flex',alignItems:'flex-start',gap:8,
                 padding:'8px 12px',marginBottom:5,borderRadius:6,
-                border:'1px solid var(--border)',
-                background: isRejected ? '#fafafa' : '#fff',
+                border:`1px solid ${isError ? '#fcd34d' : 'var(--border)'}`,
+                background: isRejected ? '#fafafa' : isError ? '#fffbeb' : '#fff',
                 opacity: isRejected ? 0.7 : 1}}>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:2}}>
@@ -14660,6 +14864,26 @@ function AiOptimizerTab() {
                     </span>
                   </div>
                 </div>
+                {isError && (
+                  <div style={{display:'flex',flexDirection:'column',gap:4,flexShrink:0}}>
+                    <button
+                      onClick={()=>handleApprove(rec.action_id)}
+                      disabled={!!busy[rec.action_id]}
+                      title="Retry this action"
+                      style={{padding:'3px 10px',borderRadius:5,fontSize:11,fontWeight:600,
+                        background:'#0e7490',color:'#fff',border:'none',cursor:'pointer'}}>
+                      {busy[rec.action_id]==='approve' ? '…' : '↻ Retry'}
+                    </button>
+                    <button
+                      onClick={()=>handleIgnore(rec.action_id)}
+                      disabled={!!busy[rec.action_id]}
+                      title="Dismiss this error"
+                      style={{padding:'3px 10px',borderRadius:5,fontSize:11,fontWeight:600,
+                        background:'none',color:'#dc2626',border:'1px solid #fca5a5',cursor:'pointer'}}>
+                      Dismiss
+                    </button>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -14917,7 +15141,22 @@ function App() {
                 onSync={() => api('/api/admin/sync', { method: 'POST' })}
                 onMatch={() => api('/api/admin/match', { method: 'POST' })}
                 onGAds={() => api('/api/admin/gads-sync', { method: 'POST' })}
+                onGAdsBackfill={async () => {
+                  // Step 1: pull 90 days of click_view → populate gads_clicks
+                  await api('/api/admin/gads-sync?days_back=90', { method: 'POST' });
+                  // Step 2: re-run keyword attribution on all unattributed calls (90d)
+                  await api('/api/admin/calls/attribute-keywords?days=90', { method: 'POST' });
+                  // Step 3: write production log for newly attributed calls
+                  return api('/api/admin/sync-call-production?days=60', { method: 'POST' });
+                }}
                 onConversions={() => api('/api/admin/upload-conversions', { method: 'POST' })}
+                onCallProduction={() => api('/api/admin/sync-call-production?days=7', { method: 'POST' })}
+                onCallProductionBackfill={async () => {
+                  // Step 1: run appointment matcher + stamp booked_outcome on historical calls
+                  await api('/api/admin/backfill-booked-outcome', { method: 'POST' });
+                  // Step 2: now run the 60-day call production attribution
+                  return api('/api/admin/sync-call-production?days=60', { method: 'POST' });
+                }}
                 onGA4Refresh={() => api('/api/admin/ga4/refresh', { method: 'POST' })}
                 onOptimize={() => api('/api/admin/optimize', { method: 'POST' })}
                 onTabSwitch={setTab} />

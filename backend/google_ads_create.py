@@ -16,6 +16,200 @@ from config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# ── Ad Schedule helpers ───────────────────────────────────────────────────────
+
+_DAY_ALIASES = {
+    "monday": "MONDAY", "mon": "MONDAY", "m": "MONDAY",
+    "tuesday": "TUESDAY", "tue": "TUESDAY", "tues": "TUESDAY", "t": "TUESDAY",
+    "wednesday": "WEDNESDAY", "wed": "WEDNESDAY", "w": "WEDNESDAY",
+    "thursday": "THURSDAY", "thu": "THURSDAY", "thurs": "THURSDAY", "th": "THURSDAY",
+    "friday": "FRIDAY", "fri": "FRIDAY", "f": "FRIDAY",
+    "saturday": "SATURDAY", "sat": "SATURDAY", "sa": "SATURDAY",
+    "sunday": "SUNDAY", "sun": "SUNDAY", "su": "SUNDAY",
+}
+_DAY_ORDER = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+
+
+def parse_ad_schedule(value) -> list[dict]:
+    """
+    Parse an ad schedule value into a list of {day, start_hour, end_hour} dicts.
+
+    Accepts:
+      - Already-parsed list of dicts: [{"day": "MONDAY", "start_hour": 7, "end_hour": 23}, ...]
+      - JSON string of the above
+      - Free-text like "Mon-Thu 7am-11pm" or "Monday to Thursday 9am to 6pm"
+      - "24/7" or "always" → all 7 days 0–24
+      - "weekdays 9am-5pm" → Mon-Fri
+      - "weekends 10am-3pm" → Sat-Sun
+
+    Returns [] if nothing parseable found (caller should skip/warn).
+    Hours use Google Ads convention: start_hour 0–23, end_hour 1–24 (24 = midnight).
+    """
+    if not value:
+        return []
+
+    # Already structured
+    if isinstance(value, list):
+        return [s for s in value if isinstance(s, dict) and "day" in s]
+
+    # Try JSON parse first
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    return [s for s in parsed if isinstance(s, dict) and "day" in s]
+            except Exception:
+                pass
+
+    text = value.strip().lower() if isinstance(value, str) else ""
+
+    # Parse hour string like "7am", "11pm", "9:30am" → integer hour (round to hour)
+    def _parse_hour(h: str) -> int | None:
+        h = h.strip()
+        m = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", h)
+        if not m:
+            return None
+        hr = int(m.group(1))
+        period = m.group(3) or ""
+        if period == "pm" and hr != 12:
+            hr += 12
+        elif period == "am" and hr == 12:
+            hr = 0
+        return hr
+
+    # Parse day range like "mon-thu", "monday to friday", "weekdays", "weekends"
+    def _expand_days(day_text: str) -> list[str]:
+        day_text = day_text.strip()
+        # Shorthand groups
+        if day_text in ("weekdays", "weekday", "week days"):
+            return ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
+        if day_text in ("weekends", "weekend", "week ends"):
+            return ["SATURDAY", "SUNDAY"]
+        if day_text in ("everyday", "every day", "daily", "all week", "24/7", "always"):
+            return list(_DAY_ORDER)
+        # Range: "mon-thu" or "monday to thursday"
+        range_m = re.match(r"([a-z]+)\s*(?:-|to)\s*([a-z]+)", day_text)
+        if range_m:
+            start_day = _DAY_ALIASES.get(range_m.group(1))
+            end_day   = _DAY_ALIASES.get(range_m.group(2))
+            if start_day and end_day:
+                si = _DAY_ORDER.index(start_day)
+                ei = _DAY_ORDER.index(end_day)
+                if ei >= si:
+                    return _DAY_ORDER[si:ei+1]
+                # Wrap-around (e.g. fri-mon) — unusual, expand linearly
+                return _DAY_ORDER[si:] + _DAY_ORDER[:ei+1]
+        # Single day
+        single = _DAY_ALIASES.get(day_text)
+        if single:
+            return [single]
+        return []
+
+    # Special case: 24/7
+    if re.search(r"24\s*/\s*7|always|all day|all week", text):
+        return [{"day": d, "start_hour": 0, "end_hour": 24} for d in _DAY_ORDER]
+
+    # Main pattern: "<days> <start_hour>-<end_hour>" or "<days> <start_hour> to <end_hour>"
+    # e.g. "mon-thu 7am-11pm" / "monday to thursday 9am to 6pm"
+    pattern = re.compile(
+        r"([a-z]+(?:\s*(?:-|to)\s*[a-z]+)?)"   # day or range
+        r"\s+"
+        r"(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)"   # start hour
+        r"\s*(?:-|to)\s*"
+        r"(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",  # end hour
+        re.IGNORECASE
+    )
+    results = []
+    for m in pattern.finditer(text):
+        days = _expand_days(m.group(1).strip())
+        start = _parse_hour(m.group(2))
+        end   = _parse_hour(m.group(3))
+        if not days or start is None or end is None:
+            continue
+        if end == 0:
+            end = 24  # midnight expressed as 12am → 24
+        for day in days:
+            results.append({"day": day, "start_hour": start, "end_hour": end})
+
+    return results
+
+
+def push_ad_schedule(client, customer_id: str, campaign_resource: str,
+                     schedule: list[dict], replace: bool = True) -> dict:
+    """
+    Push an ad schedule to Google Ads for a campaign.
+
+    Args:
+        client:            GoogleAdsClient
+        customer_id:       str digits-only
+        campaign_resource: campaigns/XXXXXXX resource name
+        schedule:          list of {day, start_hour, end_hour}
+        replace:           if True, remove all existing schedule criteria first
+
+    Returns: {"ok": bool, "pushed": int, "removed": int, "error": str|None}
+    """
+    service = client.get_service("CampaignCriterionService")
+    removed = 0
+
+    if replace:
+        # Fetch existing ad_schedule criteria and remove them
+        try:
+            ga_service = client.get_service("GoogleAdsService")
+            query = f"""
+                SELECT campaign_criterion.resource_name, campaign_criterion.type
+                FROM campaign_criterion
+                WHERE campaign_criterion.campaign = '{campaign_resource}'
+                  AND campaign_criterion.type = 'AD_SCHEDULE'
+            """
+            existing = list(ga_service.search(customer_id=customer_id, query=query))
+            if existing:
+                remove_ops = []
+                for row in existing:
+                    op = client.get_type("CampaignCriterionOperation")
+                    op.remove = row.campaign_criterion.resource_name
+                    remove_ops.append(op)
+                service.mutate_campaign_criteria(customer_id=customer_id, operations=remove_ops)
+                removed = len(remove_ops)
+        except Exception as e:
+            logger.warning(f"push_ad_schedule: remove existing failed (continuing): {e}")
+
+    if not schedule:
+        return {"ok": True, "pushed": 0, "removed": removed, "error": None}
+
+    day_enum = client.enums.DayOfWeekEnum
+    ops = []
+    for slot in schedule:
+        day_str = (slot.get("day") or "").upper()
+        start_h = int(slot.get("start_hour", 0))
+        end_h   = int(slot.get("end_hour", 24))
+        if not day_str or start_h >= end_h:
+            continue
+        try:
+            day_val = day_enum[day_str]
+        except KeyError:
+            logger.warning(f"push_ad_schedule: unknown day '{day_str}' — skipping")
+            continue
+        op = client.get_type("CampaignCriterionOperation")
+        c  = op.create
+        c.campaign = campaign_resource
+        c.ad_schedule.day_of_week  = day_val
+        c.ad_schedule.start_hour   = start_h
+        c.ad_schedule.start_minute = client.enums.MinuteOfHourEnum.ZERO
+        c.ad_schedule.end_hour     = end_h
+        c.ad_schedule.end_minute   = client.enums.MinuteOfHourEnum.ZERO
+        ops.append(op)
+
+    if not ops:
+        return {"ok": True, "pushed": 0, "removed": removed, "error": "no valid schedule slots"}
+
+    try:
+        resp = service.mutate_campaign_criteria(customer_id=customer_id, operations=ops)
+        return {"ok": True, "pushed": len(resp.results), "removed": removed, "error": None}
+    except Exception as e:
+        return {"ok": False, "pushed": 0, "removed": removed, "error": str(e)}
+
 # ── Proximity targeting: hardcoded lat/lng table ──────────────────────────────
 # Google Ads ProximityCriterion REQUIRES geo_point (lat/lng in micro-degrees).
 # Sending only city_name is unreliable: the API may fail or silently geocode to
@@ -787,6 +981,36 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
                 logger.warning(f"create_campaign_in_gads Step 8b sitelinks failed: {sle}")
         else:
             log.append("Step 8b: No sitelinks configured — skipping")
+
+        # ── Step 8c: Ad schedule ──────────────────────────────────────────────
+        # Read from launch checklist ad_schedule value (per-campaign, not office hours)
+        _schedule_value = None
+        _checklist = build.get("launch_checklist") or []
+        for _item in _checklist:
+            if isinstance(_item, dict) and _item.get("key") == "ad_schedule":
+                if not _item.get("skipped"):
+                    _schedule_value = _item.get("value")
+                break
+        if _schedule_value:
+            log.append("Step 8c: Setting ad schedule")
+            try:
+                _slots = parse_ad_schedule(_schedule_value)
+                if _slots:
+                    _sched_result = push_ad_schedule(
+                        client, customer_id, camp_resource, _slots, replace=False
+                    )
+                    if _sched_result["ok"]:
+                        _days_summary = ", ".join(sorted(set(s["day"] for s in _slots)))
+                        log.append(f"  ✓ Ad schedule set: {len(_slots)} slots ({_days_summary})")
+                    else:
+                        log.append(f"  ⚠ Ad schedule failed (non-fatal): {_sched_result['error']}")
+                else:
+                    log.append(f"  ⚠ Could not parse schedule '{_schedule_value}' — skipping")
+            except Exception as _se:
+                log.append(f"  ⚠ Ad schedule exception (non-fatal): {_se}")
+                logger.warning(f"create_campaign_in_gads Step 8c schedule failed: {_se}")
+        else:
+            log.append("Step 8c: No ad schedule configured — ads run 24/7")
 
         # ── Step 9: Enable campaign ───────────────────────────────────────────
         log.append("Step 9: Enabling campaign (PAUSED → ENABLED)")

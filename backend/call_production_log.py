@@ -10,8 +10,9 @@ Problem (G1):
 
 This module fixes that by:
   1. Walking mango_calls rows that are fully resolved:
-       - booked_outcome = 'booked'           (AI confirmed appointment was booked)
-       - od_appointment_id IS NOT NULL        (matched to an actual OD appointment)
+       - od_appointment_id IS NOT NULL        (matched to an actual OD appointment;
+                                               this is the booking signal — booked_outcome
+                                               was never populated by the pipeline)
        - od_patient_num IS NOT NULL           (matched to an OD patient)
        - attributed_keyword_method != ''      (any GAds attribution exists)
        - attributed_keyword_method != 'no_signal'
@@ -88,6 +89,13 @@ def _fetch_call_production_data(days: int = 60) -> list:
     Return mango_calls rows that are fully resolved and ready for production logging.
     Joins gads_call_view to recover campaign_id/campaign_name when the call was
     attributed via Method C (time-window/campaign-only path).
+
+    Patient status gate (mirrors google_ads_conversions.py logic):
+      new_patient      → include — no prior OD history at time of match
+      unknown / ''     → include — not yet classified, give benefit of the doubt
+      existing_active  → exclude — pre-existing patient; their implant revenue
+                         is not attributable to the ad that drove the call
+      existing_inactive→ exclude — lapsed patient; same reasoning
     """
     from database import _conn
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -106,6 +114,7 @@ def _fetch_call_production_data(days: int = 60) -> list:
                 mc.attributed_ad_group,
                 mc.attributed_keyword_method,
                 mc.attributed_keyword_confidence,
+                mc.od_patient_status,
                 -- Campaign info: prefer from lead (Method A/B), fall back to gads_call_view (C)
                 COALESCE(l.campaign_id,   gcv.campaign_id,   '') AS campaign_id,
                 COALESCE(l.campaign_name, gcv.campaign_name, '') AS campaign_name,
@@ -119,7 +128,6 @@ def _fetch_call_production_data(days: int = 60) -> list:
             LEFT JOIN gads_call_view gcv  ON gcv.call_id = mc.gads_call_id
             WHERE mc.started_at >= ?
               AND mc.direction = 'inbound'
-              AND mc.booked_outcome = 'booked'
               AND mc.od_appointment_id IS NOT NULL
               AND mc.od_appointment_id != ''
               AND mc.od_patient_num IS NOT NULL
@@ -129,6 +137,8 @@ def _fetch_call_production_data(days: int = 60) -> list:
               AND mc.attributed_keyword_method != 'no_signal'
               AND mc.attributed_keyword_method != 'campaign_only'
               AND COALESCE(mc.attributed_keyword_confidence, 0) >= ?
+              -- Exclude pre-existing patients — their production is not new-patient acquisition
+              AND COALESCE(mc.od_patient_status, '') NOT IN ('existing_active', 'existing_inactive')
             ORDER BY mc.started_at DESC
         """, (cutoff, _MIN_CONFIDENCE_FOR_PRODUCTION)).fetchall()
 

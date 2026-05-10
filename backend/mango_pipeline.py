@@ -988,19 +988,25 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             except Exception as nxt_err:
                 log.warning("[pipeline] next-action suggest failed for %s: %s", uuid, nxt_err)
 
-        # ── Step 8: Auto-match to OD appointment if graded as booked ─────────
+        # ── Step 8: Auto-match to OD appointment + set booked_outcome ───────
         # Non-blocking — failure must NOT affect the rest of the pipeline.
+        # booked_outcome is derived from od_appointment_id (the grading prompt
+        # never returned it, so it was always NULL — we set it here instead).
         try:
             refreshed = db.get_mango_call(uuid) or {}
-            if (refreshed.get("booked_outcome") == "booked"
-                    and not refreshed.get("od_appointment_id")):
+            if not refreshed.get("od_appointment_id"):
                 from od_matcher import match_calls_to_od_appointments
                 od_result = match_calls_to_od_appointments(days=90, target_uuid=uuid)
                 if od_result.get("matched", 0) > 0:
-                    log.info("[pipeline] Step 8: OD appointment matched for call %s", uuid)
+                    db.update_mango_call_analysis(uuid, booked_outcome="booked")
+                    log.info("[pipeline] Step 8: OD appointment matched → booked_outcome=booked for %s", uuid)
                 else:
                     log.debug("[pipeline] Step 8: No OD appointment found for call %s "
                               "(new patient or OD offline)", uuid)
+            else:
+                # Already has od_appointment_id — ensure booked_outcome is set
+                if not refreshed.get("booked_outcome"):
+                    db.update_mango_call_analysis(uuid, booked_outcome="booked")
         except Exception as od_err:
             log.warning("[pipeline] Step 8 OD match failed for %s (non-fatal): %s", uuid, od_err)
 
@@ -1116,6 +1122,49 @@ def _reset_stale_in_progress(stale_minutes: int = 15) -> int:
     except Exception as e:
         log.error("[pipeline] Failed to reset stale in_progress rows: %s", e)
         return 0
+
+
+def backfill_booked_outcome() -> dict:
+    """
+    Two-phase backfill:
+    Phase 1 — Run match_calls_to_od_appointments(days=90) to populate od_appointment_id
+              for the ~7,800 calls that have od_patient_num but no appointment match yet.
+              (The appointment matcher previously required booked_outcome='booked' to run,
+              which was never written — this unlocks all those historical calls.)
+    Phase 2 — Set booked_outcome='booked' for all inbound calls that now have
+              od_appointment_id, so call_production_log can find them.
+
+    Safe to run multiple times — each step is idempotent.
+    Returns: {"appointment_match": dict, "booked_outcome_updated": int}
+    """
+    from database import _conn
+    from datetime import datetime, timezone
+
+    # Phase 1: run appointment matcher for past 90 days
+    log.info("[pipeline] backfill_booked_outcome Phase 1: running appointment matcher (days=90)")
+    try:
+        from od_matcher import match_calls_to_od_appointments
+        appt_result = match_calls_to_od_appointments(days=90)
+        log.info("[pipeline] backfill Phase 1 done: %s", appt_result)
+    except Exception as e:
+        log.warning("[pipeline] backfill Phase 1 appointment match failed (non-fatal): %s", e)
+        appt_result = {"error": str(e)}
+
+    # Phase 2: stamp booked_outcome on all calls with od_appointment_id
+    log.info("[pipeline] backfill_booked_outcome Phase 2: stamping booked_outcome")
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute("""
+            UPDATE mango_calls
+               SET booked_outcome = 'booked', updated_at = ?
+             WHERE direction = 'inbound'
+               AND od_appointment_id IS NOT NULL
+               AND od_appointment_id != ''
+               AND (booked_outcome IS NULL OR booked_outcome = '')
+        """, (now,))
+        updated = cur.rowcount
+    log.info("[pipeline] backfill Phase 2 done: stamped %d rows with booked_outcome='booked'", updated)
+    return {"appointment_match": appt_result, "booked_outcome_updated": updated}
 
 
 def run_pipeline_tick(mango_token: Optional[str] = None) -> None:
