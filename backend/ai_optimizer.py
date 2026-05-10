@@ -80,6 +80,235 @@ _COMPETITOR_NAMES = [
 _OUR_NAMES = ["grafton dental", "grafton dental care", "gdc", "dr gupta", "dr. gupta"]
 
 
+# ── Excellence Report — campaign-type classification & prompt injection ────────
+
+# Tokens used to detect campaign type from campaign name.
+# Order matters: more specific checked first.
+_CAMPAIGN_TYPE_TOKENS = {
+    "emergency":  ["emergency", "urgent", "same day", "toothache", "broken tooth"],
+    "implants":   ["implant"],
+    "invisalign": ["invisalign", "clear aligner", "ortho"],
+    "cosmetic":   ["veneer", "cosmetic", "smile makeover", "whitening"],
+    "brand":      ["grafton dental", "brand", "branded"],
+    # default fallback = "general"
+}
+
+# Narrative guidance from Excellence Report — stays in code so it's git-tracked.
+# Numeric targets live in the excellence_targets DB table (editable from UI).
+_EXCELLENCE_NARRATIVE = {
+    "emergency": (
+        "Highest budget priority alongside Implants.\n"
+        "Run 24/7 ONLY if after-hours answering service exists; otherwise pause 10 PM–7 AM to avoid unanswered calls.\n"
+        "Emergency patients convert fast (same-day close rate high) — CPAs above band indicate budget or QS problem, not a conversion problem.\n"
+        "Peak times: Sunday PM / Monday AM — ensure schedule covers these."
+    ),
+    "implants": (
+        "Highest revenue-per-patient service ($5,000–$30,000/case) — CPA targets are wide for good reason.\n"
+        "Patients travel further for implants (up to 20–30 miles) — geo targeting can be wider than other campaigns.\n"
+        "High-consideration purchase: desktop converts better than mobile for research phase; expect lower mobile CVR.\n"
+        "Keywords 'all-on-4', 'dental implants near me', 'single tooth implant' are proven converters — never pause without strong data."
+    ),
+    "invisalign": (
+        "Case value $4,500–$8,000 — CPAs up to $300 are justifiable.\n"
+        "High research phase: patients compare providers. Strong landing page with before/after and financing options critical.\n"
+        "Financing messaging ('0% CareCredit') directly removes #1 conversion barrier."
+    ),
+    "cosmetic": (
+        "Moderate priority — good margin but lower urgency than emergency/implants.\n"
+        "Before/after photos and social proof (reviews) are especially important for cosmetic services.\n"
+        "Keywords: teeth whitening, veneers, smile makeover, dental bonding."
+    ),
+    "brand": (
+        "Never pause brand campaigns — branded keywords cost $0.50–$1.50 CPC and convert at 30–50% higher rate.\n"
+        "If competitor appears above GDC in brand search results, this is a critical gap.\n"
+        "Budget ~$5–$10/day is sufficient; should never be turned off."
+    ),
+    "general": (
+        "General/new patient campaign: capture top-of-funnel searchers ('dentist near me', 'family dentist').\n"
+        "Highest keyword volume, moderate CPC ($4–$12). Negative keywords critical here — most wasted spend comes from general terms.\n"
+        "Landing page must be service-specific, NOT the homepage."
+    ),
+}
+
+_BIDDING_PHASES = (
+    "BIDDING PHASE GUIDANCE (conversions/month on this campaign):\n"
+    "  Phase 1 (0–15 conv/mo):   Manual CPC — build data; review bids weekly\n"
+    "  Phase 2 (15–30 conv/mo):  MAXIMIZE_CONVERSIONS — bridge strategy; do NOT suggest manual bid changes\n"
+    "  Phase 3 (30–50 conv/mo):  TARGET_CPA — set initial target 20% above actual CPA; tighten over 4–8 weeks\n"
+    "  Phase 4 (50+ conv/mo):    TARGET_ROAS — requires offline OD revenue flowing into Google Ads\n"
+    "CRITICAL: Do NOT suggest switching to Smart Bidding before 30 conv/mo. Do NOT suggest manual bid changes when Smart Bidding is active."
+)
+
+_MATCH_TYPE_RULES = (
+    "MATCH TYPE RULES (2025):\n"
+    "  Exact Match = best CPA (top-performing in 70.79% of accounts) — use for proven winners\n"
+    "  Phrase Match = default for new keywords\n"
+    "  Broad Match = ONLY when Smart Bidding active AND 30+ conv/mo — Broad without Smart Bidding wastes 30–40% of budget\n"
+    "  Pause keywords with Quality Score ≤ 3 (monthly review)"
+)
+
+_NEGATIVE_KEYWORD_CATEGORIES = (
+    "NEGATIVE KEYWORD CATEGORIES TO FLAG (if seen in search terms):\n"
+    "  Jobs/Careers:  dental assistant jobs, dentist hiring, dental hygienist salary, dental school, dentistry degree,\n"
+    "                 how to become a dentist, dental residency, dental courses, CE credits, dental license\n"
+    "  Free/Low-cost: free dental, free dental clinic, dental school free, charity dental, Medicaid dentist,\n"
+    "                 low income dental, sliding scale dental, cheapest dentist\n"
+    "  DIY/Products:  DIY teeth whitening, whitening strips, whitening toothpaste, Crest whitening,\n"
+    "                 at-home veneers, snap-on veneers, dental bonding kit\n"
+    "  Educational:   dental implant procedure explained, how does Invisalign work, what is a root canal,\n"
+    "                 dental school curriculum\n"
+    "  Competitors:   any named competing practice (already flagged by rule-based engine)"
+)
+
+_RSA_GUIDANCE = (
+    "RSA / AD COPY GUIDANCE:\n"
+    "  Fill ALL 15 headline slots and ALL 4 description slots (10–15% more clicks)\n"
+    "  Shorter headlines (<20 chars) deliver CPA ~$9.35 vs ~$18.27 for longer headlines\n"
+    "  'Average' Ad Strength delivers best CPA ($12.43) — do NOT chase 'Excellent' at expense of message clarity\n"
+    "  Headline categories to cover: keyword-focused | value proposition | social proof | offer/urgency | trust/comfort\n"
+    "  Key converting themes: same-day access, financing/payment plans, anxiety-free, new patient special, insurance accepted"
+)
+
+_GEO_GUIDANCE = (
+    "GEO TARGETING GUIDANCE:\n"
+    "  Suburban (like Grafton MA): 10–15 mile radius standard\n"
+    "  Implants/specialty: 20–30 miles — patients travel further for the right provider\n"
+    "  Use 'Presence only' (NOT 'Presence OR Interest') — default Google setting burns budget on out-of-area traffic\n"
+    "  After 60+ days: run Geographic Report, apply +15–30% bid adjustment on high-converting zip codes"
+)
+
+_TOP_MISTAKES = (
+    "TOP MISTAKES TO FLAG IF YOU SEE EVIDENCE IN THE DATA:\n"
+    "  1. Traffic to homepage instead of service-specific landing page (costs 30–50% conv rate)\n"
+    "  2. No negative keyword list (wastes 20–42% of budget)\n"
+    "  3. Broad Match without Smart Bidding (wastes 30–40% of budget)\n"
+    "  4. Tracking only form fills — missing call conversions (Smart Bidding starved of data)\n"
+    "  5. No ad assets/extensions (leaving 10–25% CTR improvement on the table at zero cost)\n"
+    "  6. Wide geo targeting with 'Presence OR Interest' setting\n"
+    "  7. Smart Bidding enabled before 30 conv/mo (erratic bidding, insufficient data)"
+)
+
+
+def _classify_campaign(campaign_name: str) -> str:
+    """Map a campaign name to its service type for excellence target scoping."""
+    name = (campaign_name or "").lower()
+    for ctype, tokens in _CAMPAIGN_TYPE_TOKENS.items():
+        if any(tok in name for tok in tokens):
+            return ctype
+    return "general"
+
+
+def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: dict) -> str:
+    """
+    Build the campaign-type-aware excellence block injected into the Claude prompt.
+    Pulls numeric targets from excellence_targets DB and computes a live gap analysis
+    against the campaign's actual metrics. Returns empty string on error so the
+    optimizer continues working even if the DB call fails.
+    """
+    try:
+        from database import get_excellence_targets
+        ctype = _classify_campaign(campaign_name)
+
+        # Pull relevant targets: 'all' targets + service-specific targets
+        targets_all = get_excellence_targets(applies_to='all')
+        targets_service = get_excellence_targets(applies_to=ctype) if ctype != 'all' else []
+        all_targets = targets_all + targets_service
+
+        # Metric name → live value mapping (from summary + camp_settings)
+        # summary keys match what _call_claude_advisories receives
+        live_values = {
+            'ctr':                    summary.get('ctr', 0),
+            'conv_rate':              summary.get('conv_rate', summary.get('conversion_rate', 0)),
+            'cpl':                    summary.get('cost_per_lead', 0),
+            'cost_per_new_patient':   summary.get('cost_per_lead', 0),  # best proxy available
+            'impression_share':       (camp_settings.get('search_impression_share') or 0) * 100,
+            'roas':                   summary.get('roas', 0),
+            'budget_lost_is_threshold': (camp_settings.get('search_budget_lost_is') or 0) * 100,
+            'rank_lost_is_threshold':   (camp_settings.get('search_rank_lost_is') or 0) * 100,
+            # CPA targets: actual CPA from summary
+            'cpa_min':  summary.get('cost_per_lead', 0),
+            'cpa_max':  summary.get('cost_per_lead', 0),
+        }
+
+        # Build gap analysis lines
+        gap_lines = []
+        for t in all_targets:
+            metric = t['metric']
+            target_val = t['target_value']
+            direction = t['direction']  # 'above' or 'below'
+            unit = t['unit']
+            label = t['label']
+            live = live_values.get(metric)
+
+            if live is None or live == 0:
+                status = "no data"
+                gap_str = "—"
+            else:
+                if unit == '%':
+                    live_str = f"{live:.1f}%"
+                    tgt_str = f"{target_val:.0f}%"
+                elif unit == '$':
+                    live_str = f"${live:.0f}"
+                    tgt_str = f"${target_val:.0f}"
+                elif unit == 'x':
+                    live_str = f"{live:.1f}x"
+                    tgt_str = f"{target_val:.1f}x"
+                else:
+                    live_str = f"{live:.1f}"
+                    tgt_str = f"{target_val:.1f}"
+
+                if direction == 'above':
+                    ok = live >= target_val
+                    gap = live - target_val
+                    gap_str = f"+{abs(gap):.1f}{unit} above target" if ok else f"{abs(gap):.1f}{unit} BELOW target"
+                else:  # below
+                    ok = live <= target_val
+                    gap = target_val - live
+                    gap_str = f"{abs(gap):.1f}{unit} under limit" if ok else f"{abs(gap):.1f}{unit} ABOVE limit"
+
+                status = "✓ OK" if ok else "⚠ UNDERPERFORMING"
+
+            gap_lines.append(
+                f"  {label}: target {'>' if direction=='above' else '<'}{tgt_str if unit!='%' else target_val:.0f}{unit}"
+                + (f"  |  current {live_str}  →  {status} ({gap_str})" if live else "  |  no data yet")
+            )
+            if t.get('notes'):
+                gap_lines.append(f"    ({t['notes']})")
+
+        # Build service-specific narrative
+        narrative = _EXCELLENCE_NARRATIVE.get(ctype, _EXCELLENCE_NARRATIVE["general"])
+
+        lines = [
+            f"=== GDC EXCELLENCE BENCHMARKS — GAP ANALYSIS (campaign type: {ctype}) ===",
+        ] + gap_lines + [
+            "",
+            f"=== EXCELLENCE PLAYBOOK — {ctype.upper()} CAMPAIGN RULES ===",
+            narrative,
+            "",
+            _BIDDING_PHASES,
+            "",
+            _MATCH_TYPE_RULES,
+            "",
+            _NEGATIVE_KEYWORD_CATEGORIES,
+            "",
+            _RSA_GUIDANCE,
+            "",
+            _GEO_GUIDANCE,
+            "",
+            _TOP_MISTAKES,
+            "=== END EXCELLENCE BLOCK ===",
+        ]
+        return "\n".join(lines) + "\n"
+
+    except Exception as e:
+        logger.warning(f"[optimizer] _build_excellence_block failed (non-fatal): {e}")
+        return (
+            "DENTAL PPC BENCHMARKS: CTR target >7%, CPL <$100, Conv rate >10%, "
+            "Impression Share >65%, ROAS >4x. CPA targets: emergency $75-125, "
+            "general $100-175, Invisalign $150-300, implants $200-400.\n"
+        )
+
+
 def _is_competitor_term(term: str) -> str:
     """Return reason string if this search term is a competitor brand search, else empty."""
     t = term.lower()
@@ -936,18 +1165,9 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                 + json.dumps(geo_resolutions, default=str)
             )
 
-        prompt = """DENTAL PPC BENCHMARKS (from GDC Excellence Report — use these when sizing impact):
-- CTR: industry avg 5.44%, top quartile 8-12%, GDC target >7%
-- CPL: industry avg $83.93, top quartile $50-75, GDC target <$100
-- Conversion rate (click→lead): industry avg 9.08%, top quartile 12-18%
-- Search Impression Share: industry avg 40-60%, top quartile 70-85%, GDC target >65%
-- Negative keywords: comprehensive list recovers 20-42% of wasted spend
-- Landing page (service-specific vs homepage): lifts conversion rate 30-50%
-- All RSA slots filled: 10-15% more clicks; short headlines (<20 chars) CPA $9.35 vs $18.27 for long
-- Ad assets (sitelinks/callouts): 10-25% CTR improvement at zero extra cost
-- Target CPA by service: emergency $75-125, general $100-175, Invisalign $150-300, implants $200-400
-- Bidding phases: Manual CPC (0-15 conv/mo) → Maximize Conversions (15-30) → Target CPA (30-50) → Target ROAS (50+)
+        excellence_block = _build_excellence_block(campaign, summary, camp_settings or {})
 
+        prompt = excellence_block + """
 You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
 
@@ -1242,18 +1462,10 @@ def _call_claude_account_level(
             "optimizer_memory": memory_digest or {},
         }
 
-        prompt = """DENTAL PPC BENCHMARKS (from GDC Excellence Report — use these when sizing impact):
-- CTR: industry avg 5.44%, top quartile 8-12%, GDC target >7%
-- CPL: industry avg $83.93, top quartile $50-75, GDC target <$100
-- Conversion rate (click→lead): industry avg 9.08%, top quartile 12-18%
-- Search Impression Share: industry avg 40-60%, top quartile 70-85%, GDC target >65%
-- Negative keywords: comprehensive list recovers 20-42% of wasted spend
-- Landing page (service-specific vs homepage): lifts conversion rate 30-50%
-- All RSA slots filled: 10-15% more clicks; short headlines (<20 chars) CPA $9.35 vs $18.27 for long
-- Ad assets (sitelinks/callouts): 10-25% CTR improvement at zero extra cost
-- Target CPA by service: emergency $75-125, general $100-175, Invisalign $150-300, implants $200-400
-- Bidding phases: Manual CPC (0-15 conv/mo) → Maximize Conversions (15-30) → Target CPA (30-50) → Target ROAS (50+)
+        # Account-level: use aggregate summary, no specific camp_settings
+        acct_excellence_block = _build_excellence_block("", summary, {})
 
+        prompt = acct_excellence_block + """
 You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
 
 You have already reviewed individual campaigns. Now identify issues and opportunities that span the whole account or cannot be attributed to one campaign.

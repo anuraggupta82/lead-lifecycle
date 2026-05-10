@@ -191,6 +191,23 @@ CREATE TABLE IF NOT EXISTS optimizer_memory (
 CREATE INDEX IF NOT EXISTS idx_optimizer_memory_category ON optimizer_memory(category, active);
 CREATE INDEX IF NOT EXISTS idx_optimizer_memory_key ON optimizer_memory(key, active);
 
+-- Excellence targets: numeric benchmarks from the GDC Google Ads Excellence Report.
+-- The AI optimizer computes a gap analysis against these targets for every campaign run.
+CREATE TABLE IF NOT EXISTS excellence_targets (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    metric        TEXT NOT NULL,       -- e.g. 'ctr', 'cpl', 'impression_share', 'cpa_emergency_max'
+    target_value  REAL NOT NULL,
+    direction     TEXT NOT NULL DEFAULT 'above',  -- 'above' | 'below'
+    unit          TEXT NOT NULL DEFAULT '',       -- '%' | '$' | 'x' | ''
+    applies_to    TEXT NOT NULL DEFAULT 'all',    -- 'all' | 'emergency' | 'implants' | 'invisalign' | 'general' | 'cosmetic' | 'brand'
+    label         TEXT NOT NULL,                  -- human-readable label
+    notes         TEXT DEFAULT '',
+    active        INTEGER NOT NULL DEFAULT 1,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_excellence_targets_applies ON excellence_targets(applies_to, active);
+
 CREATE TABLE IF NOT EXISTS gads_keywords_cache (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     keyword_text            TEXT NOT NULL,
@@ -1012,6 +1029,26 @@ def _migrate(conn):
     except Exception:
         pass  # column already exists
     conn.execute("CREATE INDEX IF NOT EXISTS idx_optimizer_memory_campaign ON optimizer_memory(campaign, active)")
+
+    # Excellence targets table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS excellence_targets (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            metric        TEXT NOT NULL,
+            target_value  REAL NOT NULL,
+            direction     TEXT NOT NULL DEFAULT 'above',
+            unit          TEXT NOT NULL DEFAULT '',
+            applies_to    TEXT NOT NULL DEFAULT 'all',
+            label         TEXT NOT NULL,
+            notes         TEXT DEFAULT '',
+            active        INTEGER NOT NULL DEFAULT 1,
+            updated_at    TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_excellence_targets_applies ON excellence_targets(applies_to, active)")
+
+    # Seed excellence targets if table is empty
+    _seed_excellence_targets(conn)
 
     # Google Ads keywords cache
     conn.execute("""
@@ -4054,6 +4091,104 @@ def update_optimizer_memory(memory_id: int, value: str, reason: str) -> Optional
         )
         row = conn.execute("SELECT * FROM optimizer_memory WHERE id=?", (memory_id,)).fetchone()
         return dict(row) if row else None
+
+
+# ─── Excellence Targets ───────────────────────────────────────────────────────
+
+def _seed_excellence_targets(conn) -> None:
+    """Seed the excellence_targets table from the GDC Google Ads Excellence Report (May 2026).
+    Idempotent — only runs if the table is empty."""
+    existing = conn.execute("SELECT COUNT(*) FROM excellence_targets").fetchone()[0]
+    if existing > 0:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    # (metric, target_value, direction, unit, applies_to, label, notes)
+    seeds = [
+        # Account-wide benchmarks
+        ('ctr',               7.0,   'above', '%',  'all',       'Click-Through Rate target',
+         'Industry avg 5.44%, top quartile 8-12%'),
+        ('conv_rate',        10.0,   'above', '%',  'all',       'Conversion rate (click→lead)',
+         'Industry avg 9.08%, top quartile 12-18%'),
+        ('cpl',             100.0,   'below', '$',  'all',       'Cost Per Lead target',
+         'Industry avg $83.93, top quartile $50-75'),
+        ('cost_per_new_patient', 175.0, 'below', '$', 'all',     'Cost Per New Patient target',
+         'Industry avg $150-275, top quartile $75-150'),
+        ('impression_share',  65.0,  'above', '%',  'all',       'Search Impression Share target',
+         'Industry avg 40-60%, top quartile 70-85%'),
+        ('roas',               4.0,  'above', 'x',  'all',       'ROAS target (revenue / ad spend)',
+         'Industry avg 3-5x, top quartile 5-8x'),
+        ('budget_lost_is_threshold', 20.0, 'below', '%', 'all',  'Budget Lost IS — raise budget if exceeded',
+         'If >20%, campaign is budget-constrained; increasing bids will not help'),
+        ('rank_lost_is_threshold',   30.0, 'below', '%', 'all',  'Rank Lost IS — improve QS if exceeded',
+         'If >30%, low bids or poor Quality Score is limiting impressions'),
+        # Per-service CPA targets
+        ('cpa_min',           75.0,  'above', '$',  'emergency', 'Target CPA minimum (Emergency)',
+         'Emergency searches convert fast; target $75-125'),
+        ('cpa_max',          125.0,  'below', '$',  'emergency', 'Target CPA maximum (Emergency)',
+         'Emergency searches convert fast; target $75-125'),
+        ('cpa_min',          100.0,  'above', '$',  'general',   'Target CPA minimum (General/New Patient)',
+         'Target $100-175; first-year patient value $800-1200'),
+        ('cpa_max',          175.0,  'below', '$',  'general',   'Target CPA maximum (General/New Patient)',
+         'Target $100-175; first-year patient value $800-1200'),
+        ('cpa_min',          150.0,  'above', '$',  'invisalign','Target CPA minimum (Invisalign)',
+         'Justifiable at $4,000-8,000 case value'),
+        ('cpa_max',          300.0,  'below', '$',  'invisalign','Target CPA maximum (Invisalign)',
+         'Justifiable at $4,000-8,000 case value'),
+        ('cpa_min',          200.0,  'above', '$',  'implants',  'Target CPA minimum (Dental Implants)',
+         'Highly justifiable at $5,000-30,000 per case'),
+        ('cpa_max',          400.0,  'below', '$',  'implants',  'Target CPA maximum (Dental Implants)',
+         'Highly justifiable at $5,000-30,000 per case'),
+    ]
+    for metric, target_value, direction, unit, applies_to, label, notes in seeds:
+        conn.execute(
+            "INSERT INTO excellence_targets (metric, target_value, direction, unit, applies_to, label, notes, active, updated_at) VALUES (?,?,?,?,?,?,?,1,?)",
+            (metric, target_value, direction, unit, applies_to, label, notes, now)
+        )
+
+
+def get_excellence_targets(applies_to: Optional[str] = None, active_only: bool = True) -> list:
+    """Return excellence targets, optionally filtered by applies_to scope."""
+    with _conn() as conn:
+        base = "WHERE active=1" if active_only else "WHERE 1=1"
+        if applies_to:
+            rows = conn.execute(
+                f"SELECT * FROM excellence_targets {base} AND applies_to=? ORDER BY applies_to, metric",
+                (applies_to,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT * FROM excellence_targets {base} ORDER BY applies_to, metric"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_excellence_target(metric: str, target_value: float, direction: str, unit: str,
+                              applies_to: str, label: str, notes: str = '',
+                              target_id: Optional[int] = None) -> dict:
+    """Insert a new target or update an existing one by ID."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        if target_id:
+            conn.execute(
+                "UPDATE excellence_targets SET metric=?, target_value=?, direction=?, unit=?, applies_to=?, label=?, notes=?, active=1, updated_at=? WHERE id=?",
+                (metric, target_value, direction, unit, applies_to, label, notes, now, target_id)
+            )
+            row = conn.execute("SELECT * FROM excellence_targets WHERE id=?", (target_id,)).fetchone()
+        else:
+            cur = conn.execute(
+                "INSERT INTO excellence_targets (metric, target_value, direction, unit, applies_to, label, notes, active, updated_at) VALUES (?,?,?,?,?,?,?,1,?)",
+                (metric, target_value, direction, unit, applies_to, label, notes, now)
+            )
+            row = conn.execute("SELECT * FROM excellence_targets WHERE id=?", (cur.lastrowid,)).fetchone()
+        return dict(row) if row else {}
+
+
+def deactivate_excellence_target(target_id: int) -> bool:
+    """Soft-delete an excellence target."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute("UPDATE excellence_targets SET active=0, updated_at=? WHERE id=?", (now, target_id))
+        return True
 
 
 # ─── Communication Log (send-once dedupe) ────────────────────────────────────

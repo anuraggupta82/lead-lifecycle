@@ -6906,6 +6906,61 @@ def delete_memory(memory_id: int):
     return {"status": "ok"}
 
 
+# ─── Excellence Targets ───────────────────────────────────────────────────────
+
+@app.get("/api/admin/optimizer/excellence-targets", dependencies=[Depends(_require_admin)])
+def list_excellence_targets(applies_to: Optional[str] = None, include_inactive: bool = False):
+    """Return excellence targets from the GDC Google Ads Excellence Report."""
+    from database import get_excellence_targets
+    return {"targets": get_excellence_targets(applies_to=applies_to, active_only=not include_inactive)}
+
+
+class ExcellenceTargetBody(BaseModel):
+    metric: str
+    target_value: float
+    direction: str = "above"   # above | below
+    unit: str = ""             # % | $ | x | ''
+    applies_to: str = "all"   # all | emergency | implants | invisalign | general | cosmetic | brand
+    label: str
+    notes: str = ""
+
+
+@app.post("/api/admin/optimizer/excellence-targets", dependencies=[Depends(_require_admin)])
+def add_excellence_target(body: ExcellenceTargetBody):
+    """Add a new excellence target."""
+    from database import upsert_excellence_target
+    entry = upsert_excellence_target(
+        metric=body.metric, target_value=body.target_value, direction=body.direction,
+        unit=body.unit, applies_to=body.applies_to, label=body.label, notes=body.notes,
+    )
+    logger.info(f"Excellence target added: {body.metric} ({body.applies_to})")
+    return {"status": "ok", "entry": entry}
+
+
+@app.put("/api/admin/optimizer/excellence-targets/{tid}", dependencies=[Depends(_require_admin)])
+def update_excellence_target(tid: int, body: ExcellenceTargetBody):
+    """Update an existing excellence target by ID."""
+    from database import upsert_excellence_target
+    entry = upsert_excellence_target(
+        metric=body.metric, target_value=body.target_value, direction=body.direction,
+        unit=body.unit, applies_to=body.applies_to, label=body.label, notes=body.notes,
+        target_id=tid,
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Excellence target not found")
+    logger.info(f"Excellence target updated: id={tid} {body.metric}")
+    return {"status": "ok", "entry": entry}
+
+
+@app.delete("/api/admin/optimizer/excellence-targets/{tid}", dependencies=[Depends(_require_admin)])
+def delete_excellence_target(tid: int):
+    """Soft-delete (deactivate) an excellence target."""
+    from database import deactivate_excellence_target
+    deactivate_excellence_target(tid)
+    logger.info(f"Excellence target deactivated: id={tid}")
+    return {"status": "ok"}
+
+
 # ── Optimizer Run Memory (file-based, cross-run digest) ──────────────────────
 
 @app.get("/api/admin/optimizer/run-memory", dependencies=[Depends(_require_admin)])
@@ -7541,6 +7596,72 @@ def admin_delete_workflow_step(step_id: int):
         raise HTTPException(status_code=404, detail="Workflow step not found")
     delete_workflow_step(step_id)
     return {"ok": True}
+
+
+@app.post("/api/admin/test-step-email", dependencies=[Depends(_require_admin)])
+def admin_test_step_email(body: dict = Body(...)):
+    """
+    Fire a workflow step email immediately against the best available test lead.
+    Sends to the dev-redirect address (TEST_REDIRECT_EMAIL), never to a real patient.
+    Picks the lead with a smile_blob_name first (so image steps can be tested),
+    falling back to any lead with an email address.
+    Returns which lead and redirect address was used.
+    """
+    from email_service import send_workflow_step_email
+    from config import get_settings
+
+    step_id = body.get("step_id")
+    if not step_id:
+        raise HTTPException(status_code=400, detail="step_id required")
+
+    step = get_workflow_step(step_id)
+    if not step:
+        raise HTTPException(status_code=404, detail="Workflow step not found")
+
+    if step.get("channel") != "email":
+        raise HTTPException(status_code=400, detail="Step is not an email step")
+
+    settings = get_settings()
+
+    # Pick best test lead: prefer one with smile images, fallback to any with email
+    from database import _conn
+    with _conn() as _db:
+        test_lead = _db.execute(
+            "SELECT * FROM leads WHERE smile_blob_name != '' AND email != '' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if not test_lead:
+            test_lead = _db.execute(
+                "SELECT * FROM leads WHERE email != '' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+
+    if not test_lead:
+        raise HTTPException(status_code=404, detail="No leads with email found to use as test subject")
+
+    lead = dict(test_lead)
+
+    # Build unsubscribe URL using the lead's real id
+    lead_id = lead.get("lead_id") or lead.get("id", "")
+    base = settings.base_url.rstrip("/")
+    unsub_url = f"{base}/unsubscribe/{lead_id}/email"
+
+    redirect_to = getattr(settings, "test_redirect_email", "") or lead.get("email", "")
+
+    try:
+        ok = send_workflow_step_email(lead, dict(step), unsub_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Send failed: {e}")
+
+    return {
+        "ok": ok,
+        "sent_to": redirect_to,
+        "test_lead": lead.get("first_name", "") + " " + lead.get("last_name", ""),
+        "test_lead_id": lead_id,
+        "smile_blob": lead.get("smile_blob_name", ""),
+        "composite_blob": lead.get("smile_composite_blob_name", ""),
+        "step_template": step.get("template_name"),
+        "image_attachment": step.get("image_attachment", "none"),
+        "note": "Email redirected to dev address — no real patient contacted",
+    }
 
 
 # ─── Media Library ────────────────────────────────────────────────────────────

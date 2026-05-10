@@ -11572,6 +11572,8 @@ function WorkflowsSection() {
   const [steps, setSteps] = React.useState([]);
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
+  const [testingSendId, setTestingSendId] = React.useState(null); // step id currently being test-sent
+  const [testSendResult, setTestSendResult] = React.useState(null); // {ok, sent_to, test_lead, smile_blob, ...}
   const [copyingId, setCopyingId] = React.useState(null); // wf id being duplicated (null = none)
   const [seeding, setSeeding] = React.useState(false);
   const [error, setError] = React.useState('');
@@ -11892,6 +11894,24 @@ function WorkflowsSection() {
       setSuccess('Step saved');
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
+  }
+
+  async function sendTestEmail(stepId) {
+    if (!stepId) { setError('Save the step first before sending a test'); return; }
+    setTestingSendId(stepId);
+    setTestSendResult(null);
+    setError('');
+    try {
+      const result = await api('/api/admin/test-step-email', {
+        method: 'POST',
+        body: JSON.stringify({ step_id: stepId }),
+      });
+      setTestSendResult(result);
+    } catch (e) {
+      setError(`Test send failed: ${e.message}`);
+    } finally {
+      setTestingSendId(null);
+    }
   }
 
   async function deleteStep(stepId) {
@@ -12533,15 +12553,43 @@ function WorkflowsSection() {
                             </label>
                           </div>
 
-                          {/* Save / Cancel / Delete */}
-                          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                          {/* Save / Cancel / Delete / Send Test */}
+                          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                             <button className="btn btn-teal btn-sm" onClick={saveStep} disabled={saving}>{saving ? 'Saving…' : 'Save Step'}</button>
                             <button className="btn btn-ghost btn-sm" onClick={() => setEditingStep(null)}>Cancel</button>
+                            {editingStep.id && stepDraft.channel === 'email' && (
+                              <button className="btn btn-sm"
+                                style={{ background: '#eff6ff', color: '#1d4ed8', border: '1px solid #93c5fd' }}
+                                onClick={() => sendTestEmail(editingStep.id)}
+                                disabled={testingSendId === editingStep.id || saving}>
+                                {testingSendId === editingStep.id ? '⏳ Sending…' : '✉ Send Test'}
+                              </button>
+                            )}
                             {editingStep.id && (
                               <button className="btn btn-sm" style={{ marginLeft: 'auto', background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
                                 onClick={() => deleteStep(editingStep.id)} disabled={saving}>Delete Step</button>
                             )}
                           </div>
+                          {/* Test send result banner */}
+                          {testSendResult && editingStep.id && (
+                            <div style={{ marginTop: 8, background: testSendResult.ok ? '#f0fdf4' : '#fef2f2', border: `1px solid ${testSendResult.ok ? '#86efac' : '#fca5a5'}`, borderRadius: 6, padding: '8px 10px', fontSize: 11 }}>
+                              {testSendResult.ok ? (
+                                <>
+                                  <div style={{ fontWeight: 700, color: '#166534', marginBottom: 4 }}>✅ Test email sent!</div>
+                                  <div style={{ color: '#166534' }}>→ <strong>{testSendResult.sent_to}</strong></div>
+                                  <div style={{ color: '#15803d', marginTop: 3 }}>Lead: {testSendResult.test_lead} (ID {testSendResult.test_lead_id})</div>
+                                  <div style={{ color: '#15803d', marginTop: 2 }}>
+                                    After image: {testSendResult.smile_blob ? '✅ included' : '❌ none'} &nbsp;|&nbsp;
+                                    Composite: {testSendResult.composite_blob ? '✅ included' : '❌ none'}
+                                  </div>
+                                  {testSendResult.note && <div style={{ color: '#92400e', marginTop: 3, fontStyle: 'italic' }}>{testSendResult.note}</div>}
+                                </>
+                              ) : (
+                                <div style={{ color: '#dc2626' }}>❌ {testSendResult.error || 'Send failed'}</div>
+                              )}
+                              <button onClick={() => setTestSendResult(null)} style={{ marginTop: 6, fontSize: 10, background: 'none', border: 'none', color: '#6b7280', cursor: 'pointer', padding: 0 }}>dismiss</button>
+                            </div>
+                          )}
                         </div>
 
                         {/* Placeholder reference panel */}

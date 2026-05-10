@@ -242,8 +242,18 @@ def _get_smile_bytes(lead: dict) -> bytes:
     if blob_name:
         try:
             from google.cloud import storage as gcs_storage
+            from google.oauth2 import service_account as _sa
             settings = get_settings()
-            client = gcs_storage.Client()
+            # Use explicit SA key if available, otherwise fall through to ADC
+            sa_json = getattr(settings, "ga4_service_account_json", "")
+            if sa_json and __import__("os").path.exists(sa_json):
+                _creds = _sa.Credentials.from_service_account_file(
+                    sa_json,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                client = gcs_storage.Client(credentials=_creds, project=settings.gcp_project)
+            else:
+                client = gcs_storage.Client()
             blob = client.bucket(settings.gcs_bucket).blob(blob_name)
             data = blob.download_as_bytes()
             if len(data) > 1000:
@@ -294,8 +304,17 @@ def _get_composite_bytes(lead: dict) -> bytes:
     if blob_name:
         try:
             from google.cloud import storage as gcs_storage
+            from google.oauth2 import service_account as _sa
             settings = get_settings()
-            client = gcs_storage.Client()
+            sa_json = getattr(settings, "ga4_service_account_json", "")
+            if sa_json and __import__("os").path.exists(sa_json):
+                _creds = _sa.Credentials.from_service_account_file(
+                    sa_json,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                client = gcs_storage.Client(credentials=_creds, project=settings.gcp_project)
+            else:
+                client = gcs_storage.Client()
             blob = client.bucket(settings.gcs_bucket).blob(blob_name)
             data = blob.download_as_bytes()
             if len(data) > 1000:
@@ -512,6 +531,16 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
         img_filename = "smile-composite.png"
         if img_bytes and lead_id:
             delete_block = _build_smile_delete_block(lead_id, settings)
+        elif not img_bytes:
+            # Composite not generated yet — fall back to after-smile image
+            fallback = _get_smile_bytes(lead)
+            if fallback:
+                logger.info(f"smile_composite missing for lead {lead_id} — falling back to smile_after")
+                img_bytes = fallback
+                cid = "smile_after"
+                img_filename = "smile-after.png"
+                if lead_id:
+                    delete_block = _build_smile_delete_block(lead_id, settings)
 
     elif attachment == "case_photo_tagged":
         img_bytes = _get_case_photo_from_library(lead.get("goals", ""))
