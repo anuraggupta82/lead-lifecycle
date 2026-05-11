@@ -449,24 +449,26 @@ CREATE TABLE IF NOT EXISTS gads_spend_guardrails (
 -- ── Phase 3: Ad Creative Tables ───────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS gads_ads (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    ad_id           TEXT NOT NULL UNIQUE,
-    customer_id     TEXT NOT NULL DEFAULT '',   -- Google Ads customer ID (for multi-account safety)
-    ad_name         TEXT DEFAULT '',
-    ad_group_id     TEXT DEFAULT '',
-    ad_group_name   TEXT DEFAULT '',
-    campaign_id     TEXT DEFAULT '',
-    campaign_name   TEXT DEFAULT '',
-    status          TEXT DEFAULT '',            -- ENABLED, PAUSED, REMOVED
-    ad_type         TEXT DEFAULT '',            -- RESPONSIVE_SEARCH_AD, EXPANDED_TEXT_AD, etc.
-    headline_1      TEXT DEFAULT '',
-    headline_2      TEXT DEFAULT '',
-    headline_3      TEXT DEFAULT '',
-    description_1   TEXT DEFAULT '',
-    description_2   TEXT DEFAULT '',
-    final_url       TEXT DEFAULT '',
-    assets_json     TEXT DEFAULT '[]',          -- full RSA headline/description assets as JSON
-    synced_at       TEXT NOT NULL
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ad_id                   TEXT NOT NULL UNIQUE,
+    customer_id             TEXT NOT NULL DEFAULT '',   -- Google Ads customer ID (for multi-account safety)
+    ad_name                 TEXT DEFAULT '',
+    ad_group_ad_resource    TEXT DEFAULT '',            -- customers/CID/adGroupAds/AGID~ADID
+    ad_group_resource       TEXT DEFAULT '',            -- customers/CID/adGroups/AGID
+    ad_group_id             TEXT DEFAULT '',
+    ad_group_name           TEXT DEFAULT '',
+    campaign_id             TEXT DEFAULT '',
+    campaign_name           TEXT DEFAULT '',
+    status                  TEXT DEFAULT '',            -- ENABLED, PAUSED, REMOVED
+    ad_type                 TEXT DEFAULT '',            -- RESPONSIVE_SEARCH_AD, EXPANDED_TEXT_AD, etc.
+    headline_1              TEXT DEFAULT '',
+    headline_2              TEXT DEFAULT '',
+    headline_3              TEXT DEFAULT '',
+    description_1           TEXT DEFAULT '',
+    description_2           TEXT DEFAULT '',
+    final_url               TEXT DEFAULT '',
+    assets_json             TEXT DEFAULT '[]',          -- full RSA headline/description assets as JSON
+    synced_at               TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_gads_ads_campaign  ON gads_ads(campaign_id);
@@ -1738,26 +1740,34 @@ GROUP BY a.campaign_id, c.campaign_name;
     # ── Phase 3: Ad Creative Tables ───────────────────────────────────────────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS gads_ads (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            ad_id           TEXT NOT NULL UNIQUE,
-            customer_id     TEXT NOT NULL DEFAULT '',
-            ad_name         TEXT DEFAULT '',
-            ad_group_id     TEXT DEFAULT '',
-            ad_group_name   TEXT DEFAULT '',
-            campaign_id     TEXT DEFAULT '',
-            campaign_name   TEXT DEFAULT '',
-            status          TEXT DEFAULT '',
-            ad_type         TEXT DEFAULT '',
-            headline_1      TEXT DEFAULT '',
-            headline_2      TEXT DEFAULT '',
-            headline_3      TEXT DEFAULT '',
-            description_1   TEXT DEFAULT '',
-            description_2   TEXT DEFAULT '',
-            final_url       TEXT DEFAULT '',
-            assets_json     TEXT DEFAULT '[]',
-            synced_at       TEXT NOT NULL
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            ad_id                   TEXT NOT NULL UNIQUE,
+            customer_id             TEXT NOT NULL DEFAULT '',
+            ad_name                 TEXT DEFAULT '',
+            ad_group_ad_resource    TEXT DEFAULT '',
+            ad_group_resource       TEXT DEFAULT '',
+            ad_group_id             TEXT DEFAULT '',
+            ad_group_name           TEXT DEFAULT '',
+            campaign_id             TEXT DEFAULT '',
+            campaign_name           TEXT DEFAULT '',
+            status                  TEXT DEFAULT '',
+            ad_type                 TEXT DEFAULT '',
+            headline_1              TEXT DEFAULT '',
+            headline_2              TEXT DEFAULT '',
+            headline_3              TEXT DEFAULT '',
+            description_1           TEXT DEFAULT '',
+            description_2           TEXT DEFAULT '',
+            final_url               TEXT DEFAULT '',
+            assets_json             TEXT DEFAULT '[]',
+            synced_at               TEXT NOT NULL
         )
     """)
+    # Migration: add resource columns to existing gads_ads tables
+    for _col, _defval in [("ad_group_ad_resource", "''"), ("ad_group_resource", "''")]:
+        try:
+            conn.execute(f"ALTER TABLE gads_ads ADD COLUMN {_col} TEXT DEFAULT {_defval}")
+        except Exception:
+            pass  # column already exists
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ads_campaign ON gads_ads(campaign_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ads_ad_group ON gads_ads(ad_group_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_ads_status   ON gads_ads(status)")
@@ -5051,33 +5061,39 @@ def save_gads_ads(ads: list, customer_id: str = "") -> int:
         for ad in ads:
             conn.execute("""
                 INSERT INTO gads_ads
-                    (ad_id, customer_id, ad_name, ad_group_id, ad_group_name,
+                    (ad_id, customer_id, ad_name,
+                     ad_group_ad_resource, ad_group_resource,
+                     ad_group_id, ad_group_name,
                      campaign_id, campaign_name, status, ad_type,
                      headline_1, headline_2, headline_3,
                      description_1, description_2, final_url,
                      assets_json, synced_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(ad_id) DO UPDATE SET
-                    customer_id   = excluded.customer_id,
-                    ad_name       = excluded.ad_name,
-                    ad_group_id   = excluded.ad_group_id,
-                    ad_group_name = excluded.ad_group_name,
-                    campaign_id   = excluded.campaign_id,
-                    campaign_name = excluded.campaign_name,
-                    status        = excluded.status,
-                    ad_type       = excluded.ad_type,
-                    headline_1    = excluded.headline_1,
-                    headline_2    = excluded.headline_2,
-                    headline_3    = excluded.headline_3,
-                    description_1 = excluded.description_1,
-                    description_2 = excluded.description_2,
-                    final_url     = excluded.final_url,
-                    assets_json   = excluded.assets_json,
-                    synced_at     = excluded.synced_at
+                    customer_id          = excluded.customer_id,
+                    ad_name              = excluded.ad_name,
+                    ad_group_ad_resource = excluded.ad_group_ad_resource,
+                    ad_group_resource    = excluded.ad_group_resource,
+                    ad_group_id          = excluded.ad_group_id,
+                    ad_group_name        = excluded.ad_group_name,
+                    campaign_id          = excluded.campaign_id,
+                    campaign_name        = excluded.campaign_name,
+                    status               = excluded.status,
+                    ad_type              = excluded.ad_type,
+                    headline_1           = excluded.headline_1,
+                    headline_2           = excluded.headline_2,
+                    headline_3           = excluded.headline_3,
+                    description_1        = excluded.description_1,
+                    description_2        = excluded.description_2,
+                    final_url            = excluded.final_url,
+                    assets_json          = excluded.assets_json,
+                    synced_at            = excluded.synced_at
             """, (
                 ad["ad_id"],
                 ad.get("customer_id", customer_id),
                 ad.get("ad_name", ""),
+                ad.get("ad_group_ad_resource", ""),
+                ad.get("ad_group_resource", ""),
                 ad.get("ad_group_id", ""),
                 ad.get("ad_group_name", ""),
                 ad.get("campaign_id", ""),
@@ -5131,7 +5147,9 @@ def get_ads_with_metrics(days: int = 30) -> list:
     with _conn() as conn:
         rows = conn.execute("""
             SELECT
-                a.ad_id, a.ad_name, a.ad_group_id, a.ad_group_name,
+                a.ad_id, a.ad_name,
+                a.ad_group_ad_resource, a.ad_group_resource,
+                a.ad_group_id, a.ad_group_name,
                 a.campaign_id, a.campaign_name, a.status, a.ad_type,
                 a.headline_1, a.headline_2, a.headline_3,
                 a.description_1, a.description_2, a.final_url, a.assets_json,

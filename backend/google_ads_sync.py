@@ -319,6 +319,7 @@ def _fetch_ad_creatives(client, customer_id: str) -> list:
 
     query = """
         SELECT
+            ad_group_ad.resource_name,
             ad_group_ad.ad.id,
             ad_group_ad.ad.name,
             ad_group_ad.ad.type,
@@ -331,6 +332,7 @@ def _fetch_ad_creatives(client, customer_id: str) -> list:
             ad_group_ad.ad.responsive_search_ad.headlines,
             ad_group_ad.ad.responsive_search_ad.descriptions,
             ad_group_ad.ad.final_urls,
+            ad_group.resource_name,
             ad_group.id,
             ad_group.name,
             campaign.id,
@@ -394,22 +396,24 @@ def _fetch_ad_creatives(client, customer_id: str) -> list:
                 status = ""
 
             ads.append({
-                "ad_id":         ad_id,
-                "customer_id":   customer_id,
-                "ad_name":       ad.name or "",
-                "ad_group_id":   str(row.ad_group.id) if row.ad_group.id else "",
-                "ad_group_name": row.ad_group.name or "",
-                "campaign_id":   str(row.campaign.id) if row.campaign.id else "",
-                "campaign_name": row.campaign.name or "",
-                "status":        status,
-                "ad_type":       ad_type,
-                "headline_1":    h1,
-                "headline_2":    h2,
-                "headline_3":    h3,
-                "description_1": d1,
-                "description_2": d2,
-                "final_url":     final_url,
-                "assets_json":   assets,
+                "ad_id":                ad_id,
+                "customer_id":          customer_id,
+                "ad_name":              ad.name or "",
+                "ad_group_ad_resource": row.ad_group_ad.resource_name or "",
+                "ad_group_resource":    row.ad_group.resource_name or "",
+                "ad_group_id":          str(row.ad_group.id) if row.ad_group.id else "",
+                "ad_group_name":        row.ad_group.name or "",
+                "campaign_id":          str(row.campaign.id) if row.campaign.id else "",
+                "campaign_name":        row.campaign.name or "",
+                "status":               status,
+                "ad_type":              ad_type,
+                "headline_1":           h1,
+                "headline_2":           h2,
+                "headline_3":           h3,
+                "description_1":        d1,
+                "description_2":        d2,
+                "final_url":            final_url,
+                "assets_json":          assets,
             })
 
         logger.info(f"Ad creatives: {len(ads)} ads fetched")

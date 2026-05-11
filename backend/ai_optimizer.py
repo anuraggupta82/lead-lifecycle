@@ -1059,7 +1059,9 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              optimizer_run_id: str = "",
                              existing_negatives: set | None = None,
                              memory_digest: dict | None = None,
-                             camp_settings: dict | None = None) -> list:
+                             camp_settings: dict | None = None,
+                             ad_performance: list | None = None,
+                             landing_page_intel: str = "") -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -1148,6 +1150,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "google_recommendations": (google_recs or [])[:20],
             "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
             "optimizer_memory": memory_digest or {},
+            "ad_performance": (ad_performance or [])[:20],  # per-RSA performance + scored metrics
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -1155,7 +1158,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
         rsa_note = ""
         if rsa_resources:
             rsa_note = (
-                "\n\nRSA RESOURCES (use ad_group_ad_resource for ad_copy_suggestion):\n"
+                "\n\nRSA RESOURCES (use ad_group_ad_resource for ad_copy_suggestion or replace_ad):\n"
                 + json.dumps(rsa_resources[:5], default=str)
             )
         geo_note = ""
@@ -1163,6 +1166,18 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             geo_note = (
                 "\n\nPRE-RESOLVED GEO TARGETS (use geo_target_resource for geo_exclusion):\n"
                 + json.dumps(geo_resolutions, default=str)
+            )
+        ad_perf_note = ""
+        if ad_performance:
+            ad_perf_note = (
+                "\n\nAD PERFORMANCE (30-day metrics per RSA — use for replace_ad decisions):\n"
+                + json.dumps(ad_performance[:10], default=str)
+            )
+        page_intel_note = ""
+        if landing_page_intel:
+            page_intel_note = (
+                "\n\nLANDING PAGE INTELLIGENCE (use to write grounded ad copy for replace_ad):\n"
+                + landing_page_intel[:2000]
             )
 
         excellence_block = _build_excellence_block(campaign, summary, camp_settings or {})
@@ -1189,7 +1204,7 @@ Use this to:
 - Always reference the current daily_budget_usd when recommending a change_budget — state the specific dollar increase and the % change
 
 Each recommendation MUST be a JSON object with these fields:
-- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset
+- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad
 - "reason": 1-2 sentence explanation with specific numbers from the data
 - "estimated_monthly_impact": object with keys:
     "savings_usd": estimated monthly dollar savings (0 if not applicable),
@@ -1244,6 +1259,32 @@ For add_asset:
   "campaign_resource": campaign resource name,
   "description": what to add (advisory — no API call)
 
+For replace_ad (A/B ad testing — pause underperformer, create improved version):
+  "old_ad_group_ad_resource": EXACT ad_group_ad_resource from ad_performance or rsa_resources data (required)
+  "new_headlines": array of 10-15 strings, each STRICTLY ≤30 chars — count every character
+  "new_descriptions": array of 3-4 strings, each STRICTLY ≤90 chars
+  "final_url": copy from old ad's final_url unless campaign context suggests a better page
+  "path1": optional display-URL segment ≤15 chars (e.g. "dentures")
+  "path2": optional display-URL segment ≤15 chars (e.g. "grafton-ma")
+  "ad_group_resource": copy from the ad_performance row (required)
+  Use replace_ad ONLY when: CTR < 50% of campaign average for 30+ days with ≥200 impressions,
+  OR zero conversions after spending ≥$30, OR impressions < 100 in 30 days when budget allows.
+  Ground new copy in landing_page_intel — use real service names, offers, CTAs from the page.
+  Headlines must be specific and locally grounded. Avoid generic phrases like "Quality Care".
+  A/B principle: only recommend ONE replace_ad per campaign per run. Keep changes focused.
+
+AD PERFORMANCE SCORING CONTEXT:
+The "ad_performance" field contains per-RSA metrics. Key fields:
+  - ctr: click-through rate (30-day)
+  - avg_campaign_ctr: average CTR for all ads in this campaign (use as benchmark)
+  - impressions_30d: total impressions in 30 days
+  - cost_30d_usd: spend in 30 days
+  - conversions_30d: attributed conversions
+  - performance_tier: "strong"|"average"|"weak"|"cold" (pre-computed)
+  - ad_group_ad_resource: use this EXACTLY for old_ad_group_ad_resource in replace_ad
+  - ad_group_resource: use this EXACTLY for ad_group_resource in replace_ad
+Prioritize "weak" or "cold" tier ads for replacement. Never replace "strong" tier ads.
+
 GOOGLE'S OWN RECOMMENDATIONS (pulled live from Google Ads API):
 Google has flagged the following recommendations for this account. Evaluate each one against the campaign data and lead/call attribution above. For each Google rec:
 - If the data supports it → include it as your recommendation with operation matching the rec type, add "google_rec_resource_name": the resource_name field
@@ -1271,7 +1312,7 @@ Rules:
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already added as negatives in Google Ads. Do NOT suggest add_negative_keyword for any term that already appears in that list (exact or near-match). Only flag NEW terms not yet blocked.
 - OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating recommendations that were recently rejected, (2) build on patterns from past runs, (3) surface new issues not seen before. Do not re-suggest anything in "rejected_patterns".
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array
-- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.""" + rsa_note + geo_note + feedback_block
+- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.""" + rsa_note + geo_note + ad_perf_note + page_intel_note + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -1362,6 +1403,44 @@ Rules:
                     if not item.get("new_daily_budget_usd"):
                         logger.warning("Dropping change_budget — missing new_daily_budget_usd")
                         continue
+                elif op == "replace_ad":
+                    # Validate resource names and character limits
+                    old_rn = item.get("old_ad_group_ad_resource", "")
+                    if not old_rn:
+                        logger.warning("Dropping replace_ad — missing old_ad_group_ad_resource")
+                        continue
+                    # Build valid ad resources from ad_performance + rsa_resources
+                    valid_ad_resources = {
+                        a.get("ad_group_ad_resource", "") for a in (ad_performance or []) if a.get("ad_group_ad_resource")
+                    } | {
+                        r.get("ad_group_ad_resource", "") for r in (rsa_resources or []) if r.get("ad_group_ad_resource")
+                    }
+                    if valid_ad_resources and old_rn not in valid_ad_resources:
+                        logger.warning(f"Dropping replace_ad — unknown ad resource '{old_rn}'")
+                        continue
+                    # Validate and clip headlines/descriptions
+                    headlines = [h[:30].strip() for h in (item.get("new_headlines") or []) if (h or "").strip()]
+                    descriptions = [d[:90].strip() for d in (item.get("new_descriptions") or []) if (d or "").strip()]
+                    if len(headlines) < 3:
+                        logger.warning(f"Dropping replace_ad — too few headlines ({len(headlines)})")
+                        continue
+                    if len(descriptions) < 2:
+                        logger.warning(f"Dropping replace_ad — too few descriptions ({len(descriptions)})")
+                        continue
+                    if not item.get("final_url"):
+                        logger.warning("Dropping replace_ad — missing final_url")
+                        continue
+                    item["new_headlines"] = headlines
+                    item["new_descriptions"] = descriptions
+                    # Ensure ad_group_resource is populated
+                    if not item.get("ad_group_resource"):
+                        # Derive from old_ad_group_ad_resource: .../adGroupAds/AGID~ADID → .../adGroups/AGID
+                        try:
+                            base = old_rn.split("/adGroupAds/")[0]
+                            ag_id = old_rn.split("/adGroupAds/")[1].split("~")[0]
+                            item["ad_group_resource"] = f"{base}/adGroups/{ag_id}"
+                        except Exception:
+                            pass
                 validated.append(item)
             logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
             return validated
@@ -2988,6 +3067,340 @@ def _execute_replace_ad(client, customer_id: str,
     return {"paused_resource": paused_rn, "created_resource": created_rn}
 
 
+def _execute_pause_ad(client, customer_id: str,
+                       ad_group_ad_resource: str) -> dict:
+    """
+    Pause a single RSA ad without creating a replacement.
+
+    Args:
+        ad_group_ad_resource: customers/CID/adGroupAds/AGID~ADID
+
+    Returns: {"paused_resource": str}
+
+    Raises ValueError on validation failures; raises GoogleAdsException on API failure.
+    """
+    if not ad_group_ad_resource:
+        raise ValueError("ad_group_ad_resource is required")
+
+    # Pre-flight: confirm ad exists and isn't already removed/paused
+    ga_service = client.get_service("GoogleAdsService")
+    q = (f"SELECT ad_group_ad.status FROM ad_group_ad "
+         f"WHERE ad_group_ad.resource_name = '{ad_group_ad_resource}' LIMIT 1")
+    found = False
+    for row in ga_service.search(customer_id=customer_id, query=q):
+        found = True
+        status_enum = row.ad_group_ad.status
+        if status_enum == client.enums.AdGroupAdStatusEnum.REMOVED:
+            raise ValueError(f"Ad is already REMOVED: {ad_group_ad_resource}")
+        if status_enum == client.enums.AdGroupAdStatusEnum.PAUSED:
+            raise ValueError(f"Ad is already PAUSED: {ad_group_ad_resource}")
+    if not found:
+        raise ValueError(f"Ad not found: {ad_group_ad_resource}")
+
+    # Build PAUSE operation
+    pause_op = client.get_type("AdGroupAdOperation")
+    pause_aga = pause_op.update
+    pause_aga.resource_name = ad_group_ad_resource
+    pause_aga.status = client.enums.AdGroupAdStatusEnum.PAUSED
+    client.copy_from(
+        pause_op.update_mask,
+        field_mask_pb2.FieldMask(paths=["status"])
+    )
+
+    service = client.get_service("AdGroupAdService")
+    try:
+        response = service.mutate_ad_group_ads(
+            customer_id=customer_id,
+            operations=[pause_op],
+        )
+    except Exception as e:
+        logger.error(f"pause_ad failed for {ad_group_ad_resource}: {e}")
+        raise
+
+    paused_rn = response.results[0].resource_name
+    logger.info(f"pause_ad: paused {paused_rn}")
+    return {"paused_resource": paused_rn}
+
+
+def _verify_gads_change(client, customer_id: str, operation: str, context: dict) -> dict:
+    """
+    Read back the entity that was just mutated and return a human-readable confirmation dict.
+
+    Args:
+        operation: the operation string (e.g. "pause_keyword", "change_budget", "replace_ad")
+        context: relevant resource names / IDs extracted by the caller
+
+    Returns:
+        {
+          "confirmed": True/False,
+          "summary": str   — one-line confirmation message shown in the UI
+          "detail": dict   — raw read-back data for debugging
+        }
+
+    Never raises — on any failure returns {"confirmed": False, "summary": "Could not verify", "detail": {}}
+    """
+    ga_svc = client.get_service("GoogleAdsService")
+
+    def _safe_search(query: str):
+        try:
+            return list(ga_svc.search(customer_id=customer_id, query=query))
+        except Exception as e:
+            logger.warning(f"_verify_gads_change search failed: {e}")
+            return []
+
+    try:
+        # ── Keyword status (pause / enable / tighten_match_type / change_match_type) ─────
+        if operation in ("pause_keyword", "enable_keyword", "tighten_match_type", "change_match_type"):
+            resource_name = context.get("resource_name", "")
+            if not resource_name:
+                return {"confirmed": False, "summary": "Could not verify — missing resource_name", "detail": {}}
+            rows = _safe_search(
+                f"SELECT ad_group_criterion.resource_name, "
+                f"ad_group_criterion.status, ad_group_criterion.keyword.text, "
+                f"ad_group_criterion.keyword.match_type "
+                f"FROM ad_group_criterion "
+                f"WHERE ad_group_criterion.resource_name = '{resource_name}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Keyword not found in read-back", "detail": {}}
+            r = rows[0].ad_group_criterion
+            status_name = r.status.name if hasattr(r.status, "name") else str(r.status)
+            match_name = r.keyword.match_type.name if hasattr(r.keyword.match_type, "name") else str(r.keyword.match_type)
+            kw_text = r.keyword.text
+            detail = {"status": status_name, "match_type": match_name, "keyword_text": kw_text}
+            if operation == "pause_keyword":
+                ok = "PAUSED" in status_name.upper()
+                summary = f"✅ '{kw_text}' confirmed PAUSED" if ok else f"⚠️ '{kw_text}' status is {status_name} (expected PAUSED)"
+            elif operation == "enable_keyword":
+                ok = "ENABLED" in status_name.upper()
+                summary = f"✅ '{kw_text}' confirmed ENABLED" if ok else f"⚠️ '{kw_text}' status is {status_name} (expected ENABLED)"
+            else:
+                summary = f"✅ '{kw_text}' now {match_name} / {status_name}"
+            return {"confirmed": ok if operation in ("pause_keyword", "enable_keyword") else True, "summary": summary, "detail": detail}
+
+        # ── Bid change ────────────────────────────────────────────────────────────────────
+        elif operation in ("increase_bid", "decrease_bid"):
+            resource_name = context.get("resource_name", "")
+            expected_micros = context.get("new_bid_micros", 0)
+            if not resource_name:
+                return {"confirmed": False, "summary": "Could not verify — missing resource_name", "detail": {}}
+            rows = _safe_search(
+                f"SELECT ad_group_criterion.resource_name, "
+                f"ad_group_criterion.keyword.text, "
+                f"ad_group_criterion.effective_cpc_bid_micros, "
+                f"ad_group_criterion.cpc_bid_micros "
+                f"FROM ad_group_criterion "
+                f"WHERE ad_group_criterion.resource_name = '{resource_name}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Keyword not found in read-back", "detail": {}}
+            r = rows[0].ad_group_criterion
+            actual_micros = r.cpc_bid_micros or r.effective_cpc_bid_micros
+            actual_usd = actual_micros / 1_000_000
+            expected_usd = int(expected_micros) / 1_000_000 if expected_micros else None
+            kw_text = r.keyword.text
+            detail = {"keyword_text": kw_text, "cpc_bid_micros": actual_micros}
+            if expected_usd is not None:
+                ok = abs(actual_micros - int(expected_micros)) < 10_000  # within $0.01
+                summary = (f"✅ '{kw_text}' bid confirmed ${actual_usd:.2f}"
+                           if ok else
+                           f"⚠️ '{kw_text}' bid is ${actual_usd:.2f} (expected ${expected_usd:.2f})")
+            else:
+                ok = True
+                summary = f"✅ '{kw_text}' bid is ${actual_usd:.2f}"
+            return {"confirmed": ok, "summary": summary, "detail": detail}
+
+        # ── Budget change ─────────────────────────────────────────────────────────────────
+        elif operation == "change_budget":
+            campaign_resource = context.get("campaign_resource", "")
+            expected_usd = context.get("new_daily_budget_usd", 0)
+            if not campaign_resource:
+                return {"confirmed": False, "summary": "Could not verify — missing campaign_resource", "detail": {}}
+            rows = _safe_search(
+                f"SELECT campaign.name, campaign_budget.amount_micros "
+                f"FROM campaign "
+                f"WHERE campaign.resource_name = '{campaign_resource}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Campaign not found in read-back", "detail": {}}
+            camp_name = rows[0].campaign.name
+            actual_micros = rows[0].campaign_budget.amount_micros
+            actual_usd = actual_micros / 1_000_000
+            expected_float = float(expected_usd) if expected_usd else None
+            detail = {"campaign_name": camp_name, "budget_micros": actual_micros, "budget_usd": actual_usd}
+            if expected_float is not None:
+                ok = abs(actual_usd - expected_float) < 0.02
+                summary = (f"✅ '{camp_name}' budget confirmed ${actual_usd:.2f}/day"
+                           if ok else
+                           f"⚠️ '{camp_name}' budget is ${actual_usd:.2f}/day (expected ${expected_float:.2f})")
+            else:
+                ok = True
+                summary = f"✅ '{camp_name}' budget is ${actual_usd:.2f}/day"
+            return {"confirmed": ok, "summary": summary, "detail": detail}
+
+        # ── Campaign status (pause / enable) ──────────────────────────────────────────────
+        elif operation == "status":
+            campaign_resource = context.get("campaign_resource", "")
+            expected_status = context.get("expected_status", "")  # "ENABLED" or "PAUSED"
+            if not campaign_resource:
+                return {"confirmed": False, "summary": "Could not verify — missing campaign_resource", "detail": {}}
+            rows = _safe_search(
+                f"SELECT campaign.name, campaign.status "
+                f"FROM campaign "
+                f"WHERE campaign.resource_name = '{campaign_resource}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Campaign not found in read-back", "detail": {}}
+            camp_name = rows[0].campaign.name
+            status_name = rows[0].campaign.status.name if hasattr(rows[0].campaign.status, "name") else str(rows[0].campaign.status)
+            detail = {"campaign_name": camp_name, "status": status_name}
+            ok = (not expected_status) or (expected_status.upper() in status_name.upper())
+            summary = f"✅ Campaign '{camp_name}' confirmed {status_name}" if ok else f"⚠️ Campaign '{camp_name}' is {status_name} (expected {expected_status})"
+            return {"confirmed": ok, "summary": summary, "detail": detail}
+
+        # ── Ad status changes (pause_ad) ──────────────────────────────────────────────────
+        elif operation == "pause_ad":
+            ad_resource = context.get("ad_group_ad_resource", "")
+            if not ad_resource:
+                return {"confirmed": False, "summary": "Could not verify — missing ad_group_ad_resource", "detail": {}}
+            rows = _safe_search(
+                f"SELECT ad_group_ad.resource_name, ad_group_ad.status, "
+                f"ad_group_ad.ad.responsive_search_ad.headlines "
+                f"FROM ad_group_ad "
+                f"WHERE ad_group_ad.resource_name = '{ad_resource}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Ad not found in read-back", "detail": {}}
+            r = rows[0].ad_group_ad
+            status_name = r.status.name if hasattr(r.status, "name") else str(r.status)
+            ok = "PAUSED" in status_name.upper()
+            detail = {"ad_resource": ad_resource, "status": status_name}
+            summary = f"✅ Ad confirmed PAUSED" if ok else f"⚠️ Ad status is {status_name} (expected PAUSED)"
+            return {"confirmed": ok, "summary": summary, "detail": detail}
+
+        # ── Replace ad ────────────────────────────────────────────────────────────────────
+        elif operation == "replace_ad":
+            old_resource = context.get("old_ad_group_ad_resource", "")
+            new_resource = context.get("created_ad_group_ad_resource", "")
+            results = {}
+
+            # Verify old ad is PAUSED
+            if old_resource:
+                rows = _safe_search(
+                    f"SELECT ad_group_ad.status FROM ad_group_ad "
+                    f"WHERE ad_group_ad.resource_name = '{old_resource}' LIMIT 1"
+                )
+                if rows:
+                    old_status = rows[0].ad_group_ad.status.name if hasattr(rows[0].ad_group_ad.status, "name") else str(rows[0].ad_group_ad.status)
+                    results["old_ad_status"] = old_status
+                    results["old_ad_paused"] = "PAUSED" in old_status.upper()
+
+            # Verify new ad is ENABLED
+            if new_resource:
+                rows = _safe_search(
+                    f"SELECT ad_group_ad.status, ad_group_ad.ad.responsive_search_ad.headlines "
+                    f"FROM ad_group_ad "
+                    f"WHERE ad_group_ad.resource_name = '{new_resource}' LIMIT 1"
+                )
+                if rows:
+                    new_status = rows[0].ad_group_ad.status.name if hasattr(rows[0].ad_group_ad.status, "name") else str(rows[0].ad_group_ad.status)
+                    results["new_ad_status"] = new_status
+                    results["new_ad_enabled"] = "ENABLED" in new_status.upper()
+                    # Extract first headline for confirmation
+                    try:
+                        headlines = rows[0].ad_group_ad.ad.responsive_search_ad.headlines
+                        results["new_ad_first_headline"] = headlines[0].text if headlines else ""
+                    except Exception:
+                        pass
+
+            old_ok = results.get("old_ad_paused", False)
+            new_ok = results.get("new_ad_enabled", False)
+            ok = old_ok and new_ok
+            first_h = results.get("new_ad_first_headline", "")
+            if ok:
+                summary = f"✅ Old ad paused, new ad live" + (f' — \"{first_h}\"' if first_h else "")
+            elif old_ok and not new_ok:
+                summary = f"⚠️ Old ad paused but new ad status is {results.get('new_ad_status', 'unknown')}"
+            elif not old_ok and new_ok:
+                summary = f"⚠️ New ad live but old ad is {results.get('old_ad_status', 'unknown')} (expected PAUSED)"
+            else:
+                summary = f"⚠️ Could not confirm replacement — check Google Ads"
+            return {"confirmed": ok, "summary": summary, "detail": results}
+
+        # ── Add keyword (exact or negative) ──────────────────────────────────────────────
+        elif operation in ("add_exact_keyword", "add_negative_keyword", "add_to_shared_negative_list"):
+            keyword_text = context.get("keyword_text", "")
+            if not keyword_text:
+                return {"confirmed": True, "summary": "✅ Keyword operation submitted", "detail": {}}
+            # For positive keywords, read back from ad_group_criterion
+            if operation == "add_exact_keyword":
+                ad_group_resource = context.get("ad_group_resource", "")
+                # Escape single quotes in keyword_text for safe GAQL interpolation
+                kw_escaped = keyword_text.replace("'", "\\'")
+                ag_filter = (f" AND ad_group.resource_name = '{ad_group_resource}'"
+                             if ad_group_resource else "")
+                query = (
+                    f"SELECT ad_group_criterion.keyword.text, ad_group_criterion.status "
+                    f"FROM ad_group_criterion "
+                    f"WHERE ad_group_criterion.keyword.text = '{kw_escaped}' "
+                    f"AND ad_group_criterion.negative = false"
+                    f"{ag_filter} LIMIT 1"
+                )
+                rows = _safe_search(query)
+                if rows:
+                    status_name = rows[0].ad_group_criterion.status.name if hasattr(rows[0].ad_group_criterion.status, "name") else str(rows[0].ad_group_criterion.status)
+                    return {"confirmed": True, "summary": f"✅ Keyword '{keyword_text}' added ({status_name})", "detail": {"status": status_name}}
+                return {"confirmed": True, "summary": f"✅ Keyword '{keyword_text}' submitted (verify in GAds)", "detail": {}}
+            else:
+                # Negative keywords: no easy way to query by text without knowing campaign_criterion resource
+                return {"confirmed": True, "summary": f"✅ Negative keyword '{keyword_text}' submitted", "detail": {}}
+
+        # ── Bid strategy change ───────────────────────────────────────────────────────────
+        elif operation == "change_bid_strategy":
+            campaign_resource = context.get("campaign_resource", "")
+            expected_strategy = context.get("bid_strategy", "")
+            if not campaign_resource:
+                return {"confirmed": True, "summary": "✅ Bid strategy change submitted", "detail": {}}
+            rows = _safe_search(
+                f"SELECT campaign.name, campaign.bidding_strategy_type "
+                f"FROM campaign WHERE campaign.resource_name = '{campaign_resource}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Campaign not found in read-back", "detail": {}}
+            camp_name = rows[0].campaign.name
+            strategy_name = rows[0].campaign.bidding_strategy_type.name if hasattr(rows[0].campaign.bidding_strategy_type, "name") else str(rows[0].campaign.bidding_strategy_type)
+            detail = {"campaign_name": camp_name, "bidding_strategy_type": strategy_name}
+            summary = f"✅ '{camp_name}' bid strategy is now {strategy_name}"
+            return {"confirmed": True, "summary": summary, "detail": detail}
+
+        # ── Geo exclusion ─────────────────────────────────────────────────────────────────
+        elif operation == "geo_exclusion":
+            geo_target_resource = context.get("geo_target_resource", "")
+            campaign_resource = context.get("campaign_resource", "")
+            if not campaign_resource or not geo_target_resource:
+                return {"confirmed": True, "summary": "✅ Geo exclusion submitted", "detail": {}}
+            rows = _safe_search(
+                f"SELECT campaign_criterion.resource_name, campaign_criterion.negative "
+                f"FROM campaign_criterion "
+                f"WHERE campaign_criterion.campaign = '{campaign_resource}' "
+                f"AND campaign_criterion.negative = true "
+                f"AND campaign_criterion.location.geo_target_constant = '{geo_target_resource}' LIMIT 1"
+            )
+            confirmed = len(rows) > 0
+            summary = ("✅ Geo exclusion confirmed in Google Ads"
+                       if confirmed else
+                       "⚠️ Geo exclusion submitted but not yet visible in read-back — check Google Ads")
+            return {"confirmed": confirmed, "summary": summary, "detail": {"found": confirmed}}
+
+        # ── Advisory / fallthrough ────────────────────────────────────────────────────────
+        else:
+            return {"confirmed": True, "summary": "✅ Change submitted to Google Ads", "detail": {}}
+
+    except Exception as e:
+        logger.warning(f"_verify_gads_change({operation}) failed: {e}")
+        return {"confirmed": False, "summary": "Could not verify — check Google Ads", "detail": {"error": str(e)}}
+
+
 def _resolve_geo_target_id(client, location_name: str, country_code: str = "US") -> tuple:
     """
     Resolve a location name to a GeoTargetConstant resource name.
@@ -3378,6 +3791,88 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as e:
         logger.warning(f"Google recommendations fetch failed (non-fatal): {e}")
 
+    # ── Fetch and score ad performance for A/B testing loop ──────────────────
+    logger.info("Fetching ad performance metrics for A/B testing analysis...")
+    all_ads_with_metrics: list = []
+    try:
+        from database import get_ads_with_metrics as _get_ads_metrics
+        raw_ads = _get_ads_metrics(days=30)
+        # Build per-campaign CTR averages for benchmarking
+        camp_ctr_totals: dict = {}
+        for ad in raw_ads:
+            if ad.get("status") != "ENABLED" or ad.get("ad_type") != "RESPONSIVE_SEARCH_AD":
+                continue
+            impr = ad.get("impressions") or 0
+            clicks = ad.get("clicks") or 0
+            cname = (ad.get("campaign_name") or "").strip().lower()
+            if cname not in camp_ctr_totals:
+                camp_ctr_totals[cname] = {"impressions": 0, "clicks": 0}
+            camp_ctr_totals[cname]["impressions"] += impr
+            camp_ctr_totals[cname]["clicks"] += clicks
+        camp_avg_ctr: dict = {
+            c: (v["clicks"] / v["impressions"]) if v["impressions"] > 0 else 0
+            for c, v in camp_ctr_totals.items()
+        }
+        # Score each active RSA
+        for ad in raw_ads:
+            if ad.get("status") != "ENABLED" or ad.get("ad_type") != "RESPONSIVE_SEARCH_AD":
+                continue
+            impr = ad.get("impressions") or 0
+            clicks = ad.get("clicks") or 0
+            cost_micros = ad.get("cost_micros") or 0
+            conv = ad.get("conversions") or 0
+            cname = (ad.get("campaign_name") or "").strip().lower()
+            ctr = (clicks / impr) if impr > 0 else 0
+            avg_ctr = camp_avg_ctr.get(cname, 0)
+            cost_usd = cost_micros / 1_000_000
+
+            # Performance tier
+            if impr < 100:
+                tier = "cold"      # not enough data / not serving
+            elif ctr >= avg_ctr * 1.2:
+                tier = "strong"
+            elif ctr >= avg_ctr * 0.5:
+                tier = "average"
+            else:
+                tier = "weak"      # CTR < 50% of campaign average
+
+            # Override: zero conversions after meaningful spend = weak
+            if conv == 0 and cost_usd >= 30 and tier != "cold":
+                tier = "weak"
+
+            # Build assets from assets_json if available
+            assets = {}
+            try:
+                assets = json.loads(ad.get("assets_json") or "{}")
+            except Exception:
+                pass
+            headlines = assets.get("headlines", [ad.get("headline_1",""), ad.get("headline_2",""), ad.get("headline_3","")])
+            descriptions = assets.get("descriptions", [ad.get("description_1",""), ad.get("description_2","")])
+
+            all_ads_with_metrics.append({
+                "ad_id":               ad.get("ad_id",""),
+                "ad_group_ad_resource": ad.get("ad_group_ad_resource",""),
+                "ad_group_resource":   ad.get("ad_group_resource",""),
+                "campaign_name":       ad.get("campaign_name",""),
+                "campaign_id":         ad.get("campaign_id",""),
+                "ad_group_name":       ad.get("ad_group_name",""),
+                "final_url":           ad.get("final_url",""),
+                "headlines":           [h for h in headlines if h],
+                "descriptions":        [d for d in descriptions if d],
+                "impressions_30d":     impr,
+                "clicks_30d":          clicks,
+                "cost_30d_usd":        round(cost_usd, 2),
+                "conversions_30d":     round(conv, 2),
+                "ctr":                 round(ctr, 4),
+                "avg_campaign_ctr":    round(avg_ctr, 4),
+                "performance_tier":    tier,
+            })
+        enabled_rsas = len(all_ads_with_metrics)
+        weak_rsas = sum(1 for a in all_ads_with_metrics if a["performance_tier"] in ("weak","cold"))
+        logger.info(f"Ad performance: {enabled_rsas} active RSAs scored, {weak_rsas} weak/cold")
+    except Exception as _ads_err:
+        logger.warning(f"Ad performance fetch failed (non-fatal): {_ads_err}")
+
     # ── Capture account-wide totals before any filtering ──────────────────────
     total_spend_all_campaigns = round(sum(k.get("cost", 0) for k in keyword_perf), 2)
     total_clicks_all_campaigns = sum(k.get("clicks", 0) for k in keyword_perf)
@@ -3425,14 +3920,16 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     # M6 fix: key suppression by (entity_name_lower, operation) tuple — NOT entity_name
     # alone. A rejected "decrease_bid" on keyword X should NOT suppress "pause_keyword"
     # on the same keyword X. Each action type maps to a distinct operation string.
+    # Initialize rejection sets — always defined so Claude loop can reference them safely
+    rejected_op_pairs: set = set()
+    rejected_id_op_pairs: set = set()
+
     try:
         from database import get_recent_rejections
         recent_rejections = get_recent_rejections(days=30)
         suppressed_count = 0
 
         # Build (entity_name_lower, operation) and (entity_id, operation) sets
-        rejected_op_pairs = set()
-        rejected_id_op_pairs = set()
         for r in recent_rejections:
             ename = (r.get("entity_name") or "").lower()
             op = r.get("operation") or ""
@@ -3659,6 +4156,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         "change_bid_strategy":  ("campaign", "campaign_resource", "bid_strategy"),
         "change_match_type":    ("keyword",  "resource_name",     "keyword_text"),
         "add_asset":            ("campaign", "campaign_resource",  "asset_type"),
+        "replace_ad":           ("ad",       "old_ad_group_ad_resource", "old_ad_group_ad_resource"),
     }
 
     # Geo candidates for Grafton Dental Care (Worcester area, MA)
@@ -3698,6 +4196,33 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             except Exception as _rsa_e:
                 logger.warning(f"  [{camp_name}] RSA pre-fetch failed (non-fatal): {_rsa_e}")
 
+        # Filter ad performance to this campaign
+        camp_ad_perf = [
+            a for a in all_ads_with_metrics
+            if a.get("campaign_name","").strip().lower() == camp_lower
+        ]
+        weak_count = sum(1 for a in camp_ad_perf if a["performance_tier"] in ("weak","cold"))
+        if camp_ad_perf:
+            logger.info(f"  [{camp_name}] {len(camp_ad_perf)} RSAs scored — {weak_count} weak/cold")
+
+        # Load landing page intel for this campaign's final_url
+        camp_page_intel = ""
+        try:
+            from domain_crawler import build_site_context_for_url
+            # Use the most common final_url from this campaign's ads
+            camp_urls = [a.get("final_url","") for a in camp_ad_perf if a.get("final_url")]
+            if camp_urls:
+                primary_url = max(set(camp_urls), key=camp_urls.count)
+                # Strip path to get domain root for context lookup
+                from urllib.parse import urlparse as _urlparse
+                parsed = _urlparse(primary_url)
+                domain_url = f"{parsed.scheme}://{parsed.netloc}"
+                camp_page_intel = build_site_context_for_url(domain_url)
+                if camp_page_intel:
+                    logger.info(f"  [{camp_name}] Landing page intel loaded ({len(camp_page_intel)} chars)")
+        except Exception as _pi_err:
+            logger.warning(f"  [{camp_name}] Landing page intel fetch failed (non-fatal): {_pi_err}")
+
         # Pre-resolve geo targets for this campaign (gives Claude geo_target_resource for API execution)
         camp_geo_resolutions: dict = {}
         if camp_resource:
@@ -3729,11 +4254,15 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             existing_negatives=live_negatives,
             memory_digest=memory_digest,
             camp_settings=camp_settings,
+            ad_performance=camp_ad_perf,
+            landing_page_intel=camp_page_intel,
         )
         if not structured:
             continue
 
         logger.info(f"Claude recommendations for '{camp_name}': {len(structured)}")
+
+        _replace_ad_count_for_camp = 0  # enforce one replace_ad per campaign per run
 
         for rec in structured:
             op = rec.get("operation", "claude_advisory")
@@ -3746,11 +4275,51 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                     logger.info(f"  [{camp_name}] SKIPPED Claude negative '{kw_text}' — already covered")
                     continue
 
+            # One replace_ad per campaign per run (A/B principle — focused changes)
+            if op == "replace_ad":
+                if _replace_ad_count_for_camp >= 1:
+                    logger.info(f"  [{camp_name}] SKIPPED extra replace_ad — one-per-campaign limit")
+                    continue
+                _replace_ad_count_for_camp += 1
+
+            # Rejection suppression for Claude recs (mirrors rule-based suppression above)
+            op_meta_check = _OP_MAP.get(op)
+            if op_meta_check:
+                _, id_field_check, name_field_check = op_meta_check
+                eid_check = str(rec.get(id_field_check, "")).lower()
+                ename_check = str(rec.get(name_field_check, "")).lower()
+                if (eid_check, op) in rejected_id_op_pairs or (ename_check, op) in rejected_op_pairs:
+                    logger.info(f"  [{camp_name}] SKIPPED {op} '{ename_check}' — recently rejected by admin")
+                    continue
+
             advisories.append(f"[{camp_name}] {reason}")
 
             # Build before/after state from the structured fields
-            before = {}
             after = {k: v for k, v in rec.items() if k != "operation"}
+
+            # For replace_ad: populate before_state with current ad copy from ad_performance
+            before = {}
+            if op == "replace_ad":
+                old_rn = rec.get("old_ad_group_ad_resource", "")
+                # Find the matching ad in camp_ad_perf to populate before_state
+                matched_ad = next(
+                    (a for a in camp_ad_perf if a.get("ad_group_ad_resource") == old_rn),
+                    None
+                )
+                if matched_ad:
+                    before = {
+                        "status": matched_ad.get("status", "ENABLED"),
+                        "headlines": matched_ad.get("headlines", []),
+                        "descriptions": matched_ad.get("descriptions", []),
+                        "final_url": matched_ad.get("final_url", ""),
+                        "ctr_30d": matched_ad.get("ctr", 0),
+                        "impressions_30d": matched_ad.get("impressions_30d", 0),
+                        "cost_30d_usd": matched_ad.get("cost_30d_usd", 0),
+                        "conversions_30d": matched_ad.get("conversions_30d", 0),
+                        "performance_tier": matched_ad.get("performance_tier", ""),
+                    }
+                else:
+                    before = {"ad_group_ad_resource": old_rn, "status": "ENABLED"}
 
             # Determine entity fields
             op_meta = _OP_MAP.get(op)
@@ -3758,6 +4327,11 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 entity_type, id_field, name_field = op_meta
                 entity_id   = str(rec.get(id_field, camp_lower.replace(" ", "_")))
                 entity_name = str(rec.get(name_field, camp_name))
+                # For replace_ad: derive a human-readable name instead of raw resource string
+                if op == "replace_ad" and matched_ad:
+                    entity_name = f"Replace ad in {matched_ad.get('ad_group_name', camp_name)}"
+                elif op == "replace_ad":
+                    entity_name = f"Replace ad — {camp_name}"
             else:
                 entity_type = "campaign"
                 entity_id   = camp_lower.replace(" ", "_")

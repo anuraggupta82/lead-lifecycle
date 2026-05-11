@@ -9559,6 +9559,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
                             async function applyChange(change, idx) {
                               setAiRefineApplying(s => ({...s, [idx]: true}));
+                              let confirmation = null;
                               try {
                                 if (change.type === 'budget') {
                                   await api(`/api/admin/campaigns/${camp.campaign_id}/set-budget`, {
@@ -9588,6 +9589,18 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     }),
                                   });
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
+                                } else if (change.type === 'pause_ad') {
+                                  const staged = await api(`/api/admin/campaigns/${camp.campaign_id}/pause-ad/stage`, {
+                                    method: 'POST',
+                                    body: JSON.stringify({
+                                      campaign_id:          camp.campaign_id,
+                                      ad_group_ad_resource: change.ad_group_ad_resource,
+                                      rationale:            change.rationale || aiRefineInput,
+                                    }),
+                                  });
+                                  const approveResult = await api(`/api/admin/gads/approve/${staged.action_id}`, { method: 'POST' });
+                                  confirmation = approveResult?.confirmation || null;
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
                                 } else if (change.type === 'replace_ad') {
                                   const staged = await api(`/api/admin/campaigns/${camp.campaign_id}/replace-ad/stage`, {
                                     method: 'POST',
@@ -9602,13 +9615,14 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       rationale:        change.rationale || aiRefineInput,
                                     }),
                                   });
-                                  await api(`/api/admin/gads/approve/${staged.action_id}`, { method: 'POST' });
+                                  const approveResult = await api(`/api/admin/gads/approve/${staged.action_id}`, { method: 'POST' });
+                                  confirmation = approveResult?.confirmation || null;
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
                                 }
-                                // Mark applied
+                                // Mark applied with confirmation
                                 setAiRefineResult(r => ({
                                   ...r,
-                                  changes: r.changes.map((c,i) => i===idx ? {...c, _applied:true} : c)
+                                  changes: r.changes.map((c,i) => i===idx ? {...c, _applied:true, _confirmation: confirmation} : c)
                                 }));
                               } catch(e) {
                                 setAiRefineError(`Apply failed: ${e?.detail || e?.message || 'error'}`);
@@ -9617,8 +9631,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               }
                             }
 
-                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡', replace_ad:'🔁'};
-                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note', replace_ad:'Replace Ad'};
+                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡', pause_ad:'⏸️', replace_ad:'🔁'};
+                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note', pause_ad:'Pause Ad', replace_ad:'Replace Ad'};
 
                             return (
                               <div style={{marginTop:24, borderTop:'1px solid var(--border)', paddingTop:16}}>
@@ -9677,6 +9691,20 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.4}}>
                                             {change.rationale || change.message}
                                           </div>
+                                          {change.type === 'pause_ad' && (
+                                            <div style={{marginTop:8,padding:'8px 10px',background:'#fff7ed',
+                                              border:'1px solid #fed7aa',borderRadius:6,fontSize:11}}>
+                                              <div style={{fontWeight:600,marginBottom:4,color:'#92400e'}}>
+                                                {'Pausing ad: '}
+                                                <span style={{fontFamily:'monospace',fontSize:10,color:'#64748b'}}>
+                                                  {(change.ad_group_ad_resource||'').split('~').pop()}
+                                                </span>
+                                              </div>
+                                              <div style={{color:'#78350f',fontSize:10}}>
+                                                This ad will be paused. No replacement will be created.
+                                              </div>
+                                            </div>
+                                          )}
                                           {change.type === 'replace_ad' && (
                                             <div style={{marginTop:8,padding:'8px 10px',background:'#f8fafc',
                                               border:'1px solid var(--border)',borderRadius:6,fontSize:11}}>
@@ -9718,7 +9746,24 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           )}
                                         </div>
                                         {change._applied ? (
-                                          <span style={{fontSize:11,color:'#16a34a',fontWeight:600,flexShrink:0}}>✓ Applied</span>
+                                          <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:4,flexShrink:0}}>
+                                            <span style={{fontSize:11,color:'#16a34a',fontWeight:600}}>✓ Applied</span>
+                                            {change._confirmation && (
+                                              <span style={{
+                                                fontSize:10,
+                                                color: change._confirmation.confirmed ? '#15803d' : '#b45309',
+                                                background: change._confirmation.confirmed ? '#f0fdf4' : '#fffbeb',
+                                                border: `1px solid ${change._confirmation.confirmed ? '#bbf7d0' : '#fde68a'}`,
+                                                borderRadius:4,
+                                                padding:'2px 6px',
+                                                maxWidth:180,
+                                                textAlign:'right',
+                                                lineHeight:1.3,
+                                              }}>
+                                                {change._confirmation.summary}
+                                              </span>
+                                            )}
+                                          </div>
                                         ) : change.type !== 'note' ? (
                                           <button
                                             onClick={()=>applyChange(change,idx)}
@@ -13823,9 +13868,10 @@ function PendingApprovalsPanel() {
     if (!confirm('Apply this recommendation to Google Ads now?')) return;
     setActing(prev => ({...prev, [action_id]: 'apply'}));
     try {
-      await api(`/api/admin/gads/approve/${action_id}`, { method: 'POST' });
+      const result = await api(`/api/admin/gads/approve/${action_id}`, { method: 'POST' });
+      const conf = result?.confirmation || null;
       setRows(prev => prev.map(r => r.action_id === action_id
-        ? {...r, _result: 'applied'} : r));
+        ? {...r, _result: 'applied', _confirmation: conf} : r));
     } catch(e) {
       alert('Apply failed: ' + e.message);
     }
@@ -13923,10 +13969,26 @@ function PendingApprovalsPanel() {
                 "{row.entity_name}"
               </span>
               {row._result && (
-                <span style={{marginLeft:'auto',fontSize:10,fontWeight:700,
-                  color: row._result==='applied' ? '#16a34a' : '#dc2626'}}>
-                  {row._result === 'applied' ? '✅ Applied' : '❌ Rejected'}
-                </span>
+                <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',justifyContent:'flex-end'}}>
+                  <span style={{fontSize:10,fontWeight:700,
+                    color: row._result==='applied' ? '#16a34a' : '#dc2626'}}>
+                    {row._result === 'applied' ? '✅ Applied' : '❌ Rejected'}
+                  </span>
+                  {row._result === 'applied' && row._confirmation && (
+                    <span style={{
+                      fontSize:10,
+                      color: row._confirmation.confirmed ? '#15803d' : '#b45309',
+                      background: row._confirmation.confirmed ? '#f0fdf4' : '#fffbeb',
+                      border: `1px solid ${row._confirmation.confirmed ? '#bbf7d0' : '#fde68a'}`,
+                      borderRadius:4,
+                      padding:'2px 6px',
+                      maxWidth:220,
+                      lineHeight:1.3,
+                    }}>
+                      {row._confirmation.summary}
+                    </span>
+                  )}
+                </div>
               )}
             </div>
 
