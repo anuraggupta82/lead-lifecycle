@@ -759,7 +759,8 @@ def admin_hot_leads():
 @app.post("/api/admin/sync", dependencies=[Depends(_require_admin)])
 def admin_sync():
     result = sync_from_firestore()
-    return {"status": "ok", "result": result}
+    unsub_result = sync_unsubscribes_from_firestore()
+    return {"status": "ok", "result": result, "unsubscribe_sync": unsub_result}
 
 
 @app.post("/api/admin/match", dependencies=[Depends(_require_admin)])
@@ -954,7 +955,8 @@ async def gads_approve_action(action_id: str, request: Request):
                                _execute_add_negative, _execute_enable_keyword,
                                _execute_budget_change, _execute_update_rsa,
                                _execute_geo_exclusion,
-                               _execute_add_to_shared_negative_list)
+                               _execute_add_to_shared_negative_list,
+                               _execute_replace_ad)
 
     row = get_audit_row(action_id)
     if not row:
@@ -1326,6 +1328,66 @@ async def gads_approve_action(action_id: str, request: Request):
             logger.info(f"Asset recommendation acknowledged: {after.get('asset_type')} for {after.get('campaign_resource')} ({action_id[:8]})")
             update_gads_action_result(action_id, executed=True, execution_result="success")
             set_audit_approval(action_id, approver="admin")
+
+        elif operation == "replace_ad":
+            after = json.loads(row["after_state_json"] or "{}")
+            old_rn        = after.get("old_ad_group_ad_resource", "")
+            new_h         = after.get("new_headlines") or []
+            new_d         = after.get("new_descriptions") or []
+            final_url     = after.get("final_url", "")
+            ag_resource   = after.get("ad_group_resource", "")
+            path1         = after.get("path1", "")
+            path2         = after.get("path2", "")
+            if not old_rn or not new_h or not new_d or not final_url:
+                raise HTTPException(
+                    status_code=422,
+                    detail="replace_ad after_state_json missing required fields"
+                )
+            client = _build_client()
+            try:
+                result = _execute_replace_ad(
+                    client, customer_id,
+                    old_ad_group_ad_resource=old_rn,
+                    new_headlines=new_h,
+                    new_descriptions=new_d,
+                    final_url=final_url,
+                    ad_group_resource=ag_resource,
+                    path1=path1,
+                    path2=path2,
+                )
+            except ValueError as ve:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"rejected: {str(ve)[:200]}")
+                raise HTTPException(status_code=422, detail=str(ve))
+            except Exception as ae:
+                err = str(ae)
+                if "POLICY" in err.upper():
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result="rejected: policy_violation",
+                        error_detail=err[:500])
+                    raise HTTPException(status_code=422,
+                        detail=f"Google policy blocked the new ad: {err[:300]}")
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {err[:200]}", error_detail=err[:500])
+                raise HTTPException(status_code=500,
+                    detail=f"Replace ad failed: {err[:300]}")
+            # Stash created resource back into after_state for audit trail
+            try:
+                from database import _conn as _db_conn
+                with _db_conn() as _c:
+                    after["created_ad_group_ad_resource"] = result["created_resource"]
+                    _c.execute(
+                        "UPDATE gads_audit_log SET after_state_json=? WHERE action_id=?",
+                        (json.dumps(after), action_id),
+                    )
+            except Exception:
+                pass
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(
+                f"replace_ad approved: paused {result['paused_resource']}, "
+                f"created {result['created_resource']} ({action_id[:8]})"
+            )
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
@@ -2771,7 +2833,7 @@ def admin_test_email(body: TestEmailRequest):
         test_lead["email"] = body.override_email
 
     settings = get_settings()
-    unsubscribe_url = f"http://localhost:{settings.port}/unsubscribe/{body.lead_id}"
+    unsubscribe_url = f"{settings.base_url.rstrip('/')}/unsubscribe/{body.lead_id}/email"
 
     template = body.template.lower()
     try:
@@ -8607,6 +8669,100 @@ def admin_ai_performance_analysis(body: PerformanceAnalysisRequest):
 
 # ─── Campaign AI Refine ───────────────────────────────────────────────────────
 
+class ReplaceAdStageRequest(BaseModel):
+    campaign_id:                str
+    old_ad_group_ad_resource:   str
+    new_headlines:              list
+    new_descriptions:           list
+    final_url:                  str
+    path1:                      str = ""
+    path2:                      str = ""
+    rationale:                  str = ""
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/replace-ad/stage",
+          dependencies=[Depends(_require_admin)])
+def admin_replace_ad_stage(campaign_id: str, body: ReplaceAdStageRequest):
+    """
+    Stage an AI-proposed RSA replacement for staff approval.
+    Validates the payload, snapshots the old RSA, writes a pending_approval
+    audit row. Actual Google Ads mutate happens at gads_approve_action.
+    """
+    from database import log_admin_manual_action, get_campaign_by_id, get_ads_with_metrics
+    from ai_optimizer import _build_client, _get_rsa_current_assets
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(404, detail="Campaign not found")
+
+    # Server-side validation
+    h_list = [(s or "").strip() for s in (body.new_headlines or []) if (s or "").strip()]
+    d_list = [(s or "").strip() for s in (body.new_descriptions or []) if (s or "").strip()]
+    if not (3 <= len(h_list) <= 15):
+        raise HTTPException(422, detail=f"Need 3-15 headlines (got {len(h_list)})")
+    if not (2 <= len(d_list) <= 4):
+        raise HTTPException(422, detail=f"Need 2-4 descriptions (got {len(d_list)})")
+    over_h = [h for h in h_list if len(h) > 30]
+    over_d = [d for d in d_list if len(d) > 90]
+    if over_h:
+        raise HTTPException(422, detail=f"Headlines over 30 chars: {over_h}")
+    if over_d:
+        raise HTTPException(422, detail=f"Descriptions over 90 chars: {over_d}")
+    if not body.final_url.lower().startswith(("http://", "https://")):
+        raise HTTPException(422, detail="final_url must be http(s)")
+
+    # Derive ad_group_resource
+    try:
+        cid_part = body.old_ad_group_ad_resource.split("/adGroupAds/")[0]
+        ag_id    = body.old_ad_group_ad_resource.split("/adGroupAds/")[1].split("~")[0]
+        ad_group_resource = f"{cid_part}/adGroups/{ag_id}"
+    except Exception:
+        raise HTTPException(422, detail="Malformed old_ad_group_ad_resource")
+
+    # Snapshot old RSA for before_state audit
+    before = {}
+    try:
+        client = _build_client()
+        snap = _get_rsa_current_assets(
+            client, get_settings().google_ads_customer_id,
+            body.old_ad_group_ad_resource
+        )
+        if snap:
+            before = {
+                "ad_group_ad_resource": body.old_ad_group_ad_resource,
+                "headlines":    [h["text"] for h in snap.get("headlines", [])],
+                "descriptions": [d["text"] for d in snap.get("descriptions", [])],
+            }
+    except Exception as e:
+        logger.warning(f"replace-ad stage: snapshot failed (non-fatal): {e}")
+
+    after = {
+        "old_ad_group_ad_resource": body.old_ad_group_ad_resource,
+        "ad_group_resource":        ad_group_resource,
+        "new_headlines":            h_list,
+        "new_descriptions":         d_list,
+        "final_url":                body.final_url,
+        "path1":                    body.path1,
+        "path2":                    body.path2,
+        "rationale":                body.rationale,
+    }
+    action_id = log_admin_manual_action(
+        operation="replace_ad",
+        entity_type="ad",
+        entity_id=body.old_ad_group_ad_resource,
+        entity_name=(camp.get("campaign_name") or "")[:120],
+        before=before,
+        after=after,
+        reason=f"ai_refine: {body.rationale[:200]}",
+    )
+    return {
+        "action_id": action_id,
+        "operation": "replace_ad",
+        "before": before,
+        "after": after,
+    }
+
+
 class CampaignRefineRequest(BaseModel):
     campaign_id:       str
     instruction:       str          # free-text from user, e.g. "raise budget to $80, weekdays only"
@@ -8633,22 +8789,63 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
     ctx = body.campaign_context or {}
     campaign_name = ctx.get("campaign_name") or ctx.get("name") or body.campaign_id
 
+    # Fetch current RSAs for this campaign so Claude can identify which to replace
+    current_ads = []
+    try:
+        from database import get_ads_with_metrics
+        all_ads = get_ads_with_metrics(days=30)
+        settings_obj = get_settings()
+        cid = settings_obj.google_ads_customer_id
+        gads_num_id  = str(ctx.get("gads_campaign_numeric_id") or "")
+        camp_name_lc = (ctx.get("campaign_name") or "").lower()
+        for ad in all_ads:
+            if ad.get("ad_type") != "RESPONSIVE_SEARCH_AD":
+                continue
+            if not (str(ad.get("campaign_id","")) == gads_num_id or
+                    (camp_name_lc and ad.get("campaign_name","").lower() == camp_name_lc)):
+                continue
+            assets = ad.get("assets_json") or {}
+            if isinstance(assets, str):
+                try: assets = json.loads(assets)
+                except Exception: assets = {}
+            ag_id = ad.get("ad_group_id","")
+            ad_id = ad.get("ad_id","")
+            aga_resource = f"customers/{cid}/adGroupAds/{ag_id}~{ad_id}" if ag_id and ad_id else ""
+            current_ads.append({
+                "ad_group_ad_resource": aga_resource,
+                "ad_group_name": ad.get("ad_group_name",""),
+                "status": ad.get("status",""),
+                "final_url": ad.get("final_url",""),
+                "headlines":    [h.get("text","") if isinstance(h, dict) else h
+                                 for h in (assets.get("headlines") or [])],
+                "descriptions": [d.get("text","") if isinstance(d, dict) else d
+                                 for d in (assets.get("descriptions") or [])],
+                "impressions": ad.get("impressions", 0),
+                "clicks":      ad.get("clicks", 0),
+            })
+    except Exception as e:
+        logger.warning(f"campaign-refine: could not fetch current ads: {e}")
+
     system_prompt = (
         "You are a Google Ads campaign manager for a dental practice. "
         "The user will describe a change they want to make to their campaign in plain English. "
         "Interpret their intent and return a structured list of proposed changes. "
         "Be conservative — only suggest changes explicitly implied by the instruction. "
+        "When the user wants to swap, rewrite, or replace an ad, return a 'replace_ad' change "
+        "with the EXACT ad_group_ad_resource of the ad to retire (copy verbatim from "
+        "current_ads in the context) plus a full new RSA. "
         "Return ONLY a valid JSON object, no prose."
     )
 
     user_prompt = (
         f"Campaign: {campaign_name}\n"
         f"Current state:\n{json.dumps(ctx, indent=2, default=str)}\n\n"
+        f"Current RSAs in this campaign:\n{json.dumps(current_ads, indent=2)}\n\n"
         f"User instruction: {instruction}\n\n"
         "Return a JSON object with:\n"
         "  summary (string — one sentence describing what you understood)\n"
         "  changes (array of change objects). Each change object must have:\n"
-        "    type: one of 'budget' | 'geo' | 'status' | 'schedule' | 'note'\n"
+        "    type: one of 'budget' | 'geo' | 'status' | 'schedule' | 'note' | 'replace_ad'\n"
         "    rationale: string explaining why\n"
         "    For 'budget': also include new_daily_budget_usd (number)\n"
         "    For 'geo': also include locations (string, comma-separated city/region list)\n"
@@ -8657,6 +8854,17 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
         "e.g. 'Mon-Thu 7am-11pm' or 'Weekdays 9am-6pm' or '24/7'). "
         "Use this when the user asks to change when ads run, set hours, or limit days.\n"
         "    For 'note': also include message (string — advisory, nothing to apply)\n"
+        "    For 'replace_ad': also include\n"
+        "        old_ad_group_ad_resource (string — EXACT resource_name from current_ads above)\n"
+        "        new_headlines (array of 10-15 strings, each <= 30 chars, locally grounded)\n"
+        "        new_descriptions (array of 3-4 strings, each <= 90 chars)\n"
+        "        final_url (string — copy from old ad unless user specifies otherwise)\n"
+        "        path1 (optional string <= 15 chars, e.g. 'dentures')\n"
+        "        path2 (optional string <= 15 chars, e.g. 'grafton-ma')\n"
+        "        new_ad_label (short label for the new ad, e.g. 'Dentures focus')\n"
+        "      New RSA goes in same ad group as the retired ad. Do not choose an ad group.\n"
+        "      Headlines must be specific, benefit-driven, and locally grounded. "
+        "Avoid generic phrases like 'Quality Dental Care'.\n"
         "If the instruction is unclear or unsupported, return a single 'note' change explaining why.\n"
         "Return ONLY the JSON object."
     )
@@ -8665,7 +8873,7 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
         client = _get_anthropic_client()
         message = client.messages.create(
             model=SONNET_MODEL,
-            max_tokens=1024,
+            max_tokens=2048,
             messages=[{"role": "user", "content": user_prompt}],
             system=system_prompt,
         )
@@ -8680,7 +8888,36 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
 
-    return {"summary": result.get("summary", ""), "changes": result.get("changes", [])}
+    # Server-side validation of replace_ad items — ensure resource exists + clip overlong strings
+    valid_resources = {a["ad_group_ad_resource"] for a in current_ads if a.get("ad_group_ad_resource")}
+    validated_changes = []
+    for ch in result.get("changes", []):
+        if ch.get("type") != "replace_ad":
+            validated_changes.append(ch)
+            continue
+        rn = ch.get("old_ad_group_ad_resource", "")
+        if rn not in valid_resources:
+            validated_changes.append({
+                "type": "note",
+                "message": f"AI proposed replacing an ad that wasn't found in this campaign. "
+                           f"Please try again with more specific wording.",
+                "rationale": ch.get("rationale", ""),
+            })
+            continue
+        # Clip to char limits (belt-and-suspenders — Claude usually respects them)
+        ch["new_headlines"]    = [h[:30] for h in (ch.get("new_headlines") or []) if h]
+        ch["new_descriptions"] = [d[:90] for d in (ch.get("new_descriptions") or []) if d]
+        if len(ch["new_headlines"]) < 3 or len(ch["new_descriptions"]) < 2:
+            validated_changes.append({
+                "type": "note",
+                "message": "AI returned too few headlines or descriptions for the replacement ad. "
+                           "Please try again.",
+                "rationale": ch.get("rationale", ""),
+            })
+            continue
+        validated_changes.append(ch)
+
+    return {"summary": result.get("summary", ""), "changes": validated_changes}
 
 
 # ─── OD Connection Settings ──────────────────────────────────────────────────

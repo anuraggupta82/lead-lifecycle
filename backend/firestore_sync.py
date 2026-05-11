@@ -282,7 +282,16 @@ def sync_unsubscribes_from_firestore() -> dict:
         return {"applied": 0, "skipped": 0, "errors": 1, "error": "missing_dependency"}
 
     try:
-        client = _fs.Client(project=project)
+        sa_json = settings.ga4_service_account_json
+        if sa_json:
+            from google.oauth2 import service_account as _sa
+            creds = _sa.Credentials.from_service_account_file(
+                sa_json,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            client = _fs.Client(project=project, credentials=creds)
+        else:
+            client = _fs.Client(project=project)
         docs = list(client.collection("unsubscribes").stream())
     except Exception as e:
         logger.error(f"Unsubscribe sync — Firestore read failed: {e}")

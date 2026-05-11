@@ -9520,6 +9520,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             const camp = cd.campaign;
                             const campCtx = {
                               campaign_name: camp.campaign_name,
+                              gads_campaign_numeric_id: camp.gads_campaign_numeric_id || camp.gads_campaign_id || '',
                               status: camp.status,
                               daily_budget_usd: camp.daily_budget_usd || (camp.monthly_budget ? (camp.monthly_budget/30.4).toFixed(2) : null),
                               locations: camp.geo_json || camp.locations || '',
@@ -9529,6 +9530,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               cost: camp.cost,
                               ctr: camp.ctr,
                               leads: camp.leads,
+                              current_ads_brief: (cd.ads||[]).filter(a=>a.ad_type==='RESPONSIVE_SEARCH_AD').map(a=>({
+                                ad_id: a.ad_id, ad_group_name: a.ad_group_name, status: a.status,
+                              })),
                             };
 
                             async function submitRefine() {
@@ -9584,6 +9588,22 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     }),
                                   });
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
+                                } else if (change.type === 'replace_ad') {
+                                  const staged = await api(`/api/admin/campaigns/${camp.campaign_id}/replace-ad/stage`, {
+                                    method: 'POST',
+                                    body: JSON.stringify({
+                                      campaign_id: camp.campaign_id,
+                                      old_ad_group_ad_resource: change.old_ad_group_ad_resource,
+                                      new_headlines:    change.new_headlines,
+                                      new_descriptions: change.new_descriptions,
+                                      final_url:        change.final_url,
+                                      path1:            change.path1 || '',
+                                      path2:            change.path2 || '',
+                                      rationale:        change.rationale || aiRefineInput,
+                                    }),
+                                  });
+                                  await api(`/api/admin/gads/approve/${staged.action_id}`, { method: 'POST' });
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
                                 }
                                 // Mark applied
                                 setAiRefineResult(r => ({
@@ -9597,8 +9617,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               }
                             }
 
-                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡'};
-                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note'};
+                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡', replace_ad:'🔁'};
+                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note', replace_ad:'Replace Ad'};
 
                             return (
                               <div style={{marginTop:24, borderTop:'1px solid var(--border)', paddingTop:16}}>
@@ -9657,6 +9677,45 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.4}}>
                                             {change.rationale || change.message}
                                           </div>
+                                          {change.type === 'replace_ad' && (
+                                            <div style={{marginTop:8,padding:'8px 10px',background:'#f8fafc',
+                                              border:'1px solid var(--border)',borderRadius:6,fontSize:11}}>
+                                              <div style={{fontWeight:600,marginBottom:4,color:'var(--text)'}}>
+                                                {'Pausing: '}
+                                                <span style={{fontFamily:'monospace',fontSize:10,color:'#64748b'}}>
+                                                  {(change.old_ad_group_ad_resource||'').split('~').pop()}
+                                                </span>
+                                                {change.new_ad_label ? <em>{' → ' + change.new_ad_label}</em> : null}
+                                              </div>
+                                              <div style={{fontWeight:600,fontSize:10,color:'#475569',margin:'6px 0 3px'}}>
+                                                {`HEADLINES (${(change.new_headlines||[]).length}/15)`}
+                                              </div>
+                                              <ol style={{margin:0,paddingLeft:16,lineHeight:1.6}}>
+                                                {(change.new_headlines||[]).map((h,i)=>(
+                                                  <li key={i} style={{color:h.length>30?'#dc2626':'var(--text)'}}>
+                                                    {h} <span style={{color:'#94a3b8',fontSize:10}}>({h.length}/30)</span>
+                                                  </li>
+                                                ))}
+                                              </ol>
+                                              <div style={{fontWeight:600,fontSize:10,color:'#475569',margin:'6px 0 3px'}}>
+                                                {`DESCRIPTIONS (${(change.new_descriptions||[]).length}/4)`}
+                                              </div>
+                                              <ol style={{margin:0,paddingLeft:16,lineHeight:1.6}}>
+                                                {(change.new_descriptions||[]).map((d,i)=>(
+                                                  <li key={i} style={{color:d.length>90?'#dc2626':'var(--text)'}}>
+                                                    {d} <span style={{color:'#94a3b8',fontSize:10}}>({d.length}/90)</span>
+                                                  </li>
+                                                ))}
+                                              </ol>
+                                              {change.final_url && (
+                                                <div style={{marginTop:6,fontSize:10,color:'#64748b'}}>
+                                                  {'URL: '}
+                                                  <span style={{fontFamily:'monospace'}}>{change.final_url}</span>
+                                                  {change.path1 ? ` /${change.path1}${change.path2?'/'+change.path2:''}` : ''}
+                                                </div>
+                                              )}
+                                            </div>
+                                          )}
                                         </div>
                                         {change._applied ? (
                                           <span style={{fontSize:11,color:'#16a34a',fontWeight:600,flexShrink:0}}>✓ Applied</span>

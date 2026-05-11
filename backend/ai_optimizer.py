@@ -2864,6 +2864,130 @@ def _execute_update_rsa(client, customer_id: str, ad_group_ad_resource: str,
         raise
 
 
+def _execute_replace_ad(client, customer_id: str,
+                         old_ad_group_ad_resource: str,
+                         new_headlines: list,
+                         new_descriptions: list,
+                         final_url: str,
+                         ad_group_resource: str = "",
+                         path1: str = "",
+                         path2: str = "") -> dict:
+    """
+    Atomically PAUSE an existing RSA and CREATE a replacement RSA in the same
+    ad group, using one mutate_ad_group_ads() call (all-or-nothing).
+
+    RSA headlines/descriptions are IMMUTABLE on update — must PAUSE + CREATE new.
+
+    Args:
+        old_ad_group_ad_resource: customers/CID/adGroupAds/AGID~ADID (ad to pause)
+        new_headlines:    3-15 strings, each <= 30 chars
+        new_descriptions: 2-4 strings, each <= 90 chars
+        final_url:        landing page URL for the new RSA (required)
+        ad_group_resource: customers/CID/adGroups/AGID — derived from old resource if blank
+        path1, path2:     optional display-URL path segments, each <= 15 chars
+
+    Returns: {"paused_resource": str, "created_resource": str}
+
+    Does NOT check kill switch — caller must check first.
+    Raises ValueError on validation failures; raises GoogleAdsException on API failure.
+    """
+    # --- 1. Validate inputs --------------------------------------------------
+    h_list = [h.strip() for h in (new_headlines or []) if (h or "").strip()]
+    d_list = [d.strip() for d in (new_descriptions or []) if (d or "").strip()]
+    if not (3 <= len(h_list) <= 15):
+        raise ValueError(f"RSA needs 3-15 headlines (got {len(h_list)})")
+    if not (2 <= len(d_list) <= 4):
+        raise ValueError(f"RSA needs 2-4 descriptions (got {len(d_list)})")
+    for h in h_list:
+        if len(h) > 30:
+            raise ValueError(f"Headline exceeds 30 chars ({len(h)}): '{h}'")
+    for d in d_list:
+        if len(d) > 90:
+            raise ValueError(f"Description exceeds 90 chars ({len(d)}): '{d}'")
+    if not final_url or not final_url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"final_url must be an http(s) URL (got '{final_url}')")
+    if path1 and len(path1) > 15:
+        raise ValueError(f"path1 exceeds 15 chars: '{path1}'")
+    if path2 and len(path2) > 15:
+        raise ValueError(f"path2 exceeds 15 chars: '{path2}'")
+
+    # --- 2. Derive ad_group_resource if not supplied -------------------------
+    if not ad_group_resource:
+        try:
+            cid_part = old_ad_group_ad_resource.split("/adGroupAds/")[0]
+            ag_id    = old_ad_group_ad_resource.split("/adGroupAds/")[1].split("~")[0]
+            ad_group_resource = f"{cid_part}/adGroups/{ag_id}"
+        except Exception as e:
+            raise ValueError(f"Could not derive ad_group from '{old_ad_group_ad_resource}': {e}")
+
+    # --- 3. Pre-flight: confirm old ad exists and isn't REMOVED --------------
+    ga_service = client.get_service("GoogleAdsService")
+    q = (f"SELECT ad_group_ad.status FROM ad_group_ad "
+         f"WHERE ad_group_ad.resource_name = '{old_ad_group_ad_resource}' LIMIT 1")
+    found = False
+    for row in ga_service.search(customer_id=customer_id, query=q):
+        found = True
+        removed_enum = client.enums.AdGroupAdStatusEnum.REMOVED
+        if row.ad_group_ad.status == removed_enum:
+            raise ValueError(
+                f"Cannot replace: old ad is already REMOVED ({old_ad_group_ad_resource})"
+            )
+    if not found:
+        raise ValueError(f"Old ad not found: {old_ad_group_ad_resource}")
+
+    # --- 4. Build PAUSE operation (UPDATE status — status IS mutable) --------
+    pause_op = client.get_type("AdGroupAdOperation")
+    pause_aga = pause_op.update
+    pause_aga.resource_name = old_ad_group_ad_resource
+    pause_aga.status = client.enums.AdGroupAdStatusEnum.PAUSED
+    client.copy_from(
+        pause_op.update_mask,
+        field_mask_pb2.FieldMask(paths=["status"])
+    )
+
+    # --- 5. Build CREATE operation (new RSA in same ad group) ----------------
+    create_op = client.get_type("AdGroupAdOperation")
+    new_aga = create_op.create
+    new_aga.ad_group = ad_group_resource
+    new_aga.status = client.enums.AdGroupAdStatusEnum.ENABLED
+
+    ad = new_aga.ad
+    ad.final_urls.append(final_url)
+    rsa = ad.responsive_search_ad
+    for h_text in h_list:
+        asset = client.get_type("AdTextAsset")
+        asset.text = h_text
+        rsa.headlines.append(asset)
+    for d_text in d_list:
+        asset = client.get_type("AdTextAsset")
+        asset.text = d_text
+        rsa.descriptions.append(asset)
+    if path1:
+        rsa.path1 = path1
+    if path2:
+        rsa.path2 = path2
+
+    # --- 6. Atomic mutate: partial_failure=False (default) = all-or-nothing --
+    service = client.get_service("AdGroupAdService")
+    try:
+        response = service.mutate_ad_group_ads(
+            customer_id=customer_id,
+            operations=[pause_op, create_op],
+        )
+    except Exception as e:
+        logger.error(f"replace_ad failed for {old_ad_group_ad_resource}: {e}")
+        raise
+
+    # results are ordered same as operations: [pause_result, create_result]
+    paused_rn  = response.results[0].resource_name
+    created_rn = response.results[1].resource_name
+    logger.info(
+        f"replace_ad: paused {paused_rn}, created {created_rn} "
+        f"(ad_group={ad_group_resource}, {len(h_list)}H/{len(d_list)}D)"
+    )
+    return {"paused_resource": paused_rn, "created_resource": created_rn}
+
+
 def _resolve_geo_target_id(client, location_name: str, country_code: str = "US") -> tuple:
     """
     Resolve a location name to a GeoTargetConstant resource name.
