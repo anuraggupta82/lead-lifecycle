@@ -5866,8 +5866,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [negatePopover, setNegatePopover]     = useState(null);  // {term, matchType}
   const [negateLoading, setNegateLoading]     = useState(false);
   const [negatedTerms, setNegatedTerms]       = useState(new Set()); // locally-negated search terms
-  const [agStatusLoading, setAgStatusLoading] = useState({});    // {resource_name: true/false}
-  const [agStatusOverride, setAgStatusOverride] = useState({});  // {resource_name: 'PAUSED'|'ENABLED'}
+  const [agStatusLoading, setAgStatusLoading] = useState({});       // {resource_name: true/false}
+  const [agStatusOverride, setAgStatusOverride] = useState({});     // {resource_name: 'PAUSED'|'ENABLED'}
+  const [agConfirmation, setAgConfirmation] = useState({});         // {resource_name: {confirmed, summary}}
   // PR 2: budget edit
   const [budgetEdit, setBudgetEdit]           = useState(null);  // {campaign_id, campaign_resource, current_usd}
   const [budgetEditValue, setBudgetEditValue] = useState('');
@@ -6022,8 +6023,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       if (!window.confirm(`Pause "${agName}"? Ads in this group will stop serving immediately.`)) return;
     }
     setAgStatusLoading(prev => ({...prev, [agResourceName]: true}));
+    setAgConfirmation(prev => ({...prev, [agResourceName]: null}));
     try {
-      await api('/api/admin/ad-groups/set-status', {
+      const result = await api('/api/admin/ad-groups/set-status', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
@@ -6034,6 +6036,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         }),
       });
       setAgStatusOverride(prev => ({...prev, [agResourceName]: newStatus}));
+      if (result?.confirmation) {
+        setAgConfirmation(prev => ({...prev, [agResourceName]: result.confirmation}));
+      }
     } catch(e) {
       alert('Status change failed: ' + (e?.detail || e?.message || 'Unknown error'));
     } finally {
@@ -9246,6 +9251,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     <thead>
                                       <tr>
                                         <th>Ad Group</th>
+                                        <th style={{textAlign:'center'}}>Tier</th>
                                         <th className="num">Impressions</th>
                                         <th className="num">Clicks</th>
                                         <th className="num">CTR</th>
@@ -9256,20 +9262,57 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       </tr>
                                     </thead>
                                     <tbody>
-                                      {cd.ad_groups.map((ag,i)=>{
+                                      {(() => {
+                                        // Compute avg CTR across all active ad groups for tier scoring
+                                        const activeAgs = cd.ad_groups.filter(ag => (ag.impressions||0) >= 100);
+                                        const avgCtr = activeAgs.length > 0
+                                          ? activeAgs.reduce((s,ag) => s + ((ag.impressions||0) > 0 ? (ag.clicks||0)/(ag.impressions||0) : 0), 0) / activeAgs.length
+                                          : 0;
+                                        function agTier(ag) {
+                                          const impr = ag.impressions||0;
+                                          const clk = ag.clicks||0;
+                                          const cost = ag.cost||0;   // already in dollars
+                                          const conv = ag.lead_count||0;
+                                          if (impr < 100) return 'cold';
+                                          if (conv === 0 && cost >= 30) return 'weak';
+                                          const ctr = impr > 0 ? clk/impr : 0;
+                                          if (avgCtr > 0) {
+                                            if (ctr >= avgCtr * 1.2) return 'strong';
+                                            if (ctr >= avgCtr * 0.5) return 'average';
+                                            return 'weak';
+                                          }
+                                          return 'average';
+                                        }
+                                        const tierStyle = {
+                                          strong:  {bg:'#d1fae5', color:'#065f46', label:'💪 Strong'},
+                                          average: {bg:'#dbeafe', color:'#1e40af', label:'📊 Avg'},
+                                          weak:    {bg:'#fef3c7', color:'#92400e', label:'⚠️ Weak'},
+                                          cold:    {bg:'#f3f4f6', color:'#6b7280', label:'🧊 Cold'},
+                                        };
+                                        return cd.ad_groups.map((ag,i)=>{
                                         const impr = ag.impressions||0;
                                         const clk = ag.clicks||0;
-                                        const cost = (ag.cost_micros||0)/1e6;
+                                        const cost = ag.cost||0;   // already in dollars
                                         const ctr = impr>0?((clk/impr)*100).toFixed(1)+'%':'—';
                                         const rn = ag.resource_name||'';
                                         const effectiveStatus = agStatusOverride[rn] || ag.gads_status || 'ENABLED';
                                         const isPaused = effectiveStatus === 'PAUSED';
                                         const isLoading = agStatusLoading[rn];
                                         const isKwTarget = addKwPopover?.ad_group_resource === rn;
+                                        const tier = agTier(ag);
+                                        const ts = tierStyle[tier] || tierStyle.cold;
+                                        const confirm = agConfirmation[rn];
                                         return (
-                                          <tr key={i} style={{opacity: isPaused ? 0.6 : 1,
+                                          <React.Fragment key={i}>
+                                          <tr style={{opacity: isPaused ? 0.6 : 1,
                                             background: isKwTarget ? '#f0fdf4' : 'transparent'}}>
                                             <td style={{fontWeight:500}}>{ag.ad_group_name||ag.ad_group_id||'—'}</td>
+                                            <td style={{textAlign:'center'}}>
+                                              <span style={{fontSize:10,fontWeight:600,padding:'2px 7px',
+                                                borderRadius:8,background:ts.bg,color:ts.color}}>
+                                                {ts.label}
+                                              </span>
+                                            </td>
                                             <td className="num">{impr.toLocaleString()}</td>
                                             <td className="num">{clk.toLocaleString()}</td>
                                             <td className="num">{ctr}</td>
@@ -9319,8 +9362,28 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               )}
                                             </td>
                                           </tr>
+                                          {confirm && (
+                                            <tr>
+                                              <td colSpan={9} style={{padding:'3px 8px 6px',borderTop:'none'}}>
+                                                {(() => {
+                                                  const isInfo = (confirm.summary||'').startsWith('ℹ️');
+                                                  const bg = isInfo ? '#eff6ff' : confirm.confirmed ? '#f0fdf4' : '#fffbeb';
+                                                  const bd = isInfo ? '#bfdbfe' : confirm.confirmed ? '#bbf7d0' : '#fde68a';
+                                                  const cl = isInfo ? '#1d4ed8' : confirm.confirmed ? '#15803d' : '#b45309';
+                                                  return (
+                                                    <span style={{fontSize:10,padding:'2px 8px',borderRadius:4,
+                                                      background:bg,border:`1px solid ${bd}`,color:cl,fontWeight:600}}>
+                                                      {confirm.summary}
+                                                    </span>
+                                                  );
+                                                })()}
+                                              </td>
+                                            </tr>
+                                          )}
+                                          </React.Fragment>
                                         );
-                                      })}
+                                      });
+                                      })()}
                                     </tbody>
                                   </table>
                                 </div>
@@ -9562,7 +9625,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               let confirmation = null;
                               try {
                                 if (change.type === 'budget') {
-                                  await api(`/api/admin/campaigns/${camp.campaign_id}/set-budget`, {
+                                  const result = await api(`/api/admin/campaigns/${camp.campaign_id}/set-budget`, {
                                     method: 'POST',
                                     body: JSON.stringify({
                                       campaign_resource: camp.gads_campaign_resource,
@@ -9570,24 +9633,28 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       current_daily_budget_usd: campCtx.daily_budget_usd,
                                     }),
                                   });
+                                  confirmation = result?.confirmation || null;
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
                                 } else if (change.type === 'geo') {
-                                  await api(`/api/admin/campaigns/${camp.campaign_id}/set-locations`, {
+                                  const result = await api(`/api/admin/campaigns/${camp.campaign_id}/set-locations`, {
                                     method: 'POST',
                                     body: JSON.stringify({ locations: change.locations }),
                                   });
+                                  confirmation = result?.confirmation || null;
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
                                 } else if (change.type === 'status') {
-                                  await campaignAction(camp.campaign_id, change.action);
+                                  const result = await campaignAction(camp.campaign_id, change.action);
+                                  confirmation = result?.confirmation || null;
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
                                 } else if (change.type === 'schedule') {
-                                  await api(`/api/admin/campaigns/${camp.campaign_id}/set-schedule`, {
+                                  const result = await api(`/api/admin/campaigns/${camp.campaign_id}/set-schedule`, {
                                     method: 'POST',
                                     body: JSON.stringify({
                                       campaign_resource: camp.gads_campaign_resource,
                                       schedule_text: change.schedule_text,
                                     }),
                                   });
+                                  confirmation = result?.confirmation || null;
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
                                 } else if (change.type === 'pause_ad') {
                                   const staged = await api(`/api/admin/campaigns/${camp.campaign_id}/pause-ad/stage`, {
@@ -9618,6 +9685,18 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                   const approveResult = await api(`/api/admin/gads/approve/${staged.action_id}`, { method: 'POST' });
                                   confirmation = approveResult?.confirmation || null;
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
+                                } else if (change.type === 'pause_ad_group') {
+                                  const result = await api('/api/admin/ad-groups/set-status', {
+                                    method: 'POST',
+                                    body: JSON.stringify({
+                                      ad_group_resource: change.ad_group_resource,
+                                      status: 'PAUSED',
+                                      ad_group_name: change.ad_group_name || '',
+                                      campaign_id: camp.campaign_id,
+                                    }),
+                                  });
+                                  confirmation = result?.confirmation || null;
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
                                 }
                                 // Mark applied with confirmation
                                 setAiRefineResult(r => ({
@@ -9631,8 +9710,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               }
                             }
 
-                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡', pause_ad:'⏸️', replace_ad:'🔁'};
-                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note', pause_ad:'Pause Ad', replace_ad:'Replace Ad'};
+                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡', pause_ad:'⏸️', replace_ad:'🔁', pause_ad_group:'⏸📂'};
+                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note', pause_ad:'Pause Ad', replace_ad:'Replace Ad', pause_ad_group:'Pause Ad Group'};
 
                             return (
                               <div style={{marginTop:24, borderTop:'1px solid var(--border)', paddingTop:16}}>
@@ -9705,6 +9784,18 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               </div>
                                             </div>
                                           )}
+                                          {change.type === 'pause_ad_group' && (
+                                            <div style={{marginTop:8,padding:'8px 10px',background:'#fef3c7',
+                                              border:'1px solid #fde68a',borderRadius:6,fontSize:11}}>
+                                              <div style={{fontWeight:600,marginBottom:4,color:'#92400e'}}>
+                                                {'Pausing ad group: '}
+                                                <span style={{color:'var(--teal)'}}>{change.ad_group_name || change.ad_group_resource}</span>
+                                              </div>
+                                              <div style={{color:'#78350f',fontSize:10}}>
+                                                All ads in this group will stop serving immediately.
+                                              </div>
+                                            </div>
+                                          )}
                                           {change.type === 'replace_ad' && (
                                             <div style={{marginTop:8,padding:'8px 10px',background:'#f8fafc',
                                               border:'1px solid var(--border)',borderRadius:6,fontSize:11}}>
@@ -9748,21 +9839,22 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         {change._applied ? (
                                           <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:4,flexShrink:0}}>
                                             <span style={{fontSize:11,color:'#16a34a',fontWeight:600}}>✓ Applied</span>
-                                            {change._confirmation && (
-                                              <span style={{
-                                                fontSize:10,
-                                                color: change._confirmation.confirmed ? '#15803d' : '#b45309',
-                                                background: change._confirmation.confirmed ? '#f0fdf4' : '#fffbeb',
-                                                border: `1px solid ${change._confirmation.confirmed ? '#bbf7d0' : '#fde68a'}`,
-                                                borderRadius:4,
-                                                padding:'2px 6px',
-                                                maxWidth:180,
-                                                textAlign:'right',
-                                                lineHeight:1.3,
-                                              }}>
-                                                {change._confirmation.summary}
-                                              </span>
-                                            )}
+                                            {change._confirmation && (() => {
+                                              const c = change._confirmation;
+                                              const isInfo = (c.summary||'').startsWith('ℹ️');
+                                              const bg = isInfo ? '#eff6ff' : c.confirmed ? '#f0fdf4' : '#fffbeb';
+                                              const bd = isInfo ? '#bfdbfe' : c.confirmed ? '#bbf7d0' : '#fde68a';
+                                              const cl = isInfo ? '#1d4ed8' : c.confirmed ? '#15803d' : '#b45309';
+                                              return (
+                                                <span style={{
+                                                  fontSize:10, borderRadius:4, padding:'2px 6px',
+                                                  maxWidth:180, textAlign:'right', lineHeight:1.3,
+                                                  background:bg, border:`1px solid ${bd}`, color:cl,
+                                                }}>
+                                                  {c.summary}
+                                                </span>
+                                              );
+                                            })()}
                                           </div>
                                         ) : change.type !== 'note' ? (
                                           <button
@@ -13974,20 +14066,21 @@ function PendingApprovalsPanel() {
                     color: row._result==='applied' ? '#16a34a' : '#dc2626'}}>
                     {row._result === 'applied' ? '✅ Applied' : '❌ Rejected'}
                   </span>
-                  {row._result === 'applied' && row._confirmation && (
-                    <span style={{
-                      fontSize:10,
-                      color: row._confirmation.confirmed ? '#15803d' : '#b45309',
-                      background: row._confirmation.confirmed ? '#f0fdf4' : '#fffbeb',
-                      border: `1px solid ${row._confirmation.confirmed ? '#bbf7d0' : '#fde68a'}`,
-                      borderRadius:4,
-                      padding:'2px 6px',
-                      maxWidth:220,
-                      lineHeight:1.3,
-                    }}>
-                      {row._confirmation.summary}
-                    </span>
-                  )}
+                  {row._result === 'applied' && row._confirmation && (() => {
+                    const c = row._confirmation;
+                    const isInfo = (c.summary||'').startsWith('ℹ️');
+                    const bg = isInfo ? '#eff6ff' : c.confirmed ? '#f0fdf4' : '#fffbeb';
+                    const bd = isInfo ? '#bfdbfe' : c.confirmed ? '#bbf7d0' : '#fde68a';
+                    const cl = isInfo ? '#1d4ed8' : c.confirmed ? '#15803d' : '#b45309';
+                    return (
+                      <span style={{
+                        fontSize:10, borderRadius:4, padding:'2px 6px', maxWidth:220, lineHeight:1.3,
+                        background:bg, border:`1px solid ${bd}`, color:cl,
+                      }}>
+                        {c.summary}
+                      </span>
+                    );
+                  })()}
                 </div>
               )}
             </div>

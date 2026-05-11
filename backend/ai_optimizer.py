@@ -1048,6 +1048,33 @@ def _get_od_production_summary(days: int = 30) -> dict:
     return {"total_attributed": round(total, 2), "by_campaign": by_camp}
 
 
+def _score_tier(impr: int, clicks: int, cost_usd: float, conv: float, avg_ctr: float) -> str:
+    """
+    Shared tier scorer for ads and ad groups.
+    Returns: "cold" | "weak" | "average" | "strong"
+
+    Thresholds (aligned across both uses):
+    - cold:   < 100 impressions — not enough data
+    - weak:   zero conversions after ≥$30 spend (even if CTR looks ok)
+    - strong: CTR ≥ 120% of campaign average
+    - average: CTR ≥ 50% of campaign average
+    - weak:   CTR < 50% of campaign average
+    """
+    if impr < 100:
+        return "cold"
+    if conv == 0 and cost_usd >= 30:
+        return "weak"
+    ctr = (clicks / impr) if impr > 0 else 0
+    if avg_ctr > 0:
+        if ctr >= avg_ctr * 1.2:
+            return "strong"
+        if ctr >= avg_ctr * 0.5:
+            return "average"
+        return "weak"
+    # No campaign average yet — treat as average
+    return "average"
+
+
 def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms: list,
                              call_attribution: dict, od_production: dict,
                              summary: dict, campaign: str,
@@ -1061,7 +1088,8 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              memory_digest: dict | None = None,
                              camp_settings: dict | None = None,
                              ad_performance: list | None = None,
-                             landing_page_intel: str = "") -> list:
+                             landing_page_intel: str = "",
+                             ad_group_performance: list | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -1151,6 +1179,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
             "optimizer_memory": memory_digest or {},
             "ad_performance": (ad_performance or [])[:20],  # per-RSA performance + scored metrics
+            "ad_group_performance": (ad_group_performance or [])[:10],  # per-ad-group scored metrics
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -1179,6 +1208,12 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                 "\n\nLANDING PAGE INTELLIGENCE (use to write grounded ad copy for replace_ad):\n"
                 + landing_page_intel[:2000]
             )
+        ag_perf_note = ""
+        if ad_group_performance:
+            ag_perf_note = (
+                "\n\nAD GROUP PERFORMANCE (30-day metrics, pre-scored — use for pause_ad_group decisions):\n"
+                + json.dumps(ad_group_performance[:10], default=str)
+            )
 
         excellence_block = _build_excellence_block(campaign, summary, camp_settings or {})
 
@@ -1204,7 +1239,7 @@ Use this to:
 - Always reference the current daily_budget_usd when recommending a change_budget — state the specific dollar increase and the % change
 
 Each recommendation MUST be a JSON object with these fields:
-- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad
+- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group
 - "reason": 1-2 sentence explanation with specific numbers from the data
 - "estimated_monthly_impact": object with keys:
     "savings_usd": estimated monthly dollar savings (0 if not applicable),
@@ -1273,6 +1308,16 @@ For replace_ad (A/B ad testing — pause underperformer, create improved version
   Headlines must be specific and locally grounded. Avoid generic phrases like "Quality Care".
   A/B principle: only recommend ONE replace_ad per campaign per run. Keep changes focused.
 
+For pause_ad_group (pause an underperforming ad group — does NOT pause the whole campaign):
+  "ad_group_resource": EXACT ad_group_resource from ad_group_performance data (required — do not invent)
+  "ad_group_name": human-readable name from ad_group_performance data
+  Use pause_ad_group ONLY when ALL of these are true:
+    - cost_30d_usd ≥ $30 AND conversions_30d = 0 AND lead_count_30d = 0 AND impressions_30d ≥ 100
+    - performance_tier is "weak" or "cold"
+    - The campaign has at least 2 active ad groups (never pause the campaign's ONLY ad group)
+  This is a last resort — prefer replace_ad or keyword changes within the group first.
+  Limit: only ONE pause_ad_group per campaign per optimizer run.
+
 AD PERFORMANCE SCORING CONTEXT:
 The "ad_performance" field contains per-RSA metrics. Key fields:
   - ctr: click-through rate (30-day)
@@ -1284,6 +1329,17 @@ The "ad_performance" field contains per-RSA metrics. Key fields:
   - ad_group_ad_resource: use this EXACTLY for old_ad_group_ad_resource in replace_ad
   - ad_group_resource: use this EXACTLY for ad_group_resource in replace_ad
 Prioritize "weak" or "cold" tier ads for replacement. Never replace "strong" tier ads.
+
+AD GROUP PERFORMANCE SCORING CONTEXT:
+The "ad_group_performance" field contains per-ad-group metrics. Key fields:
+  - ad_group_resource: use this EXACTLY for ad_group_resource in pause_ad_group (never modify)
+  - ad_group_name: human-readable name
+  - impressions_30d, clicks_30d, cost_30d_usd, conversions_30d, lead_count_30d
+  - ctr, avg_campaign_ctr: click-through rates (ad group vs. campaign average)
+  - performance_tier: "strong"|"average"|"weak"|"cold" (pre-computed using same thresholds as ads)
+  - cpl: cost per lead (0 if no leads)
+  Lead count and revenue come from OD string-match attribution — use for directional guidance only.
+  Only recommend pause_ad_group for "weak" or "cold" tier groups meeting the spend/conversion thresholds above.
 
 GOOGLE'S OWN RECOMMENDATIONS (pulled live from Google Ads API):
 Google has flagged the following recommendations for this account. Evaluate each one against the campaign data and lead/call attribution above. For each Google rec:
@@ -1312,7 +1368,7 @@ Rules:
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already added as negatives in Google Ads. Do NOT suggest add_negative_keyword for any term that already appears in that list (exact or near-match). Only flag NEW terms not yet blocked.
 - OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating recommendations that were recently rejected, (2) build on patterns from past runs, (3) surface new issues not seen before. Do not re-suggest anything in "rejected_patterns".
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array
-- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.""" + rsa_note + geo_note + ad_perf_note + page_intel_note + feedback_block
+- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -1441,6 +1497,28 @@ Rules:
                             item["ad_group_resource"] = f"{base}/adGroups/{ag_id}"
                         except Exception:
                             pass
+                elif op == "pause_ad_group":
+                    ag_rn = item.get("ad_group_resource", "")
+                    if not ag_rn:
+                        logger.warning("Dropping pause_ad_group — missing ad_group_resource")
+                        continue
+                    # Validate against actual data from camp_ag_perf — reject hallucinated resources
+                    valid_ag_group_resources = {
+                        a.get("ad_group_resource", "")
+                        for a in (ad_group_performance or [])
+                        if a.get("ad_group_resource")
+                    }
+                    if valid_ag_group_resources and ag_rn not in valid_ag_group_resources:
+                        logger.warning(f"Dropping pause_ad_group — unknown ad_group_resource '{ag_rn}'")
+                        continue
+                    # Safety: ensure ad_group_name is populated
+                    if not item.get("ad_group_name"):
+                        # Fallback: find name from ad_group_performance data
+                        matched = next(
+                            (a for a in (ad_group_performance or []) if a.get("ad_group_resource") == ag_rn),
+                            None
+                        )
+                        item["ad_group_name"] = (matched or {}).get("ad_group_name", ag_rn.split("/")[-1])
                 validated.append(item)
             logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
             return validated
@@ -2667,11 +2745,18 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
     Supports: MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS, MAXIMIZE_CLICKS
     """
     campaign_service = client.get_service("CampaignService")
-    campaign = client.get_type("Campaign")
+    operation = client.get_type("CampaignOperation")
+    campaign = operation.update
     campaign.resource_name = campaign_resource
 
     strategy = bid_strategy.upper()
     from google.protobuf import field_mask_pb2
+
+    # Input validation — Google Ads rejects zero target values
+    if strategy == "TARGET_CPA" and int(target_cpa_micros) <= 0:
+        raise ValueError("TARGET_CPA requires target_cpa_micros > 0")
+    if strategy == "TARGET_ROAS" and float(target_roas) <= 0.0:
+        raise ValueError("TARGET_ROAS requires target_roas > 0")
 
     # In google-ads SDK v24+, simple bidding strategies (MAXIMIZE_CLICKS,
     # MAXIMIZE_CONVERSIONS) must be set via bidding_strategy_type enum.
@@ -2679,22 +2764,21 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
     # assigned directly, with leaf-level field mask paths.
     if strategy == "MAXIMIZE_CONVERSIONS":
         campaign.bidding_strategy_type = client.enums.BiddingStrategyTypeEnum.MAXIMIZE_CONVERSIONS
-        field_mask = field_mask_pb2.FieldMask(paths=["bidding_strategy_type"])
+        paths = ["bidding_strategy_type"]
     elif strategy == "MAXIMIZE_CLICKS":
         campaign.bidding_strategy_type = client.enums.BiddingStrategyTypeEnum.MAXIMIZE_CLICKS
-        field_mask = field_mask_pb2.FieldMask(paths=["bidding_strategy_type"])
+        paths = ["bidding_strategy_type"]
     elif strategy == "TARGET_CPA":
         campaign.target_cpa.target_cpa_micros = int(target_cpa_micros)
-        field_mask = field_mask_pb2.FieldMask(paths=["target_cpa.target_cpa_micros"])
+        paths = ["target_cpa.target_cpa_micros"]
     elif strategy == "TARGET_ROAS":
         campaign.target_roas.target_roas = float(target_roas)
-        field_mask = field_mask_pb2.FieldMask(paths=["target_roas.target_roas"])
+        paths = ["target_roas.target_roas"]
     else:
         raise ValueError(f"Unknown bid strategy: {bid_strategy}")
 
-    operation = client.get_type("CampaignOperation")
-    client.copy_from(operation.update, campaign)
-    client.copy_from(operation.update_mask, field_mask)
+    # Use CopyFrom (not client.copy_from) — stable across SDK v24+
+    operation.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=paths))
 
     try:
         response = campaign_service.mutate_campaigns(
@@ -3168,14 +3252,31 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
             match_name = r.keyword.match_type.name if hasattr(r.keyword.match_type, "name") else str(r.keyword.match_type)
             kw_text = r.keyword.text
             detail = {"status": status_name, "match_type": match_name, "keyword_text": kw_text}
+            old_status = (context.get("before_status") or "").upper()
             if operation == "pause_keyword":
                 ok = "PAUSED" in status_name.upper()
-                summary = f"✅ '{kw_text}' confirmed PAUSED" if ok else f"⚠️ '{kw_text}' status is {status_name} (expected PAUSED)"
+                if ok and old_status and "PAUSED" in old_status:
+                    summary = f"ℹ️ '{kw_text}' was already PAUSED — no change"
+                elif ok:
+                    summary = f"✅ '{kw_text}' paused"
+                else:
+                    summary = f"⚠️ '{kw_text}' status is {status_name} (expected PAUSED)"
             elif operation == "enable_keyword":
                 ok = "ENABLED" in status_name.upper()
-                summary = f"✅ '{kw_text}' confirmed ENABLED" if ok else f"⚠️ '{kw_text}' status is {status_name} (expected ENABLED)"
+                if ok and old_status and "ENABLED" in old_status:
+                    summary = f"ℹ️ '{kw_text}' was already ENABLED — no change"
+                elif ok:
+                    summary = f"✅ '{kw_text}' enabled"
+                else:
+                    summary = f"⚠️ '{kw_text}' status is {status_name} (expected ENABLED)"
             else:
-                summary = f"✅ '{kw_text}' now {match_name} / {status_name}"
+                old_match = context.get("before_match_type", "")
+                if old_match and old_match != match_name:
+                    summary = f"✅ '{kw_text}' match type changed: {old_match} → {match_name}"
+                elif old_match:
+                    summary = f"ℹ️ '{kw_text}' match type unchanged ({match_name})"
+                else:
+                    summary = f"✅ '{kw_text}' now {match_name} / {status_name}"
             return {"confirmed": ok if operation in ("pause_keyword", "enable_keyword") else True, "summary": summary, "detail": detail}
 
         # ── Bid change ────────────────────────────────────────────────────────────────────
@@ -3200,11 +3301,23 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
             expected_usd = int(expected_micros) / 1_000_000 if expected_micros else None
             kw_text = r.keyword.text
             detail = {"keyword_text": kw_text, "cpc_bid_micros": actual_micros}
+            old_bid_micros = context.get("before_bid_micros")
+            try:
+                old_bid_micros = int(old_bid_micros) if old_bid_micros not in (None, "", 0) else None
+            except (TypeError, ValueError):
+                old_bid_micros = None
+            old_bid_usd = old_bid_micros / 1_000_000 if old_bid_micros else None
             if expected_usd is not None:
                 ok = abs(actual_micros - int(expected_micros)) < 10_000  # within $0.01
-                summary = (f"✅ '{kw_text}' bid confirmed ${actual_usd:.2f}"
-                           if ok else
-                           f"⚠️ '{kw_text}' bid is ${actual_usd:.2f} (expected ${expected_usd:.2f})")
+                if ok and old_bid_usd is not None:
+                    if abs(actual_usd - old_bid_usd) < 0.01:
+                        summary = f"ℹ️ '{kw_text}' bid unchanged at ${actual_usd:.2f}"
+                    else:
+                        summary = f"✅ '{kw_text}' bid changed: ${old_bid_usd:.2f} → ${actual_usd:.2f}"
+                elif ok:
+                    summary = f"✅ '{kw_text}' bid set to ${actual_usd:.2f}"
+                else:
+                    summary = f"⚠️ '{kw_text}' bid is ${actual_usd:.2f} (expected ${expected_usd:.2f})"
             else:
                 ok = True
                 summary = f"✅ '{kw_text}' bid is ${actual_usd:.2f}"
@@ -3228,14 +3341,21 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
             actual_usd = actual_micros / 1_000_000
             expected_float = float(expected_usd) if expected_usd else None
             detail = {"campaign_name": camp_name, "budget_micros": actual_micros, "budget_usd": actual_usd}
+            old_budget_usd = context.get("before_daily_budget_usd")
             if expected_float is not None:
                 ok = abs(actual_usd - expected_float) < 0.02
-                summary = (f"✅ '{camp_name}' budget confirmed ${actual_usd:.2f}/day"
-                           if ok else
-                           f"⚠️ '{camp_name}' budget is ${actual_usd:.2f}/day (expected ${expected_float:.2f})")
+                if ok and old_budget_usd is not None:
+                    if abs(actual_usd - float(old_budget_usd)) < 0.02:
+                        summary = f"ℹ️ Budget unchanged at ${actual_usd:.2f}/day"
+                    else:
+                        summary = f"✅ Budget changed: ${float(old_budget_usd):.2f} → ${actual_usd:.2f}/day"
+                elif ok:
+                    summary = f"✅ Budget set to ${actual_usd:.2f}/day"
+                else:
+                    summary = f"⚠️ Budget is ${actual_usd:.2f}/day (expected ${expected_float:.2f})"
             else:
                 ok = True
-                summary = f"✅ '{camp_name}' budget is ${actual_usd:.2f}/day"
+                summary = f"✅ Budget is ${actual_usd:.2f}/day"
             return {"confirmed": ok, "summary": summary, "detail": detail}
 
         # ── Campaign status (pause / enable) ──────────────────────────────────────────────
@@ -3255,7 +3375,17 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
             status_name = rows[0].campaign.status.name if hasattr(rows[0].campaign.status, "name") else str(rows[0].campaign.status)
             detail = {"campaign_name": camp_name, "status": status_name}
             ok = (not expected_status) or (expected_status.upper() in status_name.upper())
-            summary = f"✅ Campaign '{camp_name}' confirmed {status_name}" if ok else f"⚠️ Campaign '{camp_name}' is {status_name} (expected {expected_status})"
+            old_status = (context.get("before_status") or "").upper()
+            _verb_map = {"ENABLED": "enabled", "PAUSED": "paused", "REMOVED": "removed"}
+            _verb = _verb_map.get(status_name.upper(), status_name.lower())
+            if ok and old_status and old_status in status_name.upper():
+                summary = f"ℹ️ Campaign '{camp_name}' was already {_verb} — no change"
+            elif ok and expected_status:
+                summary = f"✅ Campaign '{camp_name}' {_verb}"
+            elif ok:
+                summary = f"✅ Campaign '{camp_name}' is now {_verb}"
+            else:
+                summary = f"⚠️ Campaign '{camp_name}' is {status_name} (expected {expected_status})"
             return {"confirmed": ok, "summary": summary, "detail": detail}
 
         # ── Ad status changes (pause_ad) ──────────────────────────────────────────────────
@@ -3274,8 +3404,68 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
             r = rows[0].ad_group_ad
             status_name = r.status.name if hasattr(r.status, "name") else str(r.status)
             ok = "PAUSED" in status_name.upper()
+            old_status = (context.get("before_status") or "").upper()
             detail = {"ad_resource": ad_resource, "status": status_name}
-            summary = f"✅ Ad confirmed PAUSED" if ok else f"⚠️ Ad status is {status_name} (expected PAUSED)"
+            if ok and old_status and "PAUSED" in old_status:
+                summary = "ℹ️ Ad was already paused — no change"
+            elif ok:
+                summary = "✅ Ad paused"
+            else:
+                summary = f"⚠️ Ad status is {status_name} (expected PAUSED)"
+            return {"confirmed": ok, "summary": summary, "detail": detail}
+
+        # ── Ad group pause ────────────────────────────────────────────────────────────────
+        elif operation == "pause_ad_group":
+            ag_resource = context.get("ad_group_resource", "")
+            ag_name = context.get("ad_group_name", "")
+            if not ag_resource:
+                return {"confirmed": False, "summary": "Could not verify — missing ad_group_resource", "detail": {}}
+            rows = _safe_search(
+                f"SELECT ad_group.resource_name, ad_group.name, ad_group.status "
+                f"FROM ad_group "
+                f"WHERE ad_group.resource_name = '{ag_resource}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Ad group not found in read-back", "detail": {}}
+            r = rows[0].ad_group
+            status_name = r.status.name if hasattr(r.status, "name") else str(r.status)
+            display_name = r.name or ag_name or ag_resource.split("/")[-1]
+            ok = "PAUSED" in status_name.upper()
+            old_status = (context.get("before_status") or "").upper()
+            detail = {"ad_group_resource": ag_resource, "ad_group_name": display_name, "status": status_name}
+            if ok and old_status and "PAUSED" in old_status:
+                summary = f"ℹ️ Ad group '{display_name}' was already paused — no change"
+            elif ok:
+                summary = f"✅ Ad group '{display_name}' paused"
+            else:
+                summary = f"⚠️ Ad group '{display_name}' status is {status_name} (expected PAUSED)"
+            return {"confirmed": ok, "summary": summary, "detail": detail}
+
+        # ── Ad group enable ───────────────────────────────────────────────────────────────
+        elif operation == "enable_ad_group":
+            ag_resource = context.get("ad_group_resource", "")
+            ag_name = context.get("ad_group_name", "")
+            if not ag_resource:
+                return {"confirmed": False, "summary": "Could not verify — missing ad_group_resource", "detail": {}}
+            rows = _safe_search(
+                f"SELECT ad_group.resource_name, ad_group.name, ad_group.status "
+                f"FROM ad_group "
+                f"WHERE ad_group.resource_name = '{ag_resource}' LIMIT 1"
+            )
+            if not rows:
+                return {"confirmed": False, "summary": "Ad group not found in read-back", "detail": {}}
+            r = rows[0].ad_group
+            status_name = r.status.name if hasattr(r.status, "name") else str(r.status)
+            display_name = r.name or ag_name or ag_resource.split("/")[-1]
+            ok = "ENABLED" in status_name.upper()
+            old_status = (context.get("before_status") or "").upper()
+            detail = {"ad_group_resource": ag_resource, "ad_group_name": display_name, "status": status_name}
+            if ok and old_status and "ENABLED" in old_status:
+                summary = f"ℹ️ Ad group '{display_name}' was already active — no change"
+            elif ok:
+                summary = f"✅ Ad group '{display_name}' enabled"
+            else:
+                summary = f"⚠️ Ad group '{display_name}' status is {status_name} (expected ENABLED)"
             return {"confirmed": ok, "summary": summary, "detail": detail}
 
         # ── Replace ad ────────────────────────────────────────────────────────────────────
@@ -3369,9 +3559,21 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
                 return {"confirmed": False, "summary": "Campaign not found in read-back", "detail": {}}
             camp_name = rows[0].campaign.name
             strategy_name = rows[0].campaign.bidding_strategy_type.name if hasattr(rows[0].campaign.bidding_strategy_type, "name") else str(rows[0].campaign.bidding_strategy_type)
+            old_strategy = context.get("before_bid_strategy", "")
             detail = {"campaign_name": camp_name, "bidding_strategy_type": strategy_name}
-            summary = f"✅ '{camp_name}' bid strategy is now {strategy_name}"
-            return {"confirmed": True, "summary": summary, "detail": detail}
+            expected_upper = (expected_strategy or "").upper()
+            actual_upper = strategy_name.upper()
+            # confirmed = True if expected matches actual (or no expectation)
+            confirmed = (not expected_upper) or (expected_upper == actual_upper)
+            if old_strategy and old_strategy.upper() == actual_upper:
+                summary = f"ℹ️ Bid strategy unchanged ({strategy_name})"
+            elif expected_upper and not confirmed:
+                summary = f"⚠️ Bid strategy is {strategy_name} (expected {expected_strategy})"
+            elif old_strategy:
+                summary = f"✅ Bid strategy changed: {old_strategy} → {strategy_name}"
+            else:
+                summary = f"✅ Bid strategy set to {strategy_name}"
+            return {"confirmed": confirmed, "summary": summary, "detail": detail}
 
         # ── Geo exclusion ─────────────────────────────────────────────────────────────────
         elif operation == "geo_exclusion":
@@ -3387,7 +3589,8 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
                 f"AND campaign_criterion.location.geo_target_constant = '{geo_target_resource}' LIMIT 1"
             )
             confirmed = len(rows) > 0
-            summary = ("✅ Geo exclusion confirmed in Google Ads"
+            location_name = context.get("location_name", "") or geo_target_resource.split("/")[-1]
+            summary = (f"✅ Location excluded: {location_name}"
                        if confirmed else
                        "⚠️ Geo exclusion submitted but not yet visible in read-back — check Google Ads")
             return {"confirmed": confirmed, "summary": summary, "detail": {"found": confirmed}}
@@ -3826,19 +4029,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             avg_ctr = camp_avg_ctr.get(cname, 0)
             cost_usd = cost_micros / 1_000_000
 
-            # Performance tier
-            if impr < 100:
-                tier = "cold"      # not enough data / not serving
-            elif ctr >= avg_ctr * 1.2:
-                tier = "strong"
-            elif ctr >= avg_ctr * 0.5:
-                tier = "average"
-            else:
-                tier = "weak"      # CTR < 50% of campaign average
-
-            # Override: zero conversions after meaningful spend = weak
-            if conv == 0 and cost_usd >= 30 and tier != "cold":
-                tier = "weak"
+            # Performance tier — shared logic via _score_tier
+            tier = _score_tier(impr, clicks, cost_usd, conv, avg_ctr)
 
             # Build assets from assets_json if available
             assets = {}
@@ -3872,6 +4064,96 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         logger.info(f"Ad performance: {enabled_rsas} active RSAs scored, {weak_rsas} weak/cold")
     except Exception as _ads_err:
         logger.warning(f"Ad performance fetch failed (non-fatal): {_ads_err}")
+
+    # ── Fetch and score ad group performance ──────────────────────────────────
+    # Derive ad_group_resource from keyword_perf (API-returned, guaranteed valid)
+    # so Claude receives real resource names, not synthesised strings.
+    logger.info("Fetching ad group stats for scoring...")
+    all_ag_stats: list = []
+    try:
+        from database import get_ad_group_stats as _get_ag_stats
+        raw_ag = _get_ag_stats(days=30)
+
+        # Build ad_group_id → ad_group_resource from keyword_perf (primary source)
+        ag_id_to_resource: dict = {}
+        for kw in keyword_perf:
+            ag_res = kw.get("ad_group_resource", "")
+            # Extract numeric ad_group_id from resource name: .../adGroups/{id}
+            if ag_res and "/adGroups/" in ag_res:
+                try:
+                    ag_id = ag_res.split("/adGroups/")[-1]
+                    if ag_id.isdigit():
+                        ag_id_to_resource[ag_id] = ag_res
+                except Exception:
+                    pass
+
+        # Build per-campaign-id avg CTR for ad group benchmarking
+        # Use campaign_id (unique) not campaign_name to avoid collisions
+        camp_id_ctr_totals: dict = {}
+        for ag in raw_ag:
+            cid = ag.get("campaign_id") or ag.get("campaign_name", "")
+            if cid not in camp_id_ctr_totals:
+                camp_id_ctr_totals[cid] = {"impressions": 0, "clicks": 0}
+            camp_id_ctr_totals[cid]["impressions"] += ag.get("impressions") or 0
+            camp_id_ctr_totals[cid]["clicks"] += ag.get("clicks") or 0
+        camp_id_avg_ctr: dict = {
+            cid: (v["clicks"] / v["impressions"]) if v["impressions"] > 0 else 0
+            for cid, v in camp_id_ctr_totals.items()
+        }
+
+        for ag in raw_ag:
+            cid = ag.get("campaign_id") or ag.get("campaign_name", "")
+            impr = ag.get("impressions") or 0
+            clicks = ag.get("clicks") or 0
+            cost = float(ag.get("cost") or 0)
+            conv = float(ag.get("conversions") or 0)
+            avg_ctr = camp_id_avg_ctr.get(cid, 0)
+
+            tier = _score_tier(impr, clicks, cost, conv, avg_ctr)
+
+            # Prefer API-derived resource name; fall back to synthesised for new ad groups
+            ag_id_str = str(ag.get("ad_group_id") or "")
+            ag_resource = ag_id_to_resource.get(ag_id_str, "")
+            if not ag_resource:
+                # Synthesise only as last resort (new ad groups not yet in keyword cache)
+                ag_resource = (
+                    f"customers/{customer_id}/adGroups/{ag_id_str}"
+                    if ag_id_str.isdigit() else ""
+                )
+
+            if not ag_resource:
+                continue  # No usable resource name — skip this ad group
+
+            all_ag_stats.append({
+                "ad_group_id":      ag_id_str,
+                "ad_group_resource": ag_resource,
+                "ad_group_name":    ag.get("ad_group_name", ""),
+                "campaign_name":    ag.get("campaign_name", ""),
+                "campaign_id":      str(cid),
+                "impressions_30d":  impr,
+                "clicks_30d":       clicks,
+                "cost_30d_usd":     round(cost, 2),
+                "conversions_30d":  round(conv, 2),
+                "lead_count_30d":   int(ag.get("lead_count") or 0),
+                "revenue_30d":      float(ag.get("revenue") or 0),
+                "ctr":              round((clicks / impr) if impr > 0 else 0, 4),
+                "avg_campaign_ctr": round(avg_ctr, 4),
+                "cpl":              float(ag.get("cpl") or 0),
+                "performance_tier": tier,
+            })
+
+        weak_ags = sum(1 for a in all_ag_stats if a["performance_tier"] in ("weak", "cold"))
+        logger.info(
+            f"Ad group scoring: {len(all_ag_stats)} ad groups scored "
+            f"(from {len(raw_ag)} in DB), {weak_ags} weak/cold"
+        )
+        if len(all_ag_stats) < len(raw_ag):
+            logger.info(
+                f"  {len(raw_ag) - len(all_ag_stats)} ad group(s) skipped — "
+                f"no resource name in keyword cache (likely new groups not yet synced)"
+            )
+    except Exception as _ag_err:
+        logger.warning(f"Ad group stats fetch failed (non-fatal): {_ag_err}")
 
     # ── Capture account-wide totals before any filtering ──────────────────────
     total_spend_all_campaigns = round(sum(k.get("cost", 0) for k in keyword_perf), 2)
@@ -4157,6 +4439,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         "change_match_type":    ("keyword",  "resource_name",     "keyword_text"),
         "add_asset":            ("campaign", "campaign_resource",  "asset_type"),
         "replace_ad":           ("ad",       "old_ad_group_ad_resource", "old_ad_group_ad_resource"),
+        "pause_ad_group":       ("ad_group", "ad_group_resource",        "ad_group_name"),
     }
 
     # Geo candidates for Grafton Dental Care (Worcester area, MA)
@@ -4204,6 +4487,17 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         weak_count = sum(1 for a in camp_ad_perf if a["performance_tier"] in ("weak","cold"))
         if camp_ad_perf:
             logger.info(f"  [{camp_name}] {len(camp_ad_perf)} RSAs scored — {weak_count} weak/cold")
+
+        # Filter ad group stats to this campaign
+        camp_ag_perf = [
+            a for a in all_ag_stats
+            if a.get("campaign_name", "").strip().lower() == camp_lower
+        ]
+        if camp_ag_perf:
+            weak_ag = sum(1 for a in camp_ag_perf if a["performance_tier"] in ("weak", "cold"))
+            logger.info(f"  [{camp_name}] {len(camp_ag_perf)} ad groups — {weak_ag} weak/cold")
+        else:
+            logger.info(f"  [{camp_name}] No ad group stats (sync may be pending)")
 
         # Load landing page intel for this campaign's final_url
         camp_page_intel = ""
@@ -4256,13 +4550,23 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             camp_settings=camp_settings,
             ad_performance=camp_ad_perf,
             landing_page_intel=camp_page_intel,
+            ad_group_performance=camp_ag_perf,
         )
         if not structured:
             continue
 
         logger.info(f"Claude recommendations for '{camp_name}': {len(structured)}")
 
-        _replace_ad_count_for_camp = 0  # enforce one replace_ad per campaign per run
+        _replace_ad_count_for_camp = 0     # enforce one replace_ad per campaign per run
+        _pause_ag_count_for_camp = 0       # enforce one pause_ad_group per campaign per run
+
+        # Safety: how many active ad groups does this campaign have?
+        # get_ad_group_stats has no status filter, so we proxy "active" as
+        # impressions_30d > 0 — groups with zero impressions are not serving.
+        # This prevents pausing the campaign's only impression-generating ad group.
+        _active_ag_count = sum(
+            1 for a in camp_ag_perf if (a.get("impressions_30d") or 0) > 0
+        )
 
         for rec in structured:
             op = rec.get("operation", "claude_advisory")
@@ -4282,6 +4586,20 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                     continue
                 _replace_ad_count_for_camp += 1
 
+            # pause_ad_group: safety checks first (before rejection suppression),
+            # but quota increment AFTER rejection suppression so rejected recs
+            # don't consume the per-campaign limit.
+            if op == "pause_ad_group":
+                if _pause_ag_count_for_camp >= 1:
+                    logger.info(f"  [{camp_name}] SKIPPED extra pause_ad_group — one-per-campaign limit")
+                    continue
+                if _active_ag_count <= 1:
+                    logger.info(
+                        f"  [{camp_name}] SKIPPED pause_ad_group '{rec.get('ad_group_name','')}' "
+                        f"— only {_active_ag_count} serving ad group(s), cannot pause the last one"
+                    )
+                    continue
+
             # Rejection suppression for Claude recs (mirrors rule-based suppression above)
             op_meta_check = _OP_MAP.get(op)
             if op_meta_check:
@@ -4291,6 +4609,10 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 if (eid_check, op) in rejected_id_op_pairs or (ename_check, op) in rejected_op_pairs:
                     logger.info(f"  [{camp_name}] SKIPPED {op} '{ename_check}' — recently rejected by admin")
                     continue
+
+            # Increment pause_ad_group quota only after passing rejection suppression
+            if op == "pause_ad_group":
+                _pause_ag_count_for_camp += 1
 
             advisories.append(f"[{camp_name}] {reason}")
 

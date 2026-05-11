@@ -1412,6 +1412,36 @@ async def gads_approve_action(action_id: str, request: Request):
                 f"pause_ad approved: paused {result['paused_resource']} ({action_id[:8]})"
             )
 
+        elif operation == "pause_ad_group":
+            from google_ads_write import set_ad_group_status as _set_ag_status
+            after = json.loads(row["after_state_json"] or "{}")
+            ag_rn = after.get("ad_group_resource", "")
+            ag_name = after.get("ad_group_name", ag_rn)
+            if not ag_rn:
+                raise HTTPException(
+                    status_code=422,
+                    detail="pause_ad_group after_state_json missing ad_group_resource"
+                )
+            if "/adGroups/" not in ag_rn:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"pause_ad_group invalid ad_group_resource format: {ag_rn}"
+                )
+            try:
+                _set_ag_status(ag_rn, "PAUSED")
+            except ValueError as ve:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"rejected: {str(ve)[:200]}")
+                raise HTTPException(status_code=422, detail=str(ve))
+            except Exception as ae:
+                err = str(ae)
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {err[:200]}", error_detail=err[:500])
+                raise HTTPException(status_code=502, detail=f"Google Ads error: {ae}")
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(f"pause_ad_group approved: paused '{ag_name}' ({ag_rn}) ({action_id[:8]})")
+
         else:
             raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
 
@@ -1433,28 +1463,44 @@ async def gads_approve_action(action_id: str, request: Request):
     _verification: dict = {}
     try:
         _after_for_verify = json.loads(row.get("after_state_json") or "{}")
+        _before_for_verify = json.loads(row.get("before_state_json") or "{}")
         _verify_ctx: dict = {}
 
         if operation in ("pause_keyword", "enable_keyword", "tighten_match_type", "change_match_type"):
             _verify_ctx["resource_name"] = row.get("entity_id", "")
+            _verify_ctx["before_status"] = _before_for_verify.get("status", "")
+            _verify_ctx["before_match_type"] = _before_for_verify.get("match_type", "")
 
         elif operation in ("increase_bid", "decrease_bid"):
-            _after_for_verify2 = json.loads(row.get("after_state_json") or "{}")
             _verify_ctx["resource_name"] = row.get("entity_id", "")
-            _verify_ctx["new_bid_micros"] = _after_for_verify2.get("new_bid_micros", 0)
+            _verify_ctx["new_bid_micros"] = _after_for_verify.get("new_bid_micros", 0)
+            _verify_ctx["before_bid_micros"] = _before_for_verify.get("cpc_bid_micros") or _before_for_verify.get("bid_micros")
 
         elif operation == "change_budget":
             _verify_ctx["campaign_resource"] = (
                 _after_for_verify.get("campaign_resource") or row.get("entity_id", "")
             )
             _verify_ctx["new_daily_budget_usd"] = _after_for_verify.get("new_daily_budget_usd", 0)
+            _verify_ctx["before_daily_budget_usd"] = _before_for_verify.get("daily_budget_usd") or _before_for_verify.get("current_daily_budget_usd")
 
         elif operation == "status":
             _verify_ctx["campaign_resource"] = row.get("entity_id", "")
             _verify_ctx["expected_status"] = _after_for_verify.get("status", "")
+            _verify_ctx["before_status"] = _before_for_verify.get("status", "")
 
         elif operation == "pause_ad":
             _verify_ctx["ad_group_ad_resource"] = _after_for_verify.get("ad_group_ad_resource", "")
+            _verify_ctx["before_status"] = _before_for_verify.get("status", "")
+
+        elif operation == "pause_ad_group":
+            _verify_ctx["ad_group_resource"] = _after_for_verify.get("ad_group_resource", "")
+            _verify_ctx["ad_group_name"] = _after_for_verify.get("ad_group_name", "")
+            _verify_ctx["before_status"] = _before_for_verify.get("status", "")
+
+        elif operation == "enable_ad_group":
+            _verify_ctx["ad_group_resource"] = _after_for_verify.get("ad_group_resource", "") or row.get("entity_id", "")
+            _verify_ctx["ad_group_name"] = _after_for_verify.get("ad_group_name", "")
+            _verify_ctx["before_status"] = _before_for_verify.get("status", "")
 
         elif operation == "replace_ad":
             _verify_ctx["old_ad_group_ad_resource"] = _after_for_verify.get("old_ad_group_ad_resource", "")
@@ -1470,10 +1516,12 @@ async def gads_approve_action(action_id: str, request: Request):
         elif operation == "change_bid_strategy":
             _verify_ctx["campaign_resource"] = _after_for_verify.get("campaign_resource", "") or row.get("entity_id", "")
             _verify_ctx["bid_strategy"] = _after_for_verify.get("bid_strategy", "")
+            _verify_ctx["before_bid_strategy"] = _before_for_verify.get("bidding_strategy_type", "") or _before_for_verify.get("bid_strategy", "")
 
         elif operation == "geo_exclusion":
             _verify_ctx["campaign_resource"] = row.get("entity_id", "") or _after_for_verify.get("campaign_resource", "")
             _verify_ctx["geo_target_resource"] = _after_for_verify.get("geo_target_resource", "")
+            _verify_ctx["location_name"] = _after_for_verify.get("location_name", "") or _before_for_verify.get("location_name", "")
 
         _verify_client = _build_client()
         _verification = _verify_gads_change(_verify_client, customer_id, operation, _verify_ctx)
@@ -5762,12 +5810,30 @@ def admin_set_ad_group_status(body: AdGroupStatusRequest):
         set_ad_group_status(ad_group_resource, new_status)
         update_gads_action_result(action_id, executed=True, execution_result="success")
         set_audit_approval(action_id, "admin")
+
+        # Read-back verification
+        _verification = {"confirmed": False, "summary": "Verification skipped", "detail": {}}
+        try:
+            from ai_optimizer import _verify_gads_change as _vgc, _build_client as _bc
+            settings_obj = get_settings()
+            cid = settings_obj.google_ads_customer_id or ""
+            if cid:
+                _client = _bc()
+                _verification = _vgc(_client, cid, operation, {
+                    "ad_group_resource": ad_group_resource,
+                    "ad_group_name": body.ad_group_name or ad_group_resource,
+                    "before_status": old_status,
+                })
+        except Exception as _ve:
+            logger.warning(f"set-status verify failed: {_ve}")
+
         return {
             "ok": True,
             "action_id": action_id,
             "operation": operation,
             "ad_group_resource": ad_group_resource,
             "status": new_status,
+            "confirmation": _verification,
         }
     except Exception as e:
         update_gads_action_result(action_id, executed=True,
@@ -5840,12 +5906,30 @@ def admin_set_campaign_budget(campaign_id: str, body: SetBudgetRequest):
         # drawer shows the correct value after reload (monthly_budget = daily * 30.4)
         from database import update_campaign_fields as _ucf
         _ucf(campaign_id, {"monthly_budget": round(new_usd * 30.4, 2)})
+
+        # Read-back verification
+        _verification = {"confirmed": False, "summary": "Verification skipped", "detail": {}}
+        try:
+            from ai_optimizer import _verify_gads_change as _vgc, _build_client as _bc
+            settings_obj = get_settings()
+            cid = settings_obj.google_ads_customer_id or ""
+            if cid:
+                _client = _bc()
+                _verification = _vgc(_client, cid, "change_budget", {
+                    "campaign_resource": campaign_resource,
+                    "new_daily_budget_usd": new_usd,
+                    "before_daily_budget_usd": body.current_daily_budget_usd or None,
+                })
+        except Exception as _ve:
+            logger.warning(f"set-budget verify failed: {_ve}")
+
         return {
             "ok": True,
             "action_id": action_id,
             "operation": "set_campaign_budget",
             "campaign_resource": campaign_resource,
             "new_daily_budget_usd": new_usd,
+            "confirmation": _verification,
         }
     except Exception as e:
         update_gads_action_result(action_id, executed=True,
@@ -6059,6 +6143,23 @@ def admin_set_campaign_locations(campaign_id: str, body: SetLocationsRequest):
             live_criteria = [{"type": "error", "summary": f"Read-back failed: {ve}"}]
             has_live_criteria = False
 
+        # Diff-aware confirmation summary
+        if added == 0 and removed == 0:
+            _loc_summary = "ℹ️ Locations unchanged — no changes made"
+            _loc_confirmed = True
+        elif added > 0 and removed > 0:
+            _loc_summary = f"✅ Locations updated: {added} added, {removed} removed"
+            _loc_confirmed = has_live_criteria
+        elif added > 0:
+            _loc_summary = f"✅ {added} location{'s' if added>1 else ''} added"
+            _loc_confirmed = has_live_criteria
+        elif removed > 0:
+            _loc_summary = f"✅ {removed} location{'s' if removed>1 else ''} removed"
+            _loc_confirmed = True
+        else:
+            _loc_summary = "✅ Locations updated" if has_live_criteria else "⚠️ Location update submitted — verify in Google Ads"
+            _loc_confirmed = has_live_criteria
+
         return {
             "ok": True,
             "action_id": action_id,
@@ -6068,6 +6169,7 @@ def admin_set_campaign_locations(campaign_id: str, body: SetLocationsRequest):
             "errors": errs,
             "live_criteria": live_criteria,
             "has_live_criteria": has_live_criteria,
+            "confirmation": {"confirmed": _loc_confirmed, "summary": _loc_summary, "detail": {"added": added, "removed": removed}},
         }
     except Exception as e:
         update_gads_action_result(action_id, executed=True,
@@ -6163,13 +6265,25 @@ def admin_set_campaign_schedule(campaign_id: str, body: SetScheduleRequest):
                     (json.dumps(build), _dt.datetime.utcnow().isoformat(), campaign_id)
                 )
 
+        pushed = result.get("pushed", 0)
+        removed_sched = result.get("removed", 0)
         logger.info(f"Ad schedule set for {campaign_id}: {body.schedule_text} → {len(slots)} slots")
+        if pushed == 0 and removed_sched == 0:
+            _sched_summary = f"ℹ️ Schedule unchanged — no changes made"
+            _sched_confirmed = True
+        elif pushed > 0:
+            _sched_summary = f"✅ Schedule set: {days_summary}"
+            _sched_confirmed = True
+        else:
+            _sched_summary = f"✅ Schedule updated"
+            _sched_confirmed = True
         return {
             "ok": True,
-            "pushed": result["pushed"],
-            "removed": result["removed"],
+            "pushed": pushed,
+            "removed": removed_sched,
             "slots": slots,
             "days_summary": days_summary,
+            "confirmation": {"confirmed": _sched_confirmed, "summary": _sched_summary, "detail": {"pushed": pushed, "removed": removed_sched}},
         }
     except HTTPException:
         raise
@@ -8931,8 +9045,9 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
 
     # Fetch current RSAs for this campaign so Claude can identify which to replace
     current_ads = []
+    current_ad_groups = []
     try:
-        from database import get_ads_with_metrics
+        from database import get_ads_with_metrics, get_ad_group_stats, get_gads_campaign_snapshot
         all_ads = get_ads_with_metrics(days=30)
         settings_obj = get_settings()
         cid = settings_obj.google_ads_customer_id
@@ -8963,6 +9078,46 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
                 "impressions": ad.get("impressions", 0),
                 "clicks":      ad.get("clicks", 0),
             })
+        # Fetch ad groups for this campaign with resource names
+        all_ag = get_ad_group_stats(days=30)
+        camp_ag = [ag for ag in all_ag
+                   if str(ag.get("campaign_id","")) == gads_num_id
+                   or (camp_name_lc and ag.get("campaign_name","").lower() == camp_name_lc)]
+        # Enrich with resource names from snapshot
+        snap_ag = {}
+        if body.campaign_id:
+            try:
+                snap = get_gads_campaign_snapshot(body.campaign_id)
+                ag_block = snap.get("ad_groups") or {}
+                snap_ag_list = (ag_block.get("ad_groups") if isinstance(ag_block, dict) else ag_block) or []
+                for sag in snap_ag_list:
+                    rn = sag.get("resource_name","")
+                    if rn and "/adGroups/" in rn:
+                        ag_id = rn.split("/adGroups/")[-1]
+                        snap_ag[ag_id] = {"resource_name": rn, "status": (sag.get("status") or "ENABLED").upper()}
+            except Exception:
+                pass
+        for ag in camp_ag:
+            ag_id = str(ag.get("ad_group_id") or "")
+            snap_info = snap_ag.get(ag_id, {})
+            rn = snap_info.get("resource_name","") or (
+                f"customers/{cid}/adGroups/{ag_id}" if ag_id.isdigit() else ""
+            )
+            impr = ag.get("impressions") or 0
+            clk  = ag.get("clicks") or 0
+            cost = ag.get("cost") or 0.0   # already in dollars from get_ad_group_stats
+            ctr  = round(clk / impr * 100, 2) if impr > 0 else 0
+            current_ad_groups.append({
+                "ad_group_resource": rn,
+                "ad_group_name": ag.get("ad_group_name",""),
+                "gads_status": snap_info.get("status","ENABLED"),
+                "impressions_30d": impr,
+                "clicks_30d": clk,
+                "cost_30d": cost,
+                "ctr_pct": ctr,
+                "conversions_30d": ag.get("conversions") or 0,
+            })
+
     except Exception as e:
         logger.warning(f"campaign-refine: could not fetch current ads: {e}")
 
@@ -8975,29 +9130,33 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
         "When the user wants to swap, rewrite, or replace an ad with new copy, return 'replace_ad' "
         "with the EXACT ad_group_ad_resource of the ad to retire (copy verbatim from "
         "current_ads in the context) plus a full new RSA. "
-        "NEVER use 'status' to pause a single ad — that pauses the entire campaign. "
+        "When the user wants to pause an entire ad group (not just one ad), return 'pause_ad_group' "
+        "with the ad_group_resource from current_ad_groups in the context. "
+        "NEVER use 'status' to pause a single ad or a single ad group — that pauses the entire campaign. "
+        "NEVER use 'pause_ad' to pause an entire ad group — use 'pause_ad_group' for that. "
         "Return ONLY a valid JSON object, no prose."
     )
 
     user_prompt = (
         f"Campaign: {campaign_name}\n"
         f"Current state:\n{json.dumps(ctx, indent=2, default=str)}\n\n"
+        f"Current ad groups in this campaign:\n{json.dumps(current_ad_groups, indent=2)}\n\n"
         f"Current RSAs in this campaign:\n{json.dumps(current_ads, indent=2)}\n\n"
         f"User instruction: {instruction}\n\n"
         "Return a JSON object with:\n"
         "  summary (string — one sentence describing what you understood)\n"
         "  changes (array of change objects). Each change object must have:\n"
-        "    type: one of 'budget' | 'geo' | 'status' | 'schedule' | 'note' | 'pause_ad' | 'replace_ad'\n"
+        "    type: one of 'budget' | 'geo' | 'status' | 'schedule' | 'note' | 'pause_ad' | 'replace_ad' | 'pause_ad_group'\n"
         "    rationale: string explaining why\n"
         "    For 'budget': also include new_daily_budget_usd (number)\n"
         "    For 'geo': also include locations (string, comma-separated city/region list)\n"
         "    For 'status': also include action ('pause' or 'resume'). "
-        "Use this ONLY to pause/resume the entire campaign — NOT for pausing a single ad.\n"
+        "Use this ONLY to pause/resume the entire campaign — NOT for pausing a single ad or ad group.\n"
         "    For 'schedule': also include schedule_text (string describing the schedule, "
         "e.g. 'Mon-Thu 7am-11pm' or 'Weekdays 9am-6pm' or '24/7'). "
         "Use this when the user asks to change when ads run, set hours, or limit days.\n"
         "    For 'note': also include message (string — advisory, nothing to apply)\n"
-        "    For 'pause_ad': use when the user wants to pause a single ad (not the whole campaign). "
+        "    For 'pause_ad': use when the user wants to pause a single ad (not the whole campaign, not the whole ad group). "
         "Include ad_group_ad_resource (EXACT resource_name from current_ads above). "
         "Use this when the user says 'pause this ad', 'turn off that ad', 'disable that ad', etc.\n"
         "    For 'replace_ad': use when the user wants to pause one ad AND run a new one with different copy. "
@@ -9012,6 +9171,12 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
         "      New RSA goes in same ad group as the retired ad. Do not choose an ad group.\n"
         "      Headlines must be specific, benefit-driven, and locally grounded. "
         "Avoid generic phrases like 'Quality Dental Care'.\n"
+        "    For 'pause_ad_group': use when the user wants to pause an entire ad group (all ads in it stop serving). "
+        "Include ad_group_resource (EXACT ad_group_resource from current_ad_groups above) and "
+        "ad_group_name (copy from current_ad_groups). "
+        "Use this when the user says 'pause the [name] ad group', 'stop the [group] group', etc. "
+        "NEVER use this to pause a single ad — use 'pause_ad' for that. "
+        "NEVER use this if only one ad group is active (would stop all ads in campaign).\n"
         "If the instruction is unclear or unsupported, return a single 'note' change explaining why.\n"
         "Return ONLY the JSON object."
     )
@@ -9035,10 +9200,32 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
 
-    # Server-side validation of replace_ad/pause_ad — ensure resource exists + clip overlong strings
-    valid_resources = {a["ad_group_ad_resource"] for a in current_ads if a.get("ad_group_ad_resource")}
+    # Server-side validation of replace_ad/pause_ad/pause_ad_group — ensure resource exists + clip overlong strings
+    valid_resources    = {a["ad_group_ad_resource"] for a in current_ads if a.get("ad_group_ad_resource")}
+    valid_ag_resources = {ag["ad_group_resource"] for ag in current_ad_groups if ag.get("ad_group_resource")}
+    active_ag_count    = sum(1 for ag in current_ad_groups if ag.get("impressions_30d", 0) > 0)
     validated_changes = []
     for ch in result.get("changes", []):
+        # --- pause_ad_group validation ---
+        if ch.get("type") == "pause_ad_group":
+            rn = ch.get("ad_group_resource", "")
+            if valid_ag_resources and rn not in valid_ag_resources:
+                validated_changes.append({
+                    "type": "note",
+                    "message": "AI proposed pausing an ad group that wasn't found in this campaign. "
+                               "Please try again with more specific wording.",
+                    "rationale": ch.get("rationale", ""),
+                })
+            elif active_ag_count <= 1:
+                validated_changes.append({
+                    "type": "note",
+                    "message": "Cannot pause ad group — only one active ad group exists in this campaign. "
+                               "Pausing it would stop all ads.",
+                    "rationale": ch.get("rationale", ""),
+                })
+            else:
+                validated_changes.append(ch)
+            continue
         # --- pause_ad validation ---
         if ch.get("type") == "pause_ad":
             rn = ch.get("ad_group_ad_resource", "")
