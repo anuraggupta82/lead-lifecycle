@@ -1265,6 +1265,15 @@ def _migrate(conn):
     if "sitelinks" not in camp_cols:
         conn.execute("ALTER TABLE campaigns ADD COLUMN sitelinks TEXT DEFAULT ''")
 
+    # Per-campaign booking link — overrides practice-level default for {book_now_button}
+    try:
+        camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+        if "booking_link" not in camp_cols:
+            conn.execute("ALTER TABLE campaigns ADD COLUMN booking_link TEXT DEFAULT ''")
+    except Exception:
+        # Safe migration — column may already exist or migration may have run partially
+        pass
+
     # Sitelink library — shared pool of sitelinks that have been pushed to Google Ads
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sitelink_library (
@@ -3447,6 +3456,7 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
         "end_date", "notes", "promo_offer", "landing_page", "objective",
         "target_audience", "expected_cpl", "geographic_targeting",
         "launch_date", "call_extension_phone", "skip_workflow", "sitelinks",
+        "booking_link",
     }
     safe = {k: v for k, v in fields.items() if k in ALLOWED}
     if not safe:

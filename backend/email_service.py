@@ -13,6 +13,86 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 
+# ── Service-focus → settings key map for booking link resolution ─────────────
+def _resolve_booking_url(lead: dict, step: dict, settings) -> str:
+    """
+    Resolve the booking URL for a workflow email step using a priority chain:
+      1. Per-campaign override (campaigns.booking_link) — most specific
+      2. Service-focus → practice_booking_link_<focus> from settings
+      3. Practice-level fallback (settings.booking_url)
+
+    `lead` provides campaign association (campaign_id) and may carry a service_focus.
+    If the lead has no service_focus, falls back to the campaign's service_focus.
+    """
+    # Step 1 — per-campaign booking_link (most specific)
+    camp_id = ""
+    if isinstance(lead, dict):
+        camp_id = (
+            lead.get("source_campaign_id")
+            or lead.get("campaign_id")
+            or lead.get("gads_campaign_id")
+            or ""
+        )
+    camp_row = None
+    if camp_id:
+        try:
+            # Local import to avoid circulars at module import time
+            from database import _conn as _db_conn  # type: ignore
+            with _db_conn() as _c:
+                # leads.campaign_id may be the GAds numeric ID OR our logical campaign_id.
+                # Try logical campaign_id first, then gads_campaign_numeric_id.
+                row = _c.execute(
+                    "SELECT booking_link, service_focus FROM campaigns "
+                    "WHERE campaign_id=? OR gads_campaign_numeric_id=? LIMIT 1",
+                    (str(camp_id), str(camp_id))
+                ).fetchone()
+                if row:
+                    camp_row = dict(row)
+        except Exception as e:
+            logger.warning(f"_resolve_booking_url: campaign lookup failed for {camp_id!r}: {e}")
+
+    if camp_row:
+        camp_link = (camp_row.get("booking_link") or "").strip()
+        if camp_link:
+            return camp_link
+
+    # Step 2 — service-focus → settings key map
+    raw_focus = ""
+    if isinstance(lead, dict):
+        raw_focus = (lead.get("service_focus") or "").strip().lower()
+    if not raw_focus and camp_row:
+        raw_focus = (camp_row.get("service_focus") or "").strip().lower()
+
+    def _focus_key(focus: str) -> str | None:
+        if not focus:
+            return None
+        f = focus.lower()
+        if any(t in f for t in ("implant", "all-on-x", "all on x", "allonx", "dental implant")):
+            return "practice_booking_link_implant"
+        if any(t in f for t in ("consult", "consultation")):
+            return "practice_booking_link_consult"
+        if any(t in f for t in ("exam", "checkup", "check-up", "cleaning")):
+            return "practice_booking_link_exam"
+        if any(t in f for t in ("ortho", "orthodontic", "braces", "invisalign")):
+            return "practice_booking_link_ortho"
+        if any(t in f for t in ("general", "other", "emergency")):
+            return "practice_booking_link_general"
+        return None
+
+    settings_key = _focus_key(raw_focus)
+    if settings_key:
+        try:
+            from database import get_setting as _get_setting  # type: ignore
+            val = (_get_setting(settings_key) or "").strip()
+            if val:
+                return val
+        except Exception as e:
+            logger.warning(f"_resolve_booking_url: get_setting({settings_key}) failed: {e}")
+
+    # Step 3 — practice-level fallback (settings.booking_url)
+    return (getattr(settings, "booking_url", "") or "").strip()
+
+
 def _resolve_recipient(original_email: str) -> tuple[str, str]:
     """
     In dev mode, redirect every outbound email to the test inbox.
@@ -446,6 +526,17 @@ def send_workflow_step_email(lead: dict, step: dict, unsub_url: str) -> bool:
 
     body_template = step.get("body") or ""
     subject_template = step.get("subject") or ""
+
+    # ── Auto-resolve book_now_url if step doesn't set one ────────────────────
+    # Priority: campaign.booking_link → service-focus setting → settings.booking_url.
+    # Only resolves when the template actually uses {book_now_button}, to avoid
+    # work on emails that don't render the button.
+    if not book_now_url and "{book_now_button}" in body_template:
+        try:
+            book_now_url = (_resolve_booking_url(lead, step, settings) or "").strip()
+        except Exception as e:
+            logger.warning(f"send_workflow_step_email: booking-url resolution failed: {e}")
+            book_now_url = ""
 
     # ── Basic placeholder substitution ───────────────────────────────────────
     replacements = {

@@ -70,7 +70,7 @@ from follow_up_engine import start_scheduler, stop_scheduler, run_now
 from ga4_events import (
     track_lead_created, track_smile_completed, track_appointment_booked,
 )
-from firestore_sync import sync_from_firestore
+from firestore_sync import sync_from_firestore, sync_unsubscribes_from_firestore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -184,6 +184,14 @@ async def lifespan(app: FastAPI):
                 logger.info(f"Scheduled Firestore sync: {result}")
         except Exception as e:
             logger.error(f"Scheduled Firestore sync failed: {e}")
+        # Same cadence — pull unsubscribe opt-outs from the public Cloud Run
+        # microservice (collection `unsubscribes` in marketing-landing-page-491721).
+        try:
+            unsub_result = sync_unsubscribes_from_firestore()
+            if unsub_result.get("applied", 0) > 0:
+                logger.info(f"Scheduled unsubscribe sync: {unsub_result}")
+        except Exception as e:
+            logger.error(f"Scheduled unsubscribe sync failed: {e}")
 
     # Every 5 min — Poll IMAP inbox for inbound emails
     def _imap_poll_job():
@@ -1176,7 +1184,7 @@ async def gads_approve_action(action_id: str, request: Request):
                 # Live API execution — update RSA via API
                 client = _build_client()
                 try:
-                    _execute_update_rsa(
+                    rsa_ok = _execute_update_rsa(
                         client, customer_id,
                         ad_group_ad_resource=ad_resource,
                         new_headlines=new_headlines,
@@ -1190,9 +1198,17 @@ async def gads_approve_action(action_id: str, request: Request):
                     update_gads_action_result(action_id, executed=False,
                         execution_result=f"failed: {str(e)[:200]}")
                     raise
-                update_gads_action_result(action_id, executed=True, execution_result="success")
-                set_audit_approval(action_id, approver="admin")
-                logger.info(f"Approved + executed ad_copy_suggestion (RSA updated): '{row['entity_name']}' ({action_id[:8]})")
+                if rsa_ok:
+                    update_gads_action_result(action_id, executed=True, execution_result="success")
+                    set_audit_approval(action_id, approver="admin")
+                    logger.info(f"Approved + executed ad_copy_suggestion (RSA updated): '{row['entity_name']}' ({action_id[:8]})")
+                else:
+                    # RSA assets are IMMUTABLE via update — treat as advisory.
+                    update_gads_action_result(action_id, executed=True,
+                        execution_result="advisory_applied",
+                        error_detail="RSA headlines/descriptions are immutable via API — manual edit needed in Google Ads UI.")
+                    set_audit_approval(action_id, approver="admin")
+                    logger.info(f"Ad copy suggestion advisory_applied (IMMUTABLE_FIELD): '{row['entity_name']}' ({action_id[:8]})")
             else:
                 # Legacy or missing ad_resource — acknowledge only
                 update_gads_action_result(action_id, executed=True, execution_result="success")
@@ -1290,18 +1306,19 @@ async def gads_approve_action(action_id: str, request: Request):
             details = after
             resource_name_kw = after.get("resource_name") or details.get("resource_name", "") or row.get("entity_id", "")
             new_mt = after.get("new_match_type") or details.get("new_match_type", "EXACT")
+            kw_text = after.get("keyword_text") or row.get("entity_name", "")
             if not resource_name_kw:
                 raise HTTPException(status_code=422, detail="Missing keyword resource_name")
             client = _build_client()
             try:
-                _execute_change_match_type(client, customer_id, resource_name_kw, new_mt)
+                _execute_change_match_type(client, customer_id, resource_name_kw, new_mt, keyword_text=kw_text)
             except Exception as e:
                 update_gads_action_result(action_id, executed=False,
-                    execution_result=f"failed: {str(e)[:200]}")
+                    execution_result=f"failed: {str(e)[:200]}", error_detail=str(e)[:500])
                 raise
             update_gads_action_result(action_id, executed=True, execution_result="success")
             set_audit_approval(action_id, approver="admin")
-            logger.info(f"Approved + executed change_match_type: {new_mt} on {resource_name_kw[:30]} ({action_id[:8]})")
+            logger.info(f"Approved + executed change_match_type: '{kw_text}' → {new_mt} ({action_id[:8]})")
 
         elif operation == "add_asset":
             # Advisory — user adds manually or via ApplyRecommendation
@@ -1776,6 +1793,9 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
                                         ad_group_ad_resource=ad_resource,
                                         new_headlines=new_headlines,
                                         new_descriptions=new_descriptions)
+                    # _execute_update_rsa returns False on IMMUTABLE_FIELD —
+                    # bulk endpoint still marks the row 'success' but the function
+                    # itself logs a warning so it's traceable.
                 # else: legacy row without ad_resource — acknowledge only
 
             elif operation == "geo_exclusion":
@@ -1815,9 +1835,10 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
                 after = json.loads(row["after_state_json"] or "{}")
                 resource_name_kw = after.get("resource_name", "") or row.get("entity_id", "")
                 new_mt = after.get("new_match_type", "EXACT")
+                kw_text = after.get("keyword_text") or row.get("entity_name", "")
                 if resource_name_kw:
                     client = _build_client()
-                    _execute_change_match_type(client, customer_id, resource_name_kw, new_mt)
+                    _execute_change_match_type(client, customer_id, resource_name_kw, new_mt, keyword_text=kw_text)
 
             elif operation == "add_asset":
                 # Advisory — check for google_rec_resource_name for direct apply
@@ -2009,11 +2030,13 @@ async def gads_push_queued():
                 new_headlines = [after["headline"]] if after.get("headline") else []
                 new_descriptions = [after["description"]] if after.get("description") else []
                 if ad_resource and new_headlines:
-                    _execute_update_rsa(client, customer_id,
+                    rsa_ok = _execute_update_rsa(client, customer_id,
                         ad_group_ad_resource=ad_resource,
                         new_headlines=new_headlines,
                         new_descriptions=new_descriptions)
-                    api_hit = True
+                    # RSA assets are IMMUTABLE via API — treat as advisory when API rejects.
+                    # api_hit stays False so the row records as acknowledged_only.
+                    api_hit = bool(rsa_ok)
 
             elif operation == "geo_exclusion":
                 geo_rn = after.get("geo_target_resource")
@@ -2044,8 +2067,9 @@ async def gads_push_queued():
                 details = after
                 resource_name_kw = after.get("resource_name") or details.get("resource_name", "") or row.get("entity_id", "")
                 new_mt = after.get("new_match_type") or details.get("new_match_type", "EXACT")
+                kw_text = after.get("keyword_text") or row.get("entity_name", "")
                 if resource_name_kw:
-                    _execute_change_match_type(client, customer_id, resource_name_kw, new_mt)
+                    _execute_change_match_type(client, customer_id, resource_name_kw, new_mt, keyword_text=kw_text)
                     api_hit = True
 
             elif operation == "add_asset":
@@ -3071,6 +3095,7 @@ class CampaignUpdateFieldsRequest(BaseModel):
     geographic_targeting: str | None = None
     launch_date: str | None = None
     call_extension_phone: str | None = None
+    booking_link: str | None = None
 
     @validator("geographic_targeting")
     def validate_geographic_targeting(cls, v):

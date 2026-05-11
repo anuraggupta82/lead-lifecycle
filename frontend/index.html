@@ -8240,6 +8240,47 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                   </div>
                                 </div>
 
+                                {/* Card 4b — Booking Link (per-campaign override) */}
+                                <div style={cardStyle}>
+                                  <div style={cardHeaderStyle}>
+                                    <span style={{fontSize:12,fontWeight:700}}>📅 Booking Link</span>
+                                    {launchCardEdit?.field !== 'booking_link' && pencilBtn('booking_link', camp.booking_link || '')}
+                                  </div>
+                                  <div style={cardBodyStyle}>
+                                    {launchCardEdit?.field === 'booking_link' ? (
+                                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                                        <input autoFocus
+                                          value={launchCardEdit.draft}
+                                          onChange={e=>setLaunchCardEdit(p=>({...p, draft: e.target.value}))}
+                                          onKeyDown={e=>{
+                                            if (e.key==='Enter') saveCardField('booking_link', launchCardEdit.draft);
+                                            if (e.key==='Escape') setLaunchCardEdit(null);
+                                          }}
+                                          placeholder="https://... (overrides practice default for this campaign)"
+                                          style={{flex:1,fontSize:13,padding:'5px 9px',border:'1px solid var(--teal)',
+                                            borderRadius:6,outline:'none'}}/>
+                                        <button className="btn btn-teal btn-sm" style={{fontSize:11}}
+                                          disabled={launchCardEdit.saving}
+                                          onClick={()=>saveCardField('booking_link', launchCardEdit.draft)}>
+                                          {launchCardEdit.saving ? '…' : isLinkedAlready ? 'Save Changes' : 'Save'}
+                                        </button>
+                                        <button className="btn btn-sm" style={{fontSize:11,
+                                          background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                          onClick={()=>setLaunchCardEdit(null)}>Cancel</button>
+                                      </div>
+                                    ) : (
+                                      <div style={{fontSize:13}}>
+                                        {camp.booking_link
+                                          ? <a href={camp.booking_link} target="_blank" rel="noopener noreferrer"
+                                              style={{color:'var(--teal)',textDecoration:'none',wordBreak:'break-all'}}>
+                                              {camp.booking_link}
+                                            </a>
+                                          : <span style={{color:'#9ca3af',fontStyle:'italic'}}>Not set — uses practice default</span>}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+
                                 {/* Card 5 — Phone / Call Extension */}
                                 <div style={cardStyle}>
                                   <div style={cardHeaderStyle}>
@@ -14282,6 +14323,8 @@ function AiOptimizerTab() {
   const [expandedSections, setExpandedSections] = React.useState({});
   const [impactHistory, setImpactHistory] = React.useState([]);
   const [impactLoading, setImpactLoading] = React.useState(false);
+  const [histFilter, setHistFilter] = React.useState('all');
+  const [histSelected, setHistSelected] = React.useState({});
 
   const loadLastRun = React.useCallback(async () => {
     try {
@@ -14853,90 +14896,187 @@ function AiOptimizerTab() {
       )}
 
       {/* ── HISTORY TAB ── */}
-      {innerTab === 'history' && (
-        <div>
-          {loading && <div style={{color:'var(--text-muted)',fontSize:12,padding:'16px 0'}}>Loading history...</div>}
-          {!loading && historyRecs.length === 0 && (
-            <div style={{textAlign:'center',padding:'32px 0',color:'var(--text-muted)',fontSize:13}}>
-              No optimization history yet.
+      {innerTab === 'history' && (() => {
+
+        const filteredHistory = historyRecs.filter(r => {
+          if (histFilter === 'all') return true;
+          const isSuccess  = r.execution_result === 'success' || r.execution_result === 'advisory_applied';
+          const isRejected = (r.execution_result || '').startsWith('rejected') || r.execution_result === 'ignored';
+          const isError    = r.execution_result === 'error' || r.execution_result === 'failed';
+          if (histFilter === 'applied')  return isSuccess;
+          if (histFilter === 'ignored')  return isRejected;
+          if (histFilter === 'error')    return isError;
+          return true;
+        });
+
+        const selectableIds = filteredHistory.filter(r => r.execution_result === 'error').map(r => r.action_id);
+        const selectedCount = Object.values(histSelected).filter(Boolean).length;
+        const allErrorsSelected = selectableIds.length > 0 && selectableIds.every(id => histSelected[id]);
+        const someSelected = selectedCount > 0;
+
+        const toggleAll = () => {
+          if (allErrorsSelected) {
+            setHistSelected({});
+          } else {
+            const next = {};
+            selectableIds.forEach(id => { next[id] = true; });
+            setHistSelected(next);
+          }
+        };
+        const toggleOne = (id) => setHistSelected(prev => ({...prev, [id]: !prev[id]}));
+
+        const bulkRetry = async () => {
+          const ids = Object.keys(histSelected).filter(id => histSelected[id]);
+          for (const id of ids) { await handleApprove(id); }
+          setHistSelected({});
+        };
+        const bulkDismiss = async () => {
+          const ids = Object.keys(histSelected).filter(id => histSelected[id]);
+          for (const id of ids) { await handleIgnore(id); }
+          setHistSelected({});
+        };
+
+        const filterBtn = (key, label, color) => (
+          <button onClick={() => { setHistFilter(key); setHistSelected({}); }}
+            style={{padding:'4px 12px',borderRadius:20,fontSize:11,fontWeight:600,cursor:'pointer',
+              border: histFilter === key ? `1.5px solid ${color}` : '1.5px solid var(--border)',
+              background: histFilter === key ? color+'18' : 'var(--bg-card)',
+              color: histFilter === key ? color : 'var(--text-muted)'}}>
+            {label}
+            <span style={{marginLeft:5,background: histFilter===key ? color+'30':'#e2e8f0',
+              color: histFilter===key ? color:'#64748b',
+              borderRadius:10,padding:'0 5px',fontSize:10,fontWeight:700}}>
+              {historyRecs.filter(r => {
+                if (key==='all') return true;
+                const s = r.execution_result||'';
+                if (key==='applied') return s==='success'||s==='advisory_applied';
+                if (key==='ignored') return s.startsWith('rejected')||s==='ignored';
+                if (key==='error')   return s==='error'||s==='failed';
+                return false;
+              }).length}
+            </span>
+          </button>
+        );
+
+        return (
+          <div>
+            {/* Filter bar */}
+            <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:10,flexWrap:'wrap'}}>
+              {filterBtn('all',     'All',     '#64748b')}
+              {filterBtn('applied', '✓ Applied', '#16a34a')}
+              {filterBtn('ignored', '✕ Ignored', '#dc2626')}
+              {filterBtn('error',   '⚠ Error',  '#b45309')}
             </div>
-          )}
-          {!loading && historyRecs.length > 0 && historyRecs.map(rec => {
-            const opMeta = AI_OP_LABELS[rec.operation] || {label:rec.operation, color:'#64748b', icon:'•'};
-            const isSuccess = rec.execution_result === 'success';
-            const isRejected = (rec.execution_result || '').startsWith('rejected');
-            const isError = rec.execution_result === 'error';
-            const change = fmtRecChange(rec.after_state_json || rec.before_state_json, rec.operation);
-            const statusColor = isSuccess ? '#16a34a' : isRejected ? '#dc2626' : isError ? '#b45309' : '#d97706';
-            const statusBg    = isSuccess ? '#dcfce7' : isRejected ? '#fee2e2' : isError ? '#fef3c7' : '#fef9c3';
-            const statusLabel = isSuccess ? '✓ Applied' : isRejected ? '✕ Ignored' : isError ? '⚠ Error' : rec.execution_result;
-            return (
-              <div key={rec.action_id} style={{display:'flex',alignItems:'flex-start',gap:8,
-                padding:'8px 12px',marginBottom:5,borderRadius:6,
-                border:`1px solid ${isError ? '#fcd34d' : 'var(--border)'}`,
-                background: isRejected ? '#fafafa' : isError ? '#fffbeb' : '#fff',
-                opacity: isRejected ? 0.7 : 1}}>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:2}}>
-                    <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,
-                      background:opMeta.color+'22',color:opMeta.color,fontWeight:700}}>
-                      {opMeta.icon} {opMeta.label}
-                    </span>
-                    <span style={{fontWeight:700,fontSize:12,color:'var(--text)'}}>{rec.entity_name}</span>
-                    <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,
-                      background:statusBg,color:statusColor,fontWeight:700,marginLeft:'auto'}}>
-                      {statusLabel}
-                    </span>
-                  </div>
-                  <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-                    {rec.campaign_name && (
-                      <span style={{fontSize:10,background:'var(--teal-light)',color:'var(--teal)',
-                        borderRadius:8,padding:'1px 7px',fontWeight:600}}>
-                        {rec.campaign_name}
-                      </span>
-                    )}
-                    {!rec.campaign_name && (
-                      <span style={{fontSize:10,background:'#f1f5f9',color:'#64748b',
-                        borderRadius:8,padding:'1px 7px',fontWeight:600}}>
-                        Account Level
-                      </span>
-                    )}
-                    {change && (
-                      <span style={{fontSize:10,color:'#475569',fontFamily:'monospace',
-                        background:'#f1f5f9',borderRadius:3,padding:'1px 5px'}}>
-                        {change}
-                      </span>
-                    )}
-                    <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>
-                      {rec.created_at ? new Date(rec.created_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ''}
-                    </span>
-                  </div>
-                </div>
-                {isError && (
-                  <div style={{display:'flex',flexDirection:'column',gap:4,flexShrink:0}}>
-                    <button
-                      onClick={()=>handleApprove(rec.action_id)}
-                      disabled={!!busy[rec.action_id]}
-                      title="Retry this action"
-                      style={{padding:'3px 10px',borderRadius:5,fontSize:11,fontWeight:600,
-                        background:'#0e7490',color:'#fff',border:'none',cursor:'pointer'}}>
-                      {busy[rec.action_id]==='approve' ? '…' : '↻ Retry'}
-                    </button>
-                    <button
-                      onClick={()=>handleIgnore(rec.action_id)}
-                      disabled={!!busy[rec.action_id]}
-                      title="Dismiss this error"
-                      style={{padding:'3px 10px',borderRadius:5,fontSize:11,fontWeight:600,
-                        background:'none',color:'#dc2626',border:'1px solid #fca5a5',cursor:'pointer'}}>
-                      Dismiss
-                    </button>
-                  </div>
-                )}
+
+            {/* Bulk action bar — shown when errors exist in current filter */}
+            {selectableIds.length > 0 && (
+              <div style={{display:'flex',alignItems:'center',gap:8,padding:'6px 10px',
+                marginBottom:8,borderRadius:6,background:'#fffbeb',border:'1px solid #fcd34d'}}>
+                <input type="checkbox" checked={allErrorsSelected} ref={el => { if (el) el.indeterminate = someSelected && !allErrorsSelected; }}
+                  onChange={toggleAll} style={{cursor:'pointer',width:14,height:14}} />
+                <span style={{fontSize:11,color:'#92400e',fontWeight:600}}>
+                  {someSelected ? `${selectedCount} error${selectedCount>1?'s':''} selected` : `${selectableIds.length} error${selectableIds.length>1?'s':''} — select to retry or dismiss`}
+                </span>
+                {someSelected && (<>
+                  <button onClick={bulkRetry}
+                    style={{marginLeft:'auto',padding:'3px 12px',borderRadius:5,fontSize:11,fontWeight:600,
+                      background:'#0e7490',color:'#fff',border:'none',cursor:'pointer'}}>
+                    ↻ Retry Selected
+                  </button>
+                  <button onClick={bulkDismiss}
+                    style={{padding:'3px 12px',borderRadius:5,fontSize:11,fontWeight:600,
+                      background:'none',color:'#dc2626',border:'1px solid #fca5a5',cursor:'pointer'}}>
+                    Dismiss Selected
+                  </button>
+                </>)}
               </div>
-            );
-          })}
-        </div>
-      )}
+            )}
+
+            {loading && <div style={{color:'var(--text-muted)',fontSize:12,padding:'16px 0'}}>Loading history...</div>}
+            {!loading && filteredHistory.length === 0 && (
+              <div style={{textAlign:'center',padding:'32px 0',color:'var(--text-muted)',fontSize:13}}>
+                {histFilter === 'all' ? 'No optimization history yet.' : `No ${histFilter} items.`}
+              </div>
+            )}
+            {!loading && filteredHistory.map(rec => {
+              const opMeta = AI_OP_LABELS[rec.operation] || {label:rec.operation, color:'#64748b', icon:'•'};
+              const isSuccess  = rec.execution_result === 'success' || rec.execution_result === 'advisory_applied';
+              const isRejected = (rec.execution_result || '').startsWith('rejected') || rec.execution_result === 'ignored';
+              const isError    = rec.execution_result === 'error' || rec.execution_result === 'failed';
+              const change = fmtRecChange(rec.after_state_json || rec.before_state_json, rec.operation);
+              const statusColor = isSuccess ? '#16a34a' : isRejected ? '#dc2626' : isError ? '#b45309' : '#d97706';
+              const statusBg    = isSuccess ? '#dcfce7' : isRejected ? '#fee2e2' : isError ? '#fef3c7' : '#fef9c3';
+              const statusLabel = isSuccess ? '✓ Applied' : isRejected ? '✕ Ignored' : isError ? '⚠ Error' : rec.execution_result;
+              const isChecked = !!histSelected[rec.action_id];
+              return (
+                <div key={rec.action_id} style={{display:'flex',alignItems:'flex-start',gap:8,
+                  padding:'8px 12px',marginBottom:5,borderRadius:6,
+                  border:`1px solid ${isChecked ? '#0e7490' : isError ? '#fcd34d' : 'var(--border)'}`,
+                  background: isChecked ? '#ecfeff' : isRejected ? '#fafafa' : isError ? '#fffbeb' : '#fff',
+                  opacity: isRejected ? 0.7 : 1}}>
+                  {/* Checkbox for error rows */}
+                  {isError && (
+                    <input type="checkbox" checked={isChecked} onChange={() => toggleOne(rec.action_id)}
+                      style={{marginTop:3,cursor:'pointer',width:14,height:14,flexShrink:0}} />
+                  )}
+                  {!isError && <div style={{width:14,flexShrink:0}} />}
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:2}}>
+                      <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,
+                        background:opMeta.color+'22',color:opMeta.color,fontWeight:700}}>
+                        {opMeta.icon} {opMeta.label}
+                      </span>
+                      <span style={{fontWeight:700,fontSize:12,color:'var(--text)'}}>{rec.entity_name}</span>
+                      <span style={{fontSize:10,padding:'1px 6px',borderRadius:10,
+                        background:statusBg,color:statusColor,fontWeight:700,marginLeft:'auto'}}>
+                        {statusLabel}
+                      </span>
+                    </div>
+                    <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                      {rec.campaign_name ? (
+                        <span style={{fontSize:10,background:'var(--teal-light)',color:'var(--teal)',
+                          borderRadius:8,padding:'1px 7px',fontWeight:600}}>
+                          {rec.campaign_name}
+                        </span>
+                      ) : (
+                        <span style={{fontSize:10,background:'#f1f5f9',color:'#64748b',
+                          borderRadius:8,padding:'1px 7px',fontWeight:600}}>
+                          Account Level
+                        </span>
+                      )}
+                      {change && (
+                        <span style={{fontSize:10,color:'#475569',fontFamily:'monospace',
+                          background:'#f1f5f9',borderRadius:3,padding:'1px 5px'}}>
+                          {change}
+                        </span>
+                      )}
+                      <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>
+                        {rec.created_at ? new Date(rec.created_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ''}
+                      </span>
+                    </div>
+                  </div>
+                  {isError && (
+                    <div style={{display:'flex',flexDirection:'column',gap:4,flexShrink:0}}>
+                      <button onClick={()=>handleApprove(rec.action_id)} disabled={!!busy[rec.action_id]}
+                        title="Retry this action"
+                        style={{padding:'3px 10px',borderRadius:5,fontSize:11,fontWeight:600,
+                          background:'#0e7490',color:'#fff',border:'none',cursor:'pointer'}}>
+                        {busy[rec.action_id]==='approve' ? '…' : '↻ Retry'}
+                      </button>
+                      <button onClick={()=>handleIgnore(rec.action_id)} disabled={!!busy[rec.action_id]}
+                        title="Dismiss this error"
+                        style={{padding:'3px 10px',borderRadius:5,fontSize:11,fontWeight:600,
+                          background:'none',color:'#dc2626',border:'1px solid #fca5a5',cursor:'pointer'}}>
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
     </div>
   );
 }

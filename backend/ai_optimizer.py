@@ -2592,35 +2592,30 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
     campaign.resource_name = campaign_resource
 
     strategy = bid_strategy.upper()
+    from google.protobuf import field_mask_pb2
+
+    # In google-ads SDK v24+, simple bidding strategies (MAXIMIZE_CLICKS,
+    # MAXIMIZE_CONVERSIONS) must be set via bidding_strategy_type enum.
+    # Target-based strategies (TARGET_CPA, TARGET_ROAS) use nested sub-fields
+    # assigned directly, with leaf-level field mask paths.
     if strategy == "MAXIMIZE_CONVERSIONS":
-        campaign.maximize_conversions.CopyFrom(client.get_type("MaximizeConversions"))
-    elif strategy == "TARGET_CPA":
-        tc = client.get_type("TargetCpa")
-        tc.target_cpa_micros = int(target_cpa_micros)
-        campaign.target_cpa.CopyFrom(tc)
-    elif strategy == "TARGET_ROAS":
-        tr = client.get_type("TargetRoas")
-        tr.target_roas = float(target_roas)
-        campaign.target_roas.CopyFrom(tr)
+        campaign.bidding_strategy_type = client.enums.BiddingStrategyTypeEnum.MAXIMIZE_CONVERSIONS
+        field_mask = field_mask_pb2.FieldMask(paths=["bidding_strategy_type"])
     elif strategy == "MAXIMIZE_CLICKS":
-        campaign.maximize_clicks.CopyFrom(client.get_type("MaximizeClicks"))
+        campaign.bidding_strategy_type = client.enums.BiddingStrategyTypeEnum.MAXIMIZE_CLICKS
+        field_mask = field_mask_pb2.FieldMask(paths=["bidding_strategy_type"])
+    elif strategy == "TARGET_CPA":
+        campaign.target_cpa.target_cpa_micros = int(target_cpa_micros)
+        field_mask = field_mask_pb2.FieldMask(paths=["target_cpa.target_cpa_micros"])
+    elif strategy == "TARGET_ROAS":
+        campaign.target_roas.target_roas = float(target_roas)
+        field_mask = field_mask_pb2.FieldMask(paths=["target_roas.target_roas"])
     else:
         raise ValueError(f"Unknown bid strategy: {bid_strategy}")
 
-    from google.protobuf import field_mask_pb2
-    field_mask = field_mask_pb2.FieldMask()
-    if strategy == "MAXIMIZE_CONVERSIONS":
-        field_mask.paths.append("maximize_conversions")
-    elif strategy == "TARGET_CPA":
-        field_mask.paths.extend(["target_cpa", "target_cpa.target_cpa_micros"])
-    elif strategy == "TARGET_ROAS":
-        field_mask.paths.extend(["target_roas", "target_roas.target_roas"])
-    elif strategy == "MAXIMIZE_CLICKS":
-        field_mask.paths.append("maximize_clicks")
-
     operation = client.get_type("CampaignOperation")
-    operation.update.CopyFrom(campaign)
-    operation.update_mask.CopyFrom(field_mask)
+    client.copy_from(operation.update, campaign)
+    client.copy_from(operation.update_mask, field_mask)
 
     try:
         response = campaign_service.mutate_campaigns(
@@ -2635,32 +2630,75 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
 
 
 def _execute_change_match_type(client, customer_id: str, resource_name: str,
-                                new_match_type: str) -> bool:
+                                new_match_type: str,
+                                keyword_text: str = "") -> bool:
     """
-    Change a keyword's match type.
+    Change a keyword's match type by removing the old keyword and adding a new one.
+
+    Google Ads does not allow updating keyword.match_type via UPDATE — it is an
+    IMMUTABLE_FIELD. The correct approach is REMOVE + CREATE.
+
+    resource_name format: customers/CID/adGroupCriteria/AGID~CRITERIONID
+    The ad group resource is derived from the resource_name.
     """
     service = client.get_service("AdGroupCriterionService")
-    criterion = client.get_type("AdGroupCriterion")
-    criterion.resource_name = resource_name
+
+    # Derive the ad group resource from the criterion resource name
+    # customers/CID/adGroupCriteria/AGID~CRITERIONID → customers/CID/adGroups/AGID
+    try:
+        parts = resource_name.split("/adGroupCriteria/")
+        if len(parts) != 2:
+            raise ValueError(f"Cannot parse resource_name: {resource_name}")
+        cid_part = parts[0]  # customers/CID
+        ag_crit = parts[1]   # AGID~CRITERIONID
+        ad_group_id = ag_crit.split("~")[0]
+        ad_group_resource = f"{cid_part}/adGroups/{ad_group_id}"
+    except Exception as e:
+        raise ValueError(f"Could not derive ad group from '{resource_name}': {e}")
+
+    # If keyword_text not provided, fetch it from Google Ads
+    if not keyword_text:
+        ga_service = client.get_service("GoogleAdsService")
+        q = f"""
+            SELECT ad_group_criterion.keyword.text
+            FROM ad_group_criterion
+            WHERE ad_group_criterion.resource_name = '{resource_name}'
+            LIMIT 1
+        """
+        try:
+            resp = ga_service.search(customer_id=customer_id, query=q)
+            for row in resp:
+                keyword_text = row.ad_group_criterion.keyword.text
+                break
+        except Exception as e:
+            raise ValueError(f"Could not fetch keyword text for '{resource_name}': {e}")
+        if not keyword_text:
+            raise ValueError(f"Keyword text not found for resource: {resource_name}")
+
     match_type_enum = client.enums.KeywordMatchTypeEnum[new_match_type.upper()]
-    criterion.keyword.match_type = match_type_enum
 
-    from google.protobuf import field_mask_pb2
-    field_mask = field_mask_pb2.FieldMask(paths=["keyword.match_type"])
+    # Step 1: REMOVE the existing keyword
+    remove_op = client.get_type("AdGroupCriterionOperation")
+    remove_op.remove = resource_name
 
-    operation = client.get_type("AdGroupCriterionOperation")
-    operation.update.CopyFrom(criterion)
-    operation.update_mask.CopyFrom(field_mask)
+    # Step 2: CREATE new keyword with the new match type
+    create_op = client.get_type("AdGroupCriterionOperation")
+    new_criterion = create_op.create
+    new_criterion.ad_group = ad_group_resource
+    new_criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+    new_criterion.keyword.text = keyword_text
+    new_criterion.keyword.match_type = match_type_enum
 
     try:
         service.mutate_ad_group_criteria(
             customer_id=customer_id,
-            operations=[operation],
+            operations=[remove_op, create_op],
         )
-        logger.info(f"Changed match type to {new_match_type} for {resource_name}")
+        logger.info(f"Changed match type to {new_match_type} for '{keyword_text}' "
+                    f"(removed {resource_name}, created new {new_match_type} keyword)")
         return True
     except Exception as e:
-        logger.error(f"Failed to change match type: {e}")
+        logger.error(f"Failed to change match type for '{keyword_text}': {e}")
         raise
 
 
@@ -2723,7 +2761,12 @@ def _execute_update_rsa(client, customer_id: str, ad_group_ad_resource: str,
     new_descriptions: list of str
 
     Does NOT check kill switch — caller must check first.
-    Returns True on success.
+
+    NOTE: Google Ads API treats RSA headlines/descriptions as IMMUTABLE on update —
+    they cannot be modified in-place via AdService.mutate_ads(). If the API rejects
+    the mutation with IMMUTABLE_FIELD, the function returns False and the caller
+    should treat the suggestion as advisory (manual action needed in Google Ads UI).
+    A True return means the API accepted the update.
     """
     # Validate character limits
     for h in new_headlines:
@@ -2805,6 +2848,18 @@ def _execute_update_rsa(client, customer_id: str, ad_group_ad_resource: str,
                     f"{len(merged_headlines)} headlines, {len(merged_descriptions)} descriptions")
         return True
     except Exception as e:
+        # Google Ads API rejects RSA asset mutations with IMMUTABLE_FIELD.
+        # Treat as advisory rather than a hard failure so the approval flow
+        # can continue. Caller should mark execution_result='advisory_applied'.
+        err_str = str(e)
+        if "IMMUTABLE_FIELD" in err_str or "cannot be modified" in err_str:
+            logger.warning(
+                f"RSA update rejected as IMMUTABLE_FIELD for {ad_resource} — "
+                f"treating as advisory (manual action needed in Google Ads UI). "
+                f"Suggested: {len(new_headlines)} new headlines, "
+                f"{len(new_descriptions)} new descriptions."
+            )
+            return False
         logger.error(f"RSA update failed for {ad_resource}: {e}")
         raise
 

@@ -7,7 +7,8 @@ import logging
 import urllib.request
 import ssl
 import json
-from database import upsert_lead, get_lead, enqueue_follow_ups, add_event, is_deleted_lead
+from database import upsert_lead, get_lead, enqueue_follow_ups, add_event, is_deleted_lead, _conn
+from database import unsubscribe as db_unsubscribe
 from config import get_settings
 
 # macOS Python doesn't use the system keychain for SSL by default.
@@ -257,3 +258,72 @@ def sync_from_firestore() -> dict:
 
     logger.info(f"Firestore sync complete: synced={synced} skipped={skipped} errors={errors} deduped={deduped} purged={purged}")
     return {"synced": synced, "skipped": skipped, "errors": errors, "deduped": deduped, "purged": purged}
+
+
+def sync_unsubscribes_from_firestore() -> dict:
+    """
+    Pull opt-outs from Firestore collection `unsubscribes` (written by the
+    public nxtsmile-unsubscribe Cloud Run microservice) and apply them to the
+    local SQLite DB.
+
+    Idempotent: rows already present in the local `unsubscribes` table are
+    skipped, so this can safely run on every scheduler tick.
+
+    Returns {"applied": N, "skipped": N, "errors": N}.
+    """
+    settings = get_settings()
+    project = getattr(settings, "gcp_project", "marketing-landing-page-491721")
+
+    try:
+        # Lazy import — google-cloud-firestore is heavy and only needed here
+        from google.cloud import firestore as _fs
+    except ImportError:
+        logger.warning("google-cloud-firestore not installed — skipping unsubscribe sync")
+        return {"applied": 0, "skipped": 0, "errors": 1, "error": "missing_dependency"}
+
+    try:
+        client = _fs.Client(project=project)
+        docs = list(client.collection("unsubscribes").stream())
+    except Exception as e:
+        logger.error(f"Unsubscribe sync — Firestore read failed: {e}")
+        return {"applied": 0, "skipped": 0, "errors": 1, "error": str(e)}
+
+    # Build set of already-applied (lead_id, channel) pairs to avoid duplicate INSERTs
+    already_applied: set = set()
+    try:
+        with _conn() as conn:
+            for row in conn.execute("SELECT lead_id, channel FROM unsubscribes"):
+                already_applied.add((row["lead_id"], row["channel"]))
+    except Exception as e:
+        logger.warning(f"Could not load existing unsubscribes (continuing): {e}")
+
+    applied = skipped = errors = 0
+    for doc in docs:
+        try:
+            data = doc.to_dict() or {}
+            lead_id = (data.get("lead_id") or "").strip()
+            channel = (data.get("channel") or "").strip().lower()
+            if not lead_id or channel not in ("email", "sms"):
+                skipped += 1
+                continue
+            if (lead_id, channel) in already_applied:
+                skipped += 1
+                continue
+            # Confirm lead exists locally — if not, leave the Firestore doc in
+            # place; the next lead sync may bring this lead in.
+            if not get_lead(lead_id):
+                skipped += 1
+                continue
+            db_unsubscribe(lead_id, channel, reason="firestore-sync")
+            add_event(lead_id, "unsubscribed", source="firestore_sync",
+                      detail=json.dumps({"channel": channel}))
+            applied += 1
+        except Exception as e:
+            logger.error(f"Error applying unsubscribe doc {doc.id}: {e}")
+            errors += 1
+
+    logger.info(
+        f"Unsubscribe sync complete: applied={applied} skipped={skipped} "
+        f"errors={errors} total_docs={len(docs)}"
+    )
+    return {"applied": applied, "skipped": skipped, "errors": errors, "total_docs": len(docs)}
