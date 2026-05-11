@@ -240,22 +240,29 @@ def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: di
             label = t['label']
             live = live_values.get(metric)
 
+            # Pre-compute target display string regardless of whether live data exists
+            if unit == '%':
+                _target_display = f"{target_val:.0f}%"
+            elif unit == '$':
+                _target_display = f"${target_val:.0f}"
+            elif unit == 'x':
+                _target_display = f"{target_val:.1f}x"
+            else:
+                _target_display = f"{target_val:.1f}"
+
             if live is None or live == 0:
                 status = "no data"
                 gap_str = "—"
+                live_str = None
             else:
                 if unit == '%':
                     live_str = f"{live:.1f}%"
-                    tgt_str = f"{target_val:.0f}%"
                 elif unit == '$':
                     live_str = f"${live:.0f}"
-                    tgt_str = f"${target_val:.0f}"
                 elif unit == 'x':
                     live_str = f"{live:.1f}x"
-                    tgt_str = f"{target_val:.1f}x"
                 else:
                     live_str = f"{live:.1f}"
-                    tgt_str = f"{target_val:.1f}"
 
                 if direction == 'above':
                     ok = live >= target_val
@@ -269,8 +276,8 @@ def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: di
                 status = "✓ OK" if ok else "⚠ UNDERPERFORMING"
 
             gap_lines.append(
-                f"  {label}: target {'>' if direction=='above' else '<'}{tgt_str if unit!='%' else target_val:.0f}{unit}"
-                + (f"  |  current {live_str}  →  {status} ({gap_str})" if live else "  |  no data yet")
+                f"  {label}: target {'>' if direction=='above' else '<'}{_target_display}"
+                + (f"  |  current {live_str}  →  {status} ({gap_str})" if live_str else "  |  no data yet")
             )
             if t.get('notes'):
                 gap_lines.append(f"    ({t['notes']})")
@@ -1306,6 +1313,11 @@ For replace_ad (A/B ad testing — pause underperformer, create improved version
   OR zero conversions after spending ≥$30, OR impressions < 100 in 30 days when budget allows.
   Ground new copy in landing_page_intel — use real service names, offers, CTAs from the page.
   Headlines must be specific and locally grounded. Avoid generic phrases like "Quality Care".
+  CRITICAL — Google policy rules for ad text (violations cause PROHIBITED rejection):
+    - NEVER include phone numbers in any headline or description (e.g. "508-123-4567" or "(508) 839-xxxx")
+    - NEVER include URLs or domain names in headlines/descriptions
+    - NEVER use excessive capitalization (e.g. "CALL NOW FREE CONSULTATION")
+    - NEVER use punctuation in headlines (no periods, exclamation marks, etc.)
   A/B principle: only recommend ONE replace_ad per campaign per run. Keep changes focused.
 
 For pause_ad_group (pause an underperforming ad group — does NOT pause the whole campaign):
@@ -3073,6 +3085,15 @@ def _execute_replace_ad(client, customer_id: str,
         raise ValueError(f"path1 exceeds 15 chars: '{path1}'")
     if path2 and len(path2) > 15:
         raise ValueError(f"path2 exceeds 15 chars: '{path2}'")
+    # Google policy: phone numbers in ad text are PROHIBITED (PHONE_NUMBER_IN_AD_TEXT)
+    import re as _re
+    _phone_re = _re.compile(r'(\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}|\d{10}|1[\s.\-]?\d{3}[\s.\-]?\d{3}[\s.\-]?\d{4})')
+    for _h in h_list:
+        if _phone_re.search(_h):
+            raise ValueError(f"Headline contains a phone number (Google policy violation): '{_h}'")
+    for _d in d_list:
+        if _phone_re.search(_d):
+            raise ValueError(f"Description contains a phone number (Google policy violation): '{_d}'")
 
     # --- 2. Derive ad_group_resource if not supplied -------------------------
     if not ad_group_resource:
@@ -3103,10 +3124,7 @@ def _execute_replace_ad(client, customer_id: str,
     pause_aga = pause_op.update
     pause_aga.resource_name = old_ad_group_ad_resource
     pause_aga.status = client.enums.AdGroupAdStatusEnum.PAUSED
-    client.copy_from(
-        pause_op.update_mask,
-        field_mask_pb2.FieldMask(paths=["status"])
-    )
+    pause_op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["status"]))
 
     # --- 5. Build CREATE operation (new RSA in same ad group) ----------------
     create_op = client.get_type("AdGroupAdOperation")

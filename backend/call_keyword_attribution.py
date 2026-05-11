@@ -77,7 +77,7 @@ def attribute_calls_to_keywords(days: int = 30) -> dict:
             rows = conn.execute("""
                 SELECT
                   mc.uuid, mc.started_at, mc.lead_id, mc.gads_call_id,
-                  l.gclid, l.keyword_text AS lead_keyword, l.match_type AS lead_match_type,
+                  l.gclid, l.keyword_text AS lead_keyword, l.search_term_type AS lead_match_type,
                   l.ad_group_name AS lead_ad_group, l.campaign_name AS lead_campaign_name,
                   l.campaign_id AS lead_campaign_id,
                   gcv.campaign_id AS gcv_campaign_id, gcv.campaign_name AS gcv_campaign_name
