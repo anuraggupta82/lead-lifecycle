@@ -5876,6 +5876,11 @@ def get_mango_calls(
                        mc.raw_payload, mc.synced_at, mc.updated_at,
                        mc.team_member, mc.grade_overall_score, mc.grade_overall_notes,
                        mc.grade_gradeable, mc.grade_scores_json, mc.is_empty,
+                       -- OD patient enrichment
+                       mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
+                       -- Keyword attribution
+                       mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
+                       mc.attributed_keyword_method, mc.attributed_keyword_confidence,
                        -- GAds enrichment
                        gcv.campaign_name  AS gads_campaign_name,
                        gcv.campaign_id    AS gads_campaign_id,
@@ -5923,6 +5928,11 @@ def get_mango_call(uuid: str) -> dict | None:
                       mc.raw_payload, mc.synced_at, mc.updated_at,
                       mc.team_member, mc.grade_overall_score, mc.grade_overall_notes,
                       mc.grade_gradeable, mc.grade_scores_json, mc.is_empty,
+                      -- OD patient enrichment
+                      mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
+                      -- Keyword attribution
+                      mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
+                      mc.attributed_keyword_method, mc.attributed_keyword_confidence,
                       gcv.campaign_name  AS gads_campaign_name,
                       gcv.campaign_id    AS gads_campaign_id,
                       gcv.call_duration_sec AS gads_duration_sec,

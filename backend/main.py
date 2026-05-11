@@ -1606,7 +1606,7 @@ async def gads_reject_action(action_id: str, request: Request):
     row = get_audit_row(action_id)
     if not row:
         raise HTTPException(status_code=404, detail="Action not found")
-    if row["execution_result"] not in ("pending_approval", "error"):
+    if row["execution_result"] not in ("pending_approval", "error", "failed"):
         raise HTTPException(
             status_code=409,
             detail=f"Action already in state '{row['execution_result']}'"

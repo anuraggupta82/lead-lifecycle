@@ -2770,16 +2770,25 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
     if strategy == "TARGET_ROAS" and float(target_roas) <= 0.0:
         raise ValueError("TARGET_ROAS requires target_roas > 0")
 
-    # In google-ads SDK v24+, simple bidding strategies (MAXIMIZE_CLICKS,
-    # MAXIMIZE_CONVERSIONS) must be set via bidding_strategy_type enum.
-    # Target-based strategies (TARGET_CPA, TARGET_ROAS) use nested sub-fields
-    # assigned directly, with leaf-level field mask paths.
+    # Google Ads API v17+ — all bidding strategies are set via oneof sub-message
+    # fields on Campaign, NOT via bidding_strategy_type enum.
+    #
+    # MAXIMIZE_CLICKS  → campaign.target_spend   (TargetSpend sub-message)
+    # MAXIMIZE_CONVERSIONS → campaign.maximize_conversions (MaximizeConversions sub-message)
+    # TARGET_CPA       → campaign.target_cpa.target_cpa_micros
+    # TARGET_ROAS      → campaign.target_roas.target_roas
+    #
+    # Setting bidding_strategy_type directly causes "Unknown field for Campaign" errors.
     if strategy == "MAXIMIZE_CONVERSIONS":
-        campaign.bidding_strategy_type = client.enums.BiddingStrategyTypeEnum.MAXIMIZE_CONVERSIONS
-        paths = ["bidding_strategy_type"]
+        # Use leaf-level field mask path — Google rejects parent-only paths for sub-messages
+        # target_cpa_micros = 0 means no CPA target (pure maximize conversions)
+        campaign.maximize_conversions.target_cpa_micros = 0
+        paths = ["maximize_conversions.target_cpa_micros"]
     elif strategy == "MAXIMIZE_CLICKS":
-        campaign.bidding_strategy_type = client.enums.BiddingStrategyTypeEnum.MAXIMIZE_CLICKS
-        paths = ["bidding_strategy_type"]
+        # target_spend is the Google Ads API name for Maximize Clicks
+        # cpc_bid_ceiling_micros = 0 means no bid cap
+        campaign.target_spend.cpc_bid_ceiling_micros = 0
+        paths = ["target_spend.cpc_bid_ceiling_micros"]
     elif strategy == "TARGET_CPA":
         campaign.target_cpa.target_cpa_micros = int(target_cpa_micros)
         paths = ["target_cpa.target_cpa_micros"]
