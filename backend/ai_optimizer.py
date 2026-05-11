@@ -1615,6 +1615,14 @@ def _call_claude_account_level(
                 "daily_budget": campaign_spend.get(cn, {}).get("daily_budget_usd") if isinstance(campaign_spend.get(cn), dict) else None,
             }
 
+        # Fetch call quality flags for account-level signal
+        _call_quality_flags: dict = {}
+        try:
+            from database import get_call_flag_summary
+            _call_quality_flags = get_call_flag_summary(days=30)
+        except Exception as _cqf_err:
+            logger.debug(f"call_flag_summary fetch failed (non-fatal): {_cqf_err}")
+
         context = {
             "account_summary": summary,
             "campaign_performance": camp_perf,
@@ -1629,6 +1637,7 @@ def _call_claude_account_level(
             "google_recommendations": (google_recs or [])[:20],
             "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
             "optimizer_memory": memory_digest or {},
+            "call_quality_flags": _call_quality_flags,
         }
 
         # Account-level: use aggregate summary, no specific camp_settings
@@ -1663,6 +1672,12 @@ Focus areas for account-level recs:
 4. MISSING ASSETS — sitelinks/callouts that should exist on all campaigns but don't → add_asset
 5. CROSS-CAMPAIGN WASTE — identical wasteful terms appearing in multiple campaigns
 6. ACCOUNT HEALTH — any account-wide pattern not captured by individual campaign reviews
+7. CALL EXPERIENCE: The field "call_quality_flags" in the data shows missed/short Google Ads calls
+   flagged for follow-up. If missed_call_rate_pct > 15% OR any campaign has 3+ missed new-patient
+   calls in 30d OR short_gads_calls > 5, return a claude_advisory. The advisory should name the
+   specific campaigns bleeding qualified leads at the phone, cite exact counts, and suggest whether
+   the issue is likely after-hours coverage, IVR routing, or call handling. Do NOT recommend pausing
+   those campaigns — the spend is generating calls; the problem is downstream of the click.
 
 IMPORTANT:
 - Only flag competitor negatives here if they appear in multiple campaigns (single-campaign terms were already handled per-campaign)

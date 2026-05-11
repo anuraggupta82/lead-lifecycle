@@ -4211,6 +4211,33 @@ function CallsSubView() {
   const [bulkMsg, setBulkMsg] = useState('');
   const bulkPollInFlight = React.useRef(false);
   const activePolls = React.useRef({}); // uuid → intervalId, for cleanup on unmount
+  // Call flags panel
+  const [callFlags, setCallFlags] = useState([]);
+  const [flagsExpanded, setFlagsExpanded] = useState(false);
+  const [flagsLoading, setFlagsLoading] = useState(false);
+  const [resolvingFlag, setResolvingFlag] = useState({}); // {id: true}
+
+  async function loadCallFlags() {
+    setFlagsLoading(true);
+    try {
+      const r = await fetch('/api/admin/call-flags?days=30&unresolved_only=true');
+      if (r.ok) { const d = await r.json(); setCallFlags(d.flags || []); }
+    } catch(e) { console.warn('call-flags load error', e); }
+    setFlagsLoading(false);
+  }
+
+  async function resolveFlag(flagId, outcome) {
+    setResolvingFlag(p => ({...p, [flagId]: true}));
+    try {
+      await fetch(`/api/admin/call-flags/${flagId}/resolve`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({resolved_by:'admin', resolved_outcome: outcome})
+      });
+      setCallFlags(prev => prev.filter(f => f.id !== flagId));
+    } catch(e) { console.warn('resolve flag error', e); }
+    setResolvingFlag(p => ({...p, [flagId]: false}));
+  }
 
   // Cleanup all per-call polls on unmount
   useEffect(() => {
@@ -4234,7 +4261,7 @@ function CallsSubView() {
     finally { setLoading(false); }
   }
 
-  useEffect(() => { loadCalls(); }, [days, dirFilter, statusFilter]);
+  useEffect(() => { loadCalls(); loadCallFlags(); }, [days, dirFilter, statusFilter]);
 
   async function loadConversions() {
     setConvLoading(true);
@@ -4590,6 +4617,92 @@ function CallsSubView() {
         ))}
       </div>
 
+      {/* ── Call Flags panel ─────────────────────────────────────────────── */}
+      {(callFlags.length > 0 || flagsLoading) && (
+      <div style={{background:'#fff',border:'2px solid #dc2626',borderRadius:8,marginBottom:14,overflow:'hidden'}}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 14px',cursor:'pointer',userSelect:'none',background:'#fff5f5'}}
+             onClick={()=>setFlagsExpanded(x=>!x)}>
+          <div style={{display:'flex',alignItems:'center',gap:10}}>
+            <span style={{fontSize:13,fontWeight:700,color:'#dc2626'}}>
+              🚨 Call Flags
+              <span style={{marginLeft:6,background:'#dc2626',color:'#fff',borderRadius:10,padding:'1px 7px',fontSize:11}}>{callFlags.length}</span>
+            </span>
+            {flagsLoading
+              ? <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>
+              : <span style={{fontSize:11,color:'#dc2626'}}>{callFlags.filter(f=>f.flag_type.startsWith('missed_new')).length} new patient{callFlags.filter(f=>f.flag_type.startsWith('missed_new')).length!==1?'s':''} • {callFlags.filter(f=>f.flag_type.includes('short')).length} short GAds call{callFlags.filter(f=>f.flag_type.includes('short')).length!==1?'s':''}</span>
+            }
+          </div>
+          <span style={{fontSize:13,color:'var(--text-muted)'}}>{flagsExpanded?'▲':'▼'}</span>
+        </div>
+        {flagsExpanded && (
+        <div style={{overflowX:'auto'}}>
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+            <thead>
+              <tr style={{background:'#fff5f5',borderBottom:'1px solid #fecaca'}}>
+                {['Type','Campaign','Phone','Patient','Time','Duration','Actions'].map(h=>(
+                  <th key={h} style={{padding:'6px 10px',fontWeight:600,textAlign:'left',color:'#7f1d1d',whiteSpace:'nowrap'}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {callFlags.map((f,i)=>{
+                const flagLabels = {
+                  missed_new_patient: {label:'Missed – New Pt', color:'#dc2626', bg:'#fff5f5'},
+                  missed_existing_patient: {label:'Missed – Existing Pt', color:'#b45309', bg:'#fffbeb'},
+                  missed_new_patient_unattributed: {label:'Missed – New Pt (no GAds)', color:'#6d28d9', bg:'#faf5ff'},
+                  short_gads_call: {label:'Short GAds Call', color:'#0369a1', bg:'#eff6ff'},
+                  unconverted_short_gads_call: {label:'Unconverted Short', color:'#0369a1', bg:'#eff6ff'},
+                };
+                const fl = flagLabels[f.flag_type] || {label:f.flag_type, color:'#374151', bg:'#f9fafb'};
+                const confColor = (f.match_confidence_at_flag||0)>=0.75?'#16a34a':(f.match_confidence_at_flag||0)>=0.60?'#b45309':'#dc2626';
+                return (
+                <tr key={f.id} style={{borderBottom:'1px solid #fecaca',background:i%2===0?'#fff':'#fff5f5'}}>
+                  <td style={{padding:'7px 10px',whiteSpace:'nowrap'}}>
+                    <span style={{background:fl.bg,color:fl.color,borderRadius:4,padding:'2px 6px',fontSize:11,fontWeight:600}}>{fl.label}</span>
+                  </td>
+                  <td style={{padding:'7px 10px',color:'#374151',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                      title={f.campaign_name}>{f.campaign_name||'—'}</td>
+                  <td style={{padding:'7px 10px',whiteSpace:'nowrap',fontFamily:'monospace'}}>{f.from_number||'—'}</td>
+                  <td style={{padding:'7px 10px',whiteSpace:'nowrap'}}>
+                    {f.od_patient_name
+                      ? <span style={{fontWeight:600}}>{f.od_patient_name}</span>
+                      : <span style={{color:'var(--text-muted)'}}>Unknown</span>}
+                    {f.od_patient_status_at_flag && <span style={{marginLeft:4,fontSize:10,color:'var(--text-muted)'}}>({f.od_patient_status_at_flag.replace('_',' ')})</span>}
+                  </td>
+                  <td style={{padding:'7px 10px',whiteSpace:'nowrap',color:'var(--text-muted)'}}>
+                    {f.started_at ? new Date(f.started_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}) : '—'}
+                  </td>
+                  <td style={{padding:'7px 10px',whiteSpace:'nowrap'}}>
+                    {f.duration_sec!=null ? (f.duration_sec<60?`${f.duration_sec}s`:_fmtDur(f.duration_sec)) : '—'}
+                    {(f.match_confidence_at_flag||0)>0 && (
+                      <span style={{marginLeft:4,fontSize:10,color:confColor,fontWeight:600}}
+                            title={`Match method: ${f.match_method}`}>
+                        ({Math.round((f.match_confidence_at_flag)*100)}%)
+                      </span>
+                    )}
+                  </td>
+                  <td style={{padding:'7px 10px',whiteSpace:'nowrap'}}>
+                    <button disabled={resolvingFlag[f.id]}
+                            onClick={()=>resolveFlag(f.id,'called_back')}
+                            style={{marginRight:4,padding:'3px 8px',fontSize:11,background:'#16a34a',color:'#fff',border:'none',borderRadius:4,cursor:'pointer'}}>
+                      ✓ Called Back
+                    </button>
+                    <button disabled={resolvingFlag[f.id]}
+                            onClick={()=>resolveFlag(f.id,'not_actionable')}
+                            style={{padding:'3px 8px',fontSize:11,background:'#6b7280',color:'#fff',border:'none',borderRadius:4,cursor:'pointer'}}>
+                      Dismiss
+                    </button>
+                  </td>
+                </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        )}
+      </div>
+      )}
+
       {/* ── GAds Call Conversions panel ──────────────────────────────────── */}
       <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,marginBottom:14,overflow:'hidden'}}>
         {/* Header row */}
@@ -4834,6 +4947,14 @@ function CallsSubView() {
                   <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
                     {_fmtTime(call.started_at)}
                     {(call.gads_duration_sec||0)>=60 && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
+                    {call.gads_call_id && (() => {
+                      const conf = call.match_confidence || 0;
+                      const [bg, col] = conf >= 0.75 ? ['#dbeafe','#1d4ed8'] : conf >= 0.60 ? ['#fef3c7','#92400e'] : ['#fee2e2','#991b1b'];
+                      return <span title={`${call.match_method} · ${Math.round(conf*100)}% confidence`}
+                        style={{marginLeft:4,fontSize:9,fontWeight:700,color:col,background:bg,padding:'1px 4px',borderRadius:3,cursor:'help'}}>
+                        📱 GAds
+                      </span>;
+                    })()}
                   </td>
                   <td style={{padding:'8px 10px'}}>
                     <span style={{fontSize:10,fontWeight:600,color:call.direction==='inbound'?'#0369a1':'#7c3aed'}}>
@@ -5250,7 +5371,21 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
 
                 {call.match_method && (<React.Fragment>
                   <div style={{color:'var(--text-muted)',fontWeight:500}}>Match Method</div>
-                  <div>{call.match_method} ({Math.round((call.match_confidence||0)*100)}% confidence)</div>
+                  <div>
+                    {call.match_method}
+                    {(() => {
+                      const conf = call.match_confidence || 0;
+                      const [col, label] = conf >= 0.75 ? ['#16a34a','high'] : conf >= 0.60 ? ['#b45309','medium'] : ['#dc2626','low'];
+                      return <span style={{marginLeft:5,fontWeight:600,color:col}}>
+                        {Math.round(conf*100)}% confidence ({label})
+                      </span>;
+                    })()}
+                    {call.match_method === 'gads_time_only_no_area' && (
+                      <div style={{fontSize:10,color:'#b45309',marginTop:2}}>
+                        ⚠ Matched by time only — area code unavailable (mobile ad tap)
+                      </div>
+                    )}
+                  </div>
                 </React.Fragment>)}
 
                 {call.lead_id && (<React.Fragment>

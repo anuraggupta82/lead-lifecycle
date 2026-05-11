@@ -29,6 +29,7 @@ from database import (
     get_gads_call_view,
     get_all_leads,
     update_mango_call_attribution,
+    _conn as _db_conn,
 )
 
 logger = logging.getLogger(__name__)
@@ -456,6 +457,129 @@ def _parse_gads_dt(gc_start_str: str) -> Optional[datetime]:
         return None
 
 
+def _create_call_flag_if_needed(conn, mc: dict, gc: dict) -> None:
+    """
+    Create a call_flags row when a Google Ads-matched call warrants follow-up.
+
+    Flag types (in order of priority):
+      missed_new_patient       — GAds call was MISSED and caller is a new patient
+      missed_existing_patient  — GAds call was MISSED and caller is an existing patient
+      short_gads_call          — Call answered but <15s (misdial / accidental tap)
+      unconverted_short_gads_call — 15–30s and not booked (IVR / call experience issue)
+
+    Deferred (returns without inserting) if OD enrichment hasn't run yet for this call.
+    Does not create duplicate open flags for the same (uuid, flag_type).
+    """
+    od_status     = mc.get("od_patient_status", "") or ""
+    od_matched_at = mc.get("od_matched_at", "") or ""
+    duration      = int(mc.get("duration_sec") or 0)
+    gc_status     = (gc.get("call_status") or "").upper()
+    mc_status     = (mc.get("status") or "").lower()
+    booked        = mc.get("booked_outcome") == "booked"
+    match_conf    = float(mc.get("match_confidence") or 0.0)
+
+    # Defer flag creation if OD enrichment hasn't run yet (avoids wrong flag_type)
+    if not od_status and not od_matched_at:
+        return
+
+    # Treat as missed if either GAds reports MISSED or Mango status is missed/voicemail
+    is_missed = gc_status == "MISSED" or mc_status in ("missed", "voicemail")
+
+    flag_type = None
+    if is_missed:
+        # GAds duration is 0 for MISSED — use Mango status instead
+        if od_status == "new_patient" or (od_status in ("unknown", "") and od_matched_at):
+            flag_type = "missed_new_patient"
+        elif od_status.startswith("existing"):
+            flag_type = "missed_existing_patient"
+        else:
+            flag_type = "missed_new_patient"  # default: treat unknown as potential new patient
+    elif duration < 15:
+        flag_type = "short_gads_call"
+    elif duration < 30 and not booked:
+        flag_type = "unconverted_short_gads_call"
+
+    if not flag_type:
+        return
+
+    # Dedup: only one open flag per (uuid, flag_type)
+    existing = conn.execute(
+        "SELECT 1 FROM call_flags WHERE uuid=? AND flag_type=? AND resolved_at IS NULL LIMIT 1",
+        (mc["uuid"], flag_type)
+    ).fetchone()
+    if existing:
+        return
+
+    reason = f"{'MISSED' if is_missed else gc_status or 'SHORT'} call, duration {duration}s, Mango status: {mc_status or 'unknown'}"
+    conn.execute("""
+        INSERT INTO call_flags
+          (uuid, flag_type, reason, campaign_name, keyword,
+           od_patient_status_at_flag, match_confidence_at_flag, created_at)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (
+        mc["uuid"], flag_type, reason,
+        gc.get("campaign_name", ""),
+        mc.get("attributed_keyword", ""),
+        od_status,
+        match_conf,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    logger.info(
+        "call_flag created: uuid=%s type=%s duration=%ds campaign=%s",
+        mc["uuid"], flag_type, duration, gc.get("campaign_name", "")
+    )
+
+
+def _flag_unattributed_missed_new_patients(days: int = 7) -> int:
+    """
+    Separate pass: flag missed new-patient calls with NO Google Ads attribution.
+    These could be organic, GMB, or direct-dial — still worth following up.
+    Runs after reconcile_attribution completes.
+    Returns count of flags created.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    created = 0
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute("""
+                SELECT uuid, od_patient_status, od_matched_at, match_confidence,
+                       attributed_keyword, started_at
+                FROM mango_calls
+                WHERE direction = 'inbound'
+                  AND status IN ('missed', 'voicemail')
+                  AND (gads_call_id IS NULL OR gads_call_id = '')
+                  AND od_patient_status = 'new_patient'
+                  AND started_at >= ?
+            """, (cutoff,)).fetchall()
+
+            for row in rows:
+                existing = conn.execute(
+                    "SELECT 1 FROM call_flags WHERE uuid=? AND flag_type=? AND resolved_at IS NULL LIMIT 1",
+                    (row["uuid"], "missed_new_patient_unattributed")
+                ).fetchone()
+                if existing:
+                    continue
+                conn.execute("""
+                    INSERT INTO call_flags
+                      (uuid, flag_type, reason, campaign_name, keyword,
+                       od_patient_status_at_flag, match_confidence_at_flag, created_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (
+                    row["uuid"], "missed_new_patient_unattributed",
+                    "Missed call from new patient (no GAds attribution)",
+                    "", row["attributed_keyword"] or "",
+                    "new_patient", 0.0,
+                    datetime.now(timezone.utc).isoformat(),
+                ))
+                created += 1
+    except Exception as e:
+        logger.warning(f"_flag_unattributed_missed_new_patients failed: {e}")
+    if created:
+        logger.info(f"call_flags: {created} missed_new_patient_unattributed flags created")
+    return created
+
+
 def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
     """
     Match unattributed inbound Mango calls against:
@@ -464,6 +588,16 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
 
     Updates mango_calls.lead_id / gads_call_id / match_confidence / match_method.
     Safe to run repeatedly — only updates NULL attribution rows.
+
+    Matching tiers (highest confidence wins):
+      gads_window           0.95 — area code + ±90s + ±5s duration
+      gads_window_loose     0.75 — area code + ±300s + ±30s duration
+      gads_window_time_only 0.60 — area code + ±600s (no duration check)
+      gads_time_only_no_area 0.55 — NO area code on either side + ±120s + tight duration
+                                    (mobile ad-extension taps where Google strips area code)
+
+    After any GAds match: creates a call_flag if the call was missed or short.
+    After all GAds matching: flags unattributed missed new-patient calls.
 
     target_gads_call_id: if set, only attempt to match this one GAds row (used by
     the match-and-transcribe endpoint for targeted matching with extra diagnostics).
@@ -493,8 +627,68 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
         if gc_dt:
             gads_parsed.append((gc, gc_dt))
 
+    # Build a reverse map: gads_call_id → list of candidate Mango uuids at 0.55
+    # Used to detect ambiguous time-only matches and skip them.
+    _time_only_candidates: dict[str, list[str]] = {}   # gads_call_id → [mc_uuid, ...]
+    _mc_time_only_match:   dict[str, list[str]] = {}   # mc_uuid → [gads_call_id, ...]
+
     attributed = 0
 
+    # ── First pass: collect time-only candidates to detect ambiguity ─────────
+    for mc in unmatched:
+        mc_start_str = mc.get("started_at", "")
+        mc_area = _extract_area_code(mc.get("from_number", ""))
+        mc_dur = int(mc.get("duration_sec") or 0)
+        mc_uuid = mc["uuid"]
+
+        # Skip if Mango call has an area code — organic/non-GAds more likely
+        if mc_area:
+            continue
+
+        try:
+            mc_dt = datetime.fromisoformat(mc_start_str.replace("Z", "+00:00"))
+            if mc_dt.tzinfo is None:
+                mc_dt = mc_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        # Check if this call already has a strong phone-lead match
+        from_digits = re.sub(r"\D", "", mc.get("from_number", "") or "")
+        if len(from_digits) >= 10 and phone_to_lead.get(from_digits[-10:]):
+            continue  # known patient — skip time-only GAds fallback
+
+        for gc, gc_dt in gads_parsed:
+            gc_area = gc.get("caller_area_code", "")
+            gc_dur  = int(gc.get("call_duration_sec") or 0)
+            gc_status = (gc.get("call_status") or "").upper()
+            if gc_area:
+                continue  # GAds row has area code — handled by area-code branches
+
+            time_delta = abs((mc_dt - gc_dt).total_seconds())
+            if time_delta > 120:
+                continue
+
+            # Duration check (skip for MISSED — GAds duration is 0 for missed calls)
+            if gc_status != "MISSED":
+                dur_delta = abs(mc_dur - gc_dur)
+                max_dur = max(mc_dur, gc_dur)
+                dur_ok = dur_delta <= max(20, 0.3 * max_dur)
+                if not dur_ok:
+                    continue
+
+            gads_id = gc["call_id"]
+            _time_only_candidates.setdefault(gads_id, []).append(mc_uuid)
+            _mc_time_only_match.setdefault(mc_uuid, []).append(gads_id)
+
+    # Remove ambiguous: any GAds row matched by >1 Mango call at 0.55
+    _ambiguous_gads = {gid for gid, uuids in _time_only_candidates.items() if len(uuids) > 1}
+    # Remove ambiguous: any Mango call that could match >1 GAds row at 0.55
+    _ambiguous_mcs  = {uuid for uuid, gids in _mc_time_only_match.items() if len(gids) > 1}
+
+    def _is_clean_time_only(mc_uuid: str, gads_id: str) -> bool:
+        return gads_id not in _ambiguous_gads and mc_uuid not in _ambiguous_mcs
+
+    # ── Main attribution loop ─────────────────────────────────────────────────
     for mc in unmatched:
         mc_start_str = mc.get("started_at", "")
         mc_area = _extract_area_code(mc.get("from_number", ""))
@@ -509,44 +703,68 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
         except Exception:
             continue
 
+        # Pre-check: is this caller a known lead? If so, skip time-only fallback.
+        _from_digits_main = re.sub(r"\D", "", mc.get("from_number", "") or "")
+        _mc_is_known_lead = (len(_from_digits_main) >= 10 and
+                             phone_to_lead.get(_from_digits_main[-10:]) is not None)
+
         # ── Try GAds call_view match ──────────────────────────────────────────
         best_gads_id = None
         best_confidence = 0.0
         best_method = ""
+        best_gc = None
 
         for gc, gc_dt in gads_parsed:
-            gc_area = gc.get("caller_area_code", "")
-            gc_dur = int(gc.get("call_duration_sec") or 0)
+            gc_area   = gc.get("caller_area_code", "")
+            gc_dur    = int(gc.get("call_duration_sec") or 0)
+            gc_status = (gc.get("call_status") or "").upper()
 
             time_delta = abs((mc_dt - gc_dt).total_seconds())
-            dur_delta = abs(mc_dur - gc_dur)
-
+            dur_delta  = abs(mc_dur - gc_dur)
             area_match = gc_area and mc_area and gc_area == mc_area
 
             # Tight match: area code + ±90s time + ±5s duration
             if area_match and time_delta <= 90 and dur_delta <= 5:
                 if 0.95 > best_confidence:
-                    best_gads_id = gc["call_id"]
+                    best_gads_id   = gc["call_id"]
                     best_confidence = 0.95
-                    best_method = "gads_window"
+                    best_method    = "gads_window"
+                    best_gc        = gc
             # Loose match: area code + ±300s time + ±30s duration
             elif area_match and time_delta <= 300 and dur_delta <= 30:
                 if 0.75 > best_confidence:
-                    best_gads_id = gc["call_id"]
+                    best_gads_id   = gc["call_id"]
                     best_confidence = 0.75
-                    best_method = "gads_window_loose"
+                    best_method    = "gads_window_loose"
+                    best_gc        = gc
             # Very loose: area code + ±600s time (no duration check — GAds/Mango measure differently)
             elif area_match and time_delta <= 600:
                 if 0.60 > best_confidence:
-                    best_gads_id = gc["call_id"]
+                    best_gads_id   = gc["call_id"]
                     best_confidence = 0.60
-                    best_method = "gads_window_time_only"
-            # Last resort for targeted matching: time only, no area code (±120s)
+                    best_method    = "gads_window_time_only"
+                    best_gc        = gc
+            # Time-only fallback: neither side has area code, ±120s, unambiguous,
+            # not a known lead (known leads get phone_exact match instead).
+            # Confidence 0.55 — lower than all area-code branches
+            elif (not gc_area) and (not mc_area) and time_delta <= 120 and not _mc_is_known_lead:
+                if gc_status != "MISSED":
+                    max_dur  = max(mc_dur, gc_dur)
+                    dur_ok   = dur_delta <= max(20, 0.3 * max_dur)
+                    if not dur_ok:
+                        continue
+                if 0.55 > best_confidence and _is_clean_time_only(mc_uuid, gc["call_id"]):
+                    best_gads_id   = gc["call_id"]
+                    best_confidence = 0.55
+                    best_method    = "gads_time_only_no_area"
+                    best_gc        = gc
+            # Last resort for targeted matching: time only (±120s), any area code combo
             elif target_gads_call_id and time_delta <= 120:
                 if 0.50 > best_confidence:
-                    best_gads_id = gc["call_id"]
+                    best_gads_id   = gc["call_id"]
                     best_confidence = 0.50
-                    best_method = "gads_time_only"
+                    best_method    = "gads_time_only"
+                    best_gc        = gc
 
             if target_gads_call_id and gc["call_id"] == target_gads_call_id:
                 logger.info(
@@ -556,7 +774,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                     time_delta, dur_delta, best_confidence, best_method or "none",
                 )
 
-        if best_gads_id:
+        if best_gads_id and best_gc:
             update_mango_call_attribution(
                 uuid=mc_uuid,
                 gads_call_id=best_gads_id,
@@ -565,6 +783,16 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
             )
             attributed += 1
             _queue_process_if_needed(mc)
+
+            # Create call flag if this GAds call was missed or short
+            try:
+                with _db_conn() as conn:
+                    # Refresh mc with updated match fields for flag creation
+                    mc_fresh = dict(mc)
+                    mc_fresh["match_confidence"] = best_confidence
+                    _create_call_flag_if_needed(conn, mc_fresh, best_gc)
+            except Exception as _fe:
+                logger.warning(f"call_flag creation failed for {mc_uuid}: {_fe}")
             continue
 
         # ── Try lead phone match ──────────────────────────────────────────────
@@ -582,7 +810,50 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                 _queue_process_if_needed(mc)
 
     logger.info(f"Mango reconcile: attributed {attributed}/{len(unmatched)} calls")
+
+    # Backfill flags for previously-attributed GAds calls that may have missed flag creation
+    _backfill_call_flags_for_attributed(days=days)
+
+    # Flag unattributed missed new-patient calls (organic/GMB/direct-dial)
+    _flag_unattributed_missed_new_patients(days=days)
+
     return attributed
+
+
+def _backfill_call_flags_for_attributed(days: int = 7) -> int:
+    """
+    Catch-up pass: create flags for any GAds-matched calls that don't yet have one.
+    Handles the case where flag creation failed at match time (transient lock, etc.)
+    and ensures flags are idempotent across reconcile runs.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    created = 0
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute("""
+                SELECT mc.uuid, mc.duration_sec, mc.status, mc.od_patient_status,
+                       mc.od_matched_at, mc.booked_outcome, mc.match_confidence,
+                       mc.attributed_keyword, mc.gads_call_id,
+                       gcv.campaign_name, gcv.call_status
+                  FROM mango_calls mc
+                  JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+                 WHERE mc.gads_call_id IS NOT NULL AND mc.gads_call_id != ''
+                   AND mc.started_at >= ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM call_flags cf WHERE cf.uuid = mc.uuid
+                   )
+            """, (cutoff,)).fetchall()
+            for r in rows:
+                mc_dict = dict(r)
+                gc_dict = {"call_status": r["call_status"], "campaign_name": r["campaign_name"]}
+                _create_call_flag_if_needed(conn, mc_dict, gc_dict)
+                created += 1
+    except Exception as e:
+        logger.warning(f"_backfill_call_flags_for_attributed failed: {e}")
+    if created:
+        logger.info(f"call_flags backfill: {created} flags created for previously-matched calls")
+    return created
 
 
 def _queue_process_if_needed(mc: dict) -> None:

@@ -6504,6 +6504,43 @@ def admin_diagnose_call_attribution(days: int = 30):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/admin/call-flags", dependencies=[Depends(_require_admin)])
+def admin_get_call_flags(days: int = 30, unresolved_only: bool = True):
+    """
+    Return call flags (missed/short Google Ads calls + missed new patients).
+    Each flag includes joined mango_calls fields for display in the UI.
+    """
+    try:
+        from database import get_call_flags
+        days = max(1, min(int(days), 365))
+        flags = get_call_flags(days=days, unresolved_only=unresolved_only)
+        return {"flags": flags, "total": len(flags)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ResolveCallFlagRequest(BaseModel):
+    resolved_by: str = "admin"
+    resolved_outcome: str = "not_actionable"  # called_back | booked | not_actionable | ignored
+
+
+@app.post("/api/admin/call-flags/{flag_id}/resolve", dependencies=[Depends(_require_admin)])
+def admin_resolve_call_flag(flag_id: int, body: ResolveCallFlagRequest):
+    """Resolve a call flag with an outcome."""
+    try:
+        from database import resolve_call_flag
+        valid_outcomes = {"called_back", "booked", "not_actionable", "ignored"}
+        outcome = body.resolved_outcome if body.resolved_outcome in valid_outcomes else "not_actionable"
+        updated = resolve_call_flag(flag_id, body.resolved_by or "admin", outcome)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Flag not found or already resolved")
+        return {"ok": True, "flag_id": flag_id, "resolved_outcome": outcome}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/calls/match-od-appointments", dependencies=[Depends(_require_admin)])
 def admin_match_calls_to_od(days: int = 90):
     """
@@ -6565,6 +6602,12 @@ def admin_gads_match_and_transcribe(call_id: str, request: Request, background_t
     else:
         # 3. Run reconciler with 90-day window + targeted mode for detailed logging
         reconcile_attribution(days=90, target_gads_call_id=call_id)
+        # Also run keyword attribution so the newly-matched call gets attributed
+        try:
+            from call_keyword_attribution import attribute_calls_to_keywords
+            attribute_calls_to_keywords(days=1)
+        except Exception as _ke:
+            logger.warning(f"Keyword attribution after targeted reconcile failed: {_ke}")
 
         # 4. Re-check for a match
         with _conn() as conn:

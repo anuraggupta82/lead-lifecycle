@@ -1406,6 +1406,32 @@ def _migrate(conn):
                 pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_od_status ON mango_calls(od_patient_status)")
 
+    # ── call_flags — auto-generated flags for missed/short Google Ads calls ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS call_flags (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid                     TEXT NOT NULL,
+            flag_type                TEXT NOT NULL,
+            reason                   TEXT DEFAULT '',
+            campaign_name            TEXT DEFAULT '',
+            keyword                  TEXT DEFAULT '',
+            od_patient_status_at_flag TEXT DEFAULT '',
+            match_confidence_at_flag  REAL DEFAULT 0.0,
+            created_at               TEXT NOT NULL,
+            resolved_at              TEXT DEFAULT NULL,
+            resolved_by              TEXT DEFAULT NULL,
+            resolved_outcome         TEXT DEFAULT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_call_flags_open ON call_flags(resolved_at, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_call_flags_uuid ON call_flags(uuid)")
+    # Partial unique index: only one open flag per (uuid, flag_type) at a time
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_call_flags_open
+        ON call_flags(uuid, flag_type)
+        WHERE resolved_at IS NULL
+    """)
+
     # ── gads_clicks — persisted click_view rows (for time-window attribution) ─
     conn.execute("""
         CREATE TABLE IF NOT EXISTS gads_clicks (
@@ -6075,6 +6101,94 @@ def update_mango_call_od_status(
                WHERE uuid=?""",
             (od_patient_num, od_patient_status, od_patient_name, now, now, uuid),
         )
+
+
+# ─── Call flags helpers ───────────────────────────────────────────────────────
+
+def get_call_flags(days: int = 30, unresolved_only: bool = True) -> list:
+    """Return call flags joined to mango_calls for context.
+    Optionally filter to only open (unresolved) flags."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                cf.id, cf.uuid, cf.flag_type, cf.reason, cf.campaign_name, cf.keyword,
+                cf.od_patient_status_at_flag, cf.match_confidence_at_flag,
+                cf.created_at, cf.resolved_at, cf.resolved_by, cf.resolved_outcome,
+                mc.from_number, mc.started_at, mc.duration_sec, mc.status AS call_status,
+                mc.od_patient_name, mc.match_method, mc.match_confidence,
+                mc.gads_call_id, mc.attributed_keyword
+            FROM call_flags cf
+            JOIN mango_calls mc ON mc.uuid = cf.uuid
+            WHERE cf.created_at >= ?
+              AND (? = 0 OR cf.resolved_at IS NULL)
+            ORDER BY cf.created_at DESC
+        """, (cutoff, 1 if unresolved_only else 0)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def resolve_call_flag(flag_id: int, resolved_by: str, resolved_outcome: str) -> bool:
+    """Mark a call flag as resolved. Returns True if a row was updated."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute("""
+            UPDATE call_flags
+               SET resolved_at = ?, resolved_by = ?, resolved_outcome = ?
+             WHERE id = ? AND resolved_at IS NULL
+        """, (now, resolved_by or "admin", resolved_outcome or "not_actionable", flag_id))
+    return cur.rowcount > 0
+
+
+def get_call_flag_summary(days: int = 30) -> dict:
+    """Return aggregate flag counts for AI optimizer context injection."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        # Open flag counts by type
+        type_rows = conn.execute("""
+            SELECT flag_type, COUNT(*) AS cnt
+            FROM call_flags
+            WHERE created_at >= ? AND resolved_at IS NULL
+            GROUP BY flag_type
+        """, (cutoff,)).fetchall()
+        by_type = {r["flag_type"]: r["cnt"] for r in type_rows}
+
+        # Total GAds calls in window (for rate calculation)
+        # start_call_date_time is stored as "YYYY-MM-DD HH:MM:SS" (no tz, no T),
+        # so compare against date-only prefix to avoid ISO format mismatch.
+        total_gads = conn.execute("""
+            SELECT COUNT(*) FROM gads_call_view
+            WHERE substr(start_call_date_time, 1, 10) >= ?
+        """, (cutoff[:10],)).fetchone()[0]
+
+        # Missed GAds calls by campaign (top 5)
+        camp_rows = conn.execute("""
+            SELECT cf.campaign_name, COUNT(*) AS missed_cnt
+            FROM call_flags cf
+            WHERE cf.created_at >= ?
+              AND cf.resolved_at IS NULL
+              AND cf.flag_type IN ('missed_new_patient','missed_existing_patient')
+            GROUP BY cf.campaign_name
+            ORDER BY missed_cnt DESC
+            LIMIT 5
+        """, (cutoff,)).fetchall()
+        top_missed_camps = [{"campaign_name": r["campaign_name"], "missed_count": r["missed_cnt"]}
+                            for r in camp_rows]
+
+        open_flags = sum(by_type.values())
+        missed_gads = by_type.get("missed_new_patient", 0) + by_type.get("missed_existing_patient", 0)
+        missed_rate_pct = round(missed_gads / total_gads * 100, 1) if total_gads > 0 else 0.0
+
+    return {
+        "open_flags_30d": open_flags,
+        "missed_new_patient": by_type.get("missed_new_patient", 0),
+        "missed_existing_patient": by_type.get("missed_existing_patient", 0),
+        "short_gads_calls": by_type.get("short_gads_call", 0),
+        "unconverted_short_gads_calls": by_type.get("unconverted_short_gads_call", 0),
+        "missed_new_patient_unattributed": by_type.get("missed_new_patient_unattributed", 0),
+        "top_campaigns_with_missed_calls": top_missed_camps,
+        "total_gads_calls_30d": total_gads,
+        "missed_call_rate_pct": missed_rate_pct,
+    }
 
 
 # ─── Google Ads call_view helpers ─────────────────────────────────────────────
