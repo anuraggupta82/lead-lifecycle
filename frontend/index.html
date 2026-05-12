@@ -9034,19 +9034,42 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                           onClick={()=>setLaunchCardEdit(null)}>Cancel</button>
                                       </div>
                                     ) : (
-                                      <div style={{display:'flex',alignItems:'baseline',gap:10}}>
-                                        {hasBudget ? (
-                                          <>
-                                            <span style={{fontSize:22,fontWeight:800,color:'var(--teal-dark)'}}>
-                                              ${monthlyToDaily(camp.monthly_budget).toFixed(0)}/day
-                                            </span>
-                                            <span style={{fontSize:13,color:'var(--text-muted)'}}>
-                                              ≈ ${Math.round(camp.monthly_budget)}/mo
-                                            </span>
-                                          </>
-                                        ) : (
-                                          <span style={{fontSize:14,color:'#9ca3af',fontStyle:'italic'}}>Not set</span>
-                                        )}
+                                      <div>
+                                        <div style={{display:'flex',alignItems:'baseline',gap:10}}>
+                                          {hasBudget ? (
+                                            <>
+                                              <span style={{fontSize:22,fontWeight:800,color:'var(--teal-dark)'}}>
+                                                ${monthlyToDaily(camp.monthly_budget).toFixed(0)}/day
+                                              </span>
+                                              <span style={{fontSize:13,color:'var(--text-muted)'}}>
+                                                ≈ ${Math.round(camp.monthly_budget)}/mo
+                                              </span>
+                                            </>
+                                          ) : (
+                                            <span style={{fontSize:14,color:'#9ca3af',fontStyle:'italic'}}>Not set</span>
+                                          )}
+                                        </div>
+                                        {/* Click-rate guidance from checklist item */}
+                                        {(() => {
+                                          const budgetItem = (build.launch_checklist||[]).find(x=>x.key==='budget');
+                                          if (!budgetItem || !budgetItem.clicks_per_day) return null;
+                                          const isWarn = budgetItem.warning;
+                                          return (
+                                            <div style={{marginTop:8,padding:'6px 10px',borderRadius:5,fontSize:11,
+                                              background: isWarn ? '#fef3c7' : '#f0fdf4',
+                                              border: `1px solid ${isWarn ? '#fde68a' : '#bbf7d0'}`,
+                                              color: isWarn ? '#92400e' : '#166534'}}>
+                                              {isWarn ? '⚠️' : '✓'}{' '}
+                                              <strong>~{budgetItem.clicks_per_day} clicks/day</strong>
+                                              {' '}at ${budgetItem.est_cpc_usd} avg CPC
+                                              {isWarn && (
+                                                <span> — Google recommends ≥10 for Smart Bidding.
+                                                  Consider <strong>${Math.ceil(budgetItem.est_cpc_usd * 10)}/day</strong>.
+                                                </span>
+                                              )}
+                                            </div>
+                                          );
+                                        })()}
                                       </div>
                                     )}
                                   </div>

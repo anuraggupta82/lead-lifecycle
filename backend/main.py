@@ -4401,6 +4401,39 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         # Daily leads, monthly cap shown as reference
         budget_display = f"${daily_budget}/day (≈${budget}/mo cap)" if budget else ""
 
+        # Budget click-rate intelligence — estimate clicks/day from ad_groups suggested CPC
+        # Google recommends ≥10 clicks/day for Smart Bidding learning phase
+        _ag_groups_list = ag_groups if isinstance(ag_groups, list) else []
+        _est_cpc = 0.0
+        _clicks_per_day = 0.0
+        _budget_rec_note = ""
+        if _ag_groups_list and daily_budget > 0:
+            # Weighted average CPC by daily_budget_pct
+            _total_pct = sum(float(g.get("daily_budget_pct") or 0) for g in _ag_groups_list)
+            if _total_pct > 0:
+                _est_cpc = sum(
+                    float(g.get("suggested_cpc_usd") or 0) * float(g.get("daily_budget_pct") or 0)
+                    for g in _ag_groups_list
+                ) / _total_pct
+            else:
+                # Fallback: simple average
+                _cpcs = [float(g.get("suggested_cpc_usd") or 0) for g in _ag_groups_list if g.get("suggested_cpc_usd")]
+                _est_cpc = sum(_cpcs) / len(_cpcs) if _cpcs else 0.0
+            if _est_cpc > 0:
+                _clicks_per_day = round(daily_budget / _est_cpc, 1)
+                if _clicks_per_day < 10:
+                    _min_budget_for_10 = round(_est_cpc * 10, 0)
+                    _budget_rec_note = (
+                        f" At ${_est_cpc:.2f} avg CPC → ~{_clicks_per_day} clicks/day. "
+                        f"Google recommends ≥10 clicks/day for Smart Bidding to learn effectively. "
+                        f"Consider increasing to ${_min_budget_for_10:.0f}/day."
+                    )
+                else:
+                    _budget_rec_note = (
+                        f" At ${_est_cpc:.2f} avg CPC → ~{_clicks_per_day} clicks/day. "
+                        f"✓ Sufficient for Smart Bidding learning phase (≥10 clicks/day)."
+                    )
+
         # Practice info for extension defaults
         practice_hours = get_setting("practice_hours") or ""
 
@@ -4419,14 +4452,17 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         checklist = [
             # ── REQUIRED ────────────────────────────────────────────────────────
             {
-                "key":      "budget",
-                "item":     "Daily budget",
-                "value":    budget_display,
-                "done":     budget > 0,
-                "skippable": False,
-                "category": "required",
-                "action":   "auto",
-                "note":     "Daily spend cap set by Google Ads. Monthly cap shown for reference.",
+                "key":        "budget",
+                "item":       "Daily budget",
+                "value":      budget_display,
+                "done":       budget > 0,
+                "skippable":  False,
+                "category":   "required",
+                "action":     "auto",
+                "note":       "Daily spend cap set by Google Ads. Monthly cap shown for reference." + _budget_rec_note,
+                "warning":    _clicks_per_day > 0 and _clicks_per_day < 10,
+                "clicks_per_day": _clicks_per_day if _clicks_per_day > 0 else None,
+                "est_cpc_usd":    round(_est_cpc, 2) if _est_cpc > 0 else None,
             },
             {
                 "key":      "bidding",
@@ -4755,16 +4791,65 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
             if _comp_parts:
                 _comp_context_block = "\n\n=== Competitor Intelligence ===\n" + "\n".join(_comp_parts)
 
+        # Build campaign-type-aware intent signal guidance
+        try:
+            from search_term_classifier import _detect_campaign_type as _dtct_kw
+            _kw_camp_type = _dtct_kw(campaign_name)
+        except Exception:
+            _kw_camp_type = "general"
+
+        _intent_signals_by_type = {
+            "emergency":  ['"emergency dentist near me"', '"toothache near me"', '"dentist open now"',
+                           '"same day dentist"', '"broken tooth emergency"', '"urgent dental care"'],
+            "implants":   ['"dental implants near me"', '"tooth implant cost"', '"all on 4 implants"',
+                           '"dental implants grafton ma"', '"implant dentist worcester county"',
+                           '"single tooth implant price"'],
+            "invisalign": ['"invisalign near me"', '"invisalign cost"', '"clear braces near me"',
+                           '"orthodontist grafton ma"', '"teeth straightening cost"'],
+            "cosmetic":   ['"cosmetic dentist near me"', '"veneers cost near me"', '"teeth whitening dentist"',
+                           '"smile makeover grafton ma"', '"porcelain veneers price"'],
+            "gum":        ['"gum recession treatment near me"', '"periodontist near me"',
+                           '"gum graft cost"', '"scaling root planing near me"',
+                           '"receding gums treatment worcester"'],
+            "general":    ['"dentist near me"', '"family dentist grafton ma"', '"dentist accepting new patients"',
+                           '"dental cleaning near me"', '"affordable dentist worcester county"'],
+        }
+        _intent_examples = _intent_signals_by_type.get(_kw_camp_type, _intent_signals_by_type["general"])
+        _intent_block = (
+            f"\n\nHigh-intent keyword patterns for {_kw_camp_type} campaigns — use these as templates:\n"
+            + "\n".join(f"  {ex}" for ex in _intent_examples)
+            + "\nPrioritize: 'near me', 'same day', '[service] cost/price', '[town] [service]', "
+              "'accepting new patients', '[service] grafton ma / worcester county'"
+        )
+
+        # Negative keyword intent guidance by campaign type
+        _neg_intent_by_type = {
+            "emergency":  ["jobs", "salary", "school", "training", "course", "free", "home remedy", "DIY"],
+            "implants":   ["jobs", "salary", "free", "insurance only", "medicaid", "snap-on smile",
+                           "flipper", "partial denture", "school", "course"],
+            "invisalign": ["jobs", "free", "insurance only", "medicaid", "braces for kids", "school",
+                           "metal braces only", "retainer only"],
+            "cosmetic":   ["jobs", "free", "insurance", "medicaid", "DIY", "at home", "school"],
+            "gum":        ["jobs", "free", "home remedy", "oil pulling", "DIY", "insurance only", "school"],
+            "general":    ["jobs", "free", "medicaid only", "school", "DIY", "veterinary", "animal"],
+        }
+        _neg_intent = _neg_intent_by_type.get(_kw_camp_type, _neg_intent_by_type["general"])
+        _neg_intent_note = (
+            f"Also negate these low-intent patterns for {_kw_camp_type} campaigns: "
+            + ", ".join(_neg_intent)
+        )
+
         from ai_optimizer import GOOGLE_ADS_RULES as _GAR
         prompt = _GAR + f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
 
 Campaign: {campaign_name}
 Service Focus: {service_focus}
+Campaign Type: {_kw_camp_type}
 Monthly Budget: ${budget}
 Objective: {objective}
 Target Audience: {target_audience}
 Key Messages: {', '.join(key_messages)}
-Implementation Notes: {impl_notes}{_site_section}{_source_kw_block}{_source_neg_block}{_optimizer_memory_block}{_comp_context_block}
+Implementation Notes: {impl_notes}{_intent_block}{_site_section}{_source_kw_block}{_source_neg_block}{_optimizer_memory_block}{_comp_context_block}
 
 Return a JSON object with this exact structure:
 {{
@@ -4775,11 +4860,11 @@ Return a JSON object with this exact structure:
 }}
 
 Rules:
-- exact_match: 8-12 high-intent, specific keywords — prioritize "near me", "same day", "[service] cost", "[town] [service]" intent signals
-- phrase_match: 10-15 moderate-intent phrases
-- broad_match_modifier: 5-8 broader terms to capture volume
-- negative_keywords: Include ALL source campaign negatives above PLUS all optimizer memory negatives PLUS any additional terms relevant to this service (jobs, DIY, insurance-only, etc.)
-- All keywords should be relevant to the dental service and local search intent
+- exact_match: 8-12 high-intent keywords — must include "near me", "same day", "[service] cost", and "[town] [service]" variants using the intent patterns above
+- phrase_match: 10-15 moderate-intent phrases covering service variations and location modifiers
+- broad_match_modifier: 5-8 broader terms to capture volume (service category + location area)
+- negative_keywords: Include ALL source campaign negatives above PLUS optimizer memory negatives PLUS {_neg_intent_note}
+- Geographic targeting towns: Grafton, Shrewsbury, Westborough, Northborough, Millbury, Auburn, Worcester area
 - Return ONLY the JSON object, no explanation."""
 
     elif step == "ad_copy":
