@@ -2638,8 +2638,11 @@ function AdGroupsView({ adGroupStats, dailyStats }) {
 }
 
 // ─── SearchTermsView ───────────────────────────────────────────────────────
-function SearchTermsView({ searchTermStats }) {
+function SearchTermsView({ searchTermStats, onRefreshSearchTerms }) {
   const [campFilter, setCampFilter] = useState('all');
+  const [verdictFilter, setVerdictFilter] = useState('all');
+  const [classifying, setClassifying] = useState(false);
+  const [classifyMsg, setClassifyMsg] = useState('');
 
   const campaigns = useMemo(() => {
     const set = new Set((searchTermStats || []).map(r => r.campaign_name).filter(Boolean));
@@ -2647,9 +2650,34 @@ function SearchTermsView({ searchTermStats }) {
   }, [searchTermStats]);
 
   const filtered = useMemo(() => {
-    if (campFilter === 'all') return searchTermStats || [];
-    return (searchTermStats || []).filter(r => r.campaign_name === campFilter);
+    let rows = searchTermStats || [];
+    if (campFilter !== 'all') rows = rows.filter(r => r.campaign_name === campFilter);
+    if (verdictFilter === 'unclassified') rows = rows.filter(r => !r.verdict);
+    else if (verdictFilter !== 'all') rows = rows.filter(r => r.verdict === verdictFilter);
+    return rows;
+  }, [searchTermStats, campFilter, verdictFilter]);
+
+  const verdictCounts = useMemo(() => {
+    const rows = campFilter === 'all' ? (searchTermStats||[]) : (searchTermStats||[]).filter(r=>r.campaign_name===campFilter);
+    return {
+      negative: rows.filter(r=>r.verdict==='negative').length,
+      keep: rows.filter(r=>r.verdict==='keep').length,
+      conquest: rows.filter(r=>r.verdict==='conquest').length,
+      unclassified: rows.filter(r=>!r.verdict).length,
+    };
   }, [searchTermStats, campFilter]);
+
+  async function handleClassify() {
+    setClassifying(true); setClassifyMsg('');
+    try {
+      const camp = campFilter !== 'all' ? `?campaign=${encodeURIComponent(campFilter)}` : '';
+      const r = await api(`/api/admin/gads/classify-search-terms${camp}`, {method:'POST'});
+      setClassifyMsg(`✓ ${r.total_classified} classified, ${r.total_negatives} flagged as negative`);
+      setTimeout(() => setClassifyMsg(''), 5000);
+      if (onRefreshSearchTerms) onRefreshSearchTerms();
+    } catch(e) { setClassifyMsg('Error: ' + e.message); }
+    setClassifying(false);
+  }
 
   function statusClass(s) {
     if (!s) return 'none';
@@ -2659,7 +2687,25 @@ function SearchTermsView({ searchTermStats }) {
     return 'none';
   }
 
-  if (!filtered.length) {
+  function VerdictBadge({verdict, reason}) {
+    if (!verdict) return <span style={{fontSize:9,color:'var(--text-muted)',fontStyle:'italic'}}>—</span>;
+    const cfg = {
+      negative:  {bg:'#fee2e2',color:'#b91c1c',label:'✗ Negative'},
+      keep:      {bg:'#dcfce7',color:'#166534',label:'✓ Keep'},
+      conquest:  {bg:'#dbeafe',color:'#1d4ed8',label:'⚔ Conquest'},
+    }[verdict] || {bg:'#f3f4f6',color:'#6b7280',label:verdict};
+    return (
+      <span title={reason||''} style={{
+        fontSize:9, fontWeight:600, padding:'2px 5px', borderRadius:3,
+        background:cfg.bg, color:cfg.color, cursor: reason ? 'help' : 'default',
+        whiteSpace:'nowrap',
+      }}>
+        {cfg.label}
+      </span>
+    );
+  }
+
+  if (!(searchTermStats||[]).length) {
     return (
       <div className="report-section">
         <div className="report-title">Search Terms</div>
@@ -2672,20 +2718,59 @@ function SearchTermsView({ searchTermStats }) {
 
   return (
     <div className="report-section">
-      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+      {/* Header row */}
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,flexWrap:'wrap'}}>
         <div className="report-title" style={{marginBottom:0}}>Search Terms</div>
         <select className="filter-select" value={campFilter} onChange={e => setCampFilter(e.target.value)}>
           {campaigns.map(c => (
             <option key={c} value={c}>{c === 'all' ? 'All Campaigns' : c.replace(/^grafton_nxtsmile_/,'')}</option>
           ))}
         </select>
+        <select className="filter-select" value={verdictFilter} onChange={e => setVerdictFilter(e.target.value)}>
+          <option value="all">All verdicts</option>
+          <option value="negative">✗ Negative ({verdictCounts.negative})</option>
+          <option value="keep">✓ Keep ({verdictCounts.keep})</option>
+          <option value="conquest">⚔ Conquest ({verdictCounts.conquest})</option>
+          <option value="unclassified">— Unclassified ({verdictCounts.unclassified})</option>
+        </select>
+        <button className="btn btn-sm" onClick={handleClassify} disabled={classifying}
+          style={{fontSize:10,padding:'3px 8px',background:'var(--teal)',color:'#fff',border:'none',borderRadius:4,cursor:'pointer'}}>
+          {classifying ? '…classifying' : '🤖 Classify'}
+        </button>
+        {classifyMsg && <span style={{fontSize:10,color:classifyMsg.startsWith('Error')?'var(--red)':'var(--green)'}}>{classifyMsg}</span>}
         <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>{filtered.length} terms</span>
       </div>
+
+      {/* Verdict summary strip */}
+      {(verdictCounts.negative > 0 || verdictCounts.unclassified > 0) && (
+        <div style={{display:'flex',gap:8,marginBottom:8,fontSize:10,flexWrap:'wrap'}}>
+          {verdictCounts.negative > 0 && (
+            <span style={{padding:'3px 8px',borderRadius:4,background:'#fee2e2',color:'#b91c1c',fontWeight:600,cursor:'pointer'}}
+              onClick={()=>setVerdictFilter('negative')}>
+              ✗ {verdictCounts.negative} flagged as negative
+            </span>
+          )}
+          {verdictCounts.conquest > 0 && (
+            <span style={{padding:'3px 8px',borderRadius:4,background:'#dbeafe',color:'#1d4ed8',fontWeight:600,cursor:'pointer'}}
+              onClick={()=>setVerdictFilter('conquest')}>
+              ⚔ {verdictCounts.conquest} conquest (kept)
+            </span>
+          )}
+          {verdictCounts.unclassified > 0 && (
+            <span style={{padding:'3px 8px',borderRadius:4,background:'#f3f4f6',color:'#6b7280',fontWeight:600,cursor:'pointer'}}
+              onClick={()=>setVerdictFilter('unclassified')}>
+              — {verdictCounts.unclassified} not yet classified
+            </span>
+          )}
+        </div>
+      )}
+
       <table className="report-table">
         <thead>
           <tr>
             <th>Search Term</th>
             <th>Status</th>
+            <th>AI Verdict</th>
             <th>Campaign</th>
             <th>Ad Group</th>
             <th className="num">Impr</th>
@@ -2697,9 +2782,12 @@ function SearchTermsView({ searchTermStats }) {
         </thead>
         <tbody>
           {filtered.map((r, i) => (
-            <tr key={i}>
+            <tr key={i} style={{
+              background: r.verdict==='negative' ? '#fff5f5' : r.verdict==='conquest' ? '#f0f7ff' : undefined
+            }}>
               <td style={{fontStyle:'italic'}}>{r.search_term}</td>
               <td><span className={'st-status ' + statusClass(r.status)}>{(r.status||'NONE').toUpperCase()}</span></td>
+              <td><VerdictBadge verdict={r.verdict} reason={r.verdict_reason} /></td>
               <td style={{fontSize:10,color:'var(--text-muted)'}}>{(r.campaign_name||'').replace(/^grafton_nxtsmile_/,'')}</td>
               <td style={{fontSize:10,color:'var(--text-muted)'}}>{r.ad_group_name||''}</td>
               <td className="num">{(r.impressions||0).toLocaleString()}</td>
@@ -6953,7 +7041,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       {view==='adgroups' && <AdGroupsView adGroupStats={adGroupStats} dailyStats={dailyStats} />}
 
       {/* ── Search Terms view ── */}
-      {view==='searchterms' && <SearchTermsView searchTermStats={searchTermStats} />}
+      {view==='searchterms' && <SearchTermsView
+        searchTermStats={searchTermStats}
+        onRefreshSearchTerms={() => {
+          api('/api/admin/gads/search-terms').then(st => setSearchTermStats(st.search_terms || [])).catch(()=>{});
+        }}
+      />}
 
       {/* ── Ad Creatives view ── */}
       {view==='adcreatives' && (

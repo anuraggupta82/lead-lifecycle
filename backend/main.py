@@ -40,7 +40,7 @@ from database import (
     add_event, unsubscribe, get_follow_up_queue, get_due_follow_ups,
     add_note, get_notes, delete_note, force_stage,
     get_campaign_stats, get_google_ads_campaigns, get_distinct_sources, get_keyword_stats,
-    get_search_term_stats, get_geo_stats, get_geo_stats_by_campaign, get_schedule_stats,
+    get_search_term_stats, get_st_classifications, get_geo_stats, get_geo_stats_by_campaign, get_schedule_stats,
     get_geo_json_for_campaign_resource, update_geo_json_for_campaign_resource,
     add_deleted_lead_tombstone, backfill_communication_log,
     get_or_create_conversation, get_conversation, get_messages, get_all_conversations,
@@ -6499,8 +6499,77 @@ def admin_gads_daily_stats(days: int = 30, campaign_id: Optional[str] = None):
 
 @app.get("/api/admin/gads/search-terms", dependencies=[Depends(_require_admin)])
 def admin_gads_search_terms(days: int = 30, campaign: str = ""):
-    """Search terms from gads_search_terms_cache, optionally filtered by campaign name."""
-    return {"search_terms": get_search_term_stats(campaign_name=campaign, days=days)}
+    """Search terms from gads_search_terms_cache enriched with semantic classifications."""
+    from database import get_st_classifications
+    terms = get_search_term_stats(campaign_name=campaign, days=days)
+    # Build lookup: (search_term_lower, campaign_lower) → classification
+    classifications = get_st_classifications(campaign_name=campaign)
+    clf_map = {
+        (c["search_term"].lower(), c["campaign_name"].lower()): c
+        for c in classifications
+    }
+    for t in terms:
+        key = (t["search_term"].lower(), t["campaign_name"].lower())
+        clf = clf_map.get(key)
+        t["verdict"] = clf["verdict"] if clf else None
+        t["verdict_reason"] = clf["reason"] if clf else None
+        t["classified_at"] = clf["classified_at"] if clf else None
+    return {"search_terms": terms}
+
+
+@app.post("/api/admin/gads/classify-search-terms", dependencies=[Depends(_require_admin)])
+def admin_classify_search_terms(campaign: str = "", force: bool = False):
+    """
+    Manually trigger semantic classification for a campaign (or all campaigns).
+    Uses Claude Haiku. Results are persisted and shown in the Search Terms tab.
+    force=true re-classifies already-classified terms.
+    """
+    from search_term_classifier import classify_new_terms_for_campaign
+    from database import get_setting, get_google_ads_campaigns as _get_camps
+
+    api_key = get_setting("anthropic_api_key") or ""
+    if not api_key:
+        raise HTTPException(status_code=422, detail="No Anthropic API key configured")
+
+    if campaign:
+        campaigns_to_classify = [campaign]
+    else:
+        # Classify all known campaigns
+        try:
+            all_camps = _get_camps()
+            campaigns_to_classify = [c["campaign_name"] for c in all_camps if c.get("campaign_name")]
+        except Exception:
+            raise HTTPException(status_code=500, detail="Could not fetch campaign list")
+
+    total_classified = 0
+    total_negatives = 0
+    results = []
+    for camp in campaigns_to_classify:
+        try:
+            r = classify_new_terms_for_campaign(
+                campaign_name=camp,
+                days=30,
+                api_key=api_key,
+                force_reclassify=force,
+            )
+            total_classified += r["classified"]
+            total_negatives += len(r["negatives"])
+            results.append({
+                "campaign": camp,
+                "classified": r["classified"],
+                "negatives": len(r["negatives"]),
+                "conquests": len(r["conquests"]),
+                "skipped": r["skipped"],
+            })
+        except Exception as e:
+            results.append({"campaign": camp, "error": str(e)})
+
+    return {
+        "ok": True,
+        "total_classified": total_classified,
+        "total_negatives": total_negatives,
+        "campaigns": results,
+    }
 
 
 @app.get("/api/admin/gads/ads", dependencies=[Depends(_require_admin)])

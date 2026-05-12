@@ -1171,6 +1171,25 @@ def _migrate(conn):
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_schedule_cache_key ON gads_schedule_cache(segment_type, segment_value, days)")
 
+    # ── Search term semantic classifications ─────────────────────────────────
+    # Stores Claude Haiku verdicts per (search_term, campaign_name) so each term
+    # is only classified once. Verdict: 'negative' | 'keep' | 'conquest'
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS st_classifications (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_term     TEXT NOT NULL,
+            campaign_name   TEXT NOT NULL DEFAULT '',
+            verdict         TEXT NOT NULL,          -- 'negative' | 'keep' | 'conquest'
+            reason          TEXT DEFAULT '',
+            classified_at   TEXT NOT NULL,
+            classifier      TEXT DEFAULT 'haiku'    -- model used
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_st_class_key
+        ON st_classifications(search_term, campaign_name)
+    """)
+
     # ── Workflows + WorkflowSteps tables (Step 9 — campaign-specific sequences) ──
     conn.execute("""
         CREATE TABLE IF NOT EXISTS workflows (
@@ -3912,6 +3931,101 @@ def get_search_term_stats(campaign_name: str = "", days: int = 30) -> list:
             ORDER BY s.cost DESC, s.clicks DESC
         """, params).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Search term semantic classification helpers ────────────────────────────────
+
+def get_unclassified_search_terms(campaign_name: str = "", days: int = 30) -> list:
+    """
+    Return search terms from gads_search_terms_cache that have no classification yet.
+    Also includes terms that produced 0 leads (regardless of spend) so we catch
+    zero-cost terms before they accumulate waste.
+    """
+    with _conn() as conn:
+        where = "WHERE s.days = ?"
+        params: list = [days]
+        if campaign_name:
+            where += " AND LOWER(s.campaign_name) = ?"
+            params.append(campaign_name.strip().lower())
+
+        rows = conn.execute(f"""
+            SELECT s.search_term, s.campaign_name, s.ad_group_name,
+                   s.impressions, s.clicks, s.cost, s.conversions
+            FROM gads_search_terms_cache s
+            LEFT JOIN st_classifications c
+                ON LOWER(c.search_term) = LOWER(s.search_term)
+               AND LOWER(c.campaign_name) = LOWER(s.campaign_name)
+            {where}
+              AND c.id IS NULL
+            ORDER BY s.cost DESC, s.impressions DESC
+        """, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_st_classifications(campaign_name: str = "") -> list:
+    """Return all classifications, optionally filtered to a campaign."""
+    with _conn() as conn:
+        if campaign_name:
+            rows = conn.execute("""
+                SELECT * FROM st_classifications
+                WHERE LOWER(campaign_name) = ?
+                ORDER BY classified_at DESC
+            """, (campaign_name.strip().lower(),)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM st_classifications
+                ORDER BY classified_at DESC
+            """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_st_classification(search_term: str, campaign_name: str,
+                            verdict: str, reason: str,
+                            classifier: str = "haiku") -> None:
+    """Upsert a classification verdict for a (search_term, campaign_name) pair."""
+    now = _now()
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO st_classifications
+                (search_term, campaign_name, verdict, reason, classified_at, classifier)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(search_term, campaign_name) DO UPDATE SET
+                verdict       = excluded.verdict,
+                reason        = excluded.reason,
+                classified_at = excluded.classified_at,
+                classifier    = excluded.classifier
+        """, (search_term.strip(), campaign_name.strip(), verdict, reason, now, classifier))
+
+
+def save_st_classifications_bulk(classifications: list) -> int:
+    """
+    Bulk upsert classifications.
+    Each item: {search_term, campaign_name, verdict, reason, classifier?}
+    Returns count saved.
+    """
+    now = _now()
+    saved = 0
+    with _conn() as conn:
+        for c in classifications:
+            st = (c.get("search_term") or "").strip()
+            camp = (c.get("campaign_name") or "").strip()
+            verdict = c.get("verdict", "keep")
+            reason = c.get("reason", "")
+            classifier = c.get("classifier", "haiku")
+            if not st:
+                continue
+            conn.execute("""
+                INSERT INTO st_classifications
+                    (search_term, campaign_name, verdict, reason, classified_at, classifier)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(search_term, campaign_name) DO UPDATE SET
+                    verdict       = excluded.verdict,
+                    reason        = excluded.reason,
+                    classified_at = excluded.classified_at,
+                    classifier    = excluded.classifier
+            """, (st, camp, verdict, reason, now, classifier))
+            saved += 1
+    return saved
 
 
 def save_gads_geo_cache(geo_data: list, days: int = 30, view_type: str = "targeted"):

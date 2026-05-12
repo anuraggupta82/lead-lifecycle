@@ -5001,6 +5001,76 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     summary["keywords_with_call_attribution"] = len(keyword_call_attribution)
     summary["keyword_attributed_calls"] = sum(e["calls"] for e in keyword_call_attribution.values())
 
+    # ── Semantic search term classification (Haiku pre-pass) ─────────────────
+    # Runs BEFORE the Opus loop. For each campaign, classifies all unclassified
+    # search terms using Claude Haiku so the Opus pass can focus on strategy.
+    # Negative-verdict terms are staged as add_negative_keyword pending actions.
+    logger.info("Running semantic search term classifier (Haiku)...")
+    _classifier_negatives_staged = 0
+    _classifier_api_key = get_setting("anthropic_api_key") or ""
+    _all_camp_names_for_classify = sorted(active_campaigns_with_data) or list(campaign_spend.keys()) or ([primary_campaign] if primary_campaign else [])
+
+    for _classify_camp in _all_camp_names_for_classify:
+        try:
+            from search_term_classifier import classify_new_terms_for_campaign
+            _clf_result = classify_new_terms_for_campaign(
+                campaign_name=_classify_camp,
+                days=30,
+                api_key=_classifier_api_key,
+            )
+            # Get campaign_resource for this campaign (needed for staging)
+            _clf_camp_resource = ""
+            for kw in keyword_perf:
+                if kw.get("campaign", "").strip().lower() == _classify_camp.strip().lower():
+                    _clf_camp_resource = kw.get("campaign_resource", "")
+                    if _clf_camp_resource:
+                        break
+
+            # Stage negative verdicts as pending add_negative_keyword actions
+            for neg in _clf_result.get("negatives", []):
+                kw_text = neg["search_term"].strip().lower()
+                # Skip if already a live negative
+                if _negative_already_handled(kw_text, _classify_camp, live_negatives=live_negatives):
+                    continue
+                # Skip if already pending in this run (dedup)
+                _neg_op_key = ("add_negative_keyword", kw_text)
+                if _neg_op_key in {("add_negative_keyword", n["search_term"].lower()) for n in _clf_result.get("negatives", [][:0])}:
+                    pass  # checked below via log_pending dedup
+                aid = log_pending(
+                    operation="add_negative_keyword",
+                    entity_type="keyword",
+                    entity_id=_clf_camp_resource or kw_text,
+                    entity_name=neg["search_term"],
+                    before_state={"type": "search_term", "source": "semantic_classifier"},
+                    after_state={
+                        "keyword_text": neg["search_term"],
+                        "match_type": "PHRASE",
+                        "campaign_resource": _clf_camp_resource,
+                        "campaign": _classify_camp,
+                    },
+                    optimizer_run_id=run_id,
+                    reason=f"[Semantic] {neg['reason']}",
+                    campaign_name=_classify_camp,
+                    priority=12,  # high priority — catches waste before it accumulates
+                    impact_estimate={"savings_30d_usd": 0},  # zero-spend terms have no historic waste yet
+                )
+                if aid:
+                    _classifier_negatives_staged += 1
+
+            _n = len(_clf_result.get("negatives", []))
+            _c = len(_clf_result.get("conquests", []))
+            _tot = _clf_result.get("classified", 0)
+            if _tot > 0:
+                logger.info(
+                    f"  [{_classify_camp}] Classifier: {_tot} classified, "
+                    f"{_n} negatives staged, {_c} conquest (kept)"
+                )
+        except Exception as _clf_err:
+            logger.warning(f"  [{_classify_camp}] Classifier failed (non-fatal): {_clf_err}")
+
+    if _classifier_negatives_staged:
+        logger.info(f"Semantic classifier staged {_classifier_negatives_staged} negative(s) total")
+
     # Claude structured recommendations — run once per active campaign.
     # Returns dicts with operation + exact API parameters, not plain text.
     logger.info("Calling Claude (Opus) for structured recommendations...")
