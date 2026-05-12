@@ -4835,7 +4835,7 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         }
         _neg_intent = _neg_intent_by_type.get(_kw_camp_type, _neg_intent_by_type["general"])
         _neg_intent_note = (
-            f"Also negate these low-intent patterns for {_kw_camp_type} campaigns: "
+            f"these low-intent patterns for {_kw_camp_type} campaigns: "
             + ", ".join(_neg_intent)
         )
 
@@ -5019,7 +5019,6 @@ IMPORTANT RULES:
 Return ONLY a JSON object with this exact structure:
 {{
   "caveat": "AI-generated competitive intelligence — verify competitor details before use",
-  "campaign_type": "{_camp_type}",
   "competitors": [
     {{
       "name": "Practice Name",
@@ -5053,6 +5052,11 @@ No markdown, no explanation outside the JSON."""
         if not json_match:
             raise ValueError("No JSON found in AI response")
         data = _json.loads(json_match.group())
+
+        # For competitor_analysis: inject campaign_type server-side so the frontend
+        # conquest/no-conquest branching never depends on Sonnet echoing it back correctly
+        if step == "competitor_analysis" and isinstance(data, dict):
+            data["campaign_type"] = _camp_type  # always authoritative
 
     except Exception as e:
         logger.error(f"build-step AI call failed ({step}): {e}")

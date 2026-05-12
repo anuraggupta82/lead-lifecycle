@@ -8469,6 +8469,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     </div>
                                   </div>
                                 ) : campType && !['implants','invisalign','cosmetic'].includes(campType) ? (
+                                  // Note: conquest type list must stay in sync with _conquest_brand_map in main.py
                                   <div style={{marginBottom:16,background:'#f9fafb',borderRadius:6,padding:'8px 12px',
                                     fontSize:11,color:'var(--text-muted)',fontStyle:'italic'}}>
                                     ⚔ Conquest targeting not recommended for {campType} campaigns
@@ -9049,22 +9050,36 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                             <span style={{fontSize:14,color:'#9ca3af',fontStyle:'italic'}}>Not set</span>
                                           )}
                                         </div>
-                                        {/* Click-rate guidance from checklist item */}
+                                        {/* Click-rate guidance — computed live from ad_groups + current budget
+                                            (avoids staleness from checklist snapshot) */}
                                         {(() => {
-                                          const budgetItem = (build.launch_checklist||[]).find(x=>x.key==='budget');
-                                          if (!budgetItem || !budgetItem.clicks_per_day) return null;
-                                          const isWarn = budgetItem.warning;
+                                          const agList = (build.ad_groups && build.ad_groups.ad_groups) || [];
+                                          if (!agList.length || !hasBudget) return null;
+                                          const dailyBudgetVal = monthlyToDaily(camp.monthly_budget);
+                                          // Weighted-average CPC by daily_budget_pct
+                                          const totalPct = agList.reduce((s,g) => s + (parseFloat(g.daily_budget_pct)||0), 0);
+                                          let estCpc = 0;
+                                          if (totalPct > 0) {
+                                            estCpc = agList.reduce((s,g) => s + (parseFloat(g.suggested_cpc_usd)||0) * (parseFloat(g.daily_budget_pct)||0), 0) / totalPct;
+                                          } else {
+                                            const cpcs = agList.map(g=>parseFloat(g.suggested_cpc_usd)||0).filter(v=>v>0);
+                                            estCpc = cpcs.length ? cpcs.reduce((a,b)=>a+b,0)/cpcs.length : 0;
+                                          }
+                                          if (!estCpc) return null;
+                                          const clicksPerDay = Math.round((dailyBudgetVal / estCpc) * 10) / 10;
+                                          const isWarn = clicksPerDay < 10;
+                                          const minBudget = Math.ceil(estCpc * 10);
                                           return (
                                             <div style={{marginTop:8,padding:'6px 10px',borderRadius:5,fontSize:11,
                                               background: isWarn ? '#fef3c7' : '#f0fdf4',
                                               border: `1px solid ${isWarn ? '#fde68a' : '#bbf7d0'}`,
                                               color: isWarn ? '#92400e' : '#166534'}}>
                                               {isWarn ? '⚠️' : '✓'}{' '}
-                                              <strong>~{budgetItem.clicks_per_day} clicks/day</strong>
-                                              {' '}at ${budgetItem.est_cpc_usd} avg CPC
+                                              <strong>~{clicksPerDay} clicks/day</strong>
+                                              {' '}at ${estCpc.toFixed(2)} avg CPC
                                               {isWarn && (
                                                 <span> — Google recommends ≥10 for Smart Bidding.
-                                                  Consider <strong>${Math.ceil(budgetItem.est_cpc_usd * 10)}/day</strong>.
+                                                  Consider <strong>${minBudget}/day</strong>.
                                                 </span>
                                               )}
                                             </div>
