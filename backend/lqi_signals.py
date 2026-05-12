@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 SHORT_CALL_SEC = 60           # call <60s is "short/hangup"
-MIN_SPEND_FOR_BAD_TERM = 5.0  # only flag terms with $5+ spend
+MIN_SPEND_FOR_BAD_TERM = 1.0  # flag terms with $1+ spend (lowered from $5 — low-cost terms still matter)
 TOP_N_SHORT_CALLS = 10
 TOP_N_BAD_TERMS = 25
 TOP_N_HOTSPOTS = 12
@@ -37,17 +37,34 @@ _SPANISH_RX = re.compile(
     r"clinica|emergencia|seguro|costo|gratis|cuanto)\b",
     re.IGNORECASE,
 )
-# Competitor practice patterns
+# Competitor practice patterns — named chains AND generic "X dental group/care/office" patterns
 _COMPETITOR_RX = re.compile(
     r"\b(aspen\s+dental|gentle\s+dental|grace\s+dental|simply\s+orthodontics|"
     r"smile\s*direct|byte|invisalign\s+doctor|nibblers|kool\s+smiles|"
-    r"family\s+dentistry\s+of|metrowest\s+oral|new\s+england\s+oral)\b",
+    r"family\s+dentistry\s+of|metrowest\s+oral|new\s+england\s+oral|"
+    # Generic: any "[name] dental group/care/office/associates/center/clinic/studio"
+    r"\w+\s+dental\s+(group|care|office|associates|center|clinic|studio)|"
+    # "[name] dentistry" — other practices
+    r"\w+\s+dentistry\b|"
+    # "[town] dental" patterns that aren't us (we are "grafton dental care")
+    r"(gardner|worcester|shrewsbury|northborough|westborough|marlborough|"
+    r"clinton|fitchburg|leominster|milford|hopedale|upton|uxbridge|"
+    r"medway|holliston|hopkinton|millis|medfield|norwood|framingham)\s+dental)\b",
     re.IGNORECASE,
 )
-# Wrong-intent: education/research, not booking
+# Wrong-intent: education/research/DIY/home-remedy, not booking
 _WRONG_INTENT_RX = re.compile(
     r"\b(meaning|definition|wikipedia|reddit|youtube|images|salary|"
-    r"how\s+to\s+become|school|job|career|insurance\s+coverage)\b",
+    r"how\s+to\s+become|school|job|career|insurance\s+coverage|"
+    # DIY / home-remedy / informational patterns
+    r"how\s+to\s+(fix|treat|cure|prevent|reduce|remove|stop|get\s+rid|heal|whiten|clean|brush|floss)|"
+    r"home\s+(remedy|remedies|treatment|cure)|"
+    r"natural\s+(remedy|remedies|treatment|cure)|"
+    r"diy\s+dental|at\s+home\s+dental|"
+    r"what\s+(is|are|causes?)|why\s+(do|does|is|are)|"
+    r"symptoms?\s+of|signs?\s+of|stages?\s+of|"
+    r"dental\s+(school|student|degree|program|salary|license)|"
+    r"free\s+dental|low\s+cost\s+dental|affordable\s+dental\s+clinic)\b",
     re.IGNORECASE,
 )
 

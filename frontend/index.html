@@ -7,7 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <!-- v20260512-0930 -->
+  <!-- v20260512-1000 -->
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -6045,6 +6045,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [negatePopover, setNegatePopover]     = useState(null);  // {term, matchType}
   const [negateLoading, setNegateLoading]     = useState(false);
   const [negatedTerms, setNegatedTerms]       = useState(new Set()); // locally-negated search terms
+  // Bulk negate state
+  const [stSelectedTerms, setStSelectedTerms] = useState(new Set()); // selected search term strings
+  const [stBulkMatchType, setStBulkMatchType] = useState('EXACT');
+  const [stBulkLoading, setStBulkLoading]     = useState(false);
   const [agStatusLoading, setAgStatusLoading] = useState({});       // {resource_name: true/false}
   const [agStatusOverride, setAgStatusOverride] = useState({});     // {resource_name: 'PAUSED'|'ENABLED'}
   const [agConfirmation, setAgConfirmation] = useState({});         // {resource_name: {confirmed, summary}}
@@ -6153,6 +6157,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     if (!isSameCampaign) {
       setDetailTab('strategy');
       setNegatedTerms(new Set());
+      setStSelectedTerms(new Set());
       setAgStatusOverride({});
       setBudgetEdit(null);
       setBudgetEditValue('');
@@ -6194,6 +6199,28 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     } finally {
       setNegateLoading(false);
     }
+  }
+
+  async function bulkNegateSearchTerms(campId, terms, matchType) {
+    if (!terms.size && !terms.length) return;
+    const termList = [...terms];
+    setStBulkLoading(true);
+    let failed = 0;
+    for (const kw of termList) {
+      try {
+        await api(`/api/admin/campaigns/${campId}/negative-keywords`, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({keyword_text: kw, match_type: matchType}),
+        });
+        setNegatedTerms(prev => new Set([...prev, kw]));
+      } catch(e) {
+        failed++;
+      }
+    }
+    setStSelectedTerms(new Set());
+    setStBulkLoading(false);
+    if (failed > 0) alert(`${failed} term(s) failed to negate. The rest were applied.`);
   }
 
   async function toggleAdGroupStatus(campId, agResourceName, agName, currentStatus) {
@@ -9624,12 +9651,43 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               )}
 
                               {/* Search Terms */}
-                              {cd.search_terms && cd.search_terms.length > 0 && (
+                              {cd.search_terms && cd.search_terms.length > 0 && (() => {
+                                const campId = cd.campaign.campaign_id;
+                                const visibleTerms = cd.search_terms.slice(0,100);
+                                const negateableTerms = visibleTerms.filter(st =>
+                                  !negatedTerms.has(st.search_term) && st.status !== 'EXCLUDED'
+                                );
+                                const allNegateableSelected = negateableTerms.length > 0 &&
+                                  negateableTerms.every(st => stSelectedTerms.has(st.search_term));
+
+                                function toggleSelectAll() {
+                                  if (allNegateableSelected) {
+                                    setStSelectedTerms(new Set());
+                                  } else {
+                                    setStSelectedTerms(new Set(negateableTerms.map(st => st.search_term)));
+                                  }
+                                }
+                                function toggleSelectTerm(term) {
+                                  setStSelectedTerms(prev => {
+                                    const next = new Set(prev);
+                                    next.has(term) ? next.delete(term) : next.add(term);
+                                    return next;
+                                  });
+                                }
+
+                                return (
                                 <div style={{marginBottom:20}}>
-                                  <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>
+                                  <div style={{fontSize:12,fontWeight:700,marginBottom:8,display:'flex',alignItems:'center',gap:8}}>
                                     🔍 Search Terms ({cd.search_terms.length})
+                                    {stSelectedTerms.size > 0 && (
+                                      <span style={{fontSize:10,fontWeight:500,color:'#dc2626',
+                                        background:'#fee2e2',padding:'1px 7px',borderRadius:10}}>
+                                        {stSelectedTerms.size} selected
+                                      </span>
+                                    )}
                                   </div>
-                                  {/* Negate popover */}
+
+                                  {/* Single-term negate popover */}
                                   {negatePopover && (
                                     <div style={{background:'#fff',border:'1px solid var(--border)',
                                       borderRadius:8,padding:'12px 14px',marginBottom:10,
@@ -9660,11 +9718,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         <button className="btn btn-sm"
                                           style={{fontSize:11,background:'#dc2626',color:'#fff',border:'none'}}
                                           disabled={negateLoading}
-                                          onClick={()=>negateSearchTerm(
-                                            campDetail.campaign.campaign_id,
-                                            negatePopover.term,
-                                            negatePopover.matchType
-                                          )}>
+                                          onClick={()=>negateSearchTerm(campId, negatePopover.term, negatePopover.matchType)}>
                                           {negateLoading ? '⏳ Negating…' : '🚫 Confirm Negate'}
                                         </button>
                                         <button className="btn btn-ghost btn-sm" style={{fontSize:11}}
@@ -9675,10 +9729,58 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     </div>
                                   )}
 
+                                  {/* Bulk negate bar — shown when ≥1 term selected */}
+                                  {stSelectedTerms.size > 0 && !negatePopover && (
+                                    <div style={{display:'flex',alignItems:'center',gap:10,
+                                      background:'#fff7ed',border:'1px solid #fed7aa',
+                                      borderRadius:7,padding:'8px 12px',marginBottom:8}}>
+                                      <span style={{fontSize:11,fontWeight:600,color:'#92400e',whiteSpace:'nowrap'}}>
+                                        🚫 Negate {stSelectedTerms.size} term{stSelectedTerms.size>1?'s':''}
+                                      </span>
+                                      <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                                        {['EXACT','PHRASE','BROAD'].map(mt=>(
+                                          <label key={mt} style={{display:'flex',alignItems:'center',gap:4,
+                                            fontSize:10,cursor:'pointer',padding:'3px 8px',borderRadius:4,
+                                            background: stBulkMatchType===mt?'#dc2626':'#fff',
+                                            border:`1px solid ${stBulkMatchType===mt?'#dc2626':'#d1d5db'}`,
+                                            color: stBulkMatchType===mt?'#fff':'var(--text)'}}>
+                                            <input type="radio" name="bulkMatchType" value={mt}
+                                              checked={stBulkMatchType===mt}
+                                              onChange={()=>setStBulkMatchType(mt)}
+                                              style={{margin:0,display:'none'}} />
+                                            {mt}
+                                          </label>
+                                        ))}
+                                      </div>
+                                      <button
+                                        disabled={stBulkLoading}
+                                        onClick={()=>bulkNegateSearchTerms(campId, stSelectedTerms, stBulkMatchType)}
+                                        style={{padding:'4px 12px',borderRadius:5,background:'#dc2626',
+                                          color:'#fff',border:'none',fontSize:11,fontWeight:600,
+                                          cursor:'pointer',whiteSpace:'nowrap'}}>
+                                        {stBulkLoading ? '⏳ Negating…' : `🚫 Apply to ${stSelectedTerms.size}`}
+                                      </button>
+                                      <button
+                                        onClick={()=>setStSelectedTerms(new Set())}
+                                        style={{padding:'3px 8px',borderRadius:4,background:'none',
+                                          border:'1px solid #d1d5db',fontSize:10,cursor:'pointer',
+                                          color:'var(--text-muted)'}}>
+                                        Clear
+                                      </button>
+                                    </div>
+                                  )}
+
                                   <div style={{maxHeight:320,overflowY:'auto',border:'1px solid var(--border)',borderRadius:7}}>
                                     <table className="report-table" style={{margin:0,borderRadius:0}}>
                                       <thead style={{position:'sticky',top:0,background:'#f9fafb',zIndex:1}}>
                                         <tr>
+                                          <th style={{width:28,textAlign:'center',padding:'6px 8px'}}>
+                                            <input type="checkbox"
+                                              checked={allNegateableSelected}
+                                              onChange={toggleSelectAll}
+                                              title="Select all negateable terms"
+                                              style={{cursor:'pointer',width:13,height:13}} />
+                                          </th>
                                           <th>Search Term</th>
                                           <th className="num">Impr</th>
                                           <th className="num">Clicks</th>
@@ -9690,17 +9792,29 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         </tr>
                                       </thead>
                                       <tbody>
-                                        {cd.search_terms.slice(0,100).map((st,i)=>{
+                                        {visibleTerms.map((st,i)=>{
                                           const impr = st.impressions||0;
                                           const clk  = st.clicks||0;
-                                          const cost = st.cost||0;          // stored as dollars by save_gads_search_terms_cache
+                                          const cost = st.cost||0;
                                           const ctr  = impr>0 ? ((clk/impr)*100).toFixed(1)+'%' : '—';
-                                          const isAdded = st.status==='ADDED';
+                                          const isAdded    = st.status==='ADDED';
                                           const isExcluded = st.status==='EXCLUDED';
-                                          const isNegated = negatedTerms.has(st.search_term) || isExcluded;
+                                          const isNegated  = negatedTerms.has(st.search_term) || isExcluded;
+                                          const isSelected = stSelectedTerms.has(st.search_term);
                                           return (
-                                            <tr key={i} style={{opacity: isNegated?0.5:1,
-                                              textDecoration: isNegated?'line-through':'none'}}>
+                                            <tr key={i} style={{
+                                              opacity: isNegated ? 0.45 : 1,
+                                              textDecoration: isNegated ? 'line-through' : 'none',
+                                              background: isSelected ? '#fff7ed' : 'transparent',
+                                            }}>
+                                              <td style={{textAlign:'center',padding:'4px 8px'}}>
+                                                {!isNegated && (
+                                                  <input type="checkbox"
+                                                    checked={isSelected}
+                                                    onChange={()=>toggleSelectTerm(st.search_term)}
+                                                    style={{cursor:'pointer',width:13,height:13}} />
+                                                )}
+                                              </td>
                                               <td style={{fontFamily:'monospace',fontSize:11,maxWidth:200,
                                                 overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
                                                 {st.search_term}
@@ -9714,19 +9828,16 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                                 <span style={{fontSize:9,padding:'1px 5px',borderRadius:3,fontWeight:600,
                                                   background: isNegated?'#fee2e2': isAdded?'#d1fae5':'#f3f4f6',
                                                   color: isNegated?'#991b1b': isAdded?'#065f46':'#6b7280'}}>
-                                                  {isNegated?'NEGATED': st.status||'—'}
+                                                  {isNegated ? 'NEGATED' : st.status||'—'}
                                                 </span>
                                               </td>
                                               <td style={{textAlign:'center'}}>
                                                 {!isNegated && (
                                                   <button
-                                                    title="Add as negative keyword to campaign"
-                                                    onClick={()=>setNegatePopover({
-                                                      term: st.search_term, matchType:'EXACT'
-                                                    })}
+                                                    title="Negate this term"
+                                                    onClick={()=>setNegatePopover({term:st.search_term,matchType:'EXACT'})}
                                                     style={{fontSize:13,background:'none',border:'none',
-                                                      cursor:'pointer',color:'#dc2626',padding:'0 4px',
-                                                      lineHeight:1}}>
+                                                      cursor:'pointer',color:'#dc2626',padding:'0 4px',lineHeight:1}}>
                                                     🚫
                                                   </button>
                                                 )}
@@ -9736,9 +9847,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         })}
                                         {cd.search_terms.length > 100 && (
                                           <tr>
-                                            <td colSpan={7} style={{textAlign:'center',fontSize:11,
+                                            <td colSpan={9} style={{textAlign:'center',fontSize:11,
                                               color:'var(--text-muted)',fontStyle:'italic',padding:'8px'}}>
-                                              Showing top 100 of {cd.search_terms.length} terms. Click ↻ Sync to refresh.
+                                              Showing top 100 of {cd.search_terms.length} terms.
                                             </td>
                                           </tr>
                                         )}
@@ -9746,7 +9857,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     </table>
                                   </div>
                                 </div>
-                              )}
+                                );
+                              })()}
 
                               {cd.has_gads_data && cd.ad_groups.length===0 && cd.ads.length===0 && (
                                 <div style={{fontSize:12,color:'var(--text-muted)',fontStyle:'italic',textAlign:'center',padding:'24px 0'}}>
