@@ -8161,15 +8161,17 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                     // Wizard step completion helpers
                     const stepDone = {
                       strategy:     !!strategy,
+                      competitors:  !!build.competitor_analysis,  // tab id 'competitors' → build key 'competitor_analysis'
                       keywords:     !!build.keywords,
                       ad_copy:      !!build.ad_copy,
                       ad_groups:    !!build.ad_groups,
                       launch:       !!(build.launch_checklist && build.launch_checklist.some(x=>x.category==='required') && build.launch_checklist.filter(x=>x.category==='required').every(x=>x.done)),
                       performance:  true,
                     };
-                    const WIZARD_ORDER = ['strategy','keywords','ad_copy','ad_groups','launch','performance','geo'];
+                    const WIZARD_ORDER = ['strategy','competitors','keywords','ad_copy','ad_groups','launch','performance','geo'];
                     const TABS = [
                       { id: 'strategy',     label: '🧠 Strategy' },
+                      { id: 'competitors',  label: '🎯 Competitors' },
                       { id: 'keywords',     label: '🔍 Keywords' },
                       { id: 'ad_copy',      label: '✍ Ad Copy' },
                       { id: 'ad_groups',    label: '📂 Ad Groups' },
@@ -8358,6 +8360,145 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               {strategy && renderRefineBox('strategy')}
                             </div>
                           )}
+
+                          {/* ── Competitors tab ── */}
+                          {/* Note: tab id='competitors', build key='competitor_analysis' */}
+                          {detailTab==='competitors' && (() => {
+                            const comp = build.competitor_analysis;
+                            if (!comp) {
+                              return (
+                                <div>
+                                  <div style={{textAlign:'center',padding:40}}>
+                                    <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>🎯 Competitor Analysis</div>
+                                    <div style={{fontSize:12,color:'var(--text-muted)',marginBottom:20,maxWidth:420,margin:'0 auto 20px'}}>
+                                      Claude will identify local competitors in your service area, analyze their positioning,
+                                      and surface differentiation angles and conquest keywords for this campaign.
+                                    </div>
+                                    <button className="btn btn-teal" disabled={!!buildLoading}
+                                      onClick={()=>generateBuildStep('competitor_analysis')}>
+                                      {buildLoading==='competitor_analysis' ? '⏳ Analyzing competitors…' : '🎯 Analyze Competitors'}
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            }
+
+                            const competitors   = comp.competitors || [];
+                            const differentiators = comp.our_differentiators || [];
+                            const conquestKws   = comp.conquest_keywords || [];
+                            const posNotes      = comp.positioning_notes || '';
+                            const caveat        = comp.caveat || '';
+                            const campType      = comp.campaign_type || '';
+
+                            const confColor = (c) => c==='high' ? {bg:'#dcfce7',color:'#166534'} : c==='medium' ? {bg:'#fef9c3',color:'#854d0e'} : {bg:'#f3f4f6',color:'#6b7280'};
+
+                            return (
+                              <div>
+                                {/* Caveat banner */}
+                                {caveat && (
+                                  <div style={{background:'#fef3c7',border:'1px solid #fde68a',borderRadius:6,
+                                    padding:'7px 12px',fontSize:11,color:'#92400e',marginBottom:14,display:'flex',gap:6,alignItems:'center'}}>
+                                    <span>⚠️</span><span>{caveat}</span>
+                                  </div>
+                                )}
+
+                                {/* Competitor cards — 2-column grid */}
+                                <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+                                  letterSpacing:'.5px',marginBottom:8}}>Local Competitors ({competitors.length})</div>
+                                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:18}}>
+                                  {competitors.map((c,i) => {
+                                    const {bg,color} = confColor(c.confidence);
+                                    return (
+                                      <div key={i} style={{background:'#fff',border:'1px solid var(--border)',
+                                        borderRadius:8,padding:'10px 12px',boxShadow:'0 1px 3px rgba(0,0,0,.05)'}}>
+                                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:5}}>
+                                          <div style={{fontSize:12,fontWeight:700}}>{c.name}</div>
+                                          <span style={{fontSize:9,fontWeight:700,background:bg,color,
+                                            padding:'2px 6px',borderRadius:3,textTransform:'uppercase',flexShrink:0,marginLeft:6}}>
+                                            {c.confidence||'?'}
+                                          </span>
+                                        </div>
+                                        {c.location && (
+                                          <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:5}}>📍 {c.location}</div>
+                                        )}
+                                        {c.likely_emphasis && (
+                                          <div style={{marginBottom:4}}>
+                                            <span style={{fontSize:9,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.3px'}}>Their emphasis: </span>
+                                            <span style={{fontSize:10,color:'#374151'}}>{c.likely_emphasis}</span>
+                                          </div>
+                                        )}
+                                        {c.gap_we_can_address && (
+                                          <div style={{background:'#f0fdf4',borderRadius:4,padding:'4px 7px',marginTop:4}}>
+                                            <span style={{fontSize:9,fontWeight:700,color:'#166534',textTransform:'uppercase',letterSpacing:'.3px'}}>Our angle: </span>
+                                            <span style={{fontSize:10,color:'#166534'}}>{c.gap_we_can_address}</span>
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+
+                                {/* Our Differentiators */}
+                                {differentiators.length > 0 && (
+                                  <div style={{marginBottom:16}}>
+                                    <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+                                      letterSpacing:'.5px',marginBottom:8}}>Our Differentiators</div>
+                                    <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                                      {differentiators.map((d,i) => (
+                                        <span key={i} style={{background:'#dcfce7',color:'#166534',fontSize:11,
+                                          padding:'3px 10px',borderRadius:4,border:'1px solid #bbf7d0'}}>✓ {d}</span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* Conquest Keywords — only shown when populated */}
+                                {conquestKws.length > 0 ? (
+                                  <div style={{marginBottom:16}}>
+                                    <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+                                      letterSpacing:'.5px',marginBottom:6}}>Conquest Keywords
+                                      <span style={{fontWeight:400,textTransform:'none',marginLeft:6,color:'#6b7280'}}>
+                                        — will be included in keyword step
+                                      </span>
+                                    </div>
+                                    <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                                      {conquestKws.map((k,i) => (
+                                        <span key={i} style={{background:'#dbeafe',color:'#1e40af',fontSize:11,
+                                          padding:'3px 10px',borderRadius:4,border:'1px solid #bfdbfe'}}>⚔ {k}</span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ) : campType && !['implants','invisalign','cosmetic'].includes(campType) ? (
+                                  <div style={{marginBottom:16,background:'#f9fafb',borderRadius:6,padding:'8px 12px',
+                                    fontSize:11,color:'var(--text-muted)',fontStyle:'italic'}}>
+                                    ⚔ Conquest targeting not recommended for {campType} campaigns
+                                  </div>
+                                ) : null}
+
+                                {/* Positioning Notes */}
+                                {posNotes && (
+                                  <div style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:6,
+                                    padding:'10px 12px',marginBottom:16}}>
+                                    <div style={{fontSize:10,fontWeight:700,color:'#0369a1',marginBottom:4,textTransform:'uppercase',letterSpacing:'.4px'}}>
+                                      📋 Positioning Strategy
+                                    </div>
+                                    <div style={{fontSize:11,lineHeight:1.6,color:'#0c4a6e'}}>{posNotes}</div>
+                                  </div>
+                                )}
+
+                                {/* Regenerate button */}
+                                <div style={{marginBottom:12}}>
+                                  <button className="btn btn-sm" disabled={!!buildLoading}
+                                    style={{fontSize:11,background:'none',border:'1px solid var(--border)',color:'var(--text-muted)'}}
+                                    onClick={()=>generateBuildStep('competitor_analysis')}>
+                                    {buildLoading==='competitor_analysis' ? '⏳ Re-analyzing…' : '🔄 Regenerate'}
+                                  </button>
+                                </div>
+
+                                {renderRefineBox('competitor_analysis')}
+                              </div>
+                            );
+                          })()}
 
                           {/* ── Keywords tab ── */}
                           {detailTab==='keywords' && (() => {

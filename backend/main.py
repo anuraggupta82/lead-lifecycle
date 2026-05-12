@@ -3724,7 +3724,7 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
     from database import get_campaign_by_id, get_campaign_build
     import anthropic as _anthropic, json as _json, re as _re
 
-    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "strategy"}
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "strategy", "competitor_analysis"}
     if body.step not in VALID_STEPS:
         raise HTTPException(status_code=400, detail=f"Refinement only supported for: {VALID_STEPS}")
 
@@ -4282,7 +4282,7 @@ def admin_campaign_build_step_save(campaign_id: str, body: CampaignBuildStepSave
     camp = get_campaign_by_id(campaign_id)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist", "strategy"}
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist", "strategy", "competitor_analysis"}
     if body.step not in VALID_STEPS:
         raise HTTPException(status_code=400, detail=f"Invalid step")
     if body.step == "strategy":
@@ -4310,7 +4310,7 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
     from database import get_campaign_by_id, get_campaign_build, save_campaign_build_step
     import anthropic as _anthropic
 
-    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist"}
+    VALID_STEPS = {"keywords", "ad_copy", "ad_groups", "launch_checklist", "competitor_analysis"}
     if body.step not in VALID_STEPS:
         raise HTTPException(status_code=400, detail=f"Invalid step. Must be one of {VALID_STEPS}")
 
@@ -4735,6 +4735,26 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         except Exception as _ome:
             logger.warning(f"build-step keywords: optimizer memory read failed: {_ome}")
 
+        # Pull competitor context if available
+        _comp_data = build.get("competitor_analysis") or {}
+        _comp_context_block = ""
+        if _comp_data and isinstance(_comp_data, dict):
+            _comp_diffs = _comp_data.get("our_differentiators") or []
+            _comp_conquest = _comp_data.get("conquest_keywords") or []
+            _comp_pos = _comp_data.get("positioning_notes") or ""
+            _comp_parts = []
+            if _comp_diffs:
+                _comp_parts.append("Our differentiators (reinforce these through keyword themes): " + "; ".join(_comp_diffs))
+            if _comp_conquest:
+                _comp_parts.append(
+                    "Conquest brand keywords (include ALL in exact_match — intentional competitor targeting): "
+                    + ", ".join(f'"{k}"' for k in _comp_conquest)
+                )
+            if _comp_pos:
+                _comp_parts.append("Positioning context: " + _comp_pos)
+            if _comp_parts:
+                _comp_context_block = "\n\n=== Competitor Intelligence ===\n" + "\n".join(_comp_parts)
+
         from ai_optimizer import GOOGLE_ADS_RULES as _GAR
         prompt = _GAR + f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
 
@@ -4744,7 +4764,7 @@ Monthly Budget: ${budget}
 Objective: {objective}
 Target Audience: {target_audience}
 Key Messages: {', '.join(key_messages)}
-Implementation Notes: {impl_notes}{_site_section}{_source_kw_block}{_source_neg_block}{_optimizer_memory_block}
+Implementation Notes: {impl_notes}{_site_section}{_source_kw_block}{_source_neg_block}{_optimizer_memory_block}{_comp_context_block}
 
 Return a JSON object with this exact structure:
 {{
@@ -4755,7 +4775,7 @@ Return a JSON object with this exact structure:
 }}
 
 Rules:
-- exact_match: 8-12 high-intent, specific keywords (e.g. "emergency dentist near me")
+- exact_match: 8-12 high-intent, specific keywords — prioritize "near me", "same day", "[service] cost", "[town] [service]" intent signals
 - phrase_match: 10-15 moderate-intent phrases
 - broad_match_modifier: 5-8 broader terms to capture volume
 - negative_keywords: Include ALL source campaign negatives above PLUS all optimizer memory negatives PLUS any additional terms relevant to this service (jobs, DIY, insurance-only, etc.)
@@ -4768,6 +4788,21 @@ Rules:
         headlines_from_strategy = strategy.get("ad_headlines", [])
         descs_from_strategy = strategy.get("ad_descriptions", [])
 
+        # Pull competitor differentiators to sharpen positioning
+        _adcopy_comp_data = build.get("competitor_analysis") or {}
+        _adcopy_diff_block = ""
+        if _adcopy_comp_data and isinstance(_adcopy_comp_data, dict):
+            _adcopy_diffs = _adcopy_comp_data.get("our_differentiators") or []
+            _adcopy_pos = _adcopy_comp_data.get("positioning_notes") or ""
+            if _adcopy_diffs:
+                _adcopy_diff_block = (
+                    "\nCompetitor Differentiators (use these as headline/description themes — "
+                    "this is what sets us apart from local competitors): "
+                    + "; ".join(_adcopy_diffs)
+                )
+            if _adcopy_pos:
+                _adcopy_diff_block += f"\nPositioning Strategy: {_adcopy_pos}"
+
         from ai_optimizer import GOOGLE_ADS_RULES as _GAR
         prompt = _GAR + f"""You are a Google Ads copywriter. Generate complete RSA ad copy for this dental campaign.
 
@@ -4778,7 +4813,7 @@ Target Audience: {target_audience}
 {kw_context}
 Strategy Headlines: {', '.join(headlines_from_strategy)}
 Strategy Descriptions: {'; '.join(descs_from_strategy)}
-Implementation Notes: {impl_notes}{_site_section}
+Implementation Notes: {impl_notes}{_adcopy_diff_block}{_site_section}
 
 Return a JSON object with this exact structure:
 {{
@@ -4838,6 +4873,86 @@ Rules:
 - daily_budget_pct values should sum to 100
 - suggested_cpc_usd should be realistic for dental keywords ($2-8 range)
 - Return ONLY the JSON object, no explanation."""
+
+    elif step == "competitor_analysis":
+        # Detect campaign type for conquest brand seeding
+        try:
+            from search_term_classifier import _detect_campaign_type as _dtct
+            _camp_type = _dtct(campaign_name)
+        except Exception:
+            _camp_type = "general"
+
+        # Pull conquest brands already known for this campaign type
+        _conquest_brand_map = {
+            "implants":   ["clearchoice", "aspen dental", "affordable dentures", "teeth today", "smile again"],
+            "invisalign": ["smile direct", "smiledirectclub", "byte", "candid"],
+            "cosmetic":   ["smile direct", "smiledirectclub", "byte"],
+        }
+        _known_conquest = _conquest_brand_map.get(_camp_type, [])
+        _conquest_note = ""
+        if _known_conquest:
+            _conquest_note = (
+                f"\nKnown conquest brands for {_camp_type} campaigns (consider as conquest_keywords): "
+                + ", ".join(_known_conquest)
+            )
+        _conquest_instruction = (
+            "conquest_keywords: bare brand name stems only, lowercase, no 'near me' suffix "
+            f"(e.g. 'aspen dental' not 'aspen dental near me'). Only for {_camp_type} campaigns."
+            if _known_conquest else
+            "conquest_keywords: empty array — conquest targeting not recommended for this campaign type."
+        )
+
+        # Target towns for geo context
+        _target_towns = (
+            "Grafton, Shrewsbury, Westborough, Northborough, Millbury, Auburn, Upton, Hopkinton, "
+            "Southborough, Marlborough, Boylston, Holden, Leicester, Spencer, Sutton, Uxbridge, Worcester"
+        )
+
+        prompt = f"""You are a Google Ads competitive intelligence specialist. Analyze the local competitor landscape for a dental practice running a paid search campaign.
+
+PRACTICE: Grafton Dental Care, Grafton MA (Worcester County)
+SERVICES: Full-service dental practice — general dentistry, emergency care, implants, periodontal treatment, Invisalign, cosmetic dentistry, dentures. Dr. Anurag Gupta.
+TARGET TOWNS: {_target_towns}
+
+CAMPAIGN: "{campaign_name}"
+SERVICE FOCUS: {service_focus}
+CAMPAIGN TYPE: {_camp_type}
+OBJECTIVE: {objective}
+TARGET AUDIENCE: {target_audience}
+KEY MESSAGES: {', '.join(key_messages)}
+{_site_section}{_conquest_note}
+
+TASK: Identify 4–6 dental practices that realistically compete for the same patients in this service area for this specific service. Then identify how we can differentiate.
+
+IMPORTANT RULES:
+1. Only name practices you have HIGH confidence exist in this specific area. If unsure, use a generic descriptor like "Independent implant specialist in Shrewsbury" and mark confidence: "low".
+2. Focus on the SERVICE TYPE — for implants, name implant-focused competitors; for emergency, name practices advertising same-day care.
+3. Large chains (Aspen Dental, Gentle Dental, Heartland Dental) may be included if they have locations in Worcester County.
+4. our_differentiators must be specific to Grafton Dental Care — not generic dental tropes. Use the website intelligence and service focus above.
+5. {_conquest_instruction}
+
+Return ONLY a JSON object with this exact structure:
+{{
+  "caveat": "AI-generated competitive intelligence — verify competitor details before use",
+  "campaign_type": "{_camp_type}",
+  "competitors": [
+    {{
+      "name": "Practice Name",
+      "location": "City, MA",
+      "confidence": "high|medium|low",
+      "likely_emphasis": "What they probably lead with in ads (e.g. price, convenience, technology)",
+      "gap_we_can_address": "Positioning angle we can use against them"
+    }}
+  ],
+  "our_differentiators": [
+    "Specific differentiator 1",
+    "Specific differentiator 2"
+  ],
+  "conquest_keywords": [],
+  "positioning_notes": "Overall positioning strategy for this campaign given the competitive landscape"
+}}
+
+No markdown, no explanation outside the JSON."""
 
     try:
         response = ai_client.messages.create(
