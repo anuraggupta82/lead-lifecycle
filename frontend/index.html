@@ -7,7 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <!-- v20260512-1000 -->
+  <!-- v20260512-1500 -->
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -4195,6 +4195,7 @@ function CallsSubView() {
   const [statusFilter, setStatusFilter] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState('');
+  const [lastRefreshed, setLastRefreshed] = useState(null);
   const [drawerCall, setDrawerCall] = useState(null); // call object shown in detail drawer
   // Per-call analyze state: { uuid: 'idle'|'processing'|'polling'|'done'|'error' }
   const [analyzeState, setAnalyzeState] = useState({});
@@ -4260,10 +4261,16 @@ function CallsSubView() {
       setTotal(d.total || 0);
       setAdCallCount(d.ad_calls_from_gads || 0);
     } catch(e) { console.error('Calls load error', e); }
-    finally { setLoading(false); }
+    finally { setLoading(false); setLastRefreshed(new Date()); }
   }
 
   useEffect(() => { loadCalls(); loadCallFlags(); }, [days, dirFilter, statusFilter]);
+
+  // Auto-refresh every 5 minutes to match backend Mango sync cadence
+  useEffect(() => {
+    const id = setInterval(() => { loadCalls(); loadCallFlags(); }, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [days, dirFilter, statusFilter]);
 
   async function loadConversions() {
     setConvLoading(true);
@@ -4275,6 +4282,12 @@ function CallsSubView() {
   }
 
   useEffect(() => { loadConversions(); }, [days, convMinDur]);
+
+  // Auto-refresh conversions every 5 minutes
+  useEffect(() => {
+    const id = setInterval(() => loadConversions(), 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [days, convMinDur]);
 
   async function handleSync() {
     setSyncing(true); setSyncMsg('');
@@ -4664,7 +4677,7 @@ function CallsSubView() {
             </span>
             {flagsLoading
               ? <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>
-              : <span style={{fontSize:11,color:'#dc2626'}}>{callFlags.filter(f=>f.flag_type.startsWith('missed_new')).length} new patient{callFlags.filter(f=>f.flag_type.startsWith('missed_new')).length!==1?'s':''} • {callFlags.filter(f=>f.flag_type.includes('short')).length} short GAds call{callFlags.filter(f=>f.flag_type.includes('short')).length!==1?'s':''}</span>
+              : <span style={{fontSize:11,color:'#dc2626'}}>{callFlags.filter(f=>f.flag_type.startsWith('missed_new')).length} new patient{callFlags.filter(f=>f.flag_type.startsWith('missed_new')).length!==1?'s':''} missed</span>
             }
           </div>
           <span style={{fontSize:13,color:'var(--text-muted)'}}>{flagsExpanded?'▲':'▼'}</span>
@@ -4685,8 +4698,6 @@ function CallsSubView() {
                   missed_new_patient: {label:'Missed – New Pt', color:'#dc2626', bg:'#fff5f5'},
                   missed_existing_patient: {label:'Missed – Existing Pt', color:'#b45309', bg:'#fffbeb'},
                   missed_new_patient_unattributed: {label:'Missed – New Pt (no GAds)', color:'#6d28d9', bg:'#faf5ff'},
-                  short_gads_call: {label:'Short GAds Call', color:'#0369a1', bg:'#eff6ff'},
-                  unconverted_short_gads_call: {label:'Unconverted Short', color:'#0369a1', bg:'#eff6ff'},
                 };
                 const fl = flagLabels[f.flag_type] || {label:f.flag_type, color:'#374151', bg:'#f9fafb'};
                 const confColor = (f.match_confidence_at_flag||0)>=0.75?'#16a34a':(f.match_confidence_at_flag||0)>=0.60?'#b45309':'#dc2626';
@@ -4965,6 +4976,7 @@ function CallsSubView() {
         {syncMsg && <span style={{fontSize:11,color:syncMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{syncMsg}</span>}
         {bulkMsg && <span style={{fontSize:11,color:bulkMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{bulkMsg}</span>}
         {loading && <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>}
+        {!loading && lastRefreshed && <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>↻ {lastRefreshed.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true})}</span>}
       </div>
 
       {/* Calls table */}
@@ -5991,6 +6003,11 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [unifiedLoading, setUnifiedLoading] = useState(false);
   const [showInactive, setShowInactive] = useState(false);
   const [unifiedDays, setUnifiedDays] = useState(30);
+  // Budget summary
+  const [budgetSummary, setBudgetSummary] = useState(null);
+  const [acctBudgetEdit, setAcctBudgetEdit] = useState(false);
+  const [acctBudgetDraft, setAcctBudgetDraft] = useState('');
+  const [acctBudgetSaving, setAcctBudgetSaving] = useState(false);
   const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts}}
   const [aiReviewSaving, setAiReviewSaving] = useState({});
   const [aiMaxSaving, setAiMaxSaving] = useState({});
@@ -6081,6 +6098,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         api(`/api/admin/calls/campaign-attribution?days=${unifiedDays}`).catch(()=>[]),
       ]);
       setUnifiedCamps(d.campaigns || []);
+      if (d.budget_summary) setBudgetSummary(d.budget_summary);
       // Build lookup: campaign_id → call stats (also index by name for fallback)
       const attrib = {};
       (callRows || []).forEach(r => {
@@ -6092,6 +6110,24 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     finally { setUnifiedLoading(false); }
   }
   useEffect(() => { loadUnifiedCamps(); }, [unifiedDays, showInactive]);
+
+  async function saveAccountBudget() {
+    const val = parseFloat(acctBudgetDraft);
+    if (isNaN(val) || val < 0) { alert('Enter a valid budget amount'); return; }
+    setAcctBudgetSaving(true);
+    try {
+      await api('/api/admin/account-budget', {
+        method: 'POST',
+        body: JSON.stringify({ account_monthly_budget: val }),
+      });
+      setBudgetSummary(s => s ? {...s, account_monthly_budget: val} : s);
+      setAcctBudgetEdit(false);
+    } catch(e) {
+      alert('Save failed: ' + (e?.detail || e?.message || 'error'));
+    } finally {
+      setAcctBudgetSaving(false);
+    }
+  }
 
   async function toggleAiReview(camp) {
     if (!camp.campaign_id || camp.is_synthetic) return;
@@ -6709,6 +6745,168 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
             <button className="btn btn-ghost btn-sm" onClick={loadUnifiedCamps} style={{fontSize:10}}>↻ Refresh</button>
           </div>
         </div>
+
+        {/* ── Budget Summary Strip ─────────────────────────────────────────── */}
+        {budgetSummary && (() => {
+          const bs = budgetSummary;
+          const acctBudget  = bs.account_monthly_budget || 0;
+          const totalBudget = bs.total_monthly_budget   || 0;
+          const actualSpend = bs.total_actual_spend      || 0;
+          const projected   = bs.projected_month_end     || 0;
+          const daysElapsed = bs.days_elapsed            || 1;
+          const daysLeft    = Math.max(0, 30 - daysElapsed);
+
+          // Progress bar: actual vs account budget (or campaign budgets if no account budget set)
+          const budgetRef  = acctBudget > 0 ? acctBudget : totalBudget;
+          const spendPct   = budgetRef > 0 ? Math.min(100, (actualSpend / budgetRef) * 100) : 0;
+          const projPct    = budgetRef > 0 ? Math.min(100, (projected   / budgetRef) * 100) : 0;
+          const overBudget = projected > budgetRef && budgetRef > 0;
+          const underPacing = projected < (budgetRef * 0.8) && budgetRef > 0;
+
+          const statusColor = overBudget ? '#dc2626' : underPacing ? '#f59e0b' : '#16a34a';
+          const statusLabel = overBudget ? '⚠️ Over Pace' : underPacing ? '📉 Under Pace' : '✅ On Track';
+
+          return (
+            <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,
+              padding:'12px 16px',marginBottom:12}}>
+              {/* Row 1: KPI tiles */}
+              <div style={{display:'flex',gap:0,flexWrap:'wrap',marginBottom:10,
+                borderBottom:'1px solid var(--border)',paddingBottom:10}}>
+
+                {/* Account Budget tile — editable */}
+                <div style={{flex:'1 1 140px',padding:'4px 16px 4px 0',borderRight:'1px solid var(--border)',marginRight:16}}>
+                  <div style={{fontSize:10,color:'var(--text-muted)',fontWeight:600,textTransform:'uppercase',
+                    letterSpacing:'0.05em',marginBottom:3}}>
+                    Monthly Budget
+                    <button onClick={()=>{setAcctBudgetEdit(true);setAcctBudgetDraft(acctBudget||'');}}
+                      style={{marginLeft:6,fontSize:9,padding:'1px 5px',borderRadius:3,
+                        background:'none',border:'1px solid var(--border)',cursor:'pointer',
+                        color:'var(--text-muted)'}}>✏️ Edit</button>
+                  </div>
+                  {acctBudgetEdit ? (
+                    <div style={{display:'flex',gap:4,alignItems:'center',marginTop:2}}>
+                      <span style={{fontSize:13,color:'var(--text-muted)'}}>$</span>
+                      <input type="number" min="0" step="50"
+                        value={acctBudgetDraft}
+                        onChange={e=>setAcctBudgetDraft(e.target.value)}
+                        onKeyDown={e=>{if(e.key==='Enter')saveAccountBudget();if(e.key==='Escape')setAcctBudgetEdit(false);}}
+                        style={{width:80,fontSize:13,fontWeight:700,padding:'2px 6px',
+                          border:'1px solid var(--teal)',borderRadius:4,outline:'none'}}
+                        autoFocus />
+                      <button onClick={saveAccountBudget} disabled={acctBudgetSaving}
+                        style={{padding:'2px 8px',borderRadius:4,background:'var(--teal)',
+                          color:'#fff',border:'none',fontSize:10,cursor:'pointer',fontWeight:600}}>
+                        {acctBudgetSaving ? '…' : 'Save'}
+                      </button>
+                      <button onClick={()=>setAcctBudgetEdit(false)}
+                        style={{padding:'2px 6px',borderRadius:4,background:'none',
+                          border:'1px solid var(--border)',fontSize:10,cursor:'pointer',
+                          color:'var(--text-muted)'}}>✕</button>
+                    </div>
+                  ) : (
+                    <div style={{fontSize:20,fontWeight:700,color: acctBudget>0?'var(--text)':'var(--text-muted)'}}>
+                      {acctBudget > 0 ? `$${acctBudget.toLocaleString()}/mo` : <span style={{fontSize:13}}>Not set</span>}
+                    </div>
+                  )}
+                  {totalBudget > 0 && acctBudget > 0 && (
+                    <div style={{fontSize:10,color: totalBudget > acctBudget ? '#dc2626' : 'var(--text-muted)',marginTop:2}}>
+                      {totalBudget > acctBudget ? '⚠️' : '✓'} Campaign total: ${totalBudget.toLocaleString()}/mo
+                    </div>
+                  )}
+                </div>
+
+                {/* Campaign budgets total */}
+                <div style={{flex:'1 1 120px',padding:'4px 16px 4px 0',borderRight:'1px solid var(--border)',marginRight:16}}>
+                  <div style={{fontSize:10,color:'var(--text-muted)',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:3}}>Campaign Budgets</div>
+                  <div style={{fontSize:20,fontWeight:700,color:'var(--text)'}}>
+                    ${totalBudget.toLocaleString()}<span style={{fontSize:11,fontWeight:400,color:'var(--text-muted)'}}>/mo</span>
+                  </div>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                    ${bs.total_daily_budget.toFixed(2)}/day · {bs.active_campaign_count} active
+                  </div>
+                </div>
+
+                {/* Actual spend MTD */}
+                <div style={{flex:'1 1 120px',padding:'4px 16px 4px 0',borderRight:'1px solid var(--border)',marginRight:16}}>
+                  <div style={{fontSize:10,color:'var(--text-muted)',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:3}}>
+                    Actual Spend <span style={{textTransform:'none',fontWeight:400}}>(day {daysElapsed})</span>
+                  </div>
+                  <div style={{fontSize:20,fontWeight:700,color:'var(--text)'}}>${actualSpend.toFixed(2)}</div>
+                  <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                    ${(actualSpend/daysElapsed).toFixed(2)}/day avg · {daysLeft}d left
+                  </div>
+                </div>
+
+                {/* Projected month-end */}
+                <div style={{flex:'1 1 120px',padding:'4px 16px 4px 0',borderRight:'1px solid var(--border)',marginRight:16}}>
+                  <div style={{fontSize:10,color:'var(--text-muted)',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:3}}>Projected Month-End</div>
+                  <div style={{fontSize:20,fontWeight:700,color: overBudget?'#dc2626':'var(--text)'}}>
+                    ${projected.toFixed(2)}
+                  </div>
+                  <div style={{fontSize:10,color: overBudget?'#dc2626':underPacing?'#b45309':'#16a34a',fontWeight:600,marginTop:2}}>
+                    {statusLabel}
+                  </div>
+                </div>
+
+                {/* Remaining budget */}
+                {budgetRef > 0 && (
+                  <div style={{flex:'1 1 120px',padding:'4px 0'}}>
+                    <div style={{fontSize:10,color:'var(--text-muted)',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:3}}>Remaining</div>
+                    <div style={{fontSize:20,fontWeight:700,color: overBudget?'#dc2626':'#16a34a'}}>
+                      {overBudget ? `-$${(projected-budgetRef).toFixed(2)}` : `$${(budgetRef-actualSpend).toFixed(2)}`}
+                    </div>
+                    <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
+                      {budgetRef > 0 ? `${Math.round((actualSpend/budgetRef)*100)}% used` : ''}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Row 2: Spend progress bar */}
+              {budgetRef > 0 && (
+                <div>
+                  <div style={{display:'flex',justifyContent:'space-between',fontSize:10,
+                    color:'var(--text-muted)',marginBottom:4}}>
+                    <span>Spend progress vs {acctBudget > 0 ? 'account budget' : 'campaign budgets'}: ${budgetRef.toLocaleString()}/mo</span>
+                    <span style={{color:statusColor,fontWeight:600}}>{Math.round(spendPct)}% spent · {Math.round(projPct)}% projected</span>
+                  </div>
+                  <div style={{position:'relative',height:8,background:'#f3f4f6',borderRadius:4,overflow:'hidden'}}>
+                    {/* Projected bar (behind) */}
+                    <div style={{position:'absolute',top:0,left:0,height:'100%',
+                      width:`${projPct}%`,
+                      background: overBudget?'#fca5a5': underPacing?'#fde68a':'#bbf7d0',
+                      borderRadius:4,transition:'width .3s'}} />
+                    {/* Actual spend bar (on top) */}
+                    <div style={{position:'absolute',top:0,left:0,height:'100%',
+                      width:`${spendPct}%`,
+                      background: overBudget?'#dc2626': underPacing?'#f59e0b':'#16a34a',
+                      borderRadius:4,transition:'width .3s'}} />
+                    {/* Budget limit line */}
+                    <div style={{position:'absolute',top:0,right:0,width:2,height:'100%',
+                      background:'#374151'}} />
+                  </div>
+                  <div style={{display:'flex',gap:12,fontSize:10,color:'var(--text-muted)',marginTop:4}}>
+                    <span style={{display:'flex',alignItems:'center',gap:3}}>
+                      <span style={{width:8,height:8,borderRadius:2,background:'#16a34a',display:'inline-block'}}/>
+                      Actual (${actualSpend.toFixed(2)})
+                    </span>
+                    <span style={{display:'flex',alignItems:'center',gap:3}}>
+                      <span style={{width:8,height:8,borderRadius:2,background:'#bbf7d0',border:'1px solid #86efac',display:'inline-block'}}/>
+                      Projected (${projected.toFixed(2)})
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* Future feature notice */}
+              <div style={{marginTop:8,padding:'5px 10px',background:'#eff6ff',border:'1px solid #bfdbfe',
+                borderRadius:5,fontSize:10,color:'#1e40af',display:'flex',alignItems:'center',gap:6}}>
+                <span>🔮</span>
+                <span>Coming soon: Set a total account budget and let AI intelligently distribute it across campaigns based on performance data.</span>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Table */}
         <table className="report-table">

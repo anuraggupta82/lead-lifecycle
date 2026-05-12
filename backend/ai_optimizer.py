@@ -1495,9 +1495,35 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    "spanish" OR "competitor" OR "wrong_intent" → return add_negative_keyword with
    match_type="PHRASE". For "zero_lead", only flag if cost >= $20.
 
-4. lqi.schedule — hourly + day-of-week call quality. The "hotspots" array lists slots with
-   high short_pct or outside_office_hours. If 2+ hotspots show flag="outside_office_hours"
-   with calls >= 5 each, return a claude_advisory recommending an ad schedule narrow.
+4. lqi.schedule — CAMPAIGN-TYPE-AWARE SCHEDULE ANALYSIS:
+   Data: lqi.schedule.hotspots = [{dow, dow_name, hour, calls, short_calls, short_pct, in_office_hours, flag}]
+         lqi.schedule.by_hour   = [{hour, calls, short_calls, missed, in_office_hours}]
+         lqi.schedule.by_dow    = [{dow, dow_name, calls, short_calls, in_office_hours}]
+
+   FIRST determine this campaign's intent type from its name:
+   - EMERGENCY type: contains "emergency", "urgent", "pain", "toothache", "broken", "same day", "same-day"
+   - ELECTIVE type: contains "implant", "veneer", "denture", "invisalign", "smile", "cosmetic", "whitening"
+   - GENERAL type: everything else
+
+   THEN apply these rules:
+
+   EMERGENCY campaigns:
+   - Any hotspot with in_office_hours=false AND calls >= 3 is waste (emergency patients need immediate answers).
+   - Recommend pausing overnight hours (9pm–7am) if any after-hours hotspot shows short_pct > 0.35.
+   - If by_dow shows weekend day with short_pct > 0.50 AND calls >= 3 → recommend DOW suppression.
+   - Return: claude_advisory with specific hours/days to suppress, framed as "patients who call after hours
+     will immediately call a competitor who answers — this spend is nearly zero-ROI."
+
+   ELECTIVE campaigns:
+   - Evening hours (6pm–9pm) can still convert — research happens at home. Do NOT suppress these.
+   - Flag only extreme overnight hours (11pm–6am) with calls >= 5 and short_pct > 0.50.
+   - Prefer recommending bid adjustments (change_bid_strategy) over full suppression.
+
+   GENERAL campaigns:
+   - Flag hotspots where in_office_hours=false AND short_pct >= 0.50 AND calls >= 3.
+   - Recommend schedule tightening as a conservative spend optimization.
+
+   Always cite specific data. Budget discipline beats spend volume for a small practice.
 
 5. lqi.cold_leads — cold rate by utm_campaign, source, keyword + time_to_first_contact
    medians. If by_keyword shows a keyword with cold_rate >= 0.7 AND leads >= 5, recommend
@@ -1804,8 +1830,17 @@ def _call_claude_account_level(
         except Exception as _cqf_err:
             logger.debug(f"call_flag_summary fetch failed (non-fatal): {_cqf_err}")
 
+        # Read account budget constraint
+        _account_budget = 0.0
+        try:
+            _acct_budget_raw = _get_setting("account_monthly_budget") or "0"
+            _account_budget = float(_acct_budget_raw)
+        except Exception:
+            pass
+
         context = {
             "account_summary": summary,
+            "account_monthly_budget_usd": _account_budget,  # 0 = not set
             "campaign_performance": camp_perf,
             "campaign_resources": camp_resources,
             "cross_campaign_search_terms": dict(list(cross_camp_terms.items())[:30]),
@@ -1848,6 +1883,16 @@ Operation-specific fields (same spec as campaign-level):
 - claude_advisory: "insight" (account-level observation, no API action needed)
 
 Focus areas for account-level recs:
+0. BUDGET DISCIPLINE (check account_monthly_budget_usd first):
+   - If account_monthly_budget_usd > 0: compare sum of campaign daily_budgets × 30 vs account budget.
+     If campaigns are over the account budget, flag which campaign(s) to trim via change_budget.
+     If campaigns are under the account budget AND one campaign has strong conversion data, suggest
+     reallocating headroom to that campaign via change_budget (NOT to the weakest campaign).
+   - IMPORTANT: Be skeptical of budget increase recommendations. Only recommend budget increases when:
+     (a) the campaign has 3+ conversions in the window AND CPL is below industry average ($150 for dental)
+     (b) the campaign is impression-share-limited (shown in camp_settings if available)
+     (c) there is clear headroom within the account_monthly_budget
+   - Never recommend increasing budget just because spend is low. Low spend without conversions = pause, not increase.
 1. COMPETITOR NAMES appearing across multiple campaigns → add_negative_keyword (highest-spend campaign's resource)
 2. BUDGET REBALANCING — if one campaign has 0 conversions/calls but high spend vs another with conversions → change_budget
 3. BID STRATEGY — if a campaign has enough conversion data to switch strategies → change_bid_strategy
@@ -1878,11 +1923,44 @@ The "lqi" field in the account data contains pre-computed quality signals across
    - If a source has high leads but booked_rate < 0.10, suggest ad copy / landing page review for that source.
    - If cold_rate > 0.60 for a source, recommend reviewing that source for misleading intent signals.
 
-2. SCHEDULE WASTE (lqi.schedule_summary):
-   - lqi.schedule_summary.hotspots is a list of {dow, dow_name, hour, calls, short_calls, short_pct, in_office_hours, flag}.
-   - flag contains "outside_office_hours" when in_office_hours=false, and/or "high_short_pct" when short_pct >= 0.5.
-   - If ≥ 3 hotspots have in_office_hours=false, recommend adding an ad schedule to suppress ads during those windows account-wide.
-   - For each hotspot, cite the dow_name, hour, calls count, and whether it is outside office hours.
+2. SCHEDULE WASTE — CAMPAIGN-TYPE-AWARE ANALYSIS (lqi.schedule_summary):
+   Data: lqi.schedule_summary.hotspots = [{dow, dow_name, hour, calls, short_calls, short_pct, in_office_hours, flag}]
+         lqi.schedule_summary.by_dow   = [{dow, dow_name, calls, short_calls, in_office_hours}]
+         lqi.schedule_summary.by_hour  = [{hour, calls, short_calls, missed, in_office_hours}]
+
+   CORE PRINCIPLE: Budget is limited. Every dollar spent when users cannot or will not convert is waste.
+   Google's default recommendation is always to run 24/7 — but this serves Google's revenue, not yours.
+   Your job is to spend smarter, not more.
+
+   CAMPAIGN-TYPE SCHEDULING RULES (apply per-campaign, not account-wide):
+
+   A. EMERGENCY / URGENT campaigns (keywords: emergency, pain, toothache, urgent, broken tooth, same day):
+      - Patients in pain need IMMEDIATE resolution. If they call after hours and get no answer, they call
+        the next result — the impression and click spend is 100% wasted.
+      - STRONG recommendation to pause overnight hours (typically 9pm–7am) for emergency campaigns.
+      - Weekend performance must be evaluated against whether the office is open on weekends.
+        If office is closed Sat/Sun, suppress those days unless there is a same-day emergency protocol.
+      - High short_pct after-hours = strong signal (patients hung up, no answer).
+
+   B. ELECTIVE / CONSIDERED-PURCHASE campaigns (implants, veneers, dentures, Invisalign, smile makeover):
+      - Patients research over days/weeks. An after-hours impression may lead to a next-morning call.
+      - Evening hours (7pm–9pm) can be valuable for these — people research at home.
+      - However, very late night (11pm–5am) is still waste for dental services.
+      - Recommend keeping evening hours but potentially reducing bids (change_bid_strategy) rather than full pause.
+
+   C. GENERAL / HYGIENE / CHECKUP campaigns:
+      - Standard office hours + modest evening window usually optimal.
+      - Weekend suppression is appropriate if office closed, but verify first.
+
+   ANALYSIS STEPS:
+   1. Look at hotspots with in_office_hours=false AND short_pct >= 0.40 → these are confirmed waste windows.
+   2. For each waste window, identify which campaign type it belongs to using its name.
+   3. For emergency-type campaigns: emit a change_bid_strategy (or ideally note for operator) to add an
+      ad schedule excluding the waste hours.
+   4. For elective campaigns: only flag extreme hours (midnight–5am). Evening is usually fine.
+   5. If by_dow shows a specific day-of-week has short_pct > 0.50 AND calls > 3, recommend schedule exclusion for that DOW.
+   6. Always cite the specific data: "DOW X, hour Y: Z calls, A short (B%) — outside office hours".
+   7. Do NOT blindly recommend running 24/7. Restraint is the right strategy for a small practice.
 
 3. BAD SEARCH TERMS — CROSS-CAMPAIGN (lqi.bad_search_terms):
    - lqi.bad_search_terms.by_campaign maps campaign_name to a list of {search_term, classification, cost, clicks}.

@@ -450,10 +450,18 @@ def sync_mango_calls(
     # Normalize all calls first, then batch-upsert in a single DB connection
     # to avoid [Errno 24] Too many open files (WAL mode = 3 fds per connection)
     normalized_calls = []
+    skipped_internal = 0
     for raw in raw_calls:
+        # Skip internal calls — Mango marks these with direction="internal"
+        # This covers staff extensions dialing out (101→external) and true ext-to-ext
+        if raw.get('direction') == 'internal':
+            skipped_internal += 1
+            continue
         normalized = normalize_call(raw)
         if normalized["uuid"]:
             normalized_calls.append(normalized)
+    if skipped_internal:
+        logger.info(f"Mango sync: skipped {skipped_internal} internal calls")
 
     count = 0
     if normalized_calls:

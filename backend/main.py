@@ -3281,13 +3281,37 @@ def admin_campaigns_unified(days: int = 30, include_inactive: bool = False):
     Synthetic rows are emitted for GAds campaigns in gads_daily_stats that were
     never imported into the campaigns table.
     """
-    from database import get_unified_campaigns
+    from database import get_unified_campaigns, get_setting
     if days < 1 or days > 365:
         raise HTTPException(status_code=422, detail="days must be between 1 and 365")
     rows = get_unified_campaigns(days=days)
     if not include_inactive:
         rows = [r for r in rows if not r.get("is_inactive_90d")]
-    return {"campaigns": rows, "days": days, "include_inactive": include_inactive}
+
+    # ── Budget summary ────────────────────────────────────────────────────────
+    active_rows = [r for r in rows if (r.get("status") or "").upper() == "ACTIVE"]
+    total_monthly_budget   = sum(r.get("monthly_budget") or 0.0 for r in rows)
+    total_daily_budget     = sum(r.get("daily_budget_usd") or
+                                  round((r.get("monthly_budget") or 0.0) / 30.4, 2)
+                                  for r in active_rows)
+    total_actual_spend     = sum((r.get("metrics") or {}).get("cost") or 0.0 for r in rows)
+    # Projected month-end: scale actual spend by (30 / days_elapsed)
+    from datetime import date as _date
+    day_of_month = _date.today().day
+    projected_month_end = round(total_actual_spend * 30.0 / max(day_of_month, 1), 2) if total_actual_spend > 0 else 0.0
+    account_monthly_budget = float(get_setting("account_monthly_budget") or 0.0)
+    budget_summary = {
+        "total_monthly_budget":   round(total_monthly_budget, 2),
+        "total_daily_budget":     round(total_daily_budget, 2),
+        "total_actual_spend":     round(total_actual_spend, 2),
+        "projected_month_end":    projected_month_end,
+        "account_monthly_budget": account_monthly_budget,
+        "days_elapsed":           day_of_month,
+        "active_campaign_count":  len(active_rows),
+    }
+
+    return {"campaigns": rows, "days": days, "include_inactive": include_inactive,
+            "budget_summary": budget_summary}
 
 
 class CampaignUpdateFieldsRequest(BaseModel):
@@ -6529,7 +6553,10 @@ def admin_get_call_flags(days: int = 30, unresolved_only: bool = True):
     try:
         from database import get_call_flags
         days = max(1, min(int(days), 365))
-        flags = get_call_flags(days=days, unresolved_only=unresolved_only)
+        all_flags = get_call_flags(days=days, unresolved_only=unresolved_only)
+        # Short call flags are kept for LQI/AI analysis but excluded from the UI panel
+        _SHORT_FLAG_TYPES = {"short_gads_call", "unconverted_short_gads_call"}
+        flags = [f for f in all_flags if f.get("flag_type") not in _SHORT_FLAG_TYPES]
         return {"flags": flags, "total": len(flags)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -9625,6 +9652,26 @@ def admin_save_practice_settings(body: PracticeSettingsRequest):
     for f in _PRACTICE_FIELDS:
         save_setting(f"practice_{f}", getattr(body, f).strip())
     return {"ok": True}
+
+
+# ─── Account Monthly Budget ──────────────────────────────────────────────────
+
+class AccountBudgetRequest(BaseModel):
+    account_monthly_budget: float
+
+@app.get("/api/admin/account-budget", dependencies=[Depends(_require_admin)])
+def admin_get_account_budget():
+    from database import get_setting
+    val = get_setting("account_monthly_budget") or "0"
+    return {"account_monthly_budget": float(val)}
+
+@app.post("/api/admin/account-budget", dependencies=[Depends(_require_admin)])
+def admin_save_account_budget(body: AccountBudgetRequest):
+    from database import save_setting
+    if body.account_monthly_budget < 0:
+        raise HTTPException(status_code=422, detail="Budget cannot be negative")
+    save_setting("account_monthly_budget", str(round(body.account_monthly_budget, 2)))
+    return {"ok": True, "account_monthly_budget": round(body.account_monthly_budget, 2)}
 
 
 # ─── AI Generate Single Message ──────────────────────────────────────────────
