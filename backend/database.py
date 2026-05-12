@@ -269,8 +269,6 @@ CREATE TABLE IF NOT EXISTS gads_geo_cache (
     synced_at       TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_geo_cache_key ON gads_geo_cache(location_name, campaign_name, days);
-
 CREATE TABLE IF NOT EXISTS gads_schedule_cache (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     segment_type    TEXT NOT NULL,  -- 'hour' / 'day' / 'device'
@@ -1155,8 +1153,6 @@ def _migrate(conn):
             synced_at       TEXT NOT NULL
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_geo_cache_key ON gads_geo_cache(location_name, campaign_name, days)")
-
     # Schedule / device / hour-of-day cache
     conn.execute("""
         CREATE TABLE IF NOT EXISTS gads_schedule_cache (
@@ -2110,6 +2106,26 @@ GROUP BY a.campaign_id, c.campaign_name;
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_media_library_filename ON media_library(filename)")
+
+    # ── Geo intelligence — view_type + campaign_resource columns (May 2026) ──
+    geo_cols = {row[1] for row in conn.execute("PRAGMA table_info(gads_geo_cache)").fetchall()}
+    for _col, _def in [
+        ("view_type",         "TEXT NOT NULL DEFAULT 'targeted'"),
+        ("campaign_resource", "TEXT NOT NULL DEFAULT ''"),
+        ("zip_code",          "TEXT NOT NULL DEFAULT ''"),
+        ("distance_band",     "TEXT NOT NULL DEFAULT ''"),
+    ]:
+        if _col not in geo_cols:
+            try:
+                conn.execute(f"ALTER TABLE gads_geo_cache ADD COLUMN {_col} {_def}")
+            except Exception:
+                pass
+    # Update unique index to include view_type (drop old, create new)
+    conn.execute("DROP INDEX IF EXISTS idx_gads_geo_cache_key")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_geo_cache_key_v2
+        ON gads_geo_cache(location_name, campaign_name, days, view_type)
+    """)
 
 
 def _seed_call_grading_criteria(conn):
@@ -3898,29 +3914,39 @@ def get_search_term_stats(campaign_name: str = "", days: int = 30) -> list:
         return [dict(r) for r in rows]
 
 
-def save_gads_geo_cache(geo_data: list, days: int = 30):
-    """Save geographic performance data to cache."""
+def save_gads_geo_cache(geo_data: list, days: int = 30, view_type: str = "targeted"):
+    """Save geographic performance data to cache. view_type: 'targeted' or 'physical'."""
+    from geo_distance import city_to_distance_band, zip_to_distance_band
     now = _now()
     with _conn() as conn:
         for g in geo_data:
+            loc = g.get("location_name", "")
+            zip_code = g.get("zip_code", "")
+            # Compute distance band from zip first, fall back to city name
+            d_band = zip_to_distance_band(zip_code) if zip_code else city_to_distance_band(loc)
             conn.execute("""
                 INSERT INTO gads_geo_cache
-                    (location_name, location_type, campaign_name,
-                     impressions, clicks, cost, conversions, cpc, conversion_rate, days, synced_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(location_name, campaign_name, days) DO UPDATE SET
+                    (location_name, location_type, campaign_name, campaign_resource,
+                     impressions, clicks, cost, conversions, cpc, conversion_rate,
+                     days, view_type, zip_code, distance_band, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(location_name, campaign_name, days, view_type) DO UPDATE SET
                     location_type=excluded.location_type,
+                    campaign_resource=excluded.campaign_resource,
                     impressions=excluded.impressions,
                     clicks=excluded.clicks,
                     cost=excluded.cost,
                     conversions=excluded.conversions,
                     cpc=excluded.cpc,
                     conversion_rate=excluded.conversion_rate,
+                    zip_code=excluded.zip_code,
+                    distance_band=excluded.distance_band,
                     synced_at=excluded.synced_at
             """, (
-                g.get("location_name", ""),
+                loc,
                 g.get("location_type", ""),
                 g.get("campaign_name", ""),
+                g.get("campaign_resource", ""),
                 g.get("impressions", 0),
                 g.get("clicks", 0),
                 g.get("cost", 0.0),
@@ -3928,6 +3954,9 @@ def save_gads_geo_cache(geo_data: list, days: int = 30):
                 g.get("cpc", 0.0),
                 g.get("conversion_rate", 0.0),
                 days,
+                g.get("view_type", view_type),
+                zip_code,
+                d_band,
                 now,
             ))
 
@@ -3943,6 +3972,62 @@ def get_geo_stats(days: int = 30) -> list:
             ORDER BY conversions DESC, clicks DESC
         """, (days,)).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_geo_stats_by_campaign(campaign_name: str = "", days: int = 30) -> list:
+    """Return geo performance rows for a specific campaign (both view types)."""
+    with _conn() as conn:
+        if campaign_name:
+            rows = conn.execute("""
+                SELECT location_name, location_type, campaign_name, campaign_resource,
+                       impressions, clicks, cost, conversions, cpc, conversion_rate,
+                       view_type, zip_code, distance_band, synced_at
+                FROM gads_geo_cache
+                WHERE days = ? AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                ORDER BY view_type, conversions DESC, clicks DESC
+            """, (days, campaign_name)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT location_name, location_type, campaign_name, campaign_resource,
+                       impressions, clicks, cost, conversions, cpc, conversion_rate,
+                       view_type, zip_code, distance_band, synced_at
+                FROM gads_geo_cache
+                WHERE days = ?
+                ORDER BY campaign_name, view_type, conversions DESC, clicks DESC
+            """, (days,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_geo_json_for_campaign_resource(campaign_resource: str) -> str:
+    """
+    Return the geographic_targeting JSON string for a campaign looked up by its
+    gads_campaign_resource. Returns empty string if not found.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT geographic_targeting FROM campaigns WHERE gads_campaign_resource = ? LIMIT 1",
+            (campaign_resource,)
+        ).fetchone()
+        return (row[0] or "") if row else ""
+
+
+def update_geo_json_for_campaign_resource(campaign_resource: str, geo_json: str) -> bool:
+    """
+    Persist an updated geographic_targeting JSON string for a campaign identified by
+    its gads_campaign_resource. Returns True if a row was updated, False otherwise.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE campaigns SET geographic_targeting = ?, updated_at = ? WHERE gads_campaign_resource = ?",
+            (geo_json, now, campaign_resource)
+        )
+        changed = conn.execute(
+            "SELECT COUNT(*) FROM campaigns WHERE gads_campaign_resource = ?",
+            (campaign_resource,)
+        ).fetchone()[0]
+        return changed > 0
 
 
 def save_gads_schedule_cache(schedule_data: dict, days: int = 30):

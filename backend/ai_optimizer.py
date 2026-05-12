@@ -152,6 +152,69 @@ _CAMPAIGN_TYPE_TOKENS = {
     # default fallback = "general"
 }
 
+# ── Geo default profiles by campaign type ─────────────────────────────────────────────────
+# Injected into Claude prompt as "geo_defaults" so the AI knows the ideal state for each
+# campaign type before analyzing actual location performance data.
+# Safety constraints: EMERGENCY max ≤ 10 mi; IMPLANTS min ≥ 15 mi.
+_GEO_DEFAULTS_BY_TYPE: dict[str, dict] = {
+    "EMERGENCY": {
+        "max_radius_miles": 10,
+        "target_radius_miles": 7,
+        "rationale": "Emergency dental patients cannot travel far; high urgency = low radius tolerance.",
+        "excluded_zips": ["01608", "01610"],  # downtown Worcester — too competitive, low conversion
+        "must_include_zips": ["01519", "01536", "01545", "01581", "01527", "01590", "01772"],
+    },
+    "GENERAL": {
+        "max_radius_miles": 15,
+        "target_radius_miles": 12,
+        "rationale": "General dentistry patients will travel up to ~12 miles for a trusted practice.",
+        "excluded_zips": [],
+        "must_include_zips": [],
+    },
+    "ELECTIVE": {  # cosmetic, veneers, whitening, invisalign
+        "max_radius_miles": 30,
+        "target_radius_miles": 22,
+        "rationale": "Elective patients research extensively and travel for quality; wider radius justified.",
+        "excluded_zips": [],
+        "must_include_zips": ["01701", "01702", "01746", "01748"],  # Framingham, Holliston, Hopkinton
+    },
+    "IMPLANTS": {  # implants, all-on-4, dentures
+        "max_radius_miles": 50,
+        "target_radius_miles": 40,
+        "min_radius_miles": 15,  # safety: never shrink below 15 mi
+        "rationale": "High-value implant patients travel 40+ miles for the right specialist and price.",
+        "excluded_zips": [],
+        "must_include_zips": [],
+    },
+    "BRAND": {
+        "max_radius_miles": 30,
+        "target_radius_miles": 25,
+        "rationale": "Brand/awareness campaigns cast a wider net; name recognition is the goal.",
+        "excluded_zips": [],
+        "must_include_zips": [],
+    },
+}
+
+
+def _geo_defaults_for_campaign(campaign_name: str) -> dict:
+    """
+    Return the geo default profile for a campaign.
+    Delegates to _classify_campaign (single source of truth) so that geo type
+    classification stays in sync with excellence target and LQI signal classification.
+    """
+    # _classify_campaign is defined below; forward-reference OK at call time.
+    ctype = _classify_campaign(campaign_name)  # "emergency"|"implants"|"invisalign"|"cosmetic"|"brand"|"general"
+    _TYPE_MAP = {
+        "emergency":  "EMERGENCY",
+        "implants":   "IMPLANTS",
+        "invisalign": "ELECTIVE",
+        "cosmetic":   "ELECTIVE",
+        "brand":      "BRAND",
+        "general":    "GENERAL",
+    }
+    return _GEO_DEFAULTS_BY_TYPE[_TYPE_MAP.get(ctype, "GENERAL")]
+
+
 # Narrative guidance from Excellence Report — stays in code so it's git-tracked.
 # Numeric targets live in the excellence_targets DB table (editable from UI).
 _EXCELLENCE_NARRATIVE = {
@@ -257,12 +320,16 @@ def _classify_campaign(campaign_name: str) -> str:
     return "general"
 
 
-def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: dict) -> str:
+def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: dict,
+                             campaign_stats: dict | None = None) -> str:
     """
     Build the campaign-type-aware excellence block injected into the Claude prompt.
     Pulls numeric targets from excellence_targets DB and computes a live gap analysis
     against the campaign's actual metrics. Returns empty string on error so the
     optimizer continues working even if the DB call fails.
+
+    campaign_stats: per-campaign 30-day stats (preferred for CPA/CPL comparisons).
+    summary: account-wide totals (fallback only — DO NOT use for per-campaign benchmarks).
     """
     try:
         from database import get_excellence_targets
@@ -273,20 +340,27 @@ def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: di
         targets_service = get_excellence_targets(applies_to=ctype) if ctype != 'all' else []
         all_targets = targets_all + targets_service
 
-        # Metric name → live value mapping (from summary + camp_settings)
-        # summary keys match what _call_claude_advisories receives
+        # Prefer campaign_stats for per-campaign metrics; fall back to account summary
+        # IMPORTANT: summary.cost_per_lead / cost_per_acquisition are ACCOUNT TOTALS —
+        # they must NOT be used as the campaign's CPA benchmark. Use campaign_stats instead.
+        cs = campaign_stats or {}
+        _cpl  = cs.get('cpl_usd')  or 0
+        _cpa  = cs.get('cpa_usd')  or 0
+        _roas = cs.get('roas')     or 0
+
+        # Metric name → live value mapping (from campaign_stats + camp_settings)
         live_values = {
-            'ctr':                    summary.get('ctr', 0),
-            'conv_rate':              summary.get('conv_rate', summary.get('conversion_rate', 0)),
-            'cpl':                    summary.get('cost_per_lead', 0),
-            'cost_per_new_patient':   summary.get('cost_per_lead', 0),  # best proxy available
+            'ctr':                    cs.get('ctr_pct', 0),
+            'conv_rate':              0,  # not tracked at campaign level yet
+            'cpl':                    _cpl,
+            'cost_per_new_patient':   _cpa,
             'impression_share':       (camp_settings.get('search_impression_share') or 0) * 100,
-            'roas':                   summary.get('roas', 0),
+            'roas':                   _roas,
             'budget_lost_is_threshold': (camp_settings.get('search_budget_lost_is') or 0) * 100,
             'rank_lost_is_threshold':   (camp_settings.get('search_rank_lost_is') or 0) * 100,
-            # CPA targets: actual CPA from summary
-            'cpa_min':  summary.get('cost_per_lead', 0),
-            'cpa_max':  summary.get('cost_per_lead', 0),
+            # CPA targets: use campaign-level CPA not account total
+            'cpa_min':  _cpa,
+            'cpa_max':  _cpa,
         }
 
         # Build gap analysis lines
@@ -1161,6 +1235,14 @@ def _build_lqi_campaign_slice(campaign: str, lqi: dict) -> dict:
         if cname.strip().lower() == camp_l:
             lqi_camp_bad_terms = terms
             break
+    # Per-campaign geo signals
+    lqi_camp_geo: dict = {}
+    geo_by_camp = (lqi.get("geo") or {}).get("by_campaign", {})
+    for cname, payload in geo_by_camp.items():
+        if cname.strip().lower() == camp_l:
+            lqi_camp_geo = payload
+            break
+
     return {
         "sources":          lqi.get("sources", {}),
         "calls":            lqi_camp_calls,
@@ -1168,6 +1250,7 @@ def _build_lqi_campaign_slice(campaign: str, lqi: dict) -> dict:
         "schedule":         lqi.get("schedule", {}),
         "cold_leads":       lqi.get("cold_leads", {}),
         "no_shows":         lqi.get("no_shows", {}),
+        "geo":              lqi_camp_geo,
     }
 
 
@@ -1255,11 +1338,52 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                 if campaign_resource:
                     break
 
+        # ── Per-campaign stats (THIS campaign only) ──────────────────────────────────
+        # keyword_perf is already filtered to this campaign before being passed in.
+        # Compute campaign-level spend/clicks/leads so Claude does NOT confuse them
+        # with the account_summary totals (which cover all campaigns combined).
+        _camp_spend   = round(sum(k.get("cost", 0) for k in keyword_perf), 2)
+        _camp_clicks  = sum(k.get("clicks", 0) for k in keyword_perf)
+        _camp_impr    = sum(k.get("impressions", 0) for k in keyword_perf)
+        _camp_convs   = sum(k.get("conversions", 0) for k in keyword_perf)
+        _camp_leads   = sum(v.get("count", v.get("leads", 0)) for v in attribution.values())
+        _camp_calls   = sum(
+            v.get("calls", 0)
+            for cn, v in call_attribution.items()
+            if cn.lower() == campaign.strip().lower()
+        )
+        _camp_booked  = sum(
+            v.get("booked_calls", 0)
+            for cn, v in call_attribution.items()
+            if cn.lower() == campaign.strip().lower()
+        )
+        _camp_acq     = _camp_leads + _camp_booked
+        _camp_prod    = float((od_production.get("by_campaign") or {}).get(campaign, 0))
+        campaign_stats = {
+            "spend_30d_usd":        _camp_spend,
+            "clicks_30d":           _camp_clicks,
+            "impressions_30d":      _camp_impr,
+            "gads_conversions_30d": round(_camp_convs, 1),
+            "form_leads_30d":       _camp_leads,
+            "calls_30d":            _camp_calls,
+            "booked_calls_30d":     _camp_booked,
+            "total_acquisitions":   _camp_acq,
+            "od_production_usd":    round(_camp_prod, 2),
+            "cpa_usd":              round(_camp_spend / _camp_acq, 2) if _camp_acq > 0 else None,
+            "cpl_usd":              round(_camp_spend / _camp_leads, 2) if _camp_leads > 0 else None,
+            "ctr_pct":              round(_camp_clicks / _camp_impr * 100, 2) if _camp_impr > 0 else None,
+            "roas":                 round(_camp_prod / _camp_spend, 2) if _camp_spend > 0 and _camp_prod > 0 else None,
+        }
+        # ─────────────────────────────────────────────────────────────────────────────
+
         context = {
             "campaign_name": campaign,
             "campaign_resource": campaign_resource,
             "campaign_settings": camp_settings or {},   # budget, bidding strategy, impression share
-            "summary": summary,
+            # campaign_stats = THIS campaign's 30-day numbers only
+            # account_summary = ALL campaigns combined (for context/benchmarking only)
+            "campaign_stats": campaign_stats,
+            "account_summary": summary,
             "keyword_performance": [
                 {**k, **kw_resource_map.get(k.get("keyword","").lower(), {})}
                 for k in keyword_perf[:50]
@@ -1278,6 +1402,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "ad_performance": (ad_performance or [])[:20],  # per-RSA performance + scored metrics
             "ad_group_performance": (ad_group_performance or [])[:10],  # per-ad-group scored metrics
             "lqi": _build_lqi_campaign_slice(campaign, lqi or {}),
+            "geo_defaults": _geo_defaults_for_campaign(campaign),  # ideal geo profile for this campaign type
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -1313,11 +1438,19 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                 + json.dumps(ad_group_performance[:10], default=str)
             )
 
-        excellence_block = _build_excellence_block(campaign, summary, camp_settings or {})
+        excellence_block = _build_excellence_block(campaign, summary, camp_settings or {},
+                                                    campaign_stats=campaign_stats)
 
         prompt = excellence_block + GOOGLE_ADS_RULES + """
 You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
+
+CRITICAL — SPEND AND CPA DATA SCOPING:
+The context JSON contains TWO separate spend/performance fields:
+- "campaign_stats": THIS campaign's 30-day numbers ONLY — spend, clicks, leads, CPA, calls
+- "account_summary": ALL campaigns combined — use ONLY for cross-campaign context, NOT as this campaign's benchmark
+When citing spend, CPA, CPL, or lead counts in your reason field, ALWAYS use campaign_stats numbers.
+Never cite account_summary.total_spend or account_summary.cost_per_acquisition as this campaign's numbers.
 
 CAMPAIGN SETTINGS (use these to inform every recommendation):
 The field "campaign_settings" in the data contains the live configuration from Google Ads:
@@ -1337,7 +1470,7 @@ Use this to:
 - Always reference the current daily_budget_usd when recommending a change_budget — state the specific dollar increase and the % change
 
 Each recommendation MUST be a JSON object with these fields:
-- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group | claude_advisory
+- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group | update_geo_targeting | claude_advisory
 - "reason": 1-2 sentence explanation with specific numbers from the data
 - "estimated_monthly_impact": object with keys:
     "savings_usd": estimated monthly dollar savings (0 if not applicable),
@@ -1420,6 +1553,20 @@ For pause_ad_group (pause an underperforming ad group — does NOT pause the who
     - The campaign has at least 2 active ad groups (never pause the campaign's ONLY ad group)
   This is a last resort — prefer replace_ad or keyword changes within the group first.
   Limit: only ONE pause_ad_group per campaign per optimizer run.
+
+For update_geo_targeting (AI geo radius / ZIP recommendation — requires admin approval):
+  "campaign_resource": campaign resource name (from data)
+  "proposed_radius_miles": integer — recommended new radius
+  "add_zip_codes": list of ZIP code strings to ADD to targeting (empty list if none)
+  "remove_zip_codes": list of ZIP code strings to REMOVE from targeting (empty list if none)
+  "geo_rationale": 2-3 sentence explanation grounded in the geo_signals data (distance bands, leakage alerts, low/high perf locs)
+  Safety rules you MUST follow (violations will be rejected automatically):
+  - Only ONE update_geo_targeting recommendation per campaign per optimizer run
+  - Never propose an empty location set (at least 5 ZIPs or a radius must remain)
+  - Emergency campaigns: proposed_radius_miles MUST be ≤ 10 — never exceed this
+  - Implant/All-on-4 campaigns: proposed_radius_miles MUST be ≥ 15 — never shrink below
+  - Only recommend if geo_signals data has ≥ 30 clicks in at least one location being changed
+  - If geo_signals is absent or has insufficient data, do NOT return update_geo_targeting
 
 AD PERFORMANCE SCORING CONTEXT:
 The "ad_performance" field contains per-RSA metrics. Key fields:
@@ -1533,6 +1680,29 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
 6. lqi.no_shows — no-show rate by campaign/source + reminder stats + lead age at booking.
    If by_campaign for THIS campaign shows no_show_rate >= 0.25 AND booked >= 5, return a
    claude_advisory. If reminders.no_show_no_reminders_pct > 0.5, mention the reminder gap.
+
+7. lqi.geo — geo intelligence signals for this campaign:
+   Structure:
+     lqi.geo.by_campaign[THIS_CAMPAIGN].targeted[] — locations in the campaign's current geo targeting
+       Each entry: location_name, distance_band, clicks, cost, conversions, cvr, cpl
+     lqi.geo.by_campaign[THIS_CAMPAIGN].physical[] — where users ACTUALLY were when they clicked
+       Same fields. Physical rows NOT in the targeted set = demand leakage (people converting outside our targeting)
+     lqi.geo.by_campaign[THIS_CAMPAIGN].leakage_alerts[] — high-value physical locations not yet in targeting
+     lqi.geo.by_campaign[THIS_CAMPAIGN].low_perf_locs[] — targeted locations with clicks≥30 and CVR < 50% of avg
+     lqi.geo.by_campaign[THIS_CAMPAIGN].high_perf_locs[] — targeted locations with CVR ≥ 120% of avg
+     lqi.geo.by_campaign[THIS_CAMPAIGN].distance_band_rollup — {band: {clicks, conversions, cost}}
+
+   Also injected (not from LQI): "geo_defaults" field in the campaign data contains the
+   _GEO_DEFAULTS_BY_TYPE profile for this campaign type (target_radius, must_include_zips, etc.)
+
+   How to use:
+   - If leakage_alerts has entries with conversions ≥ 1: propose update_geo_targeting to ADD those ZIPs
+   - If low_perf_locs has location(s) with clicks ≥ 30 and CVR < 30% of avg: propose removing them via update_geo_targeting or geo_exclusion
+   - If distance_band_rollup shows 25+ band has lowest CVR AND highest cost: propose shrinking radius
+   - If distance_band_rollup shows strong CVR in 15-25 band for an EMERGENCY campaign: surface as
+     advisory only (emergency constraint overrides data — do NOT propose expanding beyond 10 mi)
+   - Always cite specific band CVR numbers from the rollup in your geo_rationale
+   - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
 ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + feedback_block
@@ -1686,6 +1856,45 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
                             None
                         )
                         item["ad_group_name"] = (matched or {}).get("ad_group_name", ag_rn.split("/")[-1])
+                elif op == "update_geo_targeting":
+                    # ── Safety guards for geo targeting changes ──────────────────────────────
+                    # Ensure campaign_resource is populated and valid
+                    cr = item.get("campaign_resource", "")
+                    if cr and cr not in valid_camp_resources:
+                        if campaign_resource:
+                            item["campaign_resource"] = campaign_resource
+                        else:
+                            logger.warning("Dropping update_geo_targeting — no valid campaign_resource")
+                            continue
+                    # Require proposed_radius_miles
+                    radius = item.get("proposed_radius_miles")
+                    if not radius:
+                        logger.warning("Dropping update_geo_targeting — missing proposed_radius_miles")
+                        continue
+                    # Emergency campaigns: hard cap at 10 mi
+                    # Use _classify_campaign (string return) for reliable type comparison — avoids
+                    # fragile dict-identity checks that break if _GEO_DEFAULTS_BY_TYPE is refactored.
+                    _camp_type = _classify_campaign(campaign)
+                    if _camp_type == "emergency" and int(radius) > 10:
+                        logger.warning(
+                            f"Dropping update_geo_targeting — Emergency campaign radius {radius} > 10 mi safety cap"
+                        )
+                        continue
+                    # Implants campaigns: must not shrink below 15 mi
+                    if _camp_type == "implants" and int(radius) < 15:
+                        logger.warning(
+                            f"Dropping update_geo_targeting — Implants campaign radius {radius} < 15 mi safety floor"
+                        )
+                        continue
+                    # Never result in an empty location set
+                    add_zips = item.get("add_zip_codes") or []
+                    remove_zips = item.get("remove_zip_codes") or []
+                    if remove_zips and not add_zips and not radius:
+                        logger.warning("Dropping update_geo_targeting — would remove locations without adding any")
+                        continue
+                    # Require geo_rationale
+                    if not item.get("geo_rationale"):
+                        item["geo_rationale"] = item.get("reason", "Geo optimization based on performance data")
                 validated.append(item)
             logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
             return validated
@@ -3940,6 +4149,25 @@ def _verify_gads_change(client, customer_id: str, operation: str, context: dict)
                        "⚠️ Geo exclusion submitted but not yet visible in read-back — check Google Ads")
             return {"confirmed": confirmed, "summary": summary, "detail": {"found": confirmed}}
 
+        # ── Geo targeting update (advisory in PR3 — execution added in PR4) ─────────────────
+        elif operation == "update_geo_targeting":
+            radius = context.get("proposed_radius_miles")
+            add_zips = context.get("add_zip_codes") or []
+            remove_zips = context.get("remove_zip_codes") or []
+            parts = []
+            if radius:
+                parts.append(f"radius → {radius} mi")
+            if add_zips:
+                parts.append(f"add ZIPs: {', '.join(str(z) for z in add_zips[:5])}")
+            if remove_zips:
+                parts.append(f"remove ZIPs: {', '.join(str(z) for z in remove_zips[:5])}")
+            # Note: by the time _verify_gads_change is called, the change has already been
+            # executed via replace_campaign_locations in main.py. The summary reflects the
+            # applied change. A full read-back verify (querying campaign_criterion) is a
+            # future improvement; for now flag as unconfirmed so the UI shows manual review.
+            summary = "📍 Geo update applied — " + "; ".join(parts) if parts else "📍 Geo targeting updated — verify in Google Ads"
+            return {"confirmed": False, "summary": summary, "detail": {"check_google_ads": True}}
+
         # ── Advisory / fallthrough ────────────────────────────────────────────────────────
         else:
             return {"confirmed": True, "summary": "✅ Change submitted to Google Ads", "detail": {}}
@@ -4795,6 +5023,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         "add_exact_keyword":    ("keyword",  "ad_group_resource", "keyword_text"),
         "ad_copy_suggestion":   ("ad",       "ad_resource",       "headline"),
         "geo_exclusion":        ("campaign", "geo_target_resource", "location_name"),
+        "update_geo_targeting": ("campaign", "campaign_resource",  "campaign_resource"),
         "change_budget":        ("campaign", "campaign_resource", "campaign_resource"),
         "change_bid_strategy":  ("campaign", "campaign_resource", "bid_strategy"),
         "change_match_type":    ("keyword",  "resource_name",     "keyword_text"),
@@ -4921,6 +5150,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
         _replace_ad_count_for_camp = 0     # enforce one replace_ad per campaign per run
         _pause_ag_count_for_camp = 0       # enforce one pause_ad_group per campaign per run
+        _geo_seen_this_run: set = set()    # enforce one update_geo_targeting per campaign per run (in-memory)
 
         # Safety: how many active ad groups does this campaign have?
         # get_ad_group_stats has no status filter, so we proxy "active" as
@@ -4976,13 +5206,95 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             if op == "pause_ad_group":
                 _pause_ag_count_for_camp += 1
 
+            # Build before/after state from the structured fields
+            # Must happen before PR7 guards so guards can use before["current_radius_miles"]
+            # without a second DB round-trip.
+            after = {k: v for k, v in rec.items() if k != "operation"}
+            before = {}  # reset unconditionally each iteration to prevent cross-rec leakage
+
+            # For update_geo_targeting: populate before_state with current geo JSON + radius
+            if op == "update_geo_targeting" and camp_resource:
+                try:
+                    from database import get_geo_json_for_campaign_resource as _get_geo
+                    _current_geo_raw = _get_geo(camp_resource)
+                    if _current_geo_raw:
+                        _current_geo = json.loads(_current_geo_raw)
+                        _locs = _current_geo.get("locations") or []
+                        # Extract current radius from any city-type proximity entry
+                        _city_entry = next(
+                            (l for l in _locs if l.get("type") == "city" and l.get("radius")),
+                            None
+                        )
+                        _current_radius = int(_city_entry["radius"]) if _city_entry else None
+                        _current_zips = [
+                            str(l.get("value", ""))
+                            for l in _locs
+                            if l.get("type") == "postal" and l.get("value")
+                        ]
+                        before = {
+                            "current_geo_json": _current_geo_raw,
+                            "current_radius_miles": _current_radius,
+                            "current_zip_codes": _current_zips,
+                        }
+                except Exception as _geo_before_err:
+                    logger.warning(f"  [{camp_name}] Could not fetch current geo for before_state: {_geo_before_err}")
+
+            # ── PR7 Safety guards for update_geo_targeting ───────────────────────────────
+            if op == "update_geo_targeting":
+                # Guard 1: One-per-run (in-memory) — skip if a geo rec was already approved
+                # for this campaign in THIS run (catches same-batch duplicates from Claude).
+                if camp_name in _geo_seen_this_run:
+                    logger.info(f"  [{camp_name}] SKIPPED update_geo_targeting — geo rec already queued this run")
+                    continue
+
+                # Guard 1b: Persistent — skip if a pending_approval geo rec already exists
+                # in the DB. Prevents stacking across separate runs.
+                try:
+                    from database import _conn as _db_conn_pr7
+                    with _db_conn_pr7() as _pr7_c:
+                        _existing_pending = _pr7_c.execute(
+                            """SELECT COUNT(*) FROM gads_audit_log
+                               WHERE operation='update_geo_targeting'
+                               AND campaign_name=?
+                               AND execution_result='pending_approval'""",
+                            (camp_name,),
+                        ).fetchone()[0]
+                    if _existing_pending > 0:
+                        logger.info(
+                            f"  [{camp_name}] SKIPPED update_geo_targeting — "
+                            f"{_existing_pending} pending geo rec(s) already await approval"
+                        )
+                        continue
+                except Exception as _pr7_err:
+                    logger.warning(f"  [{camp_name}] One-per-run geo check failed (non-fatal): {_pr7_err}")
+
+                # Guard 2: Progressive shrink — reject if proposed radius is >30% smaller
+                # than current radius. Requires incremental changes to avoid over-shrinking.
+                # Reuses before["current_radius_miles"] already fetched above (no double-fetch).
+                _prop_radius = rec.get("proposed_radius_miles")
+                _cur_radius_for_guard = before.get("current_radius_miles")
+                if _cur_radius_for_guard and _prop_radius:
+                    _shrink_pct = (_cur_radius_for_guard - float(_prop_radius)) / _cur_radius_for_guard
+                    if _shrink_pct > 0.30:
+                        logger.warning(
+                            f"  [{camp_name}] SKIPPED update_geo_targeting — proposed {_prop_radius} mi "
+                            f"is {_shrink_pct*100:.0f}% smaller than current {_cur_radius_for_guard} mi "
+                            f"(max allowed shrink: 30%)"
+                        )
+                        continue
+                    logger.info(
+                        f"  [{camp_name}] Geo shrink guard passed — "
+                        f"{'growth' if _shrink_pct <= 0 else f'{_shrink_pct*100:.0f}% shrink'}"
+                    )
+                else:
+                    logger.info(f"  [{camp_name}] Geo shrink guard skipped — no current radius baseline")
+
+                # Mark this campaign as having a geo rec in this run
+                _geo_seen_this_run.add(camp_name)
+            # ────────────────────────────────────────────────────────────────────────────
+
             advisories.append(f"[{camp_name}] {reason}")
 
-            # Build before/after state from the structured fields
-            after = {k: v for k, v in rec.items() if k != "operation"}
-
-            # For replace_ad: populate before_state with current ad copy from ad_performance
-            before = {}
             if op == "replace_ad":
                 old_rn = rec.get("old_ad_group_ad_resource", "")
                 # Find the matching ad in camp_ad_perf to populate before_state

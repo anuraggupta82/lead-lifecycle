@@ -40,7 +40,8 @@ from database import (
     add_event, unsubscribe, get_follow_up_queue, get_due_follow_ups,
     add_note, get_notes, delete_note, force_stage,
     get_campaign_stats, get_google_ads_campaigns, get_distinct_sources, get_keyword_stats,
-    get_search_term_stats, get_geo_stats, get_schedule_stats,
+    get_search_term_stats, get_geo_stats, get_geo_stats_by_campaign, get_schedule_stats,
+    get_geo_json_for_campaign_resource, update_geo_json_for_campaign_resource,
     add_deleted_lead_tombstone, backfill_communication_log,
     get_or_create_conversation, get_conversation, get_messages, get_all_conversations,
     get_daily_stats, get_ad_group_stats,
@@ -1425,6 +1426,97 @@ async def gads_approve_action(action_id: str, request: Request):
                 f"pause_ad approved: paused {result['paused_resource']} ({action_id[:8]})"
             )
 
+        elif operation == "update_geo_targeting":
+            # ── AI-recommended geo radius / ZIP change ────────────────────────────────────
+            from google_ads_write import replace_campaign_locations as _replace_locs
+            after = json.loads(row["after_state_json"] or "{}")
+            camp_rn = after.get("campaign_resource") or row.get("entity_id") or ""
+            if not camp_rn or not camp_rn.startswith("customers/"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="update_geo_targeting after_state_json missing campaign_resource"
+                )
+
+            # Build geo_json from the approved rec fields
+            proposed_radius = after.get("proposed_radius_miles")
+            add_zips = after.get("add_zip_codes") or []
+            remove_zips = after.get("remove_zip_codes") or []
+
+            # Fetch current geo_json from the campaign DB record to build the delta.
+            # Refuse if the campaign has no local geo_json — we must not blindly overwrite
+            # live Google Ads targeting from an empty/unknown local state.
+            from database import get_geo_json_for_campaign_resource
+            current_geo_raw = get_geo_json_for_campaign_resource(camp_rn)
+            if not current_geo_raw:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "update_geo_targeting: campaign has no local geo_json record — "
+                        "refusing to overwrite live Google Ads targeting from an unknown baseline. "
+                        "Save geo targeting manually from the Launch tab first."
+                    )
+                )
+            try:
+                current_geo = json.loads(current_geo_raw)
+            except Exception:
+                raise HTTPException(status_code=422, detail="update_geo_targeting: local geo_json is malformed")
+            current_locs = current_geo.get("locations") or []
+
+            # Apply delta: remove ZIPs by value (match regardless of stored type)
+            remove_set = {str(z).strip() for z in remove_zips}
+            updated_locs = [
+                loc for loc in current_locs
+                if str(loc.get("value", "")).strip() not in remove_set
+            ]
+            for z in add_zips:
+                z_str = str(z).strip()
+                if not any(str(l.get("value","")).strip() == z_str for l in updated_locs):
+                    updated_locs.append({"type": "postal", "value": z_str, "include": True})
+
+            # If radius is changing, replace the existing proximity entry.
+            # IMPORTANT: replace_campaign_locations creates a proximity criterion ONLY when
+            # type=="city" with a radius — NOT type=="address". Use "city" to match seeded format.
+            if proposed_radius:
+                # Remove old city-based proximity entries
+                updated_locs = [
+                    loc for loc in updated_locs if not (loc.get("type") == "city" and loc.get("radius"))
+                ]
+                updated_locs.append({
+                    "type": "city",
+                    "value": "Grafton, MA",
+                    "radius": int(proposed_radius),
+                    "include": True,
+                })
+
+            if not updated_locs:
+                raise HTTPException(
+                    status_code=422,
+                    detail="update_geo_targeting would result in zero locations — blocked for safety"
+                )
+
+            new_geo_json = json.dumps({"unit": "miles", "locations": updated_locs})
+            try:
+                result = _replace_locs(camp_rn, new_geo_json)
+                added = result.get("added", 0)
+                removed = result.get("removed", 0)
+                errs = result.get("errors", [])
+                exec_result = "partial_success" if errs else "success"
+            except Exception as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {str(e)[:200]}")
+                raise
+
+            update_gads_action_result(action_id, executed=True, execution_result=exec_result)
+            set_audit_approval(action_id, approver="admin")
+
+            # Persist updated geo_json to local DB
+            from database import update_geo_json_for_campaign_resource
+            update_geo_json_for_campaign_resource(camp_rn, new_geo_json)
+            logger.info(
+                f"update_geo_targeting approved: campaign={camp_rn} "
+                f"added={added} removed={removed} errs={errs} ({action_id[:8]})"
+            )
+
         elif operation == "pause_ad_group":
             from google_ads_write import set_ad_group_status as _set_ag_status
             after = json.loads(row["after_state_json"] or "{}")
@@ -1454,6 +1546,37 @@ async def gads_approve_action(action_id: str, request: Request):
             update_gads_action_result(action_id, executed=True, execution_result="success")
             set_audit_approval(action_id, approver="admin")
             logger.info(f"pause_ad_group approved: paused '{ag_name}' ({ag_rn}) ({action_id[:8]})")
+
+        elif operation == "set_ad_schedule":
+            from ai_optimizer import _build_client as _sch_build_client
+            from google_ads_create import parse_ad_schedule, push_ad_schedule
+            after = json.loads(row["after_state_json"] or "{}")
+            camp_rn_sched = after.get("campaign_resource") or row.get("entity_id") or ""
+            schedule_text = after.get("schedule_text") or ""
+            slots = after.get("slots") or (parse_ad_schedule(schedule_text) if schedule_text else [])
+            if not camp_rn_sched:
+                raise HTTPException(status_code=422, detail="set_ad_schedule missing campaign_resource")
+            if not slots:
+                raise HTTPException(status_code=422, detail=f"set_ad_schedule could not parse schedule: {schedule_text!r}")
+            _sch_cid = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+            client = _sch_build_client()
+            try:
+                result = push_ad_schedule(client, _sch_cid, camp_rn_sched, slots, replace=True)
+            except Exception as e:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {str(e)[:200]}", error_detail=str(e)[:500])
+                raise HTTPException(status_code=502, detail=f"Google Ads schedule error: {e}")
+            if not result.get("ok"):
+                err = result.get("error") or "unknown error"
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {err[:200]}", error_detail=err)
+                raise HTTPException(status_code=502, detail=f"Google Ads schedule error: {err}")
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(
+                f"set_ad_schedule approved: {camp_rn_sched} '{schedule_text}' "
+                f"pushed={result.get('pushed',0)} removed={result.get('removed',0)} ({action_id[:8]})"
+            )
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
@@ -1535,6 +1658,12 @@ async def gads_approve_action(action_id: str, request: Request):
             _verify_ctx["campaign_resource"] = row.get("entity_id", "") or _after_for_verify.get("campaign_resource", "")
             _verify_ctx["geo_target_resource"] = _after_for_verify.get("geo_target_resource", "")
             _verify_ctx["location_name"] = _after_for_verify.get("location_name", "") or _before_for_verify.get("location_name", "")
+
+        elif operation == "update_geo_targeting":
+            _verify_ctx["campaign_resource"] = _after_for_verify.get("campaign_resource", "") or row.get("entity_id", "")
+            _verify_ctx["proposed_radius_miles"] = _after_for_verify.get("proposed_radius_miles")
+            _verify_ctx["add_zip_codes"] = _after_for_verify.get("add_zip_codes", [])
+            _verify_ctx["remove_zip_codes"] = _after_for_verify.get("remove_zip_codes", [])
 
         _verify_client = _build_client()
         _verification = _verify_gads_change(_verify_client, customer_id, operation, _verify_ctx)
@@ -3289,16 +3418,34 @@ def admin_campaigns_unified(days: int = 30, include_inactive: bool = False):
         rows = [r for r in rows if not r.get("is_inactive_90d")]
 
     # ── Budget summary ────────────────────────────────────────────────────────
+    from datetime import date as _date
+    from database import _conn as _db_conn_budget
     active_rows = [r for r in rows if (r.get("status") or "").upper() == "ACTIVE"]
-    total_monthly_budget   = sum(r.get("monthly_budget") or 0.0 for r in rows)
+    # Campaign budgets: sum ACTIVE campaigns only (paused/stopped should not count)
+    total_monthly_budget   = sum(r.get("monthly_budget") or 0.0 for r in active_rows)
     total_daily_budget     = sum(r.get("daily_budget_usd") or
                                   round((r.get("monthly_budget") or 0.0) / 30.4, 2)
                                   for r in active_rows)
-    total_actual_spend     = sum((r.get("metrics") or {}).get("cost") or 0.0 for r in rows)
-    # Projected month-end: scale actual spend by (30 / days_elapsed)
-    from datetime import date as _date
+    # Actual spend: use MTD (month-to-date) from gads_daily_stats, not 30-day rolling window.
+    # The metrics.cost on each row is a rolling window that spans across month boundaries.
     day_of_month = _date.today().day
-    projected_month_end = round(total_actual_spend * 30.0 / max(day_of_month, 1), 2) if total_actual_spend > 0 else 0.0
+    try:
+        with _db_conn_budget() as _bc:
+            _mtd_row = _bc.execute(
+                """SELECT COALESCE(SUM(cost_micros), 0) AS mtd_micros
+                   FROM gads_daily_stats
+                   WHERE date >= DATE('now', 'start of month')"""
+            ).fetchone()
+        total_actual_spend = round((_mtd_row["mtd_micros"] or 0) / 1_000_000, 2)
+    except Exception:
+        # Fallback: sum metrics.cost from rows (rolling window — less accurate but available)
+        total_actual_spend = round(sum((r.get("metrics") or {}).get("cost") or 0.0 for r in rows), 2)
+    # Projected month-end: scale MTD spend by (days_in_month / days_elapsed)
+    import calendar as _cal
+    days_in_month = _cal.monthrange(_date.today().year, _date.today().month)[1]
+    projected_month_end = round(
+        total_actual_spend * days_in_month / max(day_of_month, 1), 2
+    ) if total_actual_spend > 0 else 0.0
     account_monthly_budget = float(get_setting("account_monthly_budget") or 0.0)
     budget_summary = {
         "total_monthly_budget":   round(total_monthly_budget, 2),
@@ -3307,6 +3454,7 @@ def admin_campaigns_unified(days: int = 30, include_inactive: bool = False):
         "projected_month_end":    projected_month_end,
         "account_monthly_budget": account_monthly_budget,
         "days_elapsed":           day_of_month,
+        "days_in_month":          days_in_month,
         "active_campaign_count":  len(active_rows),
     }
 
@@ -7373,6 +7521,16 @@ def get_geo_performance(days: int = 30):
     return {"geo": get_geo_stats(days=days), "days": days}
 
 
+@app.get("/api/admin/geo-stats", dependencies=[Depends(_require_admin)])
+def get_geo_stats_endpoint(campaign: str = "", days: int = 30):
+    """
+    Return geo performance rows for a specific campaign (both targeted and physical view types).
+    Used by the Geo Performance Panel in the campaign detail tab.
+    """
+    rows = get_geo_stats_by_campaign(campaign_name=campaign, days=days)
+    return rows
+
+
 @app.get("/api/admin/schedule-performance", dependencies=[Depends(_require_admin)])
 def get_schedule_performance(days: int = 30):
     """Return cached hour-of-day / day-of-week / device performance."""
@@ -9135,6 +9293,94 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
     settings_obj = get_settings()
     cid = settings_obj.google_ads_customer_id
 
+    # ── SCHEDULE SHORTCUT: detect schedule-related instructions ─────────────
+    # When the user says "set schedule" / "use office hours" / etc., skip the
+    # full Claude optimizer and directly stage a set_ad_schedule action so the
+    # user gets a single Apply button instead of keyword noise.
+    import re as _re_sched
+    _SCHED_PATTERN = _re_sched.compile(
+        r'\b(schedule|hours|office hours|ad hours|ad schedule|time|days|weekday|weekend|'
+        r'monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+        r'am|pm|7am|8am|9am|10am|11am|noon|6pm|7pm|8pm|9pm|10pm|11pm|midnight)\b',
+        _re_sched.IGNORECASE
+    )
+    _sched_match_count = len(_SCHED_PATTERN.findall(instruction))
+    _is_schedule_instruction = _sched_match_count >= 2  # at least 2 schedule-related tokens
+
+    if _is_schedule_instruction:
+        camp_resource_sched = ctx.get("gads_campaign_resource", "")
+        if camp_resource_sched:
+            from google_ads_create import parse_ad_schedule
+
+            # Resolve "office hours" keyword → actual practice hours from DB
+            # e.g. "follow office hours and sunday 8am-10pm"
+            # → "Mon-Thu 10am-6pm and sunday 8am-10pm"
+            _sched_instruction = instruction
+            if _re_sched.search(r'\boffice\s+hours\b', _sched_instruction, _re_sched.IGNORECASE):
+                _practice_hours = get_setting("practice_hours") or ""
+                if _practice_hours:
+                    _sched_instruction = _re_sched.sub(
+                        r'\boffice\s+hours\b', _practice_hours, _sched_instruction,
+                        flags=_re_sched.IGNORECASE
+                    )
+
+            slots = parse_ad_schedule(_sched_instruction)
+            if slots:
+                from campaign_audit import log_pending
+                days_summary = ", ".join(sorted(set(s["day"] for s in slots)))
+                # Store the resolved instruction (with "office hours" substituted) so
+                # gads_approve_action can re-parse it if needed. Also store original for audit.
+                _resolved_text = _sched_instruction if _sched_instruction != instruction else instruction
+                before_sched = {"schedule_text": "", "original_instruction": instruction}
+                after_sched  = {"schedule_text": _resolved_text, "slots": slots, "days": days_summary,
+                                "campaign_resource": camp_resource_sched}
+                action_id_sched = log_pending(
+                    operation="set_ad_schedule",
+                    entity_type="campaign",
+                    entity_id=camp_resource_sched,
+                    entity_name=campaign_name,
+                    before_state=before_sched,
+                    after_state=after_sched,
+                    optimizer_run_id="ai_refine",
+                    actor="ai_refine",
+                    reason=f"User requested schedule change: {instruction[:200]}",
+                    campaign_id=campaign_id,
+                    campaign_name=campaign_name,
+                )
+                change = {
+                    "operation": "set_ad_schedule",
+                    "schedule_text": _resolved_text,
+                    "slots": slots,
+                    "days": days_summary,
+                    "campaign_resource": camp_resource_sched,
+                    "reason": f"Apply ad schedule: {days_summary}",
+                    "action_id": action_id_sched,
+                }
+                return {
+                    "summary": f"Schedule change staged: {days_summary} ({len(slots)} time slots). Click Apply to push to Google Ads.",
+                    "changes": [change],
+                }
+            else:
+                # parse failed — return helpful advisory instead of keyword noise
+                return {
+                    "summary": "Could not parse schedule from your instruction.",
+                    "changes": [{
+                        "operation": "claude_advisory",
+                        "reason": (
+                            f"Could not parse a schedule from: \"{instruction}\". "
+                            "Try a format like: 'Mon-Fri 9am-7pm, Sat 9am-3pm, Sun 9am-11pm'"
+                        ),
+                    }],
+                }
+        else:
+            return {
+                "summary": "Campaign resource not found — cannot set schedule.",
+                "changes": [{
+                    "operation": "claude_advisory",
+                    "reason": "This campaign does not have a linked Google Ads resource. Launch it first.",
+                }],
+            }
+
     # ── 1. Fetch keyword performance for this campaign ───────────────────────
     camp_kw: list = []
     try:
@@ -9384,10 +9630,42 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
         "claude_advisory":             ("campaign", "campaign_resource",       "campaign_resource"),
     }
 
+    # Load existing pending_approval rows for this campaign so we can dedup
+    _existing_pending: set = set()
+    try:
+        from database import _conn as _dbc_refine
+        with _dbc_refine() as _c:
+            _pending_rows = _c.execute(
+                """SELECT operation, after_state_json FROM gads_audit_log
+                   WHERE execution_result = 'pending_approval'
+                     AND (campaign_id = ? OR campaign_name = ?)""",
+                (campaign_id, campaign_name)
+            ).fetchall()
+            for _pr in _pending_rows:
+                _pr_after = json.loads(_pr["after_state_json"] or "{}")
+                _kw = (_pr_after.get("keyword_text") or "").strip().lower()
+                if _kw:
+                    _existing_pending.add((_pr["operation"], _kw))
+    except Exception:
+        pass  # non-fatal — worst case we create duplicate pending rows
+
     staged_changes = []
     for rec in structured:
         op     = rec.get("operation", "claude_advisory")
         reason = rec.get("reason", rec.get("insight", ""))
+
+        # Dedup: skip if an identical pending_approval row already exists
+        if op in ("add_negative_keyword", "add_to_shared_negative_list", "pause_keyword", "enable_keyword"):
+            _kw_check = (rec.get("keyword_text") or "").strip().lower()
+            if _kw_check and (op, _kw_check) in _existing_pending:
+                # Already staged — add as a read-only informational entry without an action_id
+                staged_changes.append({
+                    **rec,
+                    "action_id": None,
+                    "_already_pending": True,
+                    "reason": f"[Already in approval queue] {reason}",
+                })
+                continue
 
         # Build before/after for audit log
         after  = {k: v for k, v in rec.items() if k != "operation"}

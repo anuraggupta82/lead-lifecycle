@@ -7,7 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <!-- v20260512-1500 -->
+  <!-- v20260512-1600 -->
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -2715,6 +2715,186 @@ function SearchTermsView({ searchTermStats }) {
   );
 }
 
+// ── GeoPerformancePanel ──────────────────────────────────────────────────────
+const BAND_COLORS = {'0-5':'#bbf7d0','5-10':'#d1fae5','10-15':'#fef3c7','15-25':'#fed7aa','25+':'#fecaca'};
+const BAND_ORDER  = ['0-5','5-10','10-15','15-25','25+'];
+
+function GeoLocationTable({ rows, targeted }) {
+  if (!rows.length) return (
+    <div style={{color:'var(--text-muted)',fontSize:11,fontStyle:'italic',padding:'8px 0'}}>
+      No data yet — will populate after the next Google Ads sync.
+    </div>
+  );
+  return (
+    <div style={{overflowX:'auto'}}>
+      <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+        <thead>
+          <tr style={{borderBottom:'2px solid var(--border)',textAlign:'left'}}>
+            <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600}}>Location</th>
+            <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600}}>Band</th>
+            <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600,textAlign:'right'}}>Impr</th>
+            <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600,textAlign:'right'}}>Clicks</th>
+            <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600,textAlign:'right'}}>Cost</th>
+            <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600,textAlign:'right'}}>Conv</th>
+            <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600,textAlign:'right'}}>CVR%</th>
+            {!targeted && <th style={{padding:'4px 8px',color:'var(--text-muted)',fontWeight:600}}>In Targeting?</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r,i) => {
+            return (
+              <tr key={i} style={{borderBottom:'1px solid var(--border)',
+                background: r._leakage ? '#fef3c7' : (i%2===0?'#fff':'#f9fafb')}}>
+                <td style={{padding:'5px 8px',fontWeight:500}}>{r.location_name}</td>
+                <td style={{padding:'5px 8px'}}>
+                  <span style={{fontSize:9,padding:'2px 5px',borderRadius:3,
+                    background:BAND_COLORS[r.distance_band]||'#e5e7eb',fontWeight:600,color:'#374151'}}>
+                    {r.distance_band||'—'} mi
+                  </span>
+                </td>
+                <td style={{padding:'5px 8px',textAlign:'right',color:'var(--text-muted)'}}>{(r.impressions||0).toLocaleString()}</td>
+                <td style={{padding:'5px 8px',textAlign:'right'}}>{(r.clicks||0).toLocaleString()}</td>
+                <td style={{padding:'5px 8px',textAlign:'right'}}>${(r.cost||0).toFixed(2)}</td>
+                <td style={{padding:'5px 8px',textAlign:'right',fontWeight:r.conversions>0?700:400,
+                  color:r.conversions>0?'#16a34a':'var(--text-muted)'}}>
+                  {(r.conversions||0).toFixed(1)}
+                </td>
+                <td style={{padding:'5px 8px',textAlign:'right'}}>
+                  {r.conversion_rate > 0
+                    ? <span style={{color:r.conversion_rate>5?'#15803d':r.conversion_rate>2?'#d97706':'#dc2626'}}>
+                        {(r.conversion_rate).toFixed(1)}%
+                      </span>
+                    : <span style={{color:'var(--text-muted)'}}>—</span>}
+                </td>
+                {!targeted && (
+                  <td style={{padding:'5px 8px'}}>
+                    {r._leakage
+                      ? <span style={{color:'#d97706',fontSize:10,fontWeight:700}}>⚠️ Not targeted</span>
+                      : <span style={{color:'#16a34a',fontSize:10}}>✅ In targeting</span>}
+                  </td>
+                )}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function GeoPerformancePanel({ campName }) {
+  const [geoRows, setGeoRows]     = React.useState(null);
+  const [geoLoading, setLoading]  = React.useState(false);
+  const [geoDays, setDays]        = React.useState(30);
+
+  React.useEffect(() => {
+    if (!campName) return;
+    setLoading(true);
+    api(`/api/admin/geo-stats?campaign=${encodeURIComponent(campName)}&days=${geoDays}`)
+      .then(d => setGeoRows(Array.isArray(d) ? d : []))
+      .catch(() => setGeoRows([]))
+      .finally(() => setLoading(false));
+  }, [campName, geoDays]);
+
+  const targeted = (geoRows||[]).filter(r => r.view_type === 'targeted');
+  const physical = (geoRows||[]).filter(r => r.view_type === 'physical').map(r => ({
+    ...r,
+    _leakage: !targeted.some(t => t.location_name.toLowerCase() === r.location_name.toLowerCase())
+  }));
+
+  // Distance band rollup from targeted rows
+  const bands = {};
+  targeted.forEach(r => {
+    const b = r.distance_band || 'unknown';
+    if (!bands[b]) bands[b] = {clicks:0,conversions:0,cost:0};
+    bands[b].clicks      += r.clicks || 0;
+    bands[b].conversions += r.conversions || 0;
+    bands[b].cost        += r.cost || 0;
+  });
+
+  return (
+    <div>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+        <div style={{fontSize:13,fontWeight:700}}>🗺️ Geo Performance</div>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          <select value={geoDays} onChange={e=>setDays(+e.target.value)}
+            style={{fontSize:11,padding:'3px 6px',borderRadius:4,border:'1px solid var(--border)'}}>
+            <option value={7}>7 days</option>
+            <option value={30}>30 days</option>
+            <option value={90}>90 days</option>
+          </select>
+          <span style={{fontSize:10,color:'var(--text-muted)'}}>Refreshed on Google Ads sync</span>
+        </div>
+      </div>
+
+      {geoLoading && <div style={{color:'var(--text-muted)',fontSize:11,padding:20,textAlign:'center'}}>Loading geo data…</div>}
+
+      {!geoLoading && (
+        <div>
+          {/* Distance band rollup */}
+          {BAND_ORDER.some(b => bands[b]) && (
+            <div style={{marginBottom:16,background:'#f8fafc',border:'1px solid var(--border)',
+              borderRadius:8,padding:'12px 16px'}}>
+              <div style={{fontSize:11,fontWeight:700,marginBottom:8,color:'var(--text)'}}>
+                Distance Band Rollup (targeted)
+              </div>
+              <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                {BAND_ORDER.filter(b => bands[b]).map(b => {
+                  const d = bands[b];
+                  const cvr = d.clicks > 0 ? (d.conversions / d.clicks * 100) : 0;
+                  return (
+                    <div key={b} style={{flex:'1 1 80px',minWidth:70,textAlign:'center',
+                      background:BAND_COLORS[b]||'#e5e7eb',borderRadius:6,padding:'8px 6px'}}>
+                      <div style={{fontSize:9,fontWeight:700,color:'#374151',marginBottom:3}}>{b} mi</div>
+                      <div style={{fontSize:12,fontWeight:700}}>{d.clicks}</div>
+                      <div style={{fontSize:9,color:'#6b7280'}}>clicks</div>
+                      <div style={{fontSize:10,fontWeight:600,marginTop:2,
+                        color:cvr>5?'#15803d':cvr>2?'#d97706':'#6b7280'}}>
+                        {cvr.toFixed(1)}% CVR
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Targeted locations */}
+          <div style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:'var(--text)'}}>
+              📍 Targeted Locations ({targeted.length})
+            </div>
+            <GeoLocationTable rows={targeted} targeted={true} />
+          </div>
+
+          {/* Physical / demand leakage */}
+          {physical.length > 0 && (
+            <div>
+              <div style={{fontSize:12,fontWeight:700,marginBottom:4,color:'var(--text)'}}>
+                📡 Physical Demand — where users actually were ({physical.length})
+              </div>
+              {physical.some(r=>r._leakage) && (
+                <div style={{fontSize:10,color:'#92400e',background:'#fef3c7',
+                  border:'1px solid #fde68a',borderRadius:5,padding:'6px 10px',marginBottom:8}}>
+                  ⚠️ Highlighted rows are demand leakage — users converting OUTSIDE your current targeting.
+                </div>
+              )}
+              <GeoLocationTable rows={physical} targeted={false} />
+            </div>
+          )}
+
+          {!targeted.length && !physical.length && (
+            <div style={{color:'var(--text-muted)',fontSize:11,fontStyle:'italic',padding:'20px 0',textAlign:'center'}}>
+              No geo data yet — appears after the campaign has run and synced Google Ads data (6 AM daily sync).
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── OptimizationTab ─────────────────────────────────────────────────────────
 const OP_LABELS = {
   pause_keyword:        { label: 'Pause Keyword',        color: '#dc2626', icon: '⏸' },
@@ -2727,6 +2907,7 @@ const OP_LABELS = {
   tighten_match_type:           { label: 'Tighten Match Type',   color: '#0891b2', icon: '🎯' },
   ad_copy_suggestion:   { label: 'Ad Copy Update',       color: '#0891b2', icon: '✍️' },
   geo_exclusion:        { label: 'Geo Exclusion',        color: '#7c3aed', icon: '📍' },
+  update_geo_targeting: { label: 'Geo Targeting Update', color: '#0369a1', icon: '🗺️' },
   change_budget:        { label: 'Budget Change',        color: '#d97706', icon: '💰' },
   claude_advisory:      { label: 'AI Advisory',          color: '#92400e', icon: '💡' },
 };
@@ -2813,6 +2994,82 @@ function RecommendationCard({ rec, onQueue, onIgnore, onRefine }) {
       <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:rec.user_feedback?4:0,paddingLeft:22}}>
         {rec.reason}
       </div>
+
+      {/* Geo targeting visual diff card */}
+      {rec.operation === 'update_geo_targeting' && (() => {
+        // after_state is pre-parsed by the API into rec.after_state (dict)
+        // before_state is pre-parsed by the API into rec.before_state (dict)
+        const after  = rec.after_state  || {};
+        const before = rec.before_state || {};
+        // Normalize ZIP values: backend stores arrays but guard against comma-strings
+        const toArr = v => Array.isArray(v) ? v : (typeof v === 'string' && v ? v.split(',').map(s=>s.trim()) : []);
+        const curRadius  = before.current_radius_miles != null ? Number(before.current_radius_miles) : null;
+        const propRadius = after.proposed_radius_miles != null ? Number(after.proposed_radius_miles) : null;
+        const radiusDelta = (curRadius != null && propRadius != null) ? (propRadius - curRadius) : null;
+        const curZips  = toArr(before.current_zip_codes);
+        const addZips  = toArr(after.add_zip_codes);
+        const remZips  = toArr(after.remove_zip_codes);
+        const deltaColor = radiusDelta == null || radiusDelta === 0
+          ? '#334155' : radiusDelta > 0 ? '#16a34a' : '#dc2626';
+        return (
+          <div style={{marginTop:6,borderRadius:6,border:'1px solid #bfdbfe',overflow:'hidden',fontSize:11}}>
+            {/* Header */}
+            <div style={{background:'#1e40af',color:'#fff',padding:'4px 10px',fontSize:10,
+              fontWeight:700,display:'flex',alignItems:'center',gap:6}}>
+              🗺️ GEO TARGETING CHANGE — PENDING ADMIN APPROVAL
+            </div>
+            {/* Radius diff row */}
+            {(curRadius != null || propRadius != null) && (
+              <div style={{display:'flex',background:'#fff',borderBottom:'1px solid #bfdbfe'}}>
+                <div style={{flex:1,padding:'6px 10px',background:'#f8fafc'}}>
+                  <div style={{fontSize:9,color:'#64748b',fontWeight:700,marginBottom:2}}>CURRENT RADIUS</div>
+                  <div style={{fontWeight:700,color:'#334155',fontSize:13}}>
+                    {curRadius != null ? `${curRadius} mi` : '—'}
+                  </div>
+                </div>
+                <div style={{padding:'6px 8px',display:'flex',alignItems:'center',color:'#94a3b8',fontSize:14}}>→</div>
+                <div style={{flex:1,padding:'6px 10px',background:'#eff6ff'}}>
+                  <div style={{fontSize:9,color:'#1d4ed8',fontWeight:700,marginBottom:2}}>PROPOSED RADIUS</div>
+                  <div style={{fontWeight:700,fontSize:13,color:deltaColor}}>
+                    {propRadius != null ? `${propRadius} mi` : '—'}
+                    {radiusDelta != null && radiusDelta !== 0 && (
+                      <span style={{fontSize:10,marginLeft:5,fontWeight:600}}>
+                        ({radiusDelta > 0 ? '+' : ''}{radiusDelta} mi)
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+            {/* ZIP changes */}
+            {(addZips.length > 0 || remZips.length > 0) && (
+              <div style={{padding:'6px 10px',background:'#fff',borderBottom:'1px solid #bfdbfe'}}>
+                {curZips.length > 0 && (
+                  <div style={{marginBottom:4,color:'#64748b',fontSize:10}}>
+                    <strong>Current ZIPs:</strong> {curZips.join(', ')}
+                  </div>
+                )}
+                {addZips.length > 0 && (
+                  <div style={{color:'#16a34a',marginBottom:2}}>
+                    <strong>➕ Add:</strong> {addZips.join(', ')}
+                  </div>
+                )}
+                {remZips.length > 0 && (
+                  <div style={{color:'#dc2626'}}>
+                    <strong>➖ Remove:</strong> {remZips.join(', ')}
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Rationale */}
+            {after.geo_rationale && (
+              <div style={{padding:'6px 10px',background:'#eff6ff',color:'#1e40af',fontStyle:'italic'}}>
+                {after.geo_rationale}
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Existing user feedback badge */}
       {rec.user_feedback && (
@@ -2966,6 +3223,7 @@ function OptimizationTab({ campaign }) {
     tighten_match_type:   { live: true,  note: 'Adds exact match, pauses broad match.' },
     ad_copy_suggestion:   { live: true,  note: 'Updates RSA via API (needs ad_resource).' },
     geo_exclusion:        { live: true,  note: 'Adds negative geo target to campaign.' },
+    update_geo_targeting: { live: true,  note: 'Updates campaign geo targeting via API (radius + ZIP delta).' },
     change_budget:        { live: true,  note: 'Updates daily budget (max +25%, $5–$500).' },
     claude_advisory:      { live: false, note: 'Advisory — acknowledged only, no API call.' },
   };
@@ -6753,8 +7011,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
           const totalBudget = bs.total_monthly_budget   || 0;
           const actualSpend = bs.total_actual_spend      || 0;
           const projected   = bs.projected_month_end     || 0;
-          const daysElapsed = bs.days_elapsed            || 1;
-          const daysLeft    = Math.max(0, 30 - daysElapsed);
+          const daysElapsed  = bs.days_elapsed   || 1;
+          const daysInMonth  = bs.days_in_month || 30;
+          const daysLeft     = Math.max(0, daysInMonth - daysElapsed);
 
           // Progress bar: actual vs account budget (or campaign budgets if no account budget set)
           const budgetRef  = acctBudget > 0 ? acctBudget : totalBudget;
@@ -6867,7 +7126,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                 <div>
                   <div style={{display:'flex',justifyContent:'space-between',fontSize:10,
                     color:'var(--text-muted)',marginBottom:4}}>
-                    <span>Spend progress vs {acctBudget > 0 ? 'account budget' : 'campaign budgets'}: ${budgetRef.toLocaleString()}/mo</span>
+                    <span>Spend progress vs {acctBudget > 0 ? 'account budget' : 'active campaign budgets'}: ${budgetRef.toLocaleString()}/mo</span>
                     <span style={{color:statusColor,fontWeight:600}}>{Math.round(spendPct)}% spent · {Math.round(projPct)}% projected</span>
                   </div>
                   <div style={{position:'relative',height:8,background:'#f3f4f6',borderRadius:4,overflow:'hidden'}}>
@@ -7815,7 +8074,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       launch:       !!(build.launch_checklist && build.launch_checklist.some(x=>x.category==='required') && build.launch_checklist.filter(x=>x.category==='required').every(x=>x.done)),
                       performance:  true,
                     };
-                    const WIZARD_ORDER = ['strategy','keywords','ad_copy','ad_groups','launch','performance'];
+                    const WIZARD_ORDER = ['strategy','keywords','ad_copy','ad_groups','launch','performance','geo'];
                     const TABS = [
                       { id: 'strategy',     label: '🧠 Strategy' },
                       { id: 'keywords',     label: '🔍 Keywords' },
@@ -7823,6 +8082,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       { id: 'ad_groups',    label: '📂 Ad Groups' },
                       { id: 'launch',       label: '🚀 Launch' },
                       { id: 'performance',  label: '📊 Performance' },
+                      { id: 'geo',          label: '🗺️ Geo' },
                     ];
                     const currentIdx = WIZARD_ORDER.indexOf(detailTab);
                     const nextStep = WIZARD_ORDER[currentIdx + 1];
@@ -10175,7 +10435,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               add_exact_keyword:'➕🔑', ad_copy_suggestion:'✏️',
                               geo_exclusion:'🚫📍', change_budget:'💰',
                               change_bid_strategy:'🎯', change_match_type:'🔄',
-                              add_asset:'➕📎', replace_ad:'🔁',
+                              add_asset:'➕📎',
+                              set_ad_schedule:'🕐',
                               claude_advisory:'💡',
                             };
                             const typeLabel = {
@@ -10189,7 +10450,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               add_exact_keyword:'Add Exact Keyword', ad_copy_suggestion:'Ad Copy Suggestion',
                               geo_exclusion:'Geo Exclusion', change_budget:'Change Budget',
                               change_bid_strategy:'Change Bid Strategy', change_match_type:'Change Match Type',
-                              add_asset:'Add Asset', claude_advisory:'AI Advisory',
+                              add_asset:'Add Asset', set_ad_schedule:'Set Ad Schedule',
+                              claude_advisory:'AI Advisory',
                             };
 
                             return (
@@ -10234,9 +10496,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                     {(aiRefineResult.changes||[]).map((change, idx) => (
                                       <div key={idx} style={{display:'flex',alignItems:'flex-start',gap:8,
                                         padding:'8px 10px',marginBottom:6,borderRadius:6,
-                                        background: change._applied ? '#f0fdf4' : 'var(--surface)',
-                                        border:`1px solid ${change._applied ? '#86efac' : 'var(--border)'}`,
-                                        opacity: change._applied ? 0.7 : 1}}>
+                                        background: change._applied ? '#f0fdf4' : change._already_pending ? '#f8fafc' : 'var(--surface)',
+                                        border:`1px solid ${change._applied ? '#86efac' : change._already_pending ? '#cbd5e1' : 'var(--border)'}`,
+                                        opacity: change._applied || change._already_pending ? 0.7 : 1}}>
                                         <span style={{fontSize:16,flexShrink:0}}>{typeIcon[change.operation||change.type]||'•'}</span>
                                         <div style={{flex:1,minWidth:0}}>
                                           <div style={{fontSize:11,fontWeight:700,color:'var(--text)',marginBottom:2}}>
@@ -10245,12 +10507,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                             {change.type==='geo' && ` → ${change.locations}`}
                                             {change.type==='status' && ` → ${change.action}`}
                                             {change.type==='schedule' && ` → ${change.schedule_text}`}
+                                            {change.operation==='set_ad_schedule' && change.schedule_text && ` → ${change.schedule_text}`}
                                             {change.keyword_text && ` → "${change.keyword_text}"`}
                                             {change.operation==='change_budget' && change.new_daily_budget_usd && ` → $${change.new_daily_budget_usd}/day`}
                                             {change.operation==='change_bid_strategy' && change.bid_strategy && ` → ${change.bid_strategy}`}
                                           </div>
                                           <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.4}}>
-                                            {change.rationale || change.message}
+                                            {change.rationale || change.reason || change.message}
                                           </div>
                                           {(change.type === 'pause_ad' || change.operation === 'pause_ad') && (
                                             <div style={{marginTop:8,padding:'8px 10px',background:'#fff7ed',
@@ -10317,6 +10580,22 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               )}
                                             </div>
                                           )}
+                                          {(change.operation === 'set_ad_schedule') && change.slots && (
+                                            <div style={{marginTop:8,padding:'8px 10px',background:'#f0f9ff',
+                                              border:'1px solid #bae6fd',borderRadius:6,fontSize:11}}>
+                                              <div style={{fontWeight:600,marginBottom:4,color:'#0369a1'}}>
+                                                {`${change.slots.length} time slot${change.slots.length!==1?'s':''}: ${change.days || ''}`}
+                                              </div>
+                                              <div style={{color:'#0c4a6e',fontSize:10,lineHeight:1.5}}>
+                                                {(change.slots||[]).slice(0,5).map((s,i)=>(
+                                                  <span key={i} style={{marginRight:8}}>
+                                                    {`${s.day} ${s.start_hour}:${String(s.start_minute||0).padStart(2,'0')}–${s.end_hour}:${String(s.end_minute||0).padStart(2,'0')}`}
+                                                  </span>
+                                                ))}
+                                                {change.slots.length > 5 && <span style={{color:'#64748b'}}>+{change.slots.length-5} more</span>}
+                                              </div>
+                                            </div>
+                                          )}
                                         </div>
                                         {change._applied ? (
                                           <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:4,flexShrink:0}}>
@@ -10338,6 +10617,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               );
                                             })()}
                                           </div>
+                                        ) : change._already_pending ? (
+                                          <span style={{flexShrink:0,fontSize:10,color:'#64748b',padding:'3px 7px',
+                                            background:'#f1f5f9',border:'1px solid #cbd5e1',borderRadius:5,
+                                            fontWeight:600,whiteSpace:'nowrap'}}>
+                                            In queue
+                                          </span>
                                         ) : (change.type !== 'note' && change.operation !== 'claude_advisory') ? (
                                           <button
                                             onClick={()=>applyChange(change,idx)}
@@ -10360,6 +10645,11 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               </div>
                             );
                           })()}
+
+                          {/* ── Geo Performance Panel tab ── */}
+                          {detailTab==='geo' && (
+                            <GeoPerformancePanel campName={camp.campaign || camp.campaign_name || ''} />
+                          )}
 
                         </div>
                       </div>
@@ -13864,6 +14154,166 @@ function LaunchButtonGroup({campaignId, canLaunch, onLaunched}) {
 }
 
 
+// ── Office Hours Editor ───────────────────────────────────────────────────────
+const _OH_DAYS = [
+  {key:'mon', label:'Mon', full:'MONDAY'},
+  {key:'tue', label:'Tue', full:'TUESDAY'},
+  {key:'wed', label:'Wed', full:'WEDNESDAY'},
+  {key:'thu', label:'Thu', full:'THURSDAY'},
+  {key:'fri', label:'Fri', full:'FRIDAY'},
+  {key:'sat', label:'Sat', full:'SATURDAY'},
+  {key:'sun', label:'Sun', full:'SUNDAY'},
+];
+const _OH_HOURS = Array.from({length: 25}, (_, i) => i); // 0..24
+function _ohFmt(h) {
+  if (h === 0) return '12am';
+  if (h === 12) return '12pm';
+  if (h === 24) return '12am (mid)';
+  return h < 12 ? `${h}am` : `${h-12}pm`;
+}
+
+// Parse "Mon-Thu 10am-6pm, Fri 10am-2pm, Sun 8am-10pm" → structured day map
+function _ohParse(hoursStr) {
+  const base = {};
+  _OH_DAYS.forEach(d => { base[d.key] = {enabled: false, open: 9, close: 17}; });
+  if (!hoursStr || typeof hoursStr !== 'string') return base;
+
+  // Support JSON array format (future-proof)
+  const trimmed = hoursStr.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const arr = JSON.parse(trimmed);
+      if (Array.isArray(arr)) {
+        arr.forEach(slot => {
+          const dayMatch = _OH_DAYS.find(d => d.full === slot.day);
+          if (dayMatch) {
+            base[dayMatch.key] = {enabled: true, open: slot.start_hour ?? 9, close: slot.end_hour ?? 17};
+          }
+        });
+        return base;
+      }
+    } catch(e) {}
+  }
+
+  // Free-text parsing: handle ranges like "Mon-Thu 10am-6pm" and single days
+  const dayAliases = {
+    'mon':'mon','monday':'mon','tue':'tue','tuesday':'tue','tues':'tue',
+    'wed':'wed','wednesday':'wed','thu':'thu','thursday':'thu','thurs':'thu',
+    'fri':'fri','friday':'fri','sat':'sat','saturday':'sat','sun':'sun','sunday':'sun',
+  };
+  const dayOrder = ['mon','tue','wed','thu','fri','sat','sun'];
+
+  function parseHr(s) {
+    if (!s) return null;
+    s = s.trim().toLowerCase();
+    const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+    if (!m) return null;
+    let h = parseInt(m[1]);
+    const per = m[3] || '';
+    if (per === 'pm' && h !== 12) h += 12;
+    if (per === 'am' && h === 12) h = 0;
+    return h;
+  }
+
+  function expandDays(txt) {
+    txt = txt.trim().toLowerCase();
+    if (txt === 'weekdays' || txt === 'weekday') return ['mon','tue','wed','thu','fri'];
+    if (txt === 'weekends' || txt === 'weekend') return ['sat','sun'];
+    const rng = txt.match(/^([a-z]+)\s*(?:-|to)\s*([a-z]+)$/);
+    if (rng) {
+      const s = dayAliases[rng[1]], e = dayAliases[rng[2]];
+      if (s && e) {
+        const si = dayOrder.indexOf(s), ei = dayOrder.indexOf(e);
+        if (ei >= si) return dayOrder.slice(si, ei+1);
+      }
+    }
+    const single = dayAliases[txt];
+    if (single) return [single];
+    return [];
+  }
+
+  const pat = /([a-z]+(?:\s*(?:-|to)\s*[a-z]+)?)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|to)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/gi;
+  let m;
+  while ((m = pat.exec(hoursStr)) !== null) {
+    const days = expandDays(m[1]);
+    const open = parseHr(m[2]);
+    let close = parseHr(m[3]);
+    if (close === 0) close = 24;
+    if (days.length && open !== null && close !== null) {
+      days.forEach(d => { base[d] = {enabled: true, open, close}; });
+    }
+  }
+  return base;
+}
+
+// Serialize structured day map → "Mon 10am-6pm, Tue 10am-6pm, ..."
+function _ohSerialize(dayMap) {
+  const parts = [];
+  _OH_DAYS.forEach(d => {
+    const v = dayMap[d.key];
+    if (v && v.enabled) {
+      parts.push(`${d.label} ${_ohFmt(v.open)}-${_ohFmt(v.close)}`);
+    }
+  });
+  return parts.join(', ');
+}
+
+function OfficeHoursEditor({value, onChange}) {
+  const [days, setDays] = React.useState(() => _ohParse(value));
+
+  // Re-parse when value changes externally (e.g. on load)
+  React.useEffect(() => {
+    setDays(_ohParse(value));
+  }, [value]);
+
+  function update(key, field, val) {
+    setDays(prev => {
+      const next = {...prev, [key]: {...prev[key], [field]: val}};
+      onChange(_ohSerialize(next));
+      return next;
+    });
+  }
+
+  const selStyle = {fontSize:11, padding:'2px 4px', border:'1px solid var(--border)', borderRadius:3, background:'var(--bg)', color:'var(--text)'};
+
+  return (
+    <div style={{marginBottom:8}}>
+      <label style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:4}}>
+        Office Hours <span style={{fontFamily:'monospace',fontSize:9,color:'var(--teal)',background:'var(--teal-light)',padding:'1px 4px',borderRadius:3}}>used by AI schedule</span>
+      </label>
+      <div style={{border:'1px solid var(--border)',borderRadius:4,padding:'6px 8px',background:'var(--bg-alt, #fafafa)'}}>
+        {_OH_DAYS.map(d => (
+          <div key={d.key} style={{display:'flex',alignItems:'center',gap:6,marginBottom:3,minHeight:22}}>
+            <input type="checkbox" checked={days[d.key]?.enabled || false}
+              onChange={e => update(d.key, 'enabled', e.target.checked)}
+              style={{margin:0,cursor:'pointer'}} />
+            <span style={{fontSize:11,fontWeight:600,width:26,color: days[d.key]?.enabled ? 'var(--text)' : 'var(--text-muted)'}}>{d.label}</span>
+            {days[d.key]?.enabled ? (
+              <>
+                <select value={days[d.key].open} onChange={e => update(d.key, 'open', +e.target.value)} style={selStyle}>
+                  {_OH_HOURS.slice(0,24).map(h => <option key={h} value={h}>{_ohFmt(h)}</option>)}
+                </select>
+                <span style={{fontSize:10,color:'var(--text-muted)'}}>–</span>
+                <select value={days[d.key].close} onChange={e => update(d.key, 'close', +e.target.value)} style={selStyle}>
+                  {_OH_HOURS.slice(1).map(h => <option key={h} value={h}>{_ohFmt(h)}</option>)}
+                </select>
+              </>
+            ) : (
+              <span style={{fontSize:10,color:'var(--text-muted)',fontStyle:'italic'}}>Closed</span>
+            )}
+          </div>
+        ))}
+        {_ohSerialize(days) && (
+          <div style={{marginTop:4,fontSize:9,color:'var(--text-muted)',fontFamily:'monospace',wordBreak:'break-all'}}>
+            {_ohSerialize(days)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 // ── Practice Information Card ─────────────────────────────────────────────────
 function PracticeSettingsCard() {
   const emptyForm = {
@@ -13930,7 +14380,9 @@ function PracticeSettingsCard() {
           {field('doctor_name','Doctor Name','Dr. Anurag Gupta','{doctor_name}')}
           {field('phone','Phone','508-318-4477','{practice_phone}')}
           {field('email','Email','info@graftondentalcare.com',null)}
-          {field('hours','Office Hours','Mon–Fri 8am–5pm',null)}
+        </div>
+        <OfficeHoursEditor value={form.hours || ''} onChange={v => setForm(f => ({...f, hours: v}))} />
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0 12px'}}>
           {field('review_link','Google Review Link','https://g.page/r/...',null)}
           {field('website','Practice Website','https://graftondentalcare.com','{practice_website}')}
         </div>

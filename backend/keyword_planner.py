@@ -134,6 +134,43 @@ def get_keyword_ideas(
 
 # ── Geographic Performance ────────────────────────────────────────────────────
 
+def _resolve_geo_target_names(client, customer_id: str, resource_names: set) -> dict:
+    """
+    Batch-resolve geoTargetConstants/XXXXXX resource names → human-readable city/region names.
+    Returns {resource_name: display_name} dict.
+    Resource names that cannot be resolved are omitted.
+    """
+    if not resource_names:
+        return {}
+    service = client.get_service("GoogleAdsService")
+    # Filter to actual resource-name strings (skip already-resolved names)
+    to_resolve = {r for r in resource_names if r and r.startswith("geoTargetConstants/")}
+    if not to_resolve:
+        return {}
+    # Build quoted list for GAQL IN clause
+    quoted = ", ".join(f"'{r}'" for r in to_resolve)
+    query = f"""
+        SELECT
+            geo_target_constant.resource_name,
+            geo_target_constant.name,
+            geo_target_constant.country_code,
+            geo_target_constant.target_type
+        FROM geo_target_constant
+        WHERE geo_target_constant.resource_name IN ({quoted})
+    """
+    name_map: dict = {}
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            rn = row.geo_target_constant.resource_name
+            name = row.geo_target_constant.name
+            if rn and name:
+                name_map[rn] = name
+    except Exception as e:
+        logger.warning(f"geo_target_constant name resolution failed (non-fatal): {e}")
+    return name_map
+
+
 def fetch_geo_performance(days: int = 30) -> list:
     """
     Pull campaign performance segmented by city/region from geographic_view.
@@ -185,7 +222,8 @@ def fetch_geo_performance(days: int = 30) -> list:
         LIMIT 200
     """
 
-    results = []
+    raw_rows = []
+    resource_names_to_resolve: set = set()
     try:
         response = service.search(customer_id=customer_id, query=query)
         for row in response:
@@ -193,19 +231,24 @@ def fetch_geo_performance(days: int = 30) -> list:
             clicks = row.metrics.clicks or 0
             conversions = row.metrics.conversions or 0.0
 
-            # Use geo_target_city if available, fall back to region
-            location_name = ""
+            # segments.geo_target_city and geo_target_region return resource names
+            # like "geoTargetConstants/1025471" — resolve to human-readable names below
+            location_resource = ""
             location_type = str(row.geographic_view.location_type) if row.geographic_view.location_type else "UNKNOWN"
             if hasattr(row.segments, 'geo_target_city') and row.segments.geo_target_city:
-                location_name = row.segments.geo_target_city
+                location_resource = row.segments.geo_target_city
                 location_type = "CITY"
             elif hasattr(row.segments, 'geo_target_region') and row.segments.geo_target_region:
-                location_name = row.segments.geo_target_region
+                location_resource = row.segments.geo_target_region
                 location_type = "REGION"
 
-            results.append({
+            if location_resource:
+                resource_names_to_resolve.add(location_resource)
+
+            raw_rows.append({
+                "location_resource": location_resource,
                 "location_type": location_type,
-                "location_name": location_name or f"geo:{row.geographic_view.country_criterion_id}",
+                "country_criterion_id": row.geographic_view.country_criterion_id,
                 "campaign_name": row.campaign.name or "",
                 "impressions": row.metrics.impressions or 0,
                 "clicks": clicks,
@@ -217,6 +260,146 @@ def fetch_geo_performance(days: int = 30) -> list:
 
     except Exception as e:
         logger.error(f"Geographic view query failed: {e}")
+        return []
+
+    # Batch-resolve resource IDs → human-readable names
+    name_map = _resolve_geo_target_names(client, customer_id, resource_names_to_resolve)
+
+    results = []
+    for r in raw_rows:
+        res = r["location_resource"]
+        # Use resolved name; fall back to resource name (strip prefix) if unresolved
+        if res in name_map:
+            location_name = name_map[res]
+        elif res.startswith("geoTargetConstants/"):
+            # Keep as resource name stripped of prefix as last resort
+            location_name = res  # will be filtered by caller if needed
+        else:
+            location_name = res or f"geo:{r['country_criterion_id']}"
+
+        if not location_name:
+            continue  # skip unresolvable rows
+
+        results.append({
+            "location_type": r["location_type"],
+            "location_name": location_name,
+            "campaign_name": r["campaign_name"],
+            "impressions": r["impressions"],
+            "clicks": r["clicks"],
+            "cost": r["cost"],
+            "conversions": r["conversions"],
+            "cpc": r["cpc"],
+            "conversion_rate": r["conversion_rate"],
+        })
+
+    return results
+
+
+# ── User Location (Physical) Performance ─────────────────────────────────────
+
+def fetch_user_location_performance(days: int = 30) -> list:
+    """
+    Pull campaign performance from user_location_view — where users PHYSICALLY were
+    when they clicked (not just targeted location). This reveals demand leaks: towns
+    that generate clicks/conversions but are NOT in the campaign's current targeting.
+
+    Returns list of dicts (same shape as fetch_geo_performance but view_type='physical').
+    """
+    try:
+        client = _build_client()
+    except Exception as e:
+        logger.error(f"Failed to build client for user location performance: {e}")
+        return []
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id
+    service = client.get_service("GoogleAdsService")
+
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    query = f"""
+        SELECT
+            campaign.name,
+            campaign.resource_name,
+            segments.geo_target_city,
+            segments.geo_target_region,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions
+        FROM user_location_view
+        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+            AND campaign.status = 'ENABLED'
+            AND metrics.impressions > 0
+        ORDER BY metrics.conversions DESC, metrics.clicks DESC
+        LIMIT 300
+    """
+
+    raw_rows = []
+    resource_names_to_resolve: set = set()
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            cost = (row.metrics.cost_micros or 0) / 1_000_000.0
+            clicks = row.metrics.clicks or 0
+            conversions = row.metrics.conversions or 0.0
+
+            # segments.geo_target_city/region return resource names like geoTargetConstants/XXXXXX
+            location_resource = ""
+            location_type = "CITY"
+            if hasattr(row.segments, 'geo_target_city') and row.segments.geo_target_city:
+                location_resource = row.segments.geo_target_city
+            elif hasattr(row.segments, 'geo_target_region') and row.segments.geo_target_region:
+                location_resource = row.segments.geo_target_region
+                location_type = "REGION"
+
+            if not location_resource:
+                continue  # skip unattributed rows
+
+            resource_names_to_resolve.add(location_resource)
+            raw_rows.append({
+                "location_resource": location_resource,
+                "location_type": location_type,
+                "zip_code": "",  # user_location_view does not support geo_target_postal_code segment
+                "campaign_name": row.campaign.name or "",
+                "campaign_resource": row.campaign.resource_name or "",
+                "impressions": row.metrics.impressions or 0,
+                "clicks": clicks,
+                "cost": round(cost, 2),
+                "conversions": round(conversions, 2),
+                "cpc": round(cost / clicks, 2) if clicks > 0 else 0.0,
+                "conversion_rate": round(conversions / clicks * 100, 1) if clicks > 0 else 0.0,
+                "view_type": "physical",
+            })
+    except Exception as e:
+        logger.error(f"User location view query failed: {e}")
+        return []
+
+    # Batch-resolve resource IDs → human-readable names
+    name_map = _resolve_geo_target_names(client, customer_id, resource_names_to_resolve)
+
+    results = []
+    for r in raw_rows:
+        res = r["location_resource"]
+        location_name = name_map.get(res, "")
+        if not location_name:
+            continue  # skip rows whose resource ID couldn't be resolved
+
+        results.append({
+            "location_type": r["location_type"],
+            "location_name": location_name,
+            "zip_code": r["zip_code"],
+            "campaign_name": r["campaign_name"],
+            "campaign_resource": r["campaign_resource"],
+            "impressions": r["impressions"],
+            "clicks": r["clicks"],
+            "cost": r["cost"],
+            "conversions": r["conversions"],
+            "cpc": r["cpc"],
+            "conversion_rate": r["conversion_rate"],
+            "view_type": r["view_type"],
+        })
 
     return results
 

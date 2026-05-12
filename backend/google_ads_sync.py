@@ -588,6 +588,17 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         logger.warning(f"Geo performance fetch failed (non-fatal): {e}")
         geo_data = []
 
+    # Pass 4b: User location view (physical location of user — reveals demand leaks)
+    logger.info("Fetching user location (physical) performance...")
+    try:
+        from keyword_planner import fetch_user_location_performance
+        phys_data = fetch_user_location_performance(days=30)
+        if phys_data:
+            save_gads_geo_cache(phys_data, days=30, view_type="physical")
+            logger.info(f"User location (physical) synced: {len(phys_data)} rows cached")
+    except Exception as e:
+        logger.warning(f"User location fetch failed (non-fatal): {e}")
+
     # Pass 5: Schedule / device / hour-of-day performance
     logger.info("Fetching schedule performance...")
     try:

@@ -678,6 +678,184 @@ def collect_no_show_patterns(conn, days: int = 30) -> dict:
     return out
 
 
+# ─── Geo signals ─────────────────────────────────────────────────────────────
+def collect_geo_signals(conn, days: int = 30) -> dict:
+    """
+    Per-campaign geo intelligence from gads_geo_cache.
+
+    Returns leakage alerts, low/high-perf locations, distance-band rollups.
+    Never raises — returns {} on any failure.
+    """
+    try:
+        rows = list(conn.execute("""
+            SELECT location_name, location_type, campaign_name, campaign_resource,
+                   impressions, clicks, cost, conversions, cpc, conversion_rate,
+                   days, view_type, zip_code, distance_band, synced_at
+            FROM gads_geo_cache
+            WHERE days = ?
+        """, (days,)))
+
+        if not rows:
+            # Fallback: use whatever is cached
+            rows = list(conn.execute("""
+                SELECT location_name, location_type, campaign_name, campaign_resource,
+                       impressions, clicks, cost, conversions, cpc, conversion_rate,
+                       days, view_type, zip_code, distance_band, synced_at
+                FROM gads_geo_cache
+            """))
+
+        if not rows:
+            return {}
+
+        def _classify_camp_type(name: str) -> str:
+            n = name.lower()
+            if any(t in n for t in ["implant", "all-on", "all on"]):
+                return "IMPLANTS"
+            if any(t in n for t in ["emergency", "urgent", "same day", "toothache"]):
+                return "EMERGENCY"
+            if any(t in n for t in ["invisalign", "clear aligner", "ortho", "veneer",
+                                     "cosmetic", "smile makeover", "whitening"]):
+                return "ELECTIVE"
+            if any(t in n for t in ["grafton dental", "brand", "branded"]):
+                return "BRAND"
+            return "GENERAL"
+
+        # Group rows by campaign
+        camps: dict = {}
+        for r in rows:
+            cn = (r["campaign_name"] or "(unknown)").strip()
+            camps.setdefault(cn, {"targeted": [], "physical": []})
+            view = (r["view_type"] or "").lower()
+            clicks      = int(r["clicks"] or 0)
+            cost        = float(r["cost"] or 0)
+            convs       = float(r["conversions"] or 0)
+            impr        = int(r["impressions"] or 0)
+            loc         = (r["location_name"] or "").strip()
+            band        = (r["distance_band"] or "").strip()
+            total_clicks = clicks
+            cvr_pct = round(convs / total_clicks * 100, 2) if total_clicks > 0 else 0.0
+            cpl     = round(cost / convs, 2) if convs > 0 else 0.0
+            entry = {
+                "location_name": loc,
+                "distance_band": band,
+                "impressions":   impr,
+                "clicks":        clicks,
+                "cost":          round(cost, 2),
+                "conversions":   convs,
+                "cvr_pct":       cvr_pct,
+                "cpl":           cpl,
+            }
+            if view == "targeted":
+                camps[cn]["targeted"].append(entry)
+            elif view == "physical":
+                camps[cn]["physical"].append(entry)
+
+        by_campaign: dict = {}
+        total_targeted = 0
+        total_leakage  = 0
+        total_low_perf = 0
+
+        for cn, data in camps.items():
+            targeted = sorted(data["targeted"], key=lambda x: -x["cost"])
+            physical = sorted(data["physical"], key=lambda x: -x["cost"])
+
+            # Campaign-level CVR (across all targeted rows)
+            t_clicks = sum(e["clicks"] for e in targeted)
+            t_convs  = sum(e["conversions"] for e in targeted)
+            t_cost   = sum(e["cost"] for e in targeted)
+            camp_avg_cvr = round(t_convs / t_clicks * 100, 2) if t_clicks > 0 else 0.0
+
+            # Leakage: physical rows with conversions >= 1 not matched in targeted names
+            targeted_names = {e["location_name"].lower() for e in targeted}
+            leakage_alerts = []
+            for e in physical:
+                if e["conversions"] >= 1 and e["location_name"].lower() not in targeted_names:
+                    leakage_alerts.append({
+                        "location_name": e["location_name"],
+                        "distance_band": e["distance_band"],
+                        "clicks":        e["clicks"],
+                        "cost":          e["cost"],
+                        "conversions":   e["conversions"],
+                        "msg":           f"Converts from {e['location_name']} but not in targeted list",
+                    })
+
+            # Low / high perf (clicks >= 30 floor)
+            low_perf_locs  = []
+            high_perf_locs = []
+            for e in targeted:
+                if e["clicks"] < 30:
+                    continue
+                if camp_avg_cvr > 0 and e["cvr_pct"] < camp_avg_cvr * 0.5:
+                    low_perf_locs.append({
+                        "location_name": e["location_name"],
+                        "distance_band": e["distance_band"],
+                        "clicks":        e["clicks"],
+                        "cvr_pct":       e["cvr_pct"],
+                        "camp_avg_cvr":  camp_avg_cvr,
+                        "cost":          e["cost"],
+                    })
+                elif camp_avg_cvr > 0 and e["cvr_pct"] >= camp_avg_cvr * 1.2:
+                    high_perf_locs.append({
+                        "location_name": e["location_name"],
+                        "distance_band": e["distance_band"],
+                        "clicks":        e["clicks"],
+                        "cvr_pct":       e["cvr_pct"],
+                        "camp_avg_cvr":  camp_avg_cvr,
+                    })
+
+            # Distance-band rollup (targeted only)
+            band_map: dict = {}
+            for e in targeted:
+                b = e["distance_band"] or "unknown"
+                if b not in band_map:
+                    band_map[b] = {"band": b, "clicks": 0, "cost": 0.0,
+                                   "conversions": 0.0}
+                band_map[b]["clicks"]      += e["clicks"]
+                band_map[b]["cost"]        += e["cost"]
+                band_map[b]["conversions"] += e["conversions"]
+            by_distance_band = []
+            for bd in sorted(band_map.values(), key=lambda x: x["band"]):
+                bc = bd["clicks"]
+                bconv = bd["conversions"]
+                by_distance_band.append({
+                    "band":        bd["band"],
+                    "clicks":      bc,
+                    "cost":        round(bd["cost"], 2),
+                    "conversions": bconv,
+                    "cvr_pct":     round(bconv / bc * 100, 2) if bc > 0 else 0.0,
+                    "cpl":         round(bd["cost"] / bconv, 2) if bconv > 0 else 0.0,
+                })
+
+            total_targeted += len(targeted)
+            total_leakage  += len(leakage_alerts)
+            total_low_perf += len(low_perf_locs)
+
+            by_campaign[cn] = {
+                "campaign_type":         _classify_camp_type(cn),
+                "targeted":              targeted,
+                "physical":              physical,
+                "leakage_alerts":        leakage_alerts,
+                "low_perf_locs":         low_perf_locs,
+                "high_perf_locs":        high_perf_locs,
+                "by_distance_band":      by_distance_band,
+                "camp_avg_cvr":          camp_avg_cvr,
+                "camp_total_cost":       round(t_cost, 2),
+                "camp_total_conversions": t_convs,
+            }
+
+        return {
+            "by_campaign": by_campaign,
+            "account": {
+                "total_locations_targeted": total_targeted,
+                "leakage_alerts_count":     total_leakage,
+                "low_perf_count":           total_low_perf,
+            },
+        }
+    except Exception as e:
+        logger.warning(f"LQI: collect_geo_signals failed (non-fatal): {e}")
+        return {}
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _median(xs: list) -> float:
     if not xs:
@@ -774,6 +952,7 @@ def collect_all(days: int = 30) -> dict:
         ("schedule",     collect_schedule_waste),
         ("cold_leads",   collect_cold_lead_causes),
         ("no_shows",     collect_no_show_patterns),
+        ("geo",          collect_geo_signals),
     ]
 
     try:
