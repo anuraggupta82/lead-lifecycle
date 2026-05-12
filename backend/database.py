@@ -3957,6 +3957,7 @@ def get_unclassified_search_terms(campaign_name: str = "", days: int = 30) -> li
                AND LOWER(c.campaign_name) = LOWER(s.campaign_name)
             {where}
               AND c.id IS NULL
+              AND LOWER(COALESCE(s.status, '')) NOT IN ('excluded', 'added')
             ORDER BY s.cost DESC, s.impressions DESC
         """, params).fetchall()
         return [dict(r) for r in rows]
@@ -3994,7 +3995,7 @@ def save_st_classification(search_term: str, campaign_name: str,
                 reason        = excluded.reason,
                 classified_at = excluded.classified_at,
                 classifier    = excluded.classifier
-        """, (search_term.strip(), campaign_name.strip(), verdict, reason, now, classifier))
+        """, (search_term.strip().lower(), campaign_name.strip().lower(), verdict, reason, now, classifier))
 
 
 def save_st_classifications_bulk(classifications: list) -> int:
@@ -4007,8 +4008,8 @@ def save_st_classifications_bulk(classifications: list) -> int:
     saved = 0
     with _conn() as conn:
         for c in classifications:
-            st = (c.get("search_term") or "").strip()
-            camp = (c.get("campaign_name") or "").strip()
+            st = (c.get("search_term") or "").strip().lower()    # Bug #2 fix: normalize to lowercase
+            camp = (c.get("campaign_name") or "").strip().lower()  # Bug #2 fix: normalize to lowercase
             verdict = c.get("verdict", "keep")
             reason = c.get("reason", "")
             classifier = c.get("classifier", "haiku")

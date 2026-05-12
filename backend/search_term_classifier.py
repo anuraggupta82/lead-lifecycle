@@ -13,8 +13,9 @@ Verdicts
 
 Design
 ------
-- Classifies in batches of up to 50 terms per Haiku call (cheap + fast)
+- Classifies in batches of up to 20 terms per Haiku call
 - Results are persisted to st_classifications — each term is classified only once
+  (campaign_name and search_term stored lowercase for consistent lookup)
 - The optimizer calls classify_new_terms_for_campaign() once per campaign before
   the main Opus pass; results feed into staged add_negative_keyword actions
 - A manual /api/admin/classify-search-terms endpoint lets you trigger on demand
@@ -22,7 +23,7 @@ Design
 Campaign type detection
 -----------------------
 Uses the same _classify_campaign() logic as ai_optimizer.py (imported at call time).
-Types: emergency | implants | invisalign | cosmetic | general
+Types: emergency | implants | invisalign | cosmetic | general | gum
 """
 from __future__ import annotations
 
@@ -57,23 +58,29 @@ _CAMPAIGN_SERVICE_DESC = {
 # Key = campaign type, value = list of brand substrings that are valid conquest
 _CONQUEST_BRANDS: dict[str, list[str]] = {
     "implants":   ["clearchoice", "clear choice", "aspen dental", "affordable dentures",
-                   "dentalimplantsolutions", "smile again", "teeth today"],
-    "invisalign": ["smile direct", "byte", "candid", "smilelove", "orthly"],
-    "cosmetic":   ["smile direct", "byte"],
-    "emergency":  [],  # no conquest makes sense for emergency — if someone needs emergency care elsewhere, let them go
+                   "teeth today", "smile again"],
+    "invisalign": ["smile direct", "smiledirectclub", "byte", "candid", "smilelove", "orthly"],
+    "cosmetic":   ["smile direct", "smiledirectclub", "byte"],
+    "emergency":  [],  # no conquest for emergency — patients who call elsewhere should go there
     "general":    [],
     "gum":        [],
 }
 
-# ── Batch size — how many terms per Haiku call ────────────────────────────────
-BATCH_SIZE = 50
+# ── Batch size — 20 terms keeps response well within 8k tokens ───────────────
+BATCH_SIZE = 20
 
 
 def _detect_campaign_type(campaign_name: str) -> str:
     """Classify campaign name into a service type. Mirrors ai_optimizer._classify_campaign."""
     try:
         from ai_optimizer import _classify_campaign
-        return _classify_campaign(campaign_name)
+        ctype = _classify_campaign(campaign_name)
+        # _classify_campaign may not have a "gum" bucket — map periodontal campaigns explicitly
+        if ctype == "general":
+            n = campaign_name.lower()
+            if any(w in n for w in ["gum", "recession", "periodon", "perio", "scaling"]):
+                return "gum"
+        return ctype
     except Exception:
         n = campaign_name.lower()
         if any(w in n for w in ["emergency", "urgent", "pain", "toothache", "same day", "same-day"]):
@@ -84,7 +91,7 @@ def _detect_campaign_type(campaign_name: str) -> str:
             return "invisalign"
         if any(w in n for w in ["cosmetic", "veneer", "whitening", "smile makeover"]):
             return "cosmetic"
-        if any(w in n for w in ["gum", "recession", "periodon", "perio"]):
+        if any(w in n for w in ["gum", "recession", "periodon", "perio", "scaling"]):
             return "gum"
         return "general"
 
@@ -111,7 +118,7 @@ def _build_prompt(campaign_name: str, campaign_type: str, terms: list[dict]) -> 
 
     terms_json = json.dumps(
         [{"id": i, "term": t["search_term"], "impressions": t.get("impressions", 0),
-          "clicks": t.get("clicks", 0), "cost": round(float(t.get("cost", 0)), 2)}
+          "clicks": t.get("clicks", 0), "cost": round(float(t.get("cost") or 0), 2)}
          for i, t in enumerate(terms)],
         ensure_ascii=False
     )
@@ -164,7 +171,8 @@ def classify_batch(
 ) -> list[dict]:
     """
     Send one batch of terms to Haiku. Returns list of
-    {search_term, campaign_name, verdict, reason, classifier}.
+    {search_term, campaign_name, verdict, reason, classifier, cost, impressions, clicks}.
+    Includes original cost/impressions/clicks so callers can use them for impact estimates.
     """
     if not terms:
         return []
@@ -176,7 +184,7 @@ def classify_batch(
     try:
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=2000,
+            max_tokens=8000,   # Bug #7 fix: 20 terms × ~150 tokens/result = ~3k; 8k gives headroom
             messages=[{"role": "user", "content": prompt}],
         )
         text = msg.content[0].text if msg.content else "[]"
@@ -189,7 +197,8 @@ def classify_batch(
                 model="claude-haiku-4-5-20251001",
                 input_tokens=msg.usage.input_tokens,
                 output_tokens=msg.usage.output_tokens,
-                campaign_id=campaign_name,
+                campaign_id="",  # Bug #12 fix: don't pass campaign name as campaign_id
+                optimizer_run_id="",
             )
         except Exception:
             pass
@@ -207,30 +216,53 @@ def classify_batch(
     try:
         results = json.loads(m.group(0))
     except json.JSONDecodeError as e:
-        logger.warning(f"[st_classifier] JSON parse error: {e}")
-        return []
+        logger.warning(f"[st_classifier] JSON parse error for '{campaign_name}': {e}")
+        # Partial recovery: try to extract complete {...} objects
+        partial = re.findall(r'\{[^{}]+\}', m.group(0))
+        results = []
+        for p in partial:
+            try:
+                results.append(json.loads(p))
+            except Exception:
+                pass
+        if results:
+            logger.info(f"[st_classifier] Partial recovery: {len(results)} objects extracted")
+        else:
+            return []
 
-    # Map id → original term
-    id_to_term = {i: t["search_term"] for i, t in enumerate(terms)}
+    # Map id → original term dict (for full data passthrough)
+    id_to_term = {i: t for i, t in enumerate(terms)}
 
     classified = []
+    seen_ids: set = set()
     for r in results:
         if not isinstance(r, dict):
             continue
-        term_id = r.get("id")
-        verdict = r.get("verdict", "keep").lower().strip()
-        reason = r.get("reason", "")
+        # Bug #6 fix: coerce id to int to handle string ids from Haiku
+        try:
+            term_id = int(r.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if term_id in seen_ids:
+            continue  # skip duplicates
+        seen_ids.add(term_id)
+        verdict = (r.get("verdict") or "keep").lower().strip()
+        reason = r.get("reason") or ""
         if verdict not in ("keep", "negative", "conquest"):
             verdict = "keep"  # safe default
-        search_term = id_to_term.get(term_id)
-        if not search_term:
+        orig = id_to_term.get(term_id)
+        if not orig:
             continue
         classified.append({
-            "search_term": search_term,
+            "search_term": orig["search_term"],
             "campaign_name": campaign_name,
             "verdict": verdict,
             "reason": reason,
             "classifier": "haiku",
+            # Bug #11 fix: pass cost/impressions/clicks through so optimizer can use them
+            "cost": round(float(orig.get("cost") or 0), 2),
+            "impressions": int(orig.get("impressions") or 0),
+            "clicks": int(orig.get("clicks") or 0),
         })
 
     logger.info(
@@ -254,14 +286,14 @@ def classify_new_terms_for_campaign(
     Returns:
         {
             "classified": int,       — total terms classified this run
-            "negatives": list[dict], — terms with verdict='negative' (for staging)
+            "negatives": list[dict], — terms with verdict='negative' (includes cost field)
             "conquests": list[dict], — terms with verdict='conquest' (informational)
             "skipped": int,          — terms already classified (skipped)
         }
     """
     from database import (
         get_unclassified_search_terms, save_st_classifications_bulk,
-        get_setting, get_st_classifications,
+        get_setting,
     )
 
     _api_key = api_key or get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
@@ -272,7 +304,7 @@ def classify_new_terms_for_campaign(
     campaign_type = _detect_campaign_type(campaign_name)
 
     if force_reclassify:
-        # Pull ALL terms for this campaign
+        # Pull ALL terms for this campaign (including already-classified ones)
         from database import get_search_term_stats
         all_terms = get_search_term_stats(campaign_name=campaign_name, days=days)
         unclassified = [
@@ -280,9 +312,14 @@ def classify_new_terms_for_campaign(
              "impressions": t.get("impressions", 0), "clicks": t.get("clicks", 0),
              "cost": t.get("cost", 0)}
             for t in all_terms
+            if t.get("search_term")
         ]
     else:
         unclassified = get_unclassified_search_terms(campaign_name=campaign_name, days=days)
+
+    if not unclassified:
+        logger.info(f"[st_classifier] '{campaign_name}': no unclassified terms")
+        return {"classified": 0, "negatives": [], "conquests": [], "skipped": 0}
 
     # Pre-filter conquest terms locally (fast path — no Haiku call needed)
     pre_classified = []
@@ -295,6 +332,9 @@ def classify_new_terms_for_campaign(
                 "verdict": "conquest",
                 "reason": f"Known conquest brand for {campaign_type} campaigns",
                 "classifier": "rule",
+                "cost": round(float(t.get("cost") or 0), 2),
+                "impressions": int(t.get("impressions") or 0),
+                "clicks": int(t.get("clicks") or 0),
             })
         else:
             to_classify.append(t)
@@ -312,7 +352,7 @@ def classify_new_terms_for_campaign(
         results = classify_batch(campaign_name, campaign_type, batch, _api_key)
         all_classified.extend(results)
 
-    # Persist to DB
+    # Persist to DB (Bug #2 fix: storage normalization handled in save_st_classifications_bulk)
     saved = save_st_classifications_bulk(all_classified)
     logger.info(f"[st_classifier] '{campaign_name}': saved {saved} classifications to DB")
 
@@ -325,13 +365,3 @@ def classify_new_terms_for_campaign(
         "conquests": conquests,
         "skipped": len(unclassified) - len(all_classified),
     }
-
-
-def get_pending_negative_classifications(campaign_name: str = "") -> list[dict]:
-    """
-    Return classified-negative terms that haven't yet been staged as
-    add_negative_keyword actions. Used by the optimizer to avoid re-staging.
-    """
-    from database import get_st_classifications
-    classified = get_st_classifications(campaign_name=campaign_name)
-    return [c for c in classified if c["verdict"] == "negative"]

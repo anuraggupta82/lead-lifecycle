@@ -5019,23 +5019,34 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 api_key=_classifier_api_key,
             )
             # Get campaign_resource for this campaign (needed for staging)
+            # Bug #9 fix: prefer keyword_perf lookup, fall back to campaign_settings
+            # (covers new campaigns that have search terms but no keywords yet)
             _clf_camp_resource = ""
             for kw in keyword_perf:
                 if kw.get("campaign", "").strip().lower() == _classify_camp.strip().lower():
                     _clf_camp_resource = kw.get("campaign_resource", "")
                     if _clf_camp_resource:
                         break
+            if not _clf_camp_resource:
+                # Fall back to campaign_settings map (keyed by resource name)
+                for _cr, _cs in campaign_settings.items():
+                    if (_cs.get("campaign_name") or "").strip().lower() == _classify_camp.strip().lower():
+                        _clf_camp_resource = _cr
+                        break
 
             # Stage negative verdicts as pending add_negative_keyword actions
+            # Bug #1 fix: use a local set to dedup within this campaign's staging loop
+            _clf_staged_kws: set[str] = set()
             for neg in _clf_result.get("negatives", []):
                 kw_text = neg["search_term"].strip().lower()
-                # Skip if already a live negative
+                # Skip if already staged in this loop iteration
+                if kw_text in _clf_staged_kws:
+                    continue
+                # Skip if already a live negative in Google Ads
                 if _negative_already_handled(kw_text, _classify_camp, live_negatives=live_negatives):
                     continue
-                # Skip if already pending in this run (dedup)
-                _neg_op_key = ("add_negative_keyword", kw_text)
-                if _neg_op_key in {("add_negative_keyword", n["search_term"].lower()) for n in _clf_result.get("negatives", [][:0])}:
-                    pass  # checked below via log_pending dedup
+                # Bug #11 fix: include actual cost in impact estimate
+                _clf_cost = round(float(neg.get("cost") or 0), 2)
                 aid = log_pending(
                     operation="add_negative_keyword",
                     entity_type="keyword",
@@ -5051,10 +5062,11 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                     optimizer_run_id=run_id,
                     reason=f"[Semantic] {neg['reason']}",
                     campaign_name=_classify_camp,
-                    priority=12,  # high priority — catches waste before it accumulates
-                    impact_estimate={"savings_30d_usd": 0},  # zero-spend terms have no historic waste yet
+                    priority=18,  # between rule-based negatives (15) and Opus recs (30+)
+                    impact_estimate={"savings_30d_usd": _clf_cost},
                 )
                 if aid:
+                    _clf_staged_kws.add(kw_text)
                     _classifier_negatives_staged += 1
 
             _n = len(_clf_result.get("negatives", []))
