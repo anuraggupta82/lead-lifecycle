@@ -7,7 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <!-- v20260511-2010 -->
+  <!-- v20260512-0930 -->
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -9762,6 +9762,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             const camp = cd.campaign;
                             const campCtx = {
                               campaign_name: camp.campaign_name,
+                              gads_campaign_resource: camp.gads_campaign_resource || '',
                               gads_campaign_numeric_id: camp.gads_campaign_numeric_id || camp.gads_campaign_id || '',
                               status: camp.status,
                               daily_budget_usd: camp.daily_budget_usd || (camp.monthly_budget ? (camp.monthly_budget/30.4).toFixed(2) : null),
@@ -9803,7 +9804,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               setAiRefineApplying(s => ({...s, [idx]: true}));
                               let confirmation = null;
                               try {
-                                if (change.type === 'budget') {
+                                if (change.action_id) {
+                                  // New optimizer-engine path: all ops staged server-side, just approve
+                                  const approveResult = await api(`/api/admin/gads/approve/${change.action_id}`, { method: 'POST' });
+                                  confirmation = approveResult?.confirmation || null;
+                                  openCampaignDetail(camp.campaign_id, campDetailDays);
+                                } else if (change.type === 'budget') {
+                                  // Legacy paths (old AI refine format, kept for backwards compat)
                                   const result = await api(`/api/admin/campaigns/${camp.campaign_id}/set-budget`, {
                                     method: 'POST',
                                     body: JSON.stringify({
@@ -9835,47 +9842,6 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                   });
                                   confirmation = result?.confirmation || null;
                                   openCampaignDetail(camp.campaign_id, campDetailDays);
-                                } else if (change.type === 'pause_ad') {
-                                  const staged = await api(`/api/admin/campaigns/${camp.campaign_id}/pause-ad/stage`, {
-                                    method: 'POST',
-                                    body: JSON.stringify({
-                                      campaign_id:          camp.campaign_id,
-                                      ad_group_ad_resource: change.ad_group_ad_resource,
-                                      rationale:            change.rationale || aiRefineInput,
-                                    }),
-                                  });
-                                  const approveResult = await api(`/api/admin/gads/approve/${staged.action_id}`, { method: 'POST' });
-                                  confirmation = approveResult?.confirmation || null;
-                                  openCampaignDetail(camp.campaign_id, campDetailDays);
-                                } else if (change.type === 'replace_ad') {
-                                  const staged = await api(`/api/admin/campaigns/${camp.campaign_id}/replace-ad/stage`, {
-                                    method: 'POST',
-                                    body: JSON.stringify({
-                                      campaign_id: camp.campaign_id,
-                                      old_ad_group_ad_resource: change.old_ad_group_ad_resource,
-                                      new_headlines:    change.new_headlines,
-                                      new_descriptions: change.new_descriptions,
-                                      final_url:        change.final_url,
-                                      path1:            change.path1 || '',
-                                      path2:            change.path2 || '',
-                                      rationale:        change.rationale || aiRefineInput,
-                                    }),
-                                  });
-                                  const approveResult = await api(`/api/admin/gads/approve/${staged.action_id}`, { method: 'POST' });
-                                  confirmation = approveResult?.confirmation || null;
-                                  openCampaignDetail(camp.campaign_id, campDetailDays);
-                                } else if (change.type === 'pause_ad_group') {
-                                  const result = await api('/api/admin/ad-groups/set-status', {
-                                    method: 'POST',
-                                    body: JSON.stringify({
-                                      ad_group_resource: change.ad_group_resource,
-                                      status: 'PAUSED',
-                                      ad_group_name: change.ad_group_name || '',
-                                      campaign_id: camp.campaign_id,
-                                    }),
-                                  });
-                                  confirmation = result?.confirmation || null;
-                                  openCampaignDetail(camp.campaign_id, campDetailDays);
                                 }
                                 // Mark applied with confirmation
                                 setAiRefineResult(r => ({
@@ -9889,8 +9855,32 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               }
                             }
 
-                            const typeIcon = {budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡', pause_ad:'⏸️', replace_ad:'🔁', pause_ad_group:'⏸📂'};
-                            const typeLabel = {budget:'Budget change', geo:'Geo targeting', status:'Campaign status', schedule:'Ad schedule', note:'Note', pause_ad:'Pause Ad', replace_ad:'Replace Ad', pause_ad_group:'Pause Ad Group'};
+                            const typeIcon = {
+                              budget:'💰', geo:'📍', status:'⏸', schedule:'🕐', note:'💡',
+                              pause_ad:'⏸️', replace_ad:'🔁', pause_ad_group:'⏸📂',
+                              // Optimizer operation types
+                              add_negative_keyword:'🚫', add_to_shared_negative_list:'🚫📋',
+                              pause_keyword:'⏸🔑', enable_keyword:'▶️🔑',
+                              increase_bid:'📈', decrease_bid:'📉',
+                              add_exact_keyword:'➕🔑', ad_copy_suggestion:'✏️',
+                              geo_exclusion:'🚫📍', change_budget:'💰',
+                              change_bid_strategy:'🎯', change_match_type:'🔄',
+                              add_asset:'➕📎', replace_ad:'🔁',
+                              claude_advisory:'💡',
+                            };
+                            const typeLabel = {
+                              budget:'Budget change', geo:'Geo targeting', status:'Campaign status',
+                              schedule:'Ad schedule', note:'Note', pause_ad:'Pause Ad',
+                              replace_ad:'Replace Ad', pause_ad_group:'Pause Ad Group',
+                              // Optimizer operation types
+                              add_negative_keyword:'Add Negative Keyword', add_to_shared_negative_list:'Add to Shared Negative List',
+                              pause_keyword:'Pause Keyword', enable_keyword:'Enable Keyword',
+                              increase_bid:'Increase Bid', decrease_bid:'Decrease Bid',
+                              add_exact_keyword:'Add Exact Keyword', ad_copy_suggestion:'Ad Copy Suggestion',
+                              geo_exclusion:'Geo Exclusion', change_budget:'Change Budget',
+                              change_bid_strategy:'Change Bid Strategy', change_match_type:'Change Match Type',
+                              add_asset:'Add Asset', claude_advisory:'AI Advisory',
+                            };
 
                             return (
                               <div style={{marginTop:24, borderTop:'1px solid var(--border)', paddingTop:16}}>
@@ -9937,19 +9927,22 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                         background: change._applied ? '#f0fdf4' : 'var(--surface)',
                                         border:`1px solid ${change._applied ? '#86efac' : 'var(--border)'}`,
                                         opacity: change._applied ? 0.7 : 1}}>
-                                        <span style={{fontSize:16,flexShrink:0}}>{typeIcon[change.type]||'•'}</span>
+                                        <span style={{fontSize:16,flexShrink:0}}>{typeIcon[change.operation||change.type]||'•'}</span>
                                         <div style={{flex:1,minWidth:0}}>
                                           <div style={{fontSize:11,fontWeight:700,color:'var(--text)',marginBottom:2}}>
-                                            {typeLabel[change.type]||change.type}
+                                            {typeLabel[change.operation||change.type]||(change.operation||change.type)}
                                             {change.type==='budget' && ` → $${change.new_daily_budget_usd}/day`}
                                             {change.type==='geo' && ` → ${change.locations}`}
                                             {change.type==='status' && ` → ${change.action}`}
                                             {change.type==='schedule' && ` → ${change.schedule_text}`}
+                                            {change.keyword_text && ` → "${change.keyword_text}"`}
+                                            {change.operation==='change_budget' && change.new_daily_budget_usd && ` → $${change.new_daily_budget_usd}/day`}
+                                            {change.operation==='change_bid_strategy' && change.bid_strategy && ` → ${change.bid_strategy}`}
                                           </div>
                                           <div style={{fontSize:11,color:'var(--text-muted)',lineHeight:1.4}}>
                                             {change.rationale || change.message}
                                           </div>
-                                          {change.type === 'pause_ad' && (
+                                          {(change.type === 'pause_ad' || change.operation === 'pause_ad') && (
                                             <div style={{marginTop:8,padding:'8px 10px',background:'#fff7ed',
                                               border:'1px solid #fed7aa',borderRadius:6,fontSize:11}}>
                                               <div style={{fontWeight:600,marginBottom:4,color:'#92400e'}}>
@@ -9963,7 +9956,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               </div>
                                             </div>
                                           )}
-                                          {change.type === 'pause_ad_group' && (
+                                          {(change.type === 'pause_ad_group' || change.operation === 'pause_ad_group') && (
                                             <div style={{marginTop:8,padding:'8px 10px',background:'#fef3c7',
                                               border:'1px solid #fde68a',borderRadius:6,fontSize:11}}>
                                               <div style={{fontWeight:600,marginBottom:4,color:'#92400e'}}>
@@ -9975,7 +9968,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               </div>
                                             </div>
                                           )}
-                                          {change.type === 'replace_ad' && (
+                                          {(change.type === 'replace_ad' || change.operation === 'replace_ad') && (
                                             <div style={{marginTop:8,padding:'8px 10px',background:'#f8fafc',
                                               border:'1px solid var(--border)',borderRadius:6,fontSize:11}}>
                                               <div style={{fontWeight:600,marginBottom:4,color:'var(--text)'}}>
@@ -10035,7 +10028,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                               );
                                             })()}
                                           </div>
-                                        ) : change.type !== 'note' ? (
+                                        ) : (change.type !== 'note' && change.operation !== 'claude_advisory') ? (
                                           <button
                                             onClick={()=>applyChange(change,idx)}
                                             disabled={!!aiRefineApplying[idx]}

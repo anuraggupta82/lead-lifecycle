@@ -9085,33 +9085,124 @@ class CampaignRefineRequest(BaseModel):
 @app.post("/api/admin/ai/campaign-refine", dependencies=[Depends(_require_admin)])
 def admin_ai_campaign_refine(body: CampaignRefineRequest):
     """
-    Sonnet interprets a free-text instruction in the context of the campaign's
-    current state and returns a structured list of proposed changes the user
-    can review and apply individually.
+    Ask AI (Opus) to analyse this campaign and suggest changes based on the
+    user's free-text instruction.  Uses the full AI Optimizer engine:
+    _call_claude_advisories() with complete context (keyword perf, search terms,
+    ad groups, RSAs, ad performance, LQI signals).
 
-    Supported change types returned:
-      budget   — { type, new_daily_budget_usd, rationale }
-      geo      — { type, locations, rationale }
-      status   — { type, action: 'pause'|'resume', rationale }
-      note     — { type, message }  (advisory only, nothing to apply)
+    Returns {summary, changes} where each change is an optimizer rec with an
+    action_id already staged as pending_approval in gads_audit_log.
+    The frontend Apply button calls /api/admin/gads/approve/{action_id} —
+    the same execution path the optimizer uses.
     """
     instruction = (body.instruction or "").strip()
     if not instruction:
         raise HTTPException(status_code=422, detail="instruction is required")
 
     ctx = body.campaign_context or {}
-    campaign_name = ctx.get("campaign_name") or ctx.get("name") or body.campaign_id
+    campaign_name = ctx.get("campaign_name") or ctx.get("name") or body.campaign_id or ""
+    campaign_id   = body.campaign_id or ""
+    gads_num_id   = str(ctx.get("gads_campaign_numeric_id") or "")
+    camp_name_lc  = campaign_name.strip().lower()
 
-    # Fetch current RSAs for this campaign so Claude can identify which to replace
-    current_ads = []
-    current_ad_groups = []
+    settings_obj = get_settings()
+    cid = settings_obj.google_ads_customer_id
+
+    # ── 1. Fetch keyword performance for this campaign ───────────────────────
+    camp_kw: list = []
     try:
-        from database import get_ads_with_metrics, get_ad_group_stats, get_gads_campaign_snapshot
+        from database import get_keyword_stats
+        all_kw = get_keyword_stats()  # no args — function takes no parameters
+        for kw in all_kw:
+            if (str(kw.get("campaign_id","")) == gads_num_id or
+                    (camp_name_lc and kw.get("campaign_name","").lower() == camp_name_lc)):
+                camp_kw.append(kw)
+    except Exception as e:
+        logger.warning(f"campaign-refine: keyword fetch failed: {e}")
+
+    # ── 2. Fetch search terms for this campaign ──────────────────────────────
+    camp_st: list = []
+    try:
+        from database import get_search_term_stats
+        all_st = get_search_term_stats(days=30)
+        for st in all_st:
+            if (str(st.get("campaign_id","")) == gads_num_id or
+                    (camp_name_lc and st.get("campaign_name","").lower() == camp_name_lc)):
+                camp_st.append(st)
+    except Exception as e:
+        logger.warning(f"campaign-refine: search term fetch failed: {e}")
+
+    # ── 3. Fetch ad group performance + resource names ───────────────────────
+    camp_ag_perf: list = []
+    try:
+        from database import get_ad_group_stats, get_gads_campaign_snapshot
+        all_ag = get_ad_group_stats(days=30)
+        camp_ag_raw = [ag for ag in all_ag
+                       if str(ag.get("campaign_id","")) == gads_num_id
+                       or (camp_name_lc and ag.get("campaign_name","").lower() == camp_name_lc)]
+        # Enrich with resource names from snapshot
+        snap_ag: dict = {}
+        if campaign_id:
+            try:
+                snap = get_gads_campaign_snapshot(campaign_id)
+                ag_block = snap.get("ad_groups") or {}
+                snap_ag_list = (ag_block.get("ad_groups") if isinstance(ag_block, dict) else ag_block) or []
+                for sag in snap_ag_list:
+                    rn = sag.get("resource_name","")
+                    if rn and "/adGroups/" in rn:
+                        ag_id_s = rn.split("/adGroups/")[-1]
+                        snap_ag[ag_id_s] = {
+                            "resource_name": rn,
+                            "status": (sag.get("status") or "ENABLED").upper()
+                        }
+            except Exception:
+                pass
+        for ag in camp_ag_raw:
+            ag_id_s = str(ag.get("ad_group_id") or "")
+            snap_info = snap_ag.get(ag_id_s, {})
+            rn = snap_info.get("resource_name","") or (
+                f"customers/{cid}/adGroups/{ag_id_s}" if ag_id_s.isdigit() else ""
+            )
+            impr = ag.get("impressions") or 0
+            clk  = ag.get("clicks") or 0
+            cost = ag.get("cost") or 0.0
+            ctr  = round(clk / impr * 100, 2) if impr > 0 else 0
+            camp_ag_perf.append({
+                "ad_group_resource":  rn,
+                "ad_group_name":      ag.get("ad_group_name",""),
+                "gads_status":        snap_info.get("status","ENABLED"),
+                "impressions_30d":    impr,
+                "clicks_30d":         clk,
+                "cost_30d":           cost,
+                "ctr_pct":            ctr,
+                "conversions_30d":    ag.get("conversions") or 0,
+            })
+    except Exception as e:
+        logger.warning(f"campaign-refine: ad group fetch failed: {e}")
+
+    # ── 4. Fetch RSA ad performance for this campaign ────────────────────────
+    camp_ad_perf: list = []
+    rsa_resources: list = []
+    try:
+        from database import get_ads_with_metrics
+        from ai_optimizer import _score_tier
         all_ads = get_ads_with_metrics(days=30)
-        settings_obj = get_settings()
-        cid = settings_obj.google_ads_customer_id
-        gads_num_id  = str(ctx.get("gads_campaign_numeric_id") or "")
-        camp_name_lc = (ctx.get("campaign_name") or "").lower()
+        # Compute per-campaign CTR averages for tier scoring (same logic as optimizer)
+        camp_ctr_totals: dict = {}
+        for ad in all_ads:
+            if ad.get("status") != "ENABLED" or ad.get("ad_type") != "RESPONSIVE_SEARCH_AD":
+                continue
+            impr  = ad.get("impressions") or 0
+            clks  = ad.get("clicks") or 0
+            cname = (ad.get("campaign_name") or "").strip().lower()
+            if cname not in camp_ctr_totals:
+                camp_ctr_totals[cname] = {"impressions": 0, "clicks": 0}
+            camp_ctr_totals[cname]["impressions"] += impr
+            camp_ctr_totals[cname]["clicks"]      += clks
+        camp_avg_ctr_map: dict = {
+            c: (v["clicks"] / v["impressions"]) if v["impressions"] > 0 else 0
+            for c, v in camp_ctr_totals.items()
+        }
         for ad in all_ads:
             if ad.get("ad_type") != "RESPONSIVE_SEARCH_AD":
                 continue
@@ -9122,219 +9213,206 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
             if isinstance(assets, str):
                 try: assets = json.loads(assets)
                 except Exception: assets = {}
-            ag_id = ad.get("ad_group_id","")
-            ad_id = ad.get("ad_id","")
-            aga_resource = f"customers/{cid}/adGroupAds/{ag_id}~{ad_id}" if ag_id and ad_id else ""
-            current_ads.append({
-                "ad_group_ad_resource": aga_resource,
-                "ad_group_name": ad.get("ad_group_name",""),
-                "status": ad.get("status",""),
-                "final_url": ad.get("final_url",""),
-                "headlines":    [h.get("text","") if isinstance(h, dict) else h
-                                 for h in (assets.get("headlines") or [])],
-                "descriptions": [d.get("text","") if isinstance(d, dict) else d
-                                 for d in (assets.get("descriptions") or [])],
-                "impressions": ad.get("impressions", 0),
-                "clicks":      ad.get("clicks", 0),
-            })
-        # Fetch ad groups for this campaign with resource names
-        all_ag = get_ad_group_stats(days=30)
-        camp_ag = [ag for ag in all_ag
-                   if str(ag.get("campaign_id","")) == gads_num_id
-                   or (camp_name_lc and ag.get("campaign_name","").lower() == camp_name_lc)]
-        # Enrich with resource names from snapshot
-        snap_ag = {}
-        if body.campaign_id:
-            try:
-                snap = get_gads_campaign_snapshot(body.campaign_id)
-                ag_block = snap.get("ad_groups") or {}
-                snap_ag_list = (ag_block.get("ad_groups") if isinstance(ag_block, dict) else ag_block) or []
-                for sag in snap_ag_list:
-                    rn = sag.get("resource_name","")
-                    if rn and "/adGroups/" in rn:
-                        ag_id = rn.split("/adGroups/")[-1]
-                        snap_ag[ag_id] = {"resource_name": rn, "status": (sag.get("status") or "ENABLED").upper()}
-            except Exception:
-                pass
-        for ag in camp_ag:
-            ag_id = str(ag.get("ad_group_id") or "")
-            snap_info = snap_ag.get(ag_id, {})
-            rn = snap_info.get("resource_name","") or (
-                f"customers/{cid}/adGroups/{ag_id}" if ag_id.isdigit() else ""
-            )
-            impr = ag.get("impressions") or 0
-            clk  = ag.get("clicks") or 0
-            cost = ag.get("cost") or 0.0   # already in dollars from get_ad_group_stats
-            ctr  = round(clk / impr * 100, 2) if impr > 0 else 0
-            current_ad_groups.append({
-                "ad_group_resource": rn,
-                "ad_group_name": ag.get("ad_group_name",""),
-                "gads_status": snap_info.get("status","ENABLED"),
-                "impressions_30d": impr,
-                "clicks_30d": clk,
-                "cost_30d": cost,
-                "ctr_pct": ctr,
-                "conversions_30d": ag.get("conversions") or 0,
-            })
-
+            ag_id_a  = ad.get("ad_group_id","")
+            ad_id_a  = ad.get("ad_id","")
+            aga_res  = (ad.get("ad_group_ad_resource","") or
+                        (f"customers/{cid}/adGroupAds/{ag_id_a}~{ad_id_a}"
+                         if ag_id_a and ad_id_a else ""))
+            headlines    = [h.get("text","") if isinstance(h,dict) else h
+                            for h in (assets.get("headlines") or [])]
+            descriptions = [d.get("text","") if isinstance(d,dict) else d
+                            for d in (assets.get("descriptions") or [])]
+            impr_a   = ad.get("impressions") or 0
+            clicks_a = ad.get("clicks") or 0
+            cost_usd = (ad.get("cost_micros") or 0) / 1_000_000   # cost_micros, not cost
+            conv_a   = ad.get("conversions") or 0
+            cname_a  = (ad.get("campaign_name") or "").strip().lower()
+            ctr_a    = (clicks_a / impr_a) if impr_a > 0 else 0
+            avg_ctr_a = camp_avg_ctr_map.get(cname_a, 0)
+            tier_a    = _score_tier(impr_a, clicks_a, cost_usd, conv_a, avg_ctr_a)
+            ad_entry = {
+                "ad_group_ad_resource": aga_res,
+                "ad_group_name":        ad.get("ad_group_name",""),
+                "status":               ad.get("status",""),
+                "final_url":            ad.get("final_url",""),
+                "headlines":            headlines,
+                "descriptions":         descriptions,
+                "impressions_30d":      impr_a,
+                "clicks":               clicks_a,
+                "cost_30d_usd":         round(cost_usd, 2),
+                "ctr":                  round(ctr_a, 4),
+                "avg_campaign_ctr":     round(avg_ctr_a, 4),
+                "conversions_30d":      conv_a,
+                "performance_tier":     tier_a,
+            }
+            camp_ad_perf.append(ad_entry)
+            if aga_res:
+                rsa_resources.append({
+                    "ad_group_ad_resource": aga_res,
+                    "ad_group_resource":    ad.get("ad_group_resource",""),
+                    "ad_group_name":        ad.get("ad_group_name",""),
+                    "headlines":            headlines,
+                    "descriptions":         descriptions,
+                    "final_url":            ad.get("final_url",""),
+                    "status":               ad.get("status",""),
+                })
     except Exception as e:
-        logger.warning(f"campaign-refine: could not fetch current ads: {e}")
+        logger.warning(f"campaign-refine: ad/RSA fetch failed: {e}")
 
-    # Load practice hours so Claude can resolve "office hours" without asking
-    _practice_hours = get_setting("practice_hours") or ""
-    _practice_name  = get_setting("practice_name") or "Grafton Dental Care"
+    # ── 5. Build empty attribution/od/summary dicts (refine doesn't need them) ─
+    attribution: dict = {}
+    call_attribution: dict = {}
+    od_production: dict = {}
+    summary: dict = {
+        "total_spend":           ctx.get("total_cost_30d_usd", 0),
+        "total_clicks":          ctx.get("total_clicks_30d", 0),
+        "total_impressions":     ctx.get("total_impressions_30d", 0),
+        "total_leads":           0,
+        "total_booked_calls":    0,
+        "total_production":      0,
+        "overall_roas":          0,
+        "cost_per_lead":         0,
+        "cost_per_acquisition":  0,
+    }
 
-    from ai_optimizer import GOOGLE_ADS_RULES as _GAR
-    system_prompt = (
-        _GAR +
-        f"Practice: {_practice_name}. "
-        + (f"Office hours: {_practice_hours}. "
-           "When the user says 'office hours', 'business hours', or 'open hours', "
-           "use these exact hours to build the schedule_text — do NOT ask for clarification. "
-           if _practice_hours else "") +
-        "You are a Google Ads campaign manager for a dental practice. "
-        "The user will describe a change they want to make to their campaign in plain English. "
-        "Interpret their intent and return a structured list of proposed changes. "
-        "Be conservative — only suggest changes explicitly implied by the instruction. "
-        "When the user wants to pause a single ad without replacement, return 'pause_ad' with the ad_group_ad_resource. "
-        "When the user wants to swap, rewrite, or replace an ad with new copy, return 'replace_ad' "
-        "with the EXACT ad_group_ad_resource of the ad to retire (copy verbatim from "
-        "current_ads in the context) plus a full new RSA. "
-        "When the user wants to pause an entire ad group (not just one ad), return 'pause_ad_group' "
-        "with the ad_group_resource from current_ad_groups in the context. "
-        "NEVER use 'status' to pause a single ad or a single ad group — that pauses the entire campaign. "
-        "NEVER use 'pause_ad' to pause an entire ad group — use 'pause_ad_group' for that. "
-        "Return ONLY a valid JSON object, no prose."
-    )
-
-    user_prompt = (
-        f"Campaign: {campaign_name}\n"
-        f"Current state:\n{json.dumps(ctx, indent=2, default=str)}\n\n"
-        f"Current ad groups in this campaign:\n{json.dumps(current_ad_groups, indent=2)}\n\n"
-        f"Current RSAs in this campaign:\n{json.dumps(current_ads, indent=2)}\n\n"
-        f"User instruction: {instruction}\n\n"
-        "Return a JSON object with:\n"
-        "  summary (string — one sentence describing what you understood)\n"
-        "  changes (array of change objects). Each change object must have:\n"
-        "    type: one of 'budget' | 'geo' | 'status' | 'schedule' | 'note' | 'pause_ad' | 'replace_ad' | 'pause_ad_group'\n"
-        "    rationale: string explaining why\n"
-        "    For 'budget': also include new_daily_budget_usd (number)\n"
-        "    For 'geo': also include locations (string, comma-separated city/region list)\n"
-        "    For 'status': also include action ('pause' or 'resume'). "
-        "Use this ONLY to pause/resume the entire campaign — NOT for pausing a single ad or ad group.\n"
-        "    For 'schedule': also include schedule_text (string describing the schedule, "
-        "e.g. 'Mon-Thu 7am-11pm' or 'Weekdays 9am-6pm' or '24/7'). "
-        "Use this when the user asks to change when ads run, set hours, or limit days.\n"
-        "    For 'note': also include message (string — advisory, nothing to apply)\n"
-        "    For 'pause_ad': use when the user wants to pause a single ad (not the whole campaign, not the whole ad group). "
-        "Include ad_group_ad_resource (EXACT resource_name from current_ads above). "
-        "Use this when the user says 'pause this ad', 'turn off that ad', 'disable that ad', etc.\n"
-        "    For 'replace_ad': use when the user wants to pause one ad AND run a new one with different copy. "
-        "Include:\n"
-        "        old_ad_group_ad_resource (string — EXACT resource_name from current_ads above)\n"
-        "        new_headlines (array of 10-15 strings, each <= 30 chars, locally grounded)\n"
-        "        new_descriptions (array of 3-4 strings, each <= 90 chars)\n"
-        "        final_url (string — copy from old ad unless user specifies otherwise)\n"
-        "        path1 (optional string <= 15 chars, e.g. 'dentures')\n"
-        "        path2 (optional string <= 15 chars, e.g. 'grafton-ma')\n"
-        "        new_ad_label (short label for the new ad, e.g. 'Dentures focus')\n"
-        "      New RSA goes in same ad group as the retired ad. Do not choose an ad group.\n"
-        "      Headlines must be specific, benefit-driven, and locally grounded. "
-        "Avoid generic phrases like 'Quality Dental Care'.\n"
-        "    For 'pause_ad_group': use when the user wants to pause an entire ad group (all ads in it stop serving). "
-        "Include ad_group_resource (EXACT ad_group_resource from current_ad_groups above) and "
-        "ad_group_name (copy from current_ad_groups). "
-        "Use this when the user says 'pause the [name] ad group', 'stop the [group] group', etc. "
-        "NEVER use this to pause a single ad — use 'pause_ad' for that. "
-        "NEVER use this if only one ad group is active (would stop all ads in campaign).\n"
-        "If the instruction is unclear or unsupported, return a single 'note' change explaining why.\n"
-        "Return ONLY the JSON object."
-    )
-
+    # ── 6. Live negative keywords (for dedup) ───────────────────────────────
+    live_negatives: set = set()
     try:
-        client = _get_anthropic_client()
-        message = client.messages.create(
-            model=SONNET_MODEL,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": user_prompt}],
-            system=system_prompt,
+        from database import _conn as _dbc
+        with _dbc() as _c:
+            rows = _c.execute(
+                "SELECT keyword_text FROM gads_negative_keywords WHERE active=1"
+            ).fetchall()
+            live_negatives = {r["keyword_text"].strip().lower() for r in rows}
+    except Exception:
+        pass
+
+    # ── 7. Collect LQI signals ───────────────────────────────────────────────
+    lqi_signals: dict = {}
+    try:
+        from lqi_signals import collect_all as _lqi_collect
+        lqi_signals = _lqi_collect(days=30)
+    except Exception as _lqi_e:
+        logger.warning(f"campaign-refine: LQI collection failed (non-fatal): {_lqi_e}")
+
+    # ── 8. Campaign settings (budget, bid strategy) ─────────────────────────
+    camp_settings: dict = {}
+    camp_resource = ctx.get("gads_campaign_resource","")
+    if camp_resource:
+        try:
+            from ai_optimizer import _build_client, _get_campaign_settings
+            _gs_client = _build_client()
+            csmap = _get_campaign_settings(_gs_client, cid, days=30)
+            camp_settings = csmap.get(camp_resource, {})
+        except Exception as _cs_e:
+            logger.warning(f"campaign-refine: campaign settings fetch failed (non-fatal): {_cs_e}")
+
+    # ── 9. Call _call_claude_advisories with instruction as feedback hint ─────
+    from ai_optimizer import _call_claude_advisories
+    structured = _call_claude_advisories(
+        keyword_perf=camp_kw,
+        attribution=attribution,
+        search_terms=camp_st,
+        call_attribution=call_attribution,
+        od_production=od_production,
+        summary=summary,
+        campaign=campaign_name,
+        rsa_resources=rsa_resources,
+        existing_negatives=live_negatives,
+        camp_settings=camp_settings,
+        ad_performance=camp_ad_perf,
+        ad_group_performance=camp_ag_perf,
+        lqi=lqi_signals,
+        feedback=instruction,   # user's instruction becomes the Claude focus hint
+        optimizer_run_id="refine",
+    )
+
+    if not structured:
+        # If Claude returned nothing useful, return a note
+        return {
+            "summary": "No specific changes identified based on your instruction and current campaign data.",
+            "changes": [{"operation": "claude_advisory", "reason":
+                "Try being more specific, or run the full AI Optimizer for a comprehensive analysis."}]
+        }
+
+    # ── 10. Stage each rec as pending_approval in gads_audit_log ─────────────
+    from campaign_audit import log_pending
+    _OP_MAP = {
+        "add_negative_keyword":        ("keyword",  "campaign_resource",       "keyword_text"),
+        "add_to_shared_negative_list": ("keyword",  "keyword_text",            "keyword_text"),
+        "pause_keyword":               ("keyword",  "resource_name",           "keyword_text"),
+        "enable_keyword":              ("keyword",  "resource_name",           "keyword_text"),
+        "increase_bid":                ("keyword",  "resource_name",           "keyword_text"),
+        "decrease_bid":                ("keyword",  "resource_name",           "keyword_text"),
+        "add_exact_keyword":           ("keyword",  "ad_group_resource",       "keyword_text"),
+        "ad_copy_suggestion":          ("ad",       "ad_resource",             "headline"),
+        "geo_exclusion":               ("campaign", "geo_target_resource",     "location_name"),
+        "change_budget":               ("campaign", "campaign_resource",       "campaign_resource"),
+        "change_bid_strategy":         ("campaign", "campaign_resource",       "bid_strategy"),
+        "change_match_type":           ("keyword",  "resource_name",           "keyword_text"),
+        "add_asset":                   ("campaign", "campaign_resource",       "asset_type"),
+        "replace_ad":                  ("ad",       "old_ad_group_ad_resource","old_ad_group_ad_resource"),
+        "pause_ad_group":              ("ad_group", "ad_group_resource",       "ad_group_name"),
+        "pause_ad":                    ("ad",       "ad_group_ad_resource",    "ad_group_ad_resource"),
+        "claude_advisory":             ("campaign", "campaign_resource",       "campaign_resource"),
+    }
+
+    staged_changes = []
+    for rec in structured:
+        op     = rec.get("operation", "claude_advisory")
+        reason = rec.get("reason", rec.get("insight", ""))
+
+        # Build before/after for audit log
+        after  = {k: v for k, v in rec.items() if k != "operation"}
+        before: dict = {}
+        if op == "replace_ad":
+            old_rn = rec.get("old_ad_group_ad_resource","")
+            matched = next((a for a in camp_ad_perf if a.get("ad_group_ad_resource") == old_rn), None)
+            if matched:
+                before = {
+                    "status":          matched.get("status","ENABLED"),
+                    "headlines":       matched.get("headlines",[]),
+                    "descriptions":    matched.get("descriptions",[]),
+                    "final_url":       matched.get("final_url",""),
+                    "impressions_30d": matched.get("impressions_30d",0),
+                }
+            else:
+                before = {"ad_group_ad_resource": old_rn}
+
+        op_meta = _OP_MAP.get(op)
+        if op_meta:
+            entity_type, id_field, name_field = op_meta
+            entity_id   = str(rec.get(id_field, camp_name_lc.replace(" ","_")))
+            entity_name = str(rec.get(name_field, campaign_name))
+            if op == "replace_ad":
+                matched = next((a for a in camp_ad_perf
+                                if a.get("ad_group_ad_resource") == rec.get("old_ad_group_ad_resource","")), None)
+                entity_name = (f"Replace ad in {matched['ad_group_name']}"
+                               if matched else f"Replace ad — {campaign_name}")
+        else:
+            entity_type = "campaign"
+            entity_id   = camp_name_lc.replace(" ","_")
+            entity_name = campaign_name
+
+        action_id = log_pending(
+            operation=op,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            entity_name=entity_name,
+            before_state=before,
+            after_state=after,
+            optimizer_run_id="ai_refine",
+            actor="ai_refine",
+            reason=reason,
+            campaign_id=campaign_id,
+            campaign_name=campaign_name,
         )
-        raw_text = message.content[0].text if message.content else ""
-    except Exception as e:
-        logger.error(f"AI campaign-refine failed: {e}")
-        raise HTTPException(status_code=502, detail=f"AI request failed: {e}")
+        staged_changes.append({**rec, "action_id": action_id})
 
-    json_text = _extract_json_from_ai_response(raw_text)
-    try:
-        result = json.loads(json_text)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=502, detail="AI returned invalid JSON — please try again")
-
-    # Server-side validation of replace_ad/pause_ad/pause_ad_group — ensure resource exists + clip overlong strings
-    valid_resources    = {a["ad_group_ad_resource"] for a in current_ads if a.get("ad_group_ad_resource")}
-    valid_ag_resources = {ag["ad_group_resource"] for ag in current_ad_groups if ag.get("ad_group_resource")}
-    active_ag_count    = sum(1 for ag in current_ad_groups if ag.get("impressions_30d", 0) > 0)
-    validated_changes = []
-    for ch in result.get("changes", []):
-        # --- pause_ad_group validation ---
-        if ch.get("type") == "pause_ad_group":
-            rn = ch.get("ad_group_resource", "")
-            if valid_ag_resources and rn not in valid_ag_resources:
-                validated_changes.append({
-                    "type": "note",
-                    "message": "AI proposed pausing an ad group that wasn't found in this campaign. "
-                               "Please try again with more specific wording.",
-                    "rationale": ch.get("rationale", ""),
-                })
-            elif active_ag_count <= 1:
-                validated_changes.append({
-                    "type": "note",
-                    "message": "Cannot pause ad group — only one active ad group exists in this campaign. "
-                               "Pausing it would stop all ads.",
-                    "rationale": ch.get("rationale", ""),
-                })
-            else:
-                validated_changes.append(ch)
-            continue
-        # --- pause_ad validation ---
-        if ch.get("type") == "pause_ad":
-            rn = ch.get("ad_group_ad_resource", "")
-            if valid_resources and rn not in valid_resources:
-                validated_changes.append({
-                    "type": "note",
-                    "message": "AI proposed pausing an ad that wasn't found in this campaign. "
-                               "Please try again with more specific wording.",
-                    "rationale": ch.get("rationale", ""),
-                })
-            else:
-                validated_changes.append(ch)
-            continue
-        if ch.get("type") != "replace_ad":
-            validated_changes.append(ch)
-            continue
-        rn = ch.get("old_ad_group_ad_resource", "")
-        if rn not in valid_resources:
-            validated_changes.append({
-                "type": "note",
-                "message": f"AI proposed replacing an ad that wasn't found in this campaign. "
-                           f"Please try again with more specific wording.",
-                "rationale": ch.get("rationale", ""),
-            })
-            continue
-        # Clip to char limits (belt-and-suspenders — Claude usually respects them)
-        ch["new_headlines"]    = [h[:30] for h in (ch.get("new_headlines") or []) if h]
-        ch["new_descriptions"] = [d[:90] for d in (ch.get("new_descriptions") or []) if d]
-        if len(ch["new_headlines"]) < 3 or len(ch["new_descriptions"]) < 2:
-            validated_changes.append({
-                "type": "note",
-                "message": "AI returned too few headlines or descriptions for the replacement ad. "
-                           "Please try again.",
-                "rationale": ch.get("rationale", ""),
-            })
-            continue
-        validated_changes.append(ch)
-
-    return {"summary": result.get("summary", ""), "changes": validated_changes}
+    return {
+        "summary": f"Found {len(staged_changes)} recommendation(s) based on: {instruction[:120]}",
+        "changes": staged_changes,
+    }
 
 
 # ─── OD Connection Settings ──────────────────────────────────────────────────
