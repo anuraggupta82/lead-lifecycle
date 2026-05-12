@@ -4220,7 +4220,9 @@ function CallsSubView() {
   async function loadCallFlags() {
     setFlagsLoading(true);
     try {
-      const r = await fetch('/api/admin/call-flags?days=30&unresolved_only=true');
+      const r = await fetch('/api/admin/call-flags?days=30&unresolved_only=true', {
+        headers: {'X-Admin-Password': ADMIN_PW}
+      });
       if (r.ok) { const d = await r.json(); setCallFlags(d.flags || []); }
     } catch(e) { console.warn('call-flags load error', e); }
     setFlagsLoading(false);
@@ -4231,7 +4233,7 @@ function CallsSubView() {
     try {
       await fetch(`/api/admin/call-flags/${flagId}/resolve`, {
         method:'POST',
-        headers:{'Content-Type':'application/json'},
+        headers:{'Content-Type':'application/json', 'X-Admin-Password': ADMIN_PW},
         body: JSON.stringify({resolved_by:'admin', resolved_outcome: outcome})
       });
       setCallFlags(prev => prev.filter(f => f.id !== flagId));
