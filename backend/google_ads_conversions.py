@@ -25,17 +25,66 @@ from config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Map lead stages to conversion action names
+# Map lead stages to conversion action names.
+# NOTE: "Appointment Booked" is NOT determined by stage alone — see _resolve_conversion() below.
+# Only stages that have passed the appointment confirmation gate qualify for that conversion.
 STAGE_TO_CONVERSION = {
     "new":                  "Qualified Lead",
     "auto_nurture":         "Qualified Lead",
-    "scheduled":            "Appointment Booked",
-    "no_show":              "Appointment Booked",
+    "scheduled":            None,               # not enough — requires OD confirmation (showed_at)
+    "no_show":              None,               # patient did not show — no appointment conversion
     "showed":               "Appointment Booked",
     "treatment_presented":  "Treatment Accepted",
     "treatment_accepted":   "Treatment Accepted",
     "treatment_completed":  "Treatment Completed",
 }
+
+# Stage → timestamp column in the leads table (used for accurate conversion_date_time)
+STAGE_TO_TIMESTAMP_COL = {
+    "Qualified Lead":     "created_at",      # lead creation time
+    "Appointment Booked": "showed_at",       # when they actually came in (confirmed by OD)
+    "Treatment Accepted": "tx_accepted_at",  # when treatment plan was accepted
+    "Treatment Completed": "tx_completed_at", # when treatment was completed
+}
+
+
+def _resolve_conversion(lead: sqlite3.Row) -> tuple[str | None, str | None]:
+    """
+    Determine which conversion action (if any) applies to this lead, and the
+    correct timestamp to use for conversion_date_time.
+
+    Returns: (conversion_name, iso_timestamp) or (None, None) if not eligible.
+
+    Rules:
+      - "Qualified Lead"     → stage in (new, auto_nurture); timestamp = created_at
+      - "Appointment Booked" → showed_at IS NOT NULL (confirmed they came in); timestamp = showed_at
+      - "Treatment Accepted" → stage in (treatment_presented, treatment_accepted); timestamp = tx_accepted_at
+      - "Treatment Completed"→ stage = treatment_completed; timestamp = tx_completed_at
+
+    "scheduled" and "no_show" intentionally do NOT generate an "Appointment Booked" conversion —
+    a scheduled appointment that was never kept does not confirm patient acquisition.
+    """
+    stage = lead["stage"]
+    conversion_name = STAGE_TO_CONVERSION.get(stage)
+
+    # Stages mapped to None are explicitly excluded
+    if conversion_name is None:
+        return None, None
+
+    # "Appointment Booked" requires showed_at — even if stage is "showed", verify the field exists
+    if conversion_name == "Appointment Booked":
+        showed_at = lead["showed_at"] or ""
+        if not showed_at:
+            return None, None
+        return conversion_name, showed_at
+
+    # For all other conversions, look up the stage timestamp column
+    ts_col = STAGE_TO_TIMESTAMP_COL.get(conversion_name, "created_at")
+    ts = lead[ts_col] if ts_col in lead.keys() else ""
+    # Fall back to created_at if the specific timestamp is missing (legacy rows)
+    if not ts:
+        ts = lead["created_at"]
+    return conversion_name, ts
 
 # Default values for each conversion action (used when no production data)
 DEFAULT_VALUES = {
@@ -120,11 +169,13 @@ def upload_offline_conversions() -> dict:
     if not action_cache:
         return {"uploaded": 0, "skipped": 0, "errors": 1, "error": "No conversion actions found"}
 
-    # Get all leads with a gclid
+    # Get all leads with a gclid — include stage-transition timestamps for accurate conversion times
     db = _get_db()
     leads = db.execute("""
         SELECT id, gclid, stage, created_at, attributed_production, email, first_name,
-               od_patient_num, od_relationship, od_matched_at
+               od_patient_num, od_relationship, od_matched_at,
+               showed_at, tx_accepted_at, tx_completed_at,
+               appointment_date, appointment_status
         FROM leads
         WHERE gclid != '' AND gclid IS NOT NULL
         ORDER BY updated_at DESC
@@ -182,8 +233,8 @@ def upload_offline_conversions() -> dict:
                 skipped += 1
                 continue
 
-        # Determine which conversion to upload based on current stage
-        conversion_name = STAGE_TO_CONVERSION.get(stage)
+        # Determine which conversion to upload — requires OD confirmation for appointment conversions
+        conversion_name, conversion_ts = _resolve_conversion(lead)
         if not conversion_name:
             skipped += 1
             continue
@@ -213,9 +264,17 @@ def upload_offline_conversions() -> dict:
             click_conversion.conversion_value = value
             click_conversion.currency_code = "USD"
 
-            # Conversion time = when the lead was created (for Qualified Lead)
-            # or current time for later stages
-            click_conversion.conversion_date_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
+            # Conversion time = actual stage-transition timestamp (not upload time).
+            # Using the real event time teaches Smart Bidding the correct conversion lag.
+            # conversion_ts comes from _resolve_conversion() — showed_at, tx_accepted_at, etc.
+            try:
+                # Normalize to Google Ads format: "YYYY-MM-DD HH:MM:SS+HH:MM"
+                ts = datetime.fromisoformat(conversion_ts.replace("Z", "+00:00"))
+                ts_str = ts.strftime("%Y-%m-%d %H:%M:%S+00:00")
+            except Exception:
+                # Fallback if timestamp is malformed
+                ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
+            click_conversion.conversion_date_time = ts_str
 
             # Upload
             response = conversion_upload_service.upload_click_conversions(
@@ -233,7 +292,7 @@ def upload_offline_conversions() -> dict:
                     INSERT INTO conversion_uploads
                         (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
                     VALUES (?,?,?,?,?,?,?,?)
-                """, (lead_id, conversion_name, gclid, now, value, now, "failed", error_msg[:500]))
+                """, (lead_id, conversion_name, gclid, ts_str, value, now, "failed", error_msg[:500]))
                 db.commit()
                 errors += 1
             else:
@@ -242,7 +301,7 @@ def upload_offline_conversions() -> dict:
                     INSERT INTO conversion_uploads
                         (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
                     VALUES (?,?,?,?,?,?,?,?)
-                """, (lead_id, conversion_name, gclid, now, value, now, "uploaded", "success"))
+                """, (lead_id, conversion_name, gclid, ts_str, value, now, "uploaded", "success"))
                 db.commit()
                 uploaded += 1
 
@@ -253,11 +312,12 @@ def upload_offline_conversions() -> dict:
 
         except Exception as e:
             logger.error(f"Error uploading conversion for lead {lead_id}: {e}")
+            _ts = locals().get("ts_str", now)
             db.execute("""
                 INSERT INTO conversion_uploads
                     (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
                 VALUES (?,?,?,?,?,?,?,?)
-            """, (lead_id, conversion_name, gclid, now, value, now, "failed", str(e)[:500]))
+            """, (lead_id, conversion_name, gclid, _ts, value, now, "failed", str(e)[:500]))
             db.commit()
             errors += 1
 

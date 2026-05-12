@@ -510,7 +510,7 @@ def fetch_search_terms(days: int = 30) -> list:
             clicks = row.metrics.clicks or 0
             results.append({
                 "search_term": row.search_term_view.search_term or "",
-                "status": str(row.search_term_view.status) if row.search_term_view.status else "NONE",
+                "status": (getattr(row.search_term_view.status, 'name', None) or str(row.search_term_view.status) or "NONE"),
                 "campaign_name": row.campaign.name or "",
                 "ad_group_name": row.ad_group.name or "",
                 "impressions": row.metrics.impressions or 0,

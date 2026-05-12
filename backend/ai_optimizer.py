@@ -38,6 +38,65 @@ from database import get_all_leads
 logger = logging.getLogger(__name__)
 
 
+# ── Google Ads official rules — injected into every Claude prompt ─────────────
+# Source: Google Ads Help + Advertising Policies (fetched May 2026)
+GOOGLE_ADS_RULES = """
+=== GOOGLE ADS HARD RULES (ENFORCE IN ALL AD COPY) ===
+
+RESPONSIVE SEARCH ADS (RSA) — CHARACTER LIMITS:
+- Headlines: max 30 characters each; provide 8–15 for best performance (min 3 required)
+- Descriptions: max 90 characters each; provide 2–4 (4 recommended)
+- Path1 / Path2: max 15 characters each (optional display URL segments)
+- Korean/Japanese/Chinese: each character counts as 2 toward limits
+
+RSA ASSET REQUIREMENTS:
+- Minimum 3 headlines and 2 descriptions to launch
+- Recommended 8–10+ headlines and all 4 descriptions for "Excellent" ad strength
+- Each headline and description must be meaningfully different (no repetition within or across assets)
+- Improving ad strength from Poor → Excellent averages +15% clicks and conversions
+
+CAPITALIZATION:
+- No ALL CAPS words (FLOWERS, FREE, BEST) unless it is a registered trademark
+- No alternating caps (FlOwErS) or spaced letters (F.L.O.W.E.R.S)
+- Title Case for headlines is acceptable and recommended
+- Brand names and trademarks may use their official capitalization
+
+PUNCTUATION & SYMBOLS:
+- No gimmicky punctuation or symbols (!!!, f-r-e-e, fl@wers)
+- No phone numbers in ad text (Google policy: PHONE_NUMBER_IN_AD_TEXT violation)
+- Standard punctuation (periods, commas, hyphens, apostrophes) is fine
+- Exclamation marks allowed once per description; not allowed in headlines
+
+PROHIBITED CONTENT:
+- False, misleading, or exaggerated claims ("cure", "guaranteed results", "best in the world")
+- Clickbait or sensationalist language
+- Overly generic filler ("Click here", "Buy products here", "Best service")
+- Repetition of words or phrases within a headline, across headlines, or across descriptions
+- Price claims or urgency tactics that are not accurate and verifiable
+
+LANDING PAGE & URL:
+- Display URL domain must match final URL domain exactly
+- Landing page must have original, useful content — not just ads or redirects
+- Every ad must point to a functional, relevant landing page
+
+PATH FIELD BEST PRACTICES:
+- Path fields show as: domain.com/path1/path2 in the ad
+- Use concise, keyword-relevant slugs (e.g. "dentures", "grafton-ma", "implants")
+- Hyphens allowed; no spaces; lowercase preferred
+- HARD LIMIT: 15 characters each — never exceed this
+
+AD STRENGTH TARGETS:
+- Always aim for "Good" minimum, "Excellent" preferred before recommending launch
+- To reach Excellent: maximize headline/description count, ensure diversity, include keywords
+
+OPERATIONS REFERENCE (for replace_ad / ad_copy_suggestion):
+- replace_ad: requires old_ad_group_ad_resource, new_headlines (list), new_descriptions (list),
+  final_url (https://...), optional path1 (≤15 chars), optional path2 (≤15 chars)
+- Never include phone numbers in any headline or description field
+- Never repeat a phrase across multiple headlines or descriptions
+=== END GOOGLE ADS HARD RULES ===
+"""
+
 # ── Negative keyword signals (module-level so all functions can use them) ─────
 
 _HARD_NEGATIVES = [
@@ -1082,6 +1141,36 @@ def _score_tier(impr: int, clicks: int, cost_usd: float, conv: float, avg_ctr: f
     return "average"
 
 
+def _build_lqi_campaign_slice(campaign: str, lqi: dict) -> dict:
+    """
+    Filter the account-wide LQI signals down to what's relevant for a single campaign.
+    call and bad_search_terms are filtered to this campaign only.
+    All other sub-signals (sources, schedule, cold_leads, no_shows) are account-wide
+    context that Claude should consider even at the per-campaign level.
+    """
+    camp_l = (campaign or "").strip().lower()
+    # Per-campaign call quality
+    lqi_camp_calls = {}
+    for cname, payload in (lqi.get("calls") or {}).get("by_campaign", {}).items():
+        if cname.strip().lower() == camp_l:
+            lqi_camp_calls = payload
+            break
+    # Per-campaign bad search terms
+    lqi_camp_bad_terms = []
+    for cname, terms in (lqi.get("search_terms") or {}).get("by_campaign", {}).items():
+        if cname.strip().lower() == camp_l:
+            lqi_camp_bad_terms = terms
+            break
+    return {
+        "sources":          lqi.get("sources", {}),
+        "calls":            lqi_camp_calls,
+        "bad_search_terms": lqi_camp_bad_terms,
+        "schedule":         lqi.get("schedule", {}),
+        "cold_leads":       lqi.get("cold_leads", {}),
+        "no_shows":         lqi.get("no_shows", {}),
+    }
+
+
 def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms: list,
                              call_attribution: dict, od_production: dict,
                              summary: dict, campaign: str,
@@ -1096,7 +1185,8 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              camp_settings: dict | None = None,
                              ad_performance: list | None = None,
                              landing_page_intel: str = "",
-                             ad_group_performance: list | None = None) -> list:
+                             ad_group_performance: list | None = None,
+                             lqi: dict | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -1187,6 +1277,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "optimizer_memory": memory_digest or {},
             "ad_performance": (ad_performance or [])[:20],  # per-RSA performance + scored metrics
             "ad_group_performance": (ad_group_performance or [])[:10],  # per-ad-group scored metrics
+            "lqi": _build_lqi_campaign_slice(campaign, lqi or {}),
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -1224,7 +1315,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
 
         excellence_block = _build_excellence_block(campaign, summary, camp_settings or {})
 
-        prompt = excellence_block + """
+        prompt = excellence_block + GOOGLE_ADS_RULES + """
 You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
 
@@ -1246,7 +1337,7 @@ Use this to:
 - Always reference the current daily_budget_usd when recommending a change_budget — state the specific dollar increase and the % change
 
 Each recommendation MUST be a JSON object with these fields:
-- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group
+- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group | claude_advisory
 - "reason": 1-2 sentence explanation with specific numbers from the data
 - "estimated_monthly_impact": object with keys:
     "savings_usd": estimated monthly dollar savings (0 if not applicable),
@@ -1380,7 +1471,45 @@ Rules:
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already added as negatives in Google Ads. Do NOT suggest add_negative_keyword for any term that already appears in that list (exact or near-match). Only flag NEW terms not yet blocked.
 - OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating recommendations that were recently rejected, (2) build on patterns from past runs, (3) surface new issues not seen before. Do not re-suggest anything in "rejected_patterns".
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array
-- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + feedback_block
+- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.
+
+LEAD QUALITY INTELLIGENCE (LQI) — high-signal context for this campaign:
+The "lqi" field in the data contains six sub-fields. Use them as follows:
+
+1. lqi.sources — quality_score per lead source (smile_tool, contact_form, pearly, gads_call).
+   If a source feeding this campaign has quality_score < 40 AND leads >= 10, flag it in your
+   reason and prefer recommendations that pull spend AWAY from that source's traffic
+   (e.g. add_negative_keyword on bad search terms, decrease_bid on keywords feeding it).
+   Never recommend pausing the campaign solely on source score — source mix is informational.
+
+2. lqi.calls — campaign-scoped Google Ads call data:
+   - total_calls, short_calls (<60s), short_pct, missed_calls, avg_duration_sec
+   - shortest[]: up to 10 shortest calls with transcript_snippet
+   If short_pct >= 0.40 OR missed_calls >= 3, return add_negative_keyword for any obvious
+   wrong-intent pattern visible in transcript_snippets (e.g. "wrong number", "looking for
+   [other practice]"). If transcripts show qualified callers hanging up on hold, return a
+   claude_advisory describing the front-desk issue — do NOT pause keywords in that case.
+
+3. lqi.bad_search_terms — terms with $5+ spend that produced 0 leads, classified into
+   "spanish" | "competitor" | "wrong_intent" | "zero_lead". For EACH term where reason is
+   "spanish" OR "competitor" OR "wrong_intent" → return add_negative_keyword with
+   match_type="PHRASE". For "zero_lead", only flag if cost >= $20.
+
+4. lqi.schedule — hourly + day-of-week call quality. The "hotspots" array lists slots with
+   high short_pct or outside_office_hours. If 2+ hotspots show flag="outside_office_hours"
+   with calls >= 5 each, return a claude_advisory recommending an ad schedule narrow.
+
+5. lqi.cold_leads — cold rate by utm_campaign, source, keyword + time_to_first_contact
+   medians. If by_keyword shows a keyword with cold_rate >= 0.7 AND leads >= 5, recommend
+   decrease_bid or pause_keyword. If no_staff_contact_pct >= 0.30, return a claude_advisory
+   naming the staff follow-up gap.
+
+6. lqi.no_shows — no-show rate by campaign/source + reminder stats + lead age at booking.
+   If by_campaign for THIS campaign shows no_show_rate >= 0.25 AND booked >= 5, return a
+   claude_advisory. If reminders.no_show_no_reminders_pct > 0.5, mention the reminder gap.
+
+LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
+ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -1536,6 +1665,57 @@ Rules:
             return validated
     except Exception as e:
         logger.warning(f"Claude advisory call failed (non-fatal): {e}")
+    return []
+
+
+def _build_lqi_account_summary(lqi: dict) -> dict:
+    """
+    Build the account-level LQI summary injected into _call_claude_account_level.
+    Includes source scoreboard, schedule summary, cross-campaign bad terms, calls, cold leads, no-shows.
+    """
+    src_q = lqi.get("sources") or {}
+    source_scoreboard = sorted(
+        [
+            {
+                "source":        s,
+                "leads":         v.get("leads", 0),
+                "booked_rate":   v.get("booked_rate", 0),
+                "showed_rate":   v.get("showed_rate", 0),
+                "cold_rate":     v.get("cold_rate", 0),
+                "od_match_rate": v.get("od_match_rate", 0),
+                "quality_score": v.get("quality_score", 0),
+            }
+            for s, v in src_q.items()
+        ],
+        key=lambda x: -x["quality_score"],
+    )
+    sched = lqi.get("schedule") or {}
+    schedule_summary = {
+        "by_dow":             sched.get("by_dow", []),
+        "hotspots":           (sched.get("hotspots") or [])[:10],
+        "practice_hours_raw": sched.get("practice_hours_raw", ""),
+    }
+    bt = lqi.get("search_terms") or {}
+    bad_terms_account = {
+        "totals":      bt.get("totals", {}),
+        "by_campaign": {
+            c: terms[:10]
+            for c, terms in (bt.get("by_campaign") or {}).items()
+        },
+    }
+    calls_lqi = lqi.get("calls") or {}
+    calls_account = {
+        "by_campaign":      calls_lqi.get("by_campaign", {}),
+        "shortest_overall": (calls_lqi.get("shortest_overall") or [])[:10],
+    }
+    return {
+        "source_scoreboard": source_scoreboard,
+        "schedule_summary":  schedule_summary,
+        "bad_search_terms":  bad_terms_account,
+        "calls":             calls_account,
+        "cold_leads":        lqi.get("cold_leads", {}),
+        "no_shows":          lqi.get("no_shows", {}),
+    }
 
 
 def _call_claude_account_level(
@@ -1549,6 +1729,7 @@ def _call_claude_account_level(
     optimizer_run_id: str = "",
     existing_negatives: set | None = None,
     memory_digest: dict | None = None,
+    lqi: dict | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -1638,12 +1819,13 @@ def _call_claude_account_level(
             "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
             "optimizer_memory": memory_digest or {},
             "call_quality_flags": _call_quality_flags,
+            "lqi": _build_lqi_account_summary(lqi or {}),
         }
 
         # Account-level: use aggregate summary, no specific camp_settings
         acct_excellence_block = _build_excellence_block("", summary, {})
 
-        prompt = acct_excellence_block + """
+        prompt = acct_excellence_block + GOOGLE_ADS_RULES + """
 You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
 
 You have already reviewed individual campaigns. Now identify issues and opportunities that span the whole account or cannot be attributed to one campaign.
@@ -1685,7 +1867,48 @@ IMPORTANT:
 - EXISTING NEGATIVES: The field "existing_negative_keywords" in the data lists keywords already live as negatives in Google Ads. Do NOT recommend add_negative_keyword for any term already in that list. Only suggest NEW terms not yet blocked.
 - OPTIMIZER MEMORY: The field "optimizer_memory" in the data contains historical run summaries. Use it to: (1) avoid repeating rejected recommendations, (2) identify recurring patterns, (3) highlight new trends. Do not re-suggest anything in "rejected_patterns".
 - Return ONLY a valid JSON array, no markdown, no explanation outside the array
-- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown."""
+- For estimated_monthly_impact.savings_usd: use the keyword/search term cost data to estimate realistically. For waste_reduction ops (negatives, pauses): savings = the monthly spend being wasted. For conversion_lift ops (ad copy, landing page): savings = estimated CPL reduction × monthly lead volume. For bid_efficiency: savings = bid delta × monthly clicks. Use 0 if genuinely unknown.
+
+LEAD QUALITY INTELLIGENCE (LQI) — account-wide signals:
+The "lqi" field in the account data contains pre-computed quality signals across all campaigns. Use them to generate account-level advisories:
+
+1. SOURCE QUALITY SCOREBOARD (lqi.source_scoreboard):
+   - Each item has: source, leads, booked_rate, showed_rate, cold_rate, od_match_rate, quality_score (0–100).
+   - Rank all sources by quality_score. Flag any source with quality_score < 40 as low-quality.
+   - If a source has high leads but booked_rate < 0.10, suggest ad copy / landing page review for that source.
+   - If cold_rate > 0.60 for a source, recommend reviewing that source for misleading intent signals.
+
+2. SCHEDULE WASTE (lqi.schedule_summary):
+   - lqi.schedule_summary.hotspots is a list of {dow, dow_name, hour, calls, short_calls, short_pct, in_office_hours, flag}.
+   - flag contains "outside_office_hours" when in_office_hours=false, and/or "high_short_pct" when short_pct >= 0.5.
+   - If ≥ 3 hotspots have in_office_hours=false, recommend adding an ad schedule to suppress ads during those windows account-wide.
+   - For each hotspot, cite the dow_name, hour, calls count, and whether it is outside office hours.
+
+3. BAD SEARCH TERMS — CROSS-CAMPAIGN (lqi.bad_search_terms):
+   - lqi.bad_search_terms.by_campaign maps campaign_name to a list of {search_term, classification, cost, clicks}.
+   - Find terms classified as "spanish", "competitor", or "wrong_intent" that appear in 2+ campaigns.
+   - For each cross-campaign bad term, return an add_negative_keyword operation targeting the highest-spend campaign's resource (use campaign_resources in the data).
+   - Do NOT re-suggest negatives already in existing_negative_keywords.
+
+4. SHORT CALL / MISSED CALL ADVISORY (lqi.calls):
+   - lqi.calls.by_campaign maps campaign_name to {short_calls, total_calls, short_pct, missed_calls}.
+   - If any campaign's short_pct > 0.30, generate a claude_advisory about call handling quality for that campaign.
+   - Call out the top 2 campaigns by short_pct and suggest likely cause (after-hours, IVR, ad copy mismatch).
+   - If any campaign has missed_calls > 3 in 30d, flag it explicitly.
+
+5. COLD LEAD PIPELINE (lqi.cold_leads):
+   - lqi.cold_leads.time_to_first_contact_min has cold_median and converted_median (both in minutes, not hours).
+   - If cold_median > 120 (2 hours), recommend a follow-up speed improvement advisory.
+   - lqi.cold_leads.by_utm_campaign lists {utm_campaign, leads, cold, cold_rate}.
+   - If a specific utm_campaign has cold_rate > 0.60, flag it and recommend landing page or offer review.
+   - lqi.cold_leads.no_staff_contact_pct: if > 0.40, flag as critical — cold leads never contacted.
+
+6. NO-SHOW PATTERNS (lqi.no_shows):
+   - lqi.no_shows.by_campaign lists {campaign, booked, no_shows, no_show_rate}.
+   - If any campaign has no_show_rate > 0.30, generate a claude_advisory recommending reminder sequence improvements.
+   - lqi.no_shows.lead_age_at_booking_days has no_show_median and showed_median (days between lead creation and booking).
+   - If no_show_median > 14 days, flag the long booking lag as a likely no-show driver.
+   - lqi.no_shows.reminders.no_show_no_reminders_pct: if > 0.50, flag as critical — no-shows not receiving reminders."""
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -3106,9 +3329,11 @@ def _execute_replace_ad(client, customer_id: str,
     if not final_url or not final_url.lower().startswith(("http://", "https://")):
         raise ValueError(f"final_url must be an http(s) URL (got '{final_url}')")
     if path1 and len(path1) > 15:
-        raise ValueError(f"path1 exceeds 15 chars: '{path1}'")
+        logger.warning("path1 '%s' exceeds 15 chars — truncating to '%s'", path1, path1[:15])
+        path1 = path1[:15]
     if path2 and len(path2) > 15:
-        raise ValueError(f"path2 exceeds 15 chars: '{path2}'")
+        logger.warning("path2 '%s' exceeds 15 chars — truncating to '%s'", path2, path2[:15])
+        path2 = path2[:15]
     # Google policy: phone numbers in ad text are PROHIBITED (PHONE_NUMBER_IN_AD_TEXT)
     import re as _re
     _phone_re = _re.compile(r'(\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}|\d{10}|1[\s.\-]?\d{3}[\s.\-]?\d{3}[\s.\-]?\d{4})')
@@ -4197,6 +4422,22 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _ag_err:
         logger.warning(f"Ad group stats fetch failed (non-fatal): {_ag_err}")
 
+    # ── LQI signals (lead quality intelligence) ──────────────────────────────
+    # Collected once per run; passed into both per-campaign and account-level
+    # Claude prompts for richer context on call quality, source quality,
+    # schedule waste, bad search terms, cold leads, and no-shows.
+    try:
+        from lqi_signals import collect_all as _lqi_collect_all
+        lqi_signals = _lqi_collect_all(days=30)
+        logger.info(
+            f"LQI signals collected: sources={len(lqi_signals.get('sources', {}))}, "
+            f"bad_terms={lqi_signals.get('search_terms', {}).get('totals', {}).get('terms_flagged', 0)}, "
+            f"call_campaigns={len(lqi_signals.get('calls', {}).get('by_campaign', {}))}"
+        )
+    except Exception as _lqi_err:
+        logger.warning(f"LQI collection failed (non-fatal): {_lqi_err}")
+        lqi_signals = {}
+
     # ── Capture account-wide totals before any filtering ──────────────────────
     total_spend_all_campaigns = round(sum(k.get("cost", 0) for k in keyword_perf), 2)
     total_clicks_all_campaigns = sum(k.get("clicks", 0) for k in keyword_perf)
@@ -4593,6 +4834,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             ad_performance=camp_ad_perf,
             landing_page_intel=camp_page_intel,
             ad_group_performance=camp_ag_perf,
+            lqi=lqi_signals,
         )
         if not structured:
             continue
@@ -4756,6 +4998,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         optimizer_run_id=run_id,
         existing_negatives=live_negatives,
         memory_digest=memory_digest,
+        lqi=lqi_signals,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")

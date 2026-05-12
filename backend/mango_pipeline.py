@@ -802,11 +802,11 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
                 log.warning("[pipeline] %s — could not re-fetch recording URL from Mango: %s", uuid, e)
 
         if not recording_url:
-            msg = ("Could not obtain a fresh recording URL from Mango API. "
-                   "The call may not have a recording, or the Mango token is expired.")
-            log.error("[pipeline] %s — %s", uuid, msg)
+            msg = ("No recording available in Mango — call may be too short, "
+                   "sent to voicemail without a message, or the recording has expired.")
+            log.info("[pipeline] %s — %s", uuid, msg)
             db.update_mango_call_analysis(
-                uuid, transcription_status="failed",
+                uuid, transcription_status="skipped_no_audio",
                 pipeline_error=msg,
             )
             return

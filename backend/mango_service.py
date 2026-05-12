@@ -384,8 +384,31 @@ def fetch_fresh_recording_url(
 
 # ── Main sync entry point ─────────────────────────────────────────────────────
 
-# Module-level cursor: tracks last successful sync time
+# Module-level cursor: tracks last successful sync time (populated from DB on first use)
 _last_sync_cursor: Optional[datetime] = None
+
+_SYNC_CURSOR_KEY = "mango_last_sync_cursor"
+
+
+def _load_sync_cursor() -> Optional[datetime]:
+    """Read the persisted sync cursor from the settings table. Returns None if not set."""
+    try:
+        from database import get_setting
+        raw = get_setting(_SYNC_CURSOR_KEY, "")
+        if raw:
+            return datetime.fromisoformat(raw)
+    except Exception as e:
+        logger.warning("Mango sync: could not load cursor from DB: %s", e)
+    return None
+
+
+def _save_sync_cursor(dt: datetime) -> None:
+    """Persist the sync cursor to the settings table so it survives restarts."""
+    try:
+        from database import save_setting
+        save_setting(_SYNC_CURSOR_KEY, dt.isoformat())
+    except Exception as e:
+        logger.warning("Mango sync: could not save cursor to DB: %s", e)
 
 
 def sync_mango_calls(
@@ -401,13 +424,19 @@ def sync_mango_calls(
     """
     global _last_sync_cursor
 
-    # On first run, backfill initial_days_back days; after that use cursor
+    # On first call after a restart, try to restore the cursor from the DB
     if _last_sync_cursor is None:
+        _last_sync_cursor = _load_sync_cursor()
+
+    # Determine the sync window
+    if _last_sync_cursor is None:
+        # Genuine first run — do the full historical backfill
         since = datetime.now(timezone.utc) - timedelta(days=initial_days_back)
         logger.info(f"Mango sync: initial backfill, fetching {initial_days_back} days")
     else:
-        # Overlap by 2 minutes to catch any calls that slipped through
+        # Incremental — overlap by 2 minutes to catch any calls that slipped through
         since = _last_sync_cursor - timedelta(minutes=2)
+        logger.info(f"Mango sync: incremental from {since.isoformat()}")
 
     try:
         raw_calls = fetch_calls_since(token_manager, pbx_id, since, api_base=api_base)
@@ -435,6 +464,7 @@ def sync_mango_calls(
             logger.error(f"Mango sync: batch upsert error: {e}\n{traceback.format_exc()}")
 
     _last_sync_cursor = datetime.now(timezone.utc)
+    _save_sync_cursor(_last_sync_cursor)
     logger.info(f"Mango sync: upserted {count}/{len(normalized_calls)} calls")
     return count
 
@@ -641,10 +671,6 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
         mc_dur = int(mc.get("duration_sec") or 0)
         mc_uuid = mc["uuid"]
 
-        # Skip if Mango call has an area code — organic/non-GAds more likely
-        if mc_area:
-            continue
-
         try:
             mc_dt = datetime.fromisoformat(mc_start_str.replace("Z", "+00:00"))
             if mc_dt.tzinfo is None:
@@ -661,8 +687,11 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
             gc_area = gc.get("caller_area_code", "")
             gc_dur  = int(gc.get("call_duration_sec") or 0)
             gc_status = (gc.get("call_status") or "").upper()
+
+            # Only consider GAds rows with no area code — rows with area codes are
+            # handled by area-code branches and don't need ambiguity tracking here
             if gc_area:
-                continue  # GAds row has area code — handled by area-code branches
+                continue
 
             time_delta = abs((mc_dt - gc_dt).total_seconds())
             if time_delta > 120:
@@ -672,8 +701,10 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
             if gc_status != "MISSED":
                 dur_delta = abs(mc_dur - gc_dur)
                 max_dur = max(mc_dur, gc_dur)
-                dur_ok = dur_delta <= max(20, 0.3 * max_dur)
-                if not dur_ok:
+                # Fallback A (no Mango area): looser tolerance
+                # Fallback B (Mango has area): tighter tolerance
+                tol = max(15, 0.25 * max_dur) if mc_area else max(20, 0.3 * max_dur)
+                if dur_delta > tol:
                     continue
 
             gads_id = gc["call_id"]
@@ -689,6 +720,11 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
         return gads_id not in _ambiguous_gads and mc_uuid not in _ambiguous_mcs
 
     # ── Main attribution loop ─────────────────────────────────────────────────
+    # Track which GAds call_ids have already been claimed this pass so we never
+    # assign the same GAds call to two different Mango records (can happen when
+    # two callers ring in at the same second and both pass the area+time+dur check).
+    _used_gads_ids: set = set()
+
     for mc in unmatched:
         mc_start_str = mc.get("started_at", "")
         mc_area = _extract_area_code(mc.get("from_number", ""))
@@ -715,6 +751,10 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
         best_gc = None
 
         for gc, gc_dt in gads_parsed:
+            # Skip GAds rows already claimed by an earlier Mango call this pass
+            if gc["call_id"] in _used_gads_ids:
+                continue
+
             gc_area   = gc.get("caller_area_code", "")
             gc_dur    = int(gc.get("call_duration_sec") or 0)
             gc_status = (gc.get("call_status") or "").upper()
@@ -744,7 +784,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                     best_confidence = 0.60
                     best_method    = "gads_window_time_only"
                     best_gc        = gc
-            # Time-only fallback: neither side has area code, ±120s, unambiguous,
+            # Time-only fallback A: neither side has area code, ±120s, unambiguous,
             # not a known lead (known leads get phone_exact match instead).
             # Confidence 0.55 — lower than all area-code branches
             elif (not gc_area) and (not mc_area) and time_delta <= 120 and not _mc_is_known_lead:
@@ -757,6 +797,21 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                     best_gads_id   = gc["call_id"]
                     best_confidence = 0.55
                     best_method    = "gads_time_only_no_area"
+                    best_gc        = gc
+            # Time-only fallback B: GAds has no area code but Mango does (Google strips
+            # area code for some mobile call extensions even when caller has one).
+            # ±120s time, tight duration match. Confidence 0.60 — Mango area code is real
+            # signal even if GAds doesn't have it, so slightly higher than fallback A.
+            elif (not gc_area) and mc_area and time_delta <= 120 and not _mc_is_known_lead:
+                if gc_status != "MISSED":
+                    max_dur  = max(mc_dur, gc_dur)
+                    dur_ok   = dur_delta <= max(15, 0.25 * max_dur)
+                    if not dur_ok:
+                        continue
+                if 0.60 > best_confidence and _is_clean_time_only(mc_uuid, gc["call_id"]):
+                    best_gads_id   = gc["call_id"]
+                    best_confidence = 0.60
+                    best_method    = "gads_time_only_gads_no_area"
                     best_gc        = gc
             # Last resort for targeted matching: time only (±120s), any area code combo
             elif target_gads_call_id and time_delta <= 120:
@@ -775,6 +830,8 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                 )
 
         if best_gads_id and best_gc:
+            # Claim this GAds call so no other Mango record can match it this pass
+            _used_gads_ids.add(best_gads_id)
             update_mango_call_attribution(
                 uuid=mc_uuid,
                 gads_call_id=best_gads_id,

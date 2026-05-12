@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body, BackgroundTasks, UploadFile, File, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -410,6 +410,19 @@ app.mount("/media/case-photos", StaticFiles(directory=_case_photos_dir), name="c
 def _require_admin(x_admin_password: Optional[str] = Header(None)):
     settings = get_settings()
     if x_admin_password != settings.admin_password:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_admin_media(
+    x_admin_password: Optional[str] = Header(None),
+    pw: Optional[str] = Query(None),
+):
+    """Auth for media endpoints (audio playback) where the browser cannot send headers.
+    Accepts the admin password either as the X-Admin-Password header OR as a ?pw= query param.
+    """
+    settings = get_settings()
+    token = x_admin_password or pw
+    if token != settings.admin_password:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -1338,8 +1351,8 @@ async def gads_approve_action(action_id: str, request: Request):
             new_d         = after.get("new_descriptions") or []
             final_url     = after.get("final_url", "")
             ag_resource   = after.get("ad_group_resource", "")
-            path1         = after.get("path1", "")
-            path2         = after.get("path2", "")
+            path1         = (after.get("path1", "") or "")[:15]
+            path2         = (after.get("path2", "") or "")[:15]
             if not old_rn or not new_h or not new_d or not final_url:
                 raise HTTPException(
                     status_code=422,
@@ -3943,7 +3956,8 @@ Produce improved sitelinks that avoid ALL of these issues.
     if safe_instruction:
         instruction_section = f"\n<user_instruction>{safe_instruction}</user_instruction>\n"
 
-    system_prompt = f"""You are a Google Ads specialist generating sitelink extensions for a dental practice.
+    from ai_optimizer import GOOGLE_ADS_RULES as _GAR
+    system_prompt = _GAR + f"""You are a Google Ads specialist generating sitelink extensions for a dental practice.
 
 STRICT RULES — Google will reject violations:
 1. title: MAXIMUM 25 characters (count every single character including spaces). Aim for ≤20. NEVER exceed 25.
@@ -4549,7 +4563,8 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         except Exception as _ome:
             logger.warning(f"build-step keywords: optimizer memory read failed: {_ome}")
 
-        prompt = f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
+        from ai_optimizer import GOOGLE_ADS_RULES as _GAR
+        prompt = _GAR + f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
 
 Campaign: {campaign_name}
 Service Focus: {service_focus}
@@ -4581,7 +4596,8 @@ Rules:
         headlines_from_strategy = strategy.get("ad_headlines", [])
         descs_from_strategy = strategy.get("ad_descriptions", [])
 
-        prompt = f"""You are a Google Ads copywriter. Generate complete RSA ad copy for this dental campaign.
+        from ai_optimizer import GOOGLE_ADS_RULES as _GAR
+        prompt = _GAR + f"""You are a Google Ads copywriter. Generate complete RSA ad copy for this dental campaign.
 
 Campaign: {campaign_name}
 Service Focus: {service_focus}
@@ -9039,8 +9055,8 @@ def admin_replace_ad_stage(campaign_id: str, body: ReplaceAdStageRequest):
         "new_headlines":            h_list,
         "new_descriptions":         d_list,
         "final_url":                body.final_url,
-        "path1":                    body.path1,
-        "path2":                    body.path2,
+        "path1":                    (body.path1 or "")[:15],
+        "path2":                    (body.path2 or "")[:15],
         "rationale":                body.rationale,
     }
     action_id = log_admin_manual_action(
@@ -9164,7 +9180,18 @@ def admin_ai_campaign_refine(body: CampaignRefineRequest):
     except Exception as e:
         logger.warning(f"campaign-refine: could not fetch current ads: {e}")
 
+    # Load practice hours so Claude can resolve "office hours" without asking
+    _practice_hours = get_setting("practice_hours") or ""
+    _practice_name  = get_setting("practice_name") or "Grafton Dental Care"
+
+    from ai_optimizer import GOOGLE_ADS_RULES as _GAR
     system_prompt = (
+        _GAR +
+        f"Practice: {_practice_name}. "
+        + (f"Office hours: {_practice_hours}. "
+           "When the user says 'office hours', 'business hours', or 'open hours', "
+           "use these exact hours to build the schedule_text — do NOT ask for clarification. "
+           if _practice_hours else "") +
         "You are a Google Ads campaign manager for a dental practice. "
         "The user will describe a change they want to make to their campaign in plain English. "
         "Interpret their intent and return a structured list of proposed changes. "
@@ -9433,7 +9460,7 @@ def admin_save_mango_settings(body: dict, request: Request):
 
 # ─── Recording streaming endpoint ─────────────────────────────────────────────
 
-@app.get("/api/admin/calls/recording/{uuid}/play", dependencies=[Depends(_require_admin)])
+@app.get("/api/admin/calls/recording/{uuid}/play", dependencies=[Depends(_require_admin_media)])
 def admin_play_recording(uuid: str, request: Request):
     """Stream a Mango call recording to the browser for in-page playback.
 
@@ -9476,18 +9503,13 @@ def admin_play_recording(uuid: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch recording: {e}")
 
-    def _stream():
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        # Don't delete — let the TTL sweeper handle it so re-plays reuse the cache
-
-    return StreamingResponse(
-        _stream(),
+    # FileResponse handles Content-Length, Accept-Ranges, and range requests
+    # automatically — required for browser Audio element to play and seek correctly.
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path=str(path),
         media_type="audio/mpeg",
+        filename=f"{uuid}.mp3",
         headers={"Content-Disposition": f'inline; filename="{uuid}.mp3"'},
     )
 

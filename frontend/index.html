@@ -7,7 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <!-- v20260509-1435 -->
+  <!-- v20260511-2010 -->
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -4349,35 +4349,68 @@ function CallsSubView() {
     }
   }
 
-  function PlayButton({uuid}) {
+  function PlayButton({uuid, call}) {
+    // call is optional — passed from the bottom list where we have full call data.
+    // If transcription_status is skipped_no_audio, no recording exists; show a muted icon.
+    const noRecording = call && call.transcription_status === 'skipped_no_audio';
+
     const [pState, setPState] = React.useState('idle'); // idle | loading | playing | error
+    const [errMsg, setErrMsg] = React.useState('');
     const audioRef = React.useRef(null);
-    const url = `/api/admin/calls/recording/${uuid}/play`;
+    // Include ?pw= so the browser Audio element can authenticate (it cannot send custom headers).
+    const url = `/api/admin/calls/recording/${uuid}/play?pw=${encodeURIComponent(ADMIN_PW)}`;
+
     const toggle = e => {
       e.stopPropagation();
+      if (noRecording) return;
       if (pState === 'playing') {
         audioRef.current && audioRef.current.pause();
         setPState('idle');
         return;
       }
-      if (!audioRef.current) {
-        const a = new Audio(url);
-        audioRef.current = a;
-        a.onended = () => setPState('idle');
-        a.onerror = () => setPState('error');
+      if (pState === 'error') {
+        // Reset for retry
+        if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+        setPState('idle');
+        setErrMsg('');
+        return;
       }
       setPState('loading');
-      audioRef.current.play()
-        .then(() => setPState('playing'))
-        .catch(() => setPState('error'));
+      setErrMsg('');
+      // Stream directly — browser handles range requests and buffering natively.
+      // Append a cache-buster so the browser doesn't serve a stale 401/cached response.
+      const a = new Audio(url + '&t=' + Date.now());
+      audioRef.current = a;
+      a.oncanplay  = () => setPState('playing');  // audio ready to play
+      a.onended    = () => setPState('idle');
+      a.onerror    = () => {
+        // Try to get a real error message from the endpoint
+        fetch(url, {'X-Admin-Password': ADMIN_PW})
+          .then(r => r.ok ? null : r.json().catch(() => null).then(j => j?.detail || `HTTP ${r.status}`))
+          .then(msg => { setPState('error'); setErrMsg(msg || 'Recording unavailable'); })
+          .catch(() => { setPState('error'); setErrMsg('Recording unavailable'); });
+      };
+      a.play().catch(err => {
+        setPState('error');
+        setErrMsg(err.message || 'Playback failed');
+      });
     };
+
     React.useEffect(() => () => { audioRef.current && audioRef.current.pause(); }, []);
-    const label = pState === 'loading' ? '⏳' : pState === 'playing' ? '⏸' : pState === 'error' ? '⚠' : '▶';
+
+    if (noRecording) {
+      return <span title="No recording available for this call" style={{fontSize:11,color:'#94a3b8',cursor:'default'}}>—</span>;
+    }
+
+    const label = pState === 'loading' ? '⏳' : pState === 'playing' ? '⏸' : pState === 'error' ? '↺' : '▶';
     const color  = pState === 'error' ? '#dc2626' : pState === 'playing' ? '#7c3aed' : '#0369a1';
     const bg     = pState === 'error' ? '#fef2f2' : pState === 'playing' ? '#f5f3ff' : '#e0f2fe';
     const border = pState === 'error' ? '#dc2626' : pState === 'playing' ? '#7c3aed' : '#0369a1';
+    const titleText = pState === 'playing' ? 'Pause'
+      : pState === 'error' ? `Error: ${errMsg} — click to retry`
+      : 'Play recording (auto-deleted after 60 min)';
     return (
-      <button onClick={toggle} title={pState==='playing'?'Pause':'Play recording (auto-deleted after 60 min)'}
+      <button onClick={toggle} title={titleText}
         style={{fontSize:11,padding:'3px 8px',border:`1px solid ${border}`,borderRadius:3,
           cursor:'pointer',color,background:bg,whiteSpace:'nowrap'}}>
         {label}
@@ -4399,7 +4432,7 @@ function CallsSubView() {
     const grading = gState === 'working';
 
     const playBtn = call.recording_url ? (
-      <button onClick={e=>{e.stopPropagation();window.open(`/api/admin/calls/recording/${call.uuid}/play`,'_blank');}}
+      <button onClick={e=>{e.stopPropagation();window.open(`/api/admin/calls/recording/${call.uuid}/play?pw=${encodeURIComponent(ADMIN_PW)}`,'_blank');}}
         title="Play recording"
         style={{fontSize:9,padding:'2px 5px',border:'1px solid #7c3aed',borderRadius:3,cursor:'pointer',
           color:'#7c3aed',background:'#f5f3ff'}}>
@@ -4587,7 +4620,7 @@ function CallsSubView() {
   }
 
   // ── Derived stats ─────────────────────────────────────────────────────────
-  const missed      = calls.filter(c=>c.status==='missed').length;
+  const missed      = calls.filter(c=>c.status==='missed'||c.status==='voicemail').length;
   const answered    = calls.filter(c=>c.status==='answered').length;
   const transcribed = calls.filter(c=>c.transcription_status==='done').length;
   const graded      = calls.filter(c=>c.grade_overall_score != null).length;
@@ -4712,7 +4745,7 @@ function CallsSubView() {
             <span style={{fontSize:13,fontWeight:700,color:'#0369a1'}}>📞 Google Ads Call Conversions</span>
             {convLoading
               ? <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>
-              : <span style={{fontSize:11,color:'var(--text-muted)'}}>{convCalls.length} call{convCalls.length!==1?'s':''} • {convCalls.filter(c=>c.mango_uuid).length} matched to Mango</span>
+              : <span style={{fontSize:11,color:'var(--text-muted)'}}>{convCalls.length} call{convCalls.length!==1?'s':''} • {calls.filter(c=>c.gads_call_id).length} matched to Mango</span>
             }
           </div>
           <div style={{display:'flex',alignItems:'center',gap:8}}>
@@ -4785,6 +4818,15 @@ function CallsSubView() {
                         <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
                           {ts}
                           {isConv && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
+                          {matched && c.match_method && (() => {
+                            const conf = c.match_confidence || 0;
+                            const isTimeOnly = c.match_method.includes('time_only');
+                            const [bg, col] = conf >= 0.75 ? ['#dbeafe','#1d4ed8'] : conf >= 0.60 ? ['#fef3c7','#92400e'] : ['#fee2e2','#991b1b'];
+                            return <span title={`${c.match_method} · ${Math.round(conf*100)}% confidence`}
+                              style={{marginLeft:4,fontSize:9,fontWeight:700,color:col,background:bg,padding:'1px 4px',borderRadius:3,cursor:'help'}}>
+                              📱 {isTimeOnly ? 'GAds~' : 'GAds'}
+                            </span>;
+                          })()}
                         </td>
                         <td style={{padding:'8px 10px'}}>
                           {matched
@@ -4971,7 +5013,7 @@ function CallsSubView() {
                   <td style={{padding:'8px 10px'}}>{_transcriptBadge(call.transcription_status)}</td>
                   <td style={{padding:'8px 10px'}}>{_gradeBadge(call.grade_overall_score)}</td>
                   <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}>{analyzeButton(call)}</td>
-                  <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}><PlayButton uuid={call.uuid} /></td>
+                  <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}><PlayButton uuid={call.uuid} call={call} /></td>
                 </tr>
               </React.Fragment>
             ))}
@@ -5380,9 +5422,9 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                         {Math.round(conf*100)}% confidence ({label})
                       </span>;
                     })()}
-                    {call.match_method === 'gads_time_only_no_area' && (
+                    {(call.match_method === 'gads_time_only_no_area' || call.match_method === 'gads_time_only_gads_no_area') && (
                       <div style={{fontSize:10,color:'#b45309',marginTop:2}}>
-                        ⚠ Matched by time only — area code unavailable (mobile ad tap)
+                        ⚠ Matched by time only — Google Ad stripped area code (mobile ad tap)
                       </div>
                     )}
                   </div>
