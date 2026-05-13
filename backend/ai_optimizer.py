@@ -321,7 +321,8 @@ def _classify_campaign(campaign_name: str) -> str:
 
 
 def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: dict,
-                             campaign_stats: dict | None = None) -> str:
+                             campaign_stats: dict | None = None,
+                             planned_targets: dict | None = None) -> str:
     """
     Build the campaign-type-aware excellence block injected into the Claude prompt.
     Pulls numeric targets from excellence_targets DB and computes a live gap analysis
@@ -418,9 +419,37 @@ def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: di
         # Build service-specific narrative
         narrative = _EXCELLENCE_NARRATIVE.get(ctype, _EXCELLENCE_NARRATIVE["general"])
 
+        # PR 4: planned vs live targets section
+        planned_lines = []
+        pt = planned_targets or {}
+        _planned_monthly = pt.get("monthly_budget") or 0
+        _planned_cpl = pt.get("expected_cpl") or 0
+        if _planned_monthly or _planned_cpl:
+            planned_lines.append("")
+            planned_lines.append("=== PRACTICE'S OWN PLANNED TARGETS (from campaign creation wizard) ===")
+            if _planned_monthly:
+                live_daily = (camp_settings or {}).get("daily_budget_usd") or 0
+                live_monthly = live_daily * 30
+                drift = round((live_monthly - _planned_monthly) / _planned_monthly * 100) if _planned_monthly else 0
+                drift_str = f"(DRIFT: {drift:+d}%)" if abs(drift) > 20 else "(on track)"
+                planned_lines.append(f"  Planned monthly budget: ${_planned_monthly:.0f}  |  Live monthly: ${live_monthly:.0f}  {drift_str}")
+            if _planned_cpl:
+                live_cpl = (campaign_stats or {}).get("cpl_usd") or 0
+                if live_cpl:
+                    cpl_ratio = live_cpl / _planned_cpl
+                    if cpl_ratio > 1.5:
+                        planned_lines.append(
+                            f"  Target CPL: ${_planned_cpl:.0f}  |  Live CPL: ${live_cpl:.0f}  "
+                            f"⚠ OVER TARGET ({cpl_ratio:.1f}×) — prefer waste-reduction recs over coverage-gain recs."
+                        )
+                    else:
+                        planned_lines.append(f"  Target CPL: ${_planned_cpl:.0f}  |  Live CPL: ${live_cpl:.0f}  (within target)")
+                else:
+                    planned_lines.append(f"  Target CPL: ${_planned_cpl:.0f}  |  Live CPL: no data yet")
+
         lines = [
             f"=== GDC EXCELLENCE BENCHMARKS — GAP ANALYSIS (campaign type: {ctype}) ===",
-        ] + gap_lines + [
+        ] + gap_lines + planned_lines + [
             "",
             f"=== EXCELLENCE PLAYBOOK — {ctype.upper()} CAMPAIGN RULES ===",
             narrative,
@@ -1215,6 +1244,72 @@ def _score_tier(impr: int, clicks: int, cost_usd: float, conv: float, avg_ctr: f
     return "average"
 
 
+def _compute_budget_click_signal(
+    planned_ad_groups: list,
+    monthly_budget: float,
+    live_daily_budget: float,
+    live_cpc_avg: float,
+    bidding_strategy: str,
+) -> dict:
+    """
+    PR 2: Mirror the frontend Launch-tab clicks/day calculation, plus a live counterpart.
+
+    Detects:
+      - "under_smart_bidding_floor": Smart Bidding active but < 10 clicks/day
+      - "cpc_drift_high": live CPC > 1.5× planned estimated CPC
+      - "ok": no action needed
+
+    Returns a dict with all signals; safe to pass directly into Claude context.
+    """
+    import math
+
+    # Weighted average planned CPC from wizard ad groups
+    planned_est_cpc = 0.0
+    total_budget_pct = sum(ag.get("daily_budget_pct", 0) for ag in planned_ad_groups)
+    if planned_ad_groups and total_budget_pct > 0:
+        weighted_cpc = sum(
+            ag.get("suggested_cpc_usd", 0) * ag.get("daily_budget_pct", 0)
+            for ag in planned_ad_groups
+        )
+        planned_est_cpc = weighted_cpc / total_budget_pct
+
+    planned_daily_budget = (monthly_budget / 30) if monthly_budget else 0
+    planned_clicks_per_day = (planned_daily_budget / planned_est_cpc) if planned_est_cpc > 0 else 0
+
+    live_clicks_per_day = (live_daily_budget / live_cpc_avg) if live_cpc_avg > 0 and live_daily_budget > 0 else 0
+
+    _smart_bidding_strats = {"MAXIMIZE_CONVERSIONS", "TARGET_CPA", "TARGET_ROAS", "MAXIMIZE_CONVERSION_VALUE"}
+    smart_bidding = (bidding_strategy or "").upper() in _smart_bidding_strats
+    smart_bidding_starved = smart_bidding and live_clicks_per_day > 0 and live_clicks_per_day < 10
+
+    cpc_drift_high = (
+        planned_est_cpc > 0
+        and live_cpc_avg > 0
+        and live_cpc_avg > planned_est_cpc * 1.5
+    )
+
+    if smart_bidding_starved:
+        flag = "under_smart_bidding_floor"
+    elif cpc_drift_high:
+        flag = "cpc_drift_high"
+    else:
+        flag = "ok"
+
+    min_budget_for_smart_bidding = math.ceil(live_cpc_avg * 10) if live_cpc_avg > 0 else 0
+
+    return {
+        "planned_est_cpc": round(planned_est_cpc, 2),
+        "planned_clicks_per_day": round(planned_clicks_per_day, 1),
+        "live_cpc": round(live_cpc_avg, 2),
+        "live_clicks_per_day": round(live_clicks_per_day, 1),
+        "smart_bidding_active": smart_bidding,
+        "smart_bidding_starved": smart_bidding_starved,
+        "cpc_drift_high": cpc_drift_high,
+        "min_daily_budget_for_smart_bidding": min_budget_for_smart_bidding,
+        "flag": flag,
+    }
+
+
 def _build_lqi_campaign_slice(campaign: str, lqi: dict) -> dict:
     """
     Filter the account-wide LQI signals down to what's relevant for a single campaign.
@@ -1269,7 +1364,17 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              ad_performance: list | None = None,
                              landing_page_intel: str = "",
                              ad_group_performance: list | None = None,
-                             lqi: dict | None = None) -> list:
+                             lqi: dict | None = None,
+                             # PR 1: wizard context
+                             campaign_brief: dict | None = None,
+                             competitor_intel: dict | None = None,
+                             planned_build: dict | None = None,
+                             # PR 2: budget feasibility
+                             budget_feasibility: dict | None = None,
+                             # PR 3: intent signals
+                             intent_signals: dict | None = None,
+                             # PR 7: conquest keyword protection (set of lowercase terms)
+                             conquest_keywords_protected: set | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -1403,6 +1508,14 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "ad_group_performance": (ad_group_performance or [])[:10],  # per-ad-group scored metrics
             "lqi": _build_lqi_campaign_slice(campaign, lqi or {}),
             "geo_defaults": _geo_defaults_for_campaign(campaign),  # ideal geo profile for this campaign type
+            # PR 1: wizard context — strategy, competitors, planned structure
+            "campaign_brief": campaign_brief or {},
+            "competitor_intel": competitor_intel or {},
+            "planned_build_summary": planned_build or {},
+            # PR 2: budget feasibility signal
+            "budget_feasibility": budget_feasibility or {},
+            # PR 3: keyword intent signals (same vocabulary as creation wizard)
+            "keyword_intent_signals": intent_signals or {},
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -1439,7 +1552,129 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             )
 
         excellence_block = _build_excellence_block(campaign, summary, camp_settings or {},
-                                                    campaign_stats=campaign_stats)
+                                                    campaign_stats=campaign_stats,
+                                                    planned_targets={
+                                                        "monthly_budget": (campaign_brief or {}).get("planned_monthly_budget_usd", 0),
+                                                        "expected_cpl":   (campaign_brief or {}).get("target_cpl_usd", 0),
+                                                    })
+
+        # ── PR 1: campaign brief + competitor intel note ──────────────────────
+        campaign_brief_note = ""
+        if campaign_brief:
+            live_monthly = round((camp_settings or {}).get("daily_budget_usd", 0) * 30, 0)
+            planned_monthly = campaign_brief.get("planned_monthly_budget_usd") or 0
+            target_cpl = campaign_brief.get("target_cpl_usd") or 0
+            live_cpl = campaign_stats.get("cpl_usd") or 0
+            drift_budget = round((live_monthly - planned_monthly) / planned_monthly * 100) if planned_monthly else 0
+            drift_cpl = round((live_cpl - target_cpl) / target_cpl * 100) if target_cpl and live_cpl else 0
+
+            strategy = campaign_brief.get("strategy") or {}
+            campaign_brief_note = "\n\nCAMPAIGN BRIEF (set during campaign creation — align recs with practice intent):\n"
+            if campaign_brief.get("service_focus"):
+                campaign_brief_note += f"- service_focus: {campaign_brief['service_focus']}\n"
+            if campaign_brief.get("objective"):
+                campaign_brief_note += f"- objective: {campaign_brief['objective']}\n"
+            if campaign_brief.get("target_audience"):
+                campaign_brief_note += f"- target_audience: {campaign_brief['target_audience']}\n"
+            if campaign_brief.get("promo_offer"):
+                campaign_brief_note += f"- promo_offer: {campaign_brief['promo_offer']}\n"
+            if planned_monthly:
+                drift_str = f" (DRIFT: {drift_budget:+d}% vs planned)" if abs(drift_budget) > 20 else " (on track)"
+                campaign_brief_note += f"- planned_monthly_budget_usd: ${planned_monthly:.0f} | live_monthly: ${live_monthly:.0f}{drift_str}\n"
+            if target_cpl:
+                cpl_str = ""
+                if live_cpl and live_cpl > target_cpl * 1.5:
+                    cpl_str = f" ⚠ OVER TARGET by {drift_cpl:+d}% — prefer waste-reduction recs over coverage-gain"
+                elif live_cpl:
+                    cpl_str = f" ({drift_cpl:+d}% vs target)"
+                campaign_brief_note += f"- target_cpl_usd: ${target_cpl:.0f} | live_cpl: ${live_cpl:.0f}{cpl_str}\n"
+            if strategy.get("key_messages"):
+                campaign_brief_note += f"- key_messages: {strategy.get('key_messages')}\n"
+            if strategy.get("ad_headlines"):
+                campaign_brief_note += f"- intended_headline_themes: {strategy.get('ad_headlines')}\n"
+            if strategy.get("implementation_instructions"):
+                campaign_brief_note += f"- operator_notes: {strategy.get('implementation_instructions')}\n"
+
+        competitor_intel_note = ""
+        if competitor_intel and (competitor_intel.get("our_differentiators") or competitor_intel.get("conquest_keywords") or competitor_intel.get("competitors")):
+            competitor_intel_note = "\n\nCOMPETITOR INTELLIGENCE (from campaign creation wizard):\n"
+            if competitor_intel.get("our_differentiators"):
+                competitor_intel_note += f"- our_differentiators (use as headline angles for replace_ad): {competitor_intel['our_differentiators']}\n"
+            if competitor_intel.get("conquest_keywords"):
+                competitor_intel_note += (
+                    f"- conquest_keywords (INTENTIONAL competitor targets — DO NOT recommend as negatives): "
+                    f"{competitor_intel['conquest_keywords']}\n"
+                )
+            if competitor_intel.get("positioning_notes"):
+                competitor_intel_note += f"- positioning_notes: {competitor_intel['positioning_notes']}\n"
+            if competitor_intel.get("competitors"):
+                for comp in competitor_intel["competitors"][:5]:
+                    competitor_intel_note += (
+                        f"  • {comp.get('name','?')} ({comp.get('location','')}): "
+                        f"emphasis={comp.get('likely_emphasis','')} | "
+                        f"gap_we_can_address={comp.get('gap_we_can_address','')}\n"
+                    )
+
+        planned_build_note = ""
+        if planned_build and (planned_build.get("planned_keywords") or planned_build.get("planned_ad_groups")):
+            planned_build_note = "\n\nPLANNED BUILD SUMMARY (wizard's intended structure — flag drift from live):\n"
+            pk = planned_build.get("planned_keywords") or {}
+            if pk.get("exact_match"):
+                planned_build_note += f"- planned_exact_match_keywords: {(pk.get('exact_match') or [])[:10]}\n"
+            if pk.get("phrase_match"):
+                planned_build_note += f"- planned_phrase_match_keywords: {(pk.get('phrase_match') or [])[:10]}\n"
+            if pk.get("negative_keywords"):
+                planned_build_note += f"- planned_negative_keywords: {(pk.get('negative_keywords') or [])[:10]}\n"
+            pags = planned_build.get("planned_ad_groups") or []
+            if pags:
+                planned_build_note += "- planned_ad_groups (theme / suggested CPC / budget pct):\n"
+                for ag in pags[:5]:
+                    planned_build_note += (
+                        f"  • {ag.get('name','?')}: suggested_cpc=${ag.get('suggested_cpc_usd',0):.2f}, "
+                        f"budget_pct={ag.get('daily_budget_pct',0)}%, theme={ag.get('theme','')}\n"
+                    )
+
+        # ── PR 2: budget feasibility note ──────────────────────────────────────
+        budget_feasibility_note = ""
+        if budget_feasibility:
+            flag = budget_feasibility.get("flag", "ok")
+            if flag != "ok":
+                budget_feasibility_note = "\n\nBUDGET FEASIBILITY SIGNAL (wizard launch-tab calculator):\n"
+                budget_feasibility_note += (
+                    f"- planned_est_cpc: ${budget_feasibility.get('planned_est_cpc', 0):.2f} | "
+                    f"planned_clicks_per_day: {budget_feasibility.get('planned_clicks_per_day', 0):.1f}\n"
+                    f"- live_cpc: ${budget_feasibility.get('live_cpc', 0):.2f} | "
+                    f"live_clicks_per_day: {budget_feasibility.get('live_clicks_per_day', 0):.1f}\n"
+                    f"- flag: {flag}\n"
+                )
+                if flag == "under_smart_bidding_floor":
+                    min_budget = budget_feasibility.get("min_daily_budget_for_smart_bidding", 0)
+                    budget_feasibility_note += (
+                        f"  Smart Bidding strategy is active but campaign has <10 clicks/day. "
+                        f"Recommend EITHER change_budget to ≥${min_budget:.0f}/day OR switch "
+                        f"to MAXIMIZE_CLICKS/MANUAL_CPC until volume grows. Cite both options.\n"
+                    )
+                elif flag == "cpc_drift_high":
+                    budget_feasibility_note += (
+                        f"  Live CPC is >1.5× planned CPC. Likely Quality Score or ad relevance issue. "
+                        f"Prefer replace_ad or change_match_type before recommending bid changes.\n"
+                    )
+
+        # ── PR 3: intent signals note ──────────────────────────────────────────
+        intent_signals_note = ""
+        if intent_signals and intent_signals.get("high_intent_examples"):
+            ctype_intent = intent_signals.get("campaign_type", "general")
+            intent_signals_note = (
+                f"\n\nKEYWORD INTENT SIGNALS for {ctype_intent} campaigns:\n"
+                f"- high_intent_examples: {intent_signals['high_intent_examples']}\n"
+                f"  → When a search_term matches these patterns with 0 conversions and ≥10 clicks, "
+                f"prefer add_exact_keyword (capture intent precisely) over pause_keyword.\n"
+            )
+            if intent_signals.get("low_intent_negatives"):
+                intent_signals_note += (
+                    f"- low_intent_negatives: {intent_signals['low_intent_negatives']}\n"
+                    f"  → Any search term containing these tokens with ≥$5 spend → add_negative_keyword (PHRASE).\n"
+                )
 
         prompt = excellence_block + GOOGLE_ADS_RULES + """
 You are a Google Ads specialist optimizing a dental practice's campaigns.
@@ -1705,7 +1940,7 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
-ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + feedback_block
+ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -1761,6 +1996,28 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
                             item["campaign_resource"] = campaign_resource
                             logger.info(f"  Fixed campaign_resource for '{item.get('keyword_text','?')}' → {campaign_resource}")
                         else:
+                            continue
+                    # PR 7: conquest keyword protection — never stage intentional competitor targets as negatives
+                    if conquest_keywords_protected:
+                        import re as _re_ck
+                        kw_text = item.get("keyword_text", "").strip().lower()
+                        _conquest_hit = False
+                        for ck in conquest_keywords_protected:
+                            if len(ck) < 4:
+                                continue  # too short to match safely
+                            # word-boundary match: conquest term appears as a whole word in the negative
+                            if _re_ck.search(r'\b' + _re_ck.escape(ck) + r'\b', kw_text):
+                                _conquest_hit = True
+                                break
+                            # reverse: the proposed negative term is a whole word inside the conquest phrase
+                            if len(kw_text) >= 4 and _re_ck.search(r'\b' + _re_ck.escape(kw_text) + r'\b', ck):
+                                _conquest_hit = True
+                                break
+                        if _conquest_hit:
+                            logger.warning(
+                                f"Dropping add_negative_keyword '{item.get('keyword_text','')}' — "
+                                f"matches conquest keyword (intentional target)"
+                            )
                             continue
                 elif op == "ad_copy_suggestion":
                     # Validate character limits — drop silently if over limit
@@ -1965,6 +2222,8 @@ def _call_claude_account_level(
     existing_negatives: set | None = None,
     memory_digest: dict | None = None,
     lqi: dict | None = None,
+    # PR 5: account-wide competitor intel union
+    competitor_intel_union: dict | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -2064,6 +2323,8 @@ def _call_claude_account_level(
             "optimizer_memory": memory_digest or {},
             "call_quality_flags": _call_quality_flags,
             "lqi": _build_lqi_account_summary(lqi or {}),
+            # PR 5: account-wide competitor intel
+            "competitor_intel_union": competitor_intel_union or {},
         }
 
         # Account-level: use aggregate summary, no specific camp_settings
@@ -2195,7 +2456,14 @@ The "lqi" field in the account data contains pre-computed quality signals across
    - If any campaign has no_show_rate > 0.30, generate a claude_advisory recommending reminder sequence improvements.
    - lqi.no_shows.lead_age_at_booking_days has no_show_median and showed_median (days between lead creation and booking).
    - If no_show_median > 14 days, flag the long booking lag as a likely no-show driver.
-   - lqi.no_shows.reminders.no_show_no_reminders_pct: if > 0.50, flag as critical — no-shows not receiving reminders."""
+   - lqi.no_shows.reminders.no_show_no_reminders_pct: if > 0.50, flag as critical — no-shows not receiving reminders.
+
+ACCOUNT-WIDE COMPETITOR INTELLIGENCE (from campaign creation wizard data):
+The "competitor_intel_union" field contains the union of all conquest keywords and differentiators across all managed campaigns.
+- all_conquest_keywords: these are INTENTIONAL competitor brand targets — NEVER recommend them as cross-campaign add_negative_keyword.
+- all_differentiators: the practice's committed positioning themes — use these when writing account-wide advisory framing.
+- by_campaign: per-campaign breakdown for reference.
+If you see a search term that appears in all_conquest_keywords, treat it as intentional targeting, not waste."""
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -2221,6 +2489,12 @@ The "lqi" field in the account data contains pre-computed quality signals across
         if m:
             arr = json.loads(m.group(0))
             valid_camp_resources = set(camp_resources.values())
+            # PR 5: build conquest keyword protection set for account-level
+            _acct_conquest: set = {
+                k.strip().lower()
+                for k in ((competitor_intel_union or {}).get("all_conquest_keywords") or [])
+                if k.strip()
+            }
             validated = []
             for item in arr:
                 if not isinstance(item, dict) or not item.get("operation"):
@@ -2228,6 +2502,26 @@ The "lqi" field in the account data contains pre-computed quality signals across
                 # Force campaign_name to empty — these are account-level
                 item["campaign_name"] = ""
                 op = item["operation"]
+                # PR 5: drop conquest keyword negatives at account level too
+                if op == "add_negative_keyword" and _acct_conquest:
+                    import re as _re_acct_ck
+                    kw_text = item.get("keyword_text", "").strip().lower()
+                    _acct_conquest_hit = False
+                    for ck in _acct_conquest:
+                        if len(ck) < 4:
+                            continue
+                        if _re_acct_ck.search(r'\b' + _re_acct_ck.escape(ck) + r'\b', kw_text):
+                            _acct_conquest_hit = True
+                            break
+                        if len(kw_text) >= 4 and _re_acct_ck.search(r'\b' + _re_acct_ck.escape(kw_text) + r'\b', ck):
+                            _acct_conquest_hit = True
+                            break
+                    if _acct_conquest_hit:
+                        logger.warning(
+                            f"Account-level: dropping add_negative_keyword '{item.get('keyword_text','')}' — "
+                            f"matches conquest keyword"
+                        )
+                        continue
                 cr = item.get("campaign_resource", "")
                 if op in ("add_negative_keyword", "change_bid_strategy", "change_budget", "add_asset"):
                     if cr and cr not in valid_camp_resources:
@@ -5125,6 +5419,9 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         "Auburn, Massachusetts",
     ]
 
+    # PR 5: accumulate competitor intel across all campaigns for account-level pass
+    _per_camp_competitor_blocks: dict = {}  # camp_name -> competitor_intel dict
+
     for camp_name in all_campaign_names:
         camp_lower = camp_name.strip().lower()
 
@@ -5208,6 +5505,80 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         # Resolve campaign settings for this campaign by resource name
         camp_settings = campaign_settings.get(camp_resource, {}) if camp_resource else {}
 
+        # ── PR 1: load wizard context from DB ────────────────────────────────
+        from database import get_campaign_by_gads_resource as _get_camp_by_res, \
+                             get_campaign_by_name as _get_camp_by_name
+        _camp_local_row = None
+        if camp_resource:
+            _camp_local_row = _get_camp_by_res(camp_resource)
+        if not _camp_local_row:
+            _camp_local_row = _get_camp_by_name(camp_name)
+
+        _camp_build: dict = {}
+        _camp_strategy: dict = {}
+        if _camp_local_row:
+            _cb_raw = _camp_local_row.get("campaign_build_json")
+            if _cb_raw:
+                try:
+                    _camp_build = json.loads(_cb_raw) if isinstance(_cb_raw, str) else (_cb_raw or {})
+                except Exception:
+                    _camp_build = {}
+            _cs_raw = _camp_local_row.get("strategy_json")
+            if _cs_raw:
+                try:
+                    _camp_strategy = json.loads(_cs_raw) if isinstance(_cs_raw, str) else (_cs_raw or {})
+                except Exception:
+                    _camp_strategy = {}
+
+        _competitor_intel: dict = _camp_build.get("competitor_analysis") or {}
+        _conquest_kws: set = {
+            k.strip().lower() for k in (_competitor_intel.get("conquest_keywords") or []) if k.strip()
+        }
+        # PR 5: collect for account-level union
+        if _competitor_intel:
+            _per_camp_competitor_blocks[camp_name] = _competitor_intel
+
+        _campaign_brief: dict = {}
+        if _camp_local_row:
+            _campaign_brief = {
+                "service_focus":             _camp_local_row.get("service_focus", ""),
+                "objective":                 _camp_local_row.get("objective", ""),
+                "target_audience":           _camp_local_row.get("target_audience", ""),
+                "promo_offer":               _camp_local_row.get("promo_offer", ""),
+                "planned_monthly_budget_usd": _camp_local_row.get("monthly_budget") or 0,
+                "target_cpl_usd":            _camp_local_row.get("expected_cpl") or 0,
+                "strategy":                  _camp_strategy,
+            }
+
+        _planned_build: dict = {
+            "planned_keywords":  _camp_build.get("keywords") or {},
+            "planned_ad_groups": (_camp_build.get("ad_groups") or {}).get("ad_groups") or [],
+        }
+
+        # ── PR 2: budget feasibility signal ──────────────────────────────────
+        _live_cpc_avg = 0.0
+        _camp_clicks_total = sum(k.get("clicks", 0) for k in camp_kw)
+        _camp_cost_total   = sum(k.get("cost", 0) for k in camp_kw)
+        if _camp_clicks_total > 0:
+            _live_cpc_avg = _camp_cost_total / _camp_clicks_total
+
+        _budget_feasibility = _compute_budget_click_signal(
+            planned_ad_groups=_planned_build["planned_ad_groups"],
+            monthly_budget=(_campaign_brief.get("planned_monthly_budget_usd") or 0),
+            live_daily_budget=(camp_settings.get("daily_budget_usd") or 0),
+            live_cpc_avg=_live_cpc_avg,
+            bidding_strategy=(camp_settings.get("bidding_strategy_type") or ""),
+        )
+
+        # ── PR 3: intent signals ──────────────────────────────────────────────
+        try:
+            from intent_signals import get_intent_signals as _get_intent_signals
+            from search_term_classifier import _detect_campaign_type as _detect_ct
+            _intent_signals = _get_intent_signals(_detect_ct(camp_name))
+        except Exception as _is_err:
+            logger.debug(f"[optimizer] intent_signals load failed (non-fatal): {_is_err}")
+            _intent_signals = {}
+
         structured = _call_claude_advisories(
             camp_kw, attribution, camp_st,
             call_attribution, od_production,
@@ -5224,6 +5595,16 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             landing_page_intel=camp_page_intel,
             ad_group_performance=camp_ag_perf,
             lqi=lqi_signals,
+            # PR 1
+            campaign_brief=_campaign_brief,
+            competitor_intel=_competitor_intel,
+            planned_build=_planned_build,
+            # PR 2
+            budget_feasibility=_budget_feasibility,
+            # PR 3
+            intent_signals=_intent_signals,
+            # PR 7
+            conquest_keywords_protected=_conquest_kws,
         )
         if not structured:
             continue
@@ -5459,6 +5840,31 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             "daily_budget_usd": next((k.get("daily_budget_micros", 0) / 1e6 for k in kws if k.get("daily_budget_micros")), None),
         }
 
+    # PR 5: build account-wide competitor intel union from per-campaign blocks
+    _all_conquest_kws = sorted({
+        k.strip().lower()
+        for intel in _per_camp_competitor_blocks.values()
+        for k in (intel.get("conquest_keywords") or [])
+        if k.strip()
+    })
+    _all_differentiators = sorted({
+        d
+        for intel in _per_camp_competitor_blocks.values()
+        for d in (intel.get("our_differentiators") or [])
+        if d
+    })
+    _competitor_intel_union: dict = {
+        "all_conquest_keywords": _all_conquest_kws,
+        "all_differentiators": _all_differentiators,
+        "by_campaign": {
+            cn: {
+                "conquest_keywords": intel.get("conquest_keywords") or [],
+                "differentiators": intel.get("our_differentiators") or [],
+            }
+            for cn, intel in _per_camp_competitor_blocks.items()
+        },
+    }
+
     acct_structured = _call_claude_account_level(
         all_keyword_perf=keyword_perf,
         all_search_terms=search_terms,
@@ -5471,6 +5877,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         existing_negatives=live_negatives,
         memory_digest=memory_digest,
         lqi=lqi_signals,
+        competitor_intel_union=_competitor_intel_union,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")

@@ -2104,6 +2104,12 @@ GROUP BY a.campaign_id, c.campaign_name;
     if "smile_composite_blob_name" not in leads_img_cols:
         conn.execute("ALTER TABLE leads ADD COLUMN smile_composite_blob_name TEXT DEFAULT ''")
 
+    # ── GA4 client_id: browser-side _ga cookie value for server-event stitching ──
+    # Without this, GA4 Measurement Protocol events land in a separate session from
+    # the browser pageview — funnel attribution is broken.
+    if "ga4_client_id" not in leads_img_cols:
+        conn.execute("ALTER TABLE leads ADD COLUMN ga4_client_id TEXT DEFAULT ''")
+
     # ── Image Attachments: image_attachment on workflow_steps ─────────────────
     ws_cols = {row[1] for row in conn.execute("PRAGMA table_info(workflow_steps)").fetchall()}
     if "image_attachment" not in ws_cols:
@@ -2319,8 +2325,9 @@ def upsert_lead(data: dict) -> dict:
                     first_name, last_name, email, phone, phone_hash, email_hash,
                     goals, gclid, fbclid, msclkid, utm_source, utm_medium,
                     utm_campaign, utm_term, utm_content, landing_url,
-                    smile_image_url, smile_blob_name, smile_composite_blob_name, notes, tags)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    smile_image_url, smile_blob_name, smile_composite_blob_name,
+                    notes, tags, ga4_client_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
                 data.get("source") or "unknown", data.get("stage", "new"),
@@ -2337,6 +2344,7 @@ def upsert_lead(data: dict) -> dict:
                 data.get("smile_composite_blob_name", ""),
                 data.get("notes", ""),
                 data.get("tags", "[]"),
+                data.get("ga4_client_id", ""),  # browser _ga cookie for GA4 Measurement Protocol stitching
             ))
             # Auto-note: inline into same connection so no nested-transaction risk
             try:
@@ -2759,15 +2767,27 @@ def enqueue_follow_ups(lead: dict, created_at: str):
         base = datetime.now(timezone.utc)
 
     with _conn() as conn:
-        # Check if the matched campaign has skip_workflow=1 — if so, don't enqueue anything
-        camp_id = (lead.get("utm_campaign") or "").strip()
-        if camp_id:
-            skip_row = conn.execute(
-                "SELECT skip_workflow FROM campaigns WHERE campaign_id=? LIMIT 1", (camp_id,)
+        # DB-B2 fix: skip_workflow lookup uses campaign_id (GAds numeric ID) or campaign_name.
+        # utm_campaign is the URL UTM string (e.g. "Implants+-+Worcester"), NOT the campaigns.campaign_id.
+        # Use lead.campaign_id (set by GAds sync) first; fall back to campaign_name match.
+        _skip_row = None
+        _gads_camp_id = (lead.get("campaign_id") or "").strip()
+        _camp_name = (lead.get("campaign_name") or "").strip()
+        if _gads_camp_id:
+            _skip_row = conn.execute(
+                "SELECT skip_workflow FROM campaigns WHERE campaign_id=? LIMIT 1", (_gads_camp_id,)
             ).fetchone()
-            if skip_row and skip_row["skip_workflow"]:
-                _log.info(f"enqueue_follow_ups: skipping lead {lead['id']} — campaign '{camp_id}' has skip_workflow=1")
-                return
+        if not _skip_row and _camp_name:
+            _skip_row = conn.execute(
+                "SELECT skip_workflow FROM campaigns WHERE campaign_name=? LIMIT 1", (_camp_name,)
+            ).fetchone()
+        if _skip_row and _skip_row["skip_workflow"]:
+            import logging as _ef_log
+            _ef_log.getLogger(__name__).info(
+                f"enqueue_follow_ups: skipping lead {lead['id']} — campaign "
+                f"'{_gads_camp_id or _camp_name}' has skip_workflow=1"
+            )
+            return
 
         steps = _get_workflow_steps_for_lead(conn, lead)
         if not steps:
@@ -3414,6 +3434,33 @@ def get_campaign_build(campaign_id: str) -> dict:
         return json.loads(row[0])
     except Exception:
         return {}
+
+
+def get_campaign_by_gads_resource(gads_campaign_resource: str) -> dict | None:
+    """Return the full campaigns row matching a Google Ads resource name, or None."""
+    if not gads_campaign_resource:
+        return None
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM campaigns WHERE gads_campaign_resource=? LIMIT 1",
+            (gads_campaign_resource,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_campaign_by_name(campaign_name: str) -> dict | None:
+    """
+    Return the full campaigns row whose campaign_name matches (case-insensitive trim), or None.
+    Used as a fallback when no gads_campaign_resource is available.
+    """
+    if not campaign_name:
+        return None
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM campaigns WHERE LOWER(TRIM(campaign_name))=? LIMIT 1",
+            (campaign_name.strip().lower(),)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def save_campaign_build_step(campaign_id: str, step: str, data) -> bool:

@@ -24,7 +24,7 @@ import json
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body, BackgroundTasks, UploadFile, File, Form, Query
@@ -479,6 +479,7 @@ class EventPayload(BaseModel):
     smile_image_url: Optional[str] = None
     booking_id: Optional[str] = None
     created_at: Optional[str] = None
+    ga4_client_id: Optional[str] = None   # browser _ga cookie value for GA4 session stitching
 
 
 @app.post("/api/events", status_code=201)
@@ -538,7 +539,8 @@ async def receive_event(payload: EventPayload):
 
         # Fire GA4 event
         try:
-            track_lead_created(payload.lead_id, source=payload.source, gclid=payload.gclid or "")
+            _ga4_cid = getattr(payload, "ga4_client_id", "") or ""
+            track_lead_created(payload.lead_id, source=payload.source, gclid=payload.gclid or "", ga4_client_id=_ga4_cid)
         except Exception as e:
             logger.debug(f"GA4 lead_created event failed (non-fatal): {e}")
 
@@ -554,7 +556,7 @@ async def receive_event(payload: EventPayload):
 
         # Fire GA4 event
         try:
-            track_smile_completed(lead["id"])
+            track_smile_completed(lead["id"], ga4_client_id=lead.get("ga4_client_id") or "")
         except Exception as e:
             logger.debug(f"GA4 smile_completed event failed (non-fatal): {e}")
 
@@ -572,7 +574,7 @@ async def receive_event(payload: EventPayload):
 
         # Fire GA4 event
         try:
-            track_appointment_booked(lead["id"])
+            track_appointment_booked(lead["id"], ga4_client_id=lead.get("ga4_client_id") or "")
         except Exception as e:
             logger.debug(f"GA4 appointment_booked event failed (non-fatal): {e}")
 
@@ -2036,7 +2038,11 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
                                        _execute_add_negative, _execute_enable_keyword,
                                        _execute_budget_change, _execute_update_rsa,
                                        _execute_geo_exclusion,
-                                       _execute_add_to_shared_negative_list)
+                                       _execute_add_to_shared_negative_list,
+                                       _execute_replace_ad, _execute_pause_ad,
+                                       _execute_change_bid_strategy,
+                                       _execute_change_match_type,
+                                       _apply_google_recommendation)
 
             row = get_audit_row(aid)
             if not row:
@@ -2183,10 +2189,62 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
                 # Advisory — check for google_rec_resource_name for direct apply
                 google_rec_rn = row.get("google_rec_resource_name", "")
                 if google_rec_rn:
-                    from ai_optimizer import _apply_google_recommendation
                     client = _build_client()
                     _apply_google_recommendation(client, customer_id, google_rec_rn)
                 # else: acknowledged only
+
+            elif operation == "replace_ad":
+                after = json.loads(row["after_state_json"] or "{}")
+                old_rn = after.get("old_ad_group_ad_resource", "")
+                new_h  = after.get("new_headlines", [])
+                new_d  = after.get("new_descriptions", [])
+                if old_rn and new_h:
+                    client = _build_client()
+                    _execute_replace_ad(client, customer_id,
+                                        old_ad_group_ad_resource=old_rn,
+                                        new_headlines=new_h,
+                                        new_descriptions=new_d)
+
+            elif operation == "pause_ad":
+                after = json.loads(row["after_state_json"] or "{}")
+                ad_rn = after.get("ad_group_ad_resource", "")
+                if ad_rn:
+                    client = _build_client()
+                    _execute_pause_ad(client, customer_id, ad_rn)
+
+            elif operation == "pause_ad_group":
+                after = json.loads(row["after_state_json"] or "{}")
+                ag_rn = after.get("ad_group_resource", "")
+                if ag_rn:
+                    from google_ads_write import set_ad_group_status as _set_ag_status_bulk
+                    _set_ag_status_bulk(ag_rn, "PAUSED")
+
+            elif operation == "update_geo_targeting":
+                # Delegate to the single-action approve path via a minimal re-implementation
+                # (full safety/validation lives there; bulk just needs to call the same helper)
+                after = json.loads(row["after_state_json"] or "{}")
+                from database import get_campaign_by_id as _gcbi_bulk, save_campaign_geo
+                from google_ads_write import apply_geo_targets as _apply_geo_bulk
+                camp_rn_geo = after.get("campaign_resource", "")
+                new_locs    = after.get("new_locations") or []
+                if camp_rn_geo and new_locs:
+                    client = _build_client()
+                    _cid_digits = "".join(c for c in (customer_id or "") if c.isdigit())
+                    added, removed, errs = _apply_geo_bulk(client, _cid_digits, camp_rn_geo, new_locs)
+                    if errs:
+                        raise RuntimeError(f"update_geo_targeting partial errors: {errs[:2]}")
+
+            elif operation == "set_ad_schedule":
+                after = json.loads(row["after_state_json"] or "{}")
+                camp_rn_sched = after.get("campaign_resource", "")
+                schedule_text = after.get("schedule_text", "")
+                if camp_rn_sched and schedule_text:
+                    from google_ads_write import parse_schedule_text, set_ad_schedule as _set_sched_bulk
+                    slots = parse_schedule_text(schedule_text)
+                    if slots:
+                        client = _build_client()
+                        _cid_digits = "".join(c for c in (customer_id or "") if c.isdigit())
+                        _set_sched_bulk(client, _cid_digits, camp_rn_sched, slots)
 
             else:
                 results[aid] = {"status": "error", "detail": f"Unknown operation: {operation}"}
@@ -2424,6 +2482,55 @@ async def gads_push_queued():
                 else:
                     logger.info(f"Asset recommendation acknowledged: {after.get('asset_type')} for {after.get('campaign_resource')}")
                     # api_hit stays False
+
+            elif operation == "replace_ad":
+                old_rn = after.get("old_ad_group_ad_resource", "")
+                new_h  = after.get("new_headlines", [])
+                new_d  = after.get("new_descriptions", [])
+                if old_rn and new_h:
+                    from ai_optimizer import _execute_replace_ad as _exec_repl_push
+                    _exec_repl_push(client, customer_id,
+                                    old_ad_group_ad_resource=old_rn,
+                                    new_headlines=new_h,
+                                    new_descriptions=new_d)
+                    api_hit = True
+
+            elif operation == "pause_ad":
+                ad_rn = after.get("ad_group_ad_resource", "")
+                if ad_rn:
+                    from ai_optimizer import _execute_pause_ad as _exec_pause_ad_push
+                    _exec_pause_ad_push(client, customer_id, ad_rn)
+                    api_hit = True
+
+            elif operation == "pause_ad_group":
+                ag_rn = after.get("ad_group_resource", "")
+                if ag_rn:
+                    from google_ads_write import set_ad_group_status as _set_ag_push
+                    _set_ag_push(ag_rn, "PAUSED")
+                    api_hit = True
+
+            elif operation == "update_geo_targeting":
+                camp_rn_geo = after.get("campaign_resource", "")
+                new_locs    = after.get("new_locations") or []
+                if camp_rn_geo and new_locs:
+                    from google_ads_write import apply_geo_targets as _apply_geo_push
+                    _cid_digits = "".join(c for c in (customer_id or "") if c.isdigit())
+                    added, removed, errs = _apply_geo_push(client, _cid_digits, camp_rn_geo, new_locs)
+                    if not errs:
+                        api_hit = True
+                    else:
+                        raise RuntimeError(f"update_geo_targeting errors: {errs[:2]}")
+
+            elif operation == "set_ad_schedule":
+                camp_rn_sched = after.get("campaign_resource", "")
+                schedule_text = after.get("schedule_text", "")
+                if camp_rn_sched and schedule_text:
+                    from google_ads_write import parse_schedule_text, set_ad_schedule as _set_sched_push
+                    slots = parse_schedule_text(schedule_text)
+                    if slots:
+                        _cid_digits = "".join(c for c in (customer_id or "") if c.isdigit())
+                        _set_sched_push(client, _cid_digits, camp_rn_sched, slots)
+                        api_hit = True
 
             # claude_advisory and other advisory ops — acknowledged only, api_hit stays False
             # execution_result='success' always; api_executed=True only if we actually called the API
@@ -3624,7 +3731,7 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
                 raise HTTPException(status_code=502, detail=f"Google Ads enable failed: {result['error']}")
             update_campaign_status(
                 campaign_id, "ACTIVE",
-                launch_date=_dt.datetime.utcnow().isoformat() + "Z",
+                launch_date=_dt.datetime.now(_dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
             )
             return {
                 "ok": True,
@@ -3632,7 +3739,7 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
                 "campaign_id": campaign_id,
                 "gads_action": "enabled_existing",
                 "resource_name": existing_resource,
-                "launch_date": _dt.datetime.utcnow().isoformat() + "Z",
+                "launch_date": _dt.datetime.now(_dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
             }
         else:
             # ── New campaign — create in Google Ads ──────────────────────────
@@ -3663,12 +3770,12 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
                 conn.execute(
                     "UPDATE campaigns SET campaign_name=?, gads_campaign_resource=?, gads_campaign_numeric_id=?, geographic_targeting=?, updated_at=? WHERE campaign_id=?",
                     (result["gads_campaign_name"], result["campaign_resource_name"], result["campaign_numeric_id"],
-                     _geo_to_save, _dt.datetime.utcnow().isoformat(), campaign_id)
+                     _geo_to_save, _dt.datetime.now(_dt.timezone.utc).isoformat(), campaign_id)
                 )
 
             update_campaign_status(
                 campaign_id, "ACTIVE",
-                launch_date=_dt.datetime.utcnow().isoformat() + "Z",
+                launch_date=_dt.datetime.now(_dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
             )
 
             url_warnings = result.get("url_warnings", [])
@@ -3683,7 +3790,7 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
                 "ads_created": result["ads_created"],
                 "enabled": result.get("enabled", False),
                 "url_warnings": url_warnings,
-                "launch_date": _dt.datetime.utcnow().isoformat() + "Z",
+                "launch_date": _dt.datetime.now(_dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
                 "log": result["log"],
             }
 
@@ -3820,10 +3927,9 @@ Rules:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        json_match = _re.search(r'\{[\s\S]*\}|\[[\s\S]*\]', raw)
-        if not json_match:
-            raise ValueError("No JSON found in AI response")
-        refined = _json.loads(json_match.group())
+        # BE-G12 fix: use shared helper to handle ```json fences + bare JSON
+        _refined_text = _extract_json_from_ai_response(raw, allow_array=True)
+        refined = _json.loads(_refined_text)
     except Exception as e:
         logger.error(f"build-step-refine AI call failed ({body.step}): {e}")
         raise HTTPException(status_code=500, detail=f"AI refinement failed: {e}")
@@ -4289,7 +4395,17 @@ def admin_campaign_build_step_save(campaign_id: str, body: CampaignBuildStepSave
         # Strategy lives in strategy_json on the campaign row
         update_campaign_strategy(campaign_id, body.data)
     else:
-        save_campaign_build_step(campaign_id, body.step, body.data)
+        data_to_save = body.data
+        # B4 fix: re-derive campaign_type on save for competitor_analysis so it's
+        # never dropped by the refine → save flow (Sonnet doesn't echo it back).
+        if body.step == "competitor_analysis" and isinstance(data_to_save, dict):
+            try:
+                from search_term_classifier import _detect_campaign_type as _dtct_save
+                data_to_save = dict(data_to_save)  # copy; don't mutate request body
+                data_to_save["campaign_type"] = _dtct_save(camp.get("campaign_name", ""))
+            except Exception:
+                pass  # leave data_to_save as-is if import fails
+        save_campaign_build_step(campaign_id, body.step, data_to_save)
     return {"ok": True, "step": body.step}
 
 
@@ -4401,38 +4517,9 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         # Daily leads, monthly cap shown as reference
         budget_display = f"${daily_budget}/day (≈${budget}/mo cap)" if budget else ""
 
-        # Budget click-rate intelligence — estimate clicks/day from ad_groups suggested CPC
-        # Google recommends ≥10 clicks/day for Smart Bidding learning phase
-        _ag_groups_list = ag_groups if isinstance(ag_groups, list) else []
-        _est_cpc = 0.0
-        _clicks_per_day = 0.0
-        _budget_rec_note = ""
-        if _ag_groups_list and daily_budget > 0:
-            # Weighted average CPC by daily_budget_pct
-            _total_pct = sum(float(g.get("daily_budget_pct") or 0) for g in _ag_groups_list)
-            if _total_pct > 0:
-                _est_cpc = sum(
-                    float(g.get("suggested_cpc_usd") or 0) * float(g.get("daily_budget_pct") or 0)
-                    for g in _ag_groups_list
-                ) / _total_pct
-            else:
-                # Fallback: simple average
-                _cpcs = [float(g.get("suggested_cpc_usd") or 0) for g in _ag_groups_list if g.get("suggested_cpc_usd")]
-                _est_cpc = sum(_cpcs) / len(_cpcs) if _cpcs else 0.0
-            if _est_cpc > 0:
-                _clicks_per_day = round(daily_budget / _est_cpc, 1)
-                if _clicks_per_day < 10:
-                    _min_budget_for_10 = round(_est_cpc * 10, 0)
-                    _budget_rec_note = (
-                        f" At ${_est_cpc:.2f} avg CPC → ~{_clicks_per_day} clicks/day. "
-                        f"Google recommends ≥10 clicks/day for Smart Bidding to learn effectively. "
-                        f"Consider increasing to ${_min_budget_for_10:.0f}/day."
-                    )
-                else:
-                    _budget_rec_note = (
-                        f" At ${_est_cpc:.2f} avg CPC → ~{_clicks_per_day} clicks/day. "
-                        f"✓ Sufficient for Smart Bidding learning phase (≥10 clicks/day)."
-                    )
+        # Note: click-rate guidance (clicks/day from ad_groups CPC) is computed live
+        # in the frontend from build.ad_groups + camp.monthly_budget. No need to
+        # duplicate it here in the static checklist payload. (B2 cleanup)
 
         # Practice info for extension defaults
         practice_hours = get_setting("practice_hours") or ""
@@ -4459,10 +4546,7 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
                 "skippable":  False,
                 "category":   "required",
                 "action":     "auto",
-                "note":       "Daily spend cap set by Google Ads. Monthly cap shown for reference." + _budget_rec_note,
-                "warning":    _clicks_per_day > 0 and _clicks_per_day < 10,
-                "clicks_per_day": _clicks_per_day if _clicks_per_day > 0 else None,
-                "est_cpc_usd":    round(_est_cpc, 2) if _est_cpc > 0 else None,
+                "note":       "Daily spend cap set by Google Ads. Monthly cap shown for reference.",
             },
             {
                 "key":      "bidding",
@@ -4609,8 +4693,14 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
                     ):
                         item["value"] = old["value"]
                     # Preserve done=True for non-wizard items (user manually checked)
-                    if old.get("done") and item["action"] == "manual" and not item["done"]:
-                        item["done"] = True
+                    # Also preserve done=True for auto items where user has explicitly set a value
+                    # (e.g. ad_schedule set via the Set Schedule button — BE-G14 fix)
+                    if old.get("done") and not item["done"]:
+                        if item["action"] == "manual":
+                            item["done"] = True
+                        elif item["action"] == "auto" and old.get("value"):
+                            # Only preserve if a real value was saved (not just re-generated as blank)
+                            item["done"] = True
                     # Preserve skipped flag
                     if old.get("skipped"):
                         item["skipped"] = True
@@ -4791,30 +4881,27 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
             if _comp_parts:
                 _comp_context_block = "\n\n=== Competitor Intelligence ===\n" + "\n".join(_comp_parts)
 
-        # Build campaign-type-aware intent signal guidance
+        # B3 fix: conquest keywords as a Rule-level instruction (not just data)
+        _conquest_rule = ""
+        if _comp_data and isinstance(_comp_data, dict):
+            _kw_conquest_list = _comp_data.get("conquest_keywords") or []
+            if _kw_conquest_list:
+                _conquest_rule = (
+                    f"\n- conquest_keywords: Add these competitor brand terms as exact-match keywords "
+                    f"in a dedicated conquest ad group: {', '.join(_kw_conquest_list)}. "
+                    f"Include them in exact_match list."
+                )
+
+        # Build campaign-type-aware intent signal guidance (shared module keeps wizard + optimizer in sync)
         try:
             from search_term_classifier import _detect_campaign_type as _dtct_kw
             _kw_camp_type = _dtct_kw(campaign_name)
         except Exception:
             _kw_camp_type = "general"
 
-        _intent_signals_by_type = {
-            "emergency":  ['"emergency dentist near me"', '"toothache near me"', '"dentist open now"',
-                           '"same day dentist"', '"broken tooth emergency"', '"urgent dental care"'],
-            "implants":   ['"dental implants near me"', '"tooth implant cost"', '"all on 4 implants"',
-                           '"dental implants grafton ma"', '"implant dentist worcester county"',
-                           '"single tooth implant price"'],
-            "invisalign": ['"invisalign near me"', '"invisalign cost"', '"clear braces near me"',
-                           '"orthodontist grafton ma"', '"teeth straightening cost"'],
-            "cosmetic":   ['"cosmetic dentist near me"', '"veneers cost near me"', '"teeth whitening dentist"',
-                           '"smile makeover grafton ma"', '"porcelain veneers price"'],
-            "gum":        ['"gum recession treatment near me"', '"periodontist near me"',
-                           '"gum graft cost"', '"scaling root planing near me"',
-                           '"receding gums treatment worcester"'],
-            "general":    ['"dentist near me"', '"family dentist grafton ma"', '"dentist accepting new patients"',
-                           '"dental cleaning near me"', '"affordable dentist worcester county"'],
-        }
-        _intent_examples = _intent_signals_by_type.get(_kw_camp_type, _intent_signals_by_type["general"])
+        from intent_signals import get_intent_signals as _get_intent_signals
+        _intent_pack = _get_intent_signals(_kw_camp_type)
+        _intent_examples = _intent_pack["high_intent_examples"]
         _intent_block = (
             f"\n\nHigh-intent keyword patterns for {_kw_camp_type} campaigns — use these as templates:\n"
             + "\n".join(f"  {ex}" for ex in _intent_examples)
@@ -4822,18 +4909,7 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
               "'accepting new patients', '[service] grafton ma / worcester county'"
         )
 
-        # Negative keyword intent guidance by campaign type
-        _neg_intent_by_type = {
-            "emergency":  ["jobs", "salary", "school", "training", "course", "free", "home remedy", "DIY"],
-            "implants":   ["jobs", "salary", "free", "insurance only", "medicaid", "snap-on smile",
-                           "flipper", "partial denture", "school", "course"],
-            "invisalign": ["jobs", "free", "insurance only", "medicaid", "braces for kids", "school",
-                           "metal braces only", "retainer only"],
-            "cosmetic":   ["jobs", "free", "insurance", "medicaid", "DIY", "at home", "school"],
-            "gum":        ["jobs", "free", "home remedy", "oil pulling", "DIY", "insurance only", "school"],
-            "general":    ["jobs", "free", "medicaid only", "school", "DIY", "veterinary", "animal"],
-        }
-        _neg_intent = _neg_intent_by_type.get(_kw_camp_type, _neg_intent_by_type["general"])
+        _neg_intent = _intent_pack["low_intent_negatives"]
         _neg_intent_note = (
             f"these low-intent patterns for {_kw_camp_type} campaigns: "
             + ", ".join(_neg_intent)
@@ -4864,7 +4940,7 @@ Rules:
 - phrase_match: 10-15 moderate-intent phrases covering service variations and location modifiers
 - broad_match_modifier: 5-8 broader terms to capture volume (service category + location area)
 - negative_keywords: Include ALL source campaign negatives above PLUS optimizer memory negatives PLUS {_neg_intent_note}
-- Geographic targeting towns: Grafton, Shrewsbury, Westborough, Northborough, Millbury, Auburn, Worcester area
+- Geographic targeting towns: Grafton, Shrewsbury, Westborough, Northborough, Millbury, Auburn, Worcester area{_conquest_rule}
 - Return ONLY the JSON object, no explanation."""
 
     elif step == "ad_copy":
@@ -5046,12 +5122,10 @@ No markdown, no explanation outside the JSON."""
         )
         raw = response.content[0].text.strip()
 
-        # Extract JSON
-        import re as _re, json as _json
-        json_match = _re.search(r'\{[\s\S]*\}', raw)
-        if not json_match:
-            raise ValueError("No JSON found in AI response")
-        data = _json.loads(json_match.group())
+        # BE-G12 fix: use shared helper to handle ```json fences + bare JSON
+        import json as _json
+        _json_text = _extract_json_from_ai_response(raw)
+        data = _json.loads(_json_text)
 
         # For competitor_analysis: inject campaign_type server-side so the frontend
         # conquest/no-conquest branching never depends on Sonnet echoing it back correctly
@@ -5401,7 +5475,7 @@ def admin_link_gads_campaign(body: LinkGadsCampaignRequest, background_tasks: Ba
             )
 
     # 4. Update local row: resource name, numeric ID, and sync campaign_name to match Google Ads
-    now = _dt2.datetime.utcnow().isoformat()
+    now = _dt2.datetime.now(_dt2.timezone.utc).isoformat()
     with _conn() as conn:
         conn.execute(
             "UPDATE campaigns SET gads_campaign_resource=?, gads_campaign_numeric_id=?, "
@@ -5964,7 +6038,6 @@ def admin_campaign_sync_perf(campaign_id: str):
     from database import (
         get_campaign_by_id, save_gads_search_terms_cache, save_gads_daily_stats
     )
-    from datetime import datetime, timezone, timedelta
 
     camp = get_campaign_by_id(campaign_id)
     if not camp:
@@ -6654,7 +6727,7 @@ def admin_set_campaign_schedule(campaign_id: str, body: SetScheduleRequest):
                 build["launch_checklist"] = checklist
                 conn.execute(
                     "UPDATE campaigns SET campaign_build_json=?, updated_at=? WHERE campaign_id=?",
-                    (json.dumps(build), _dt.datetime.utcnow().isoformat(), campaign_id)
+                    (json.dumps(build), _dt.datetime.now(_dt.timezone.utc).isoformat(), campaign_id)
                 )
 
         pushed = result.get("pushed", 0)
@@ -8183,17 +8256,33 @@ class AIGenerateMessageRequest(BaseModel):
     prompt:           str
 
 
-def _extract_json_from_ai_response(raw_text: str) -> str:
-    """Extract JSON object from AI response that may have code fences or surrounding text."""
+def _extract_json_from_ai_response(raw_text: str, allow_array: bool = False) -> str:
+    """Extract JSON object (or array if allow_array=True) from AI response.
+
+    Handles:
+      - Bare JSON (most common)
+      - Wrapped in ```json ... ``` or ``` ... ``` fences
+      - JSON preceded by explanation text
+    """
     json_text = raw_text.strip()
-    # Use [\s\S]+ (greedy, matches newlines) so nested JSON objects are captured correctly.
+    # 1. Code-fenced JSON object
     match = re.search(r"```(?:json)?\s*(\{[\s\S]+\})\s*```", json_text)
     if match:
         return match.group(1)
+    if allow_array:
+        # 2. Code-fenced JSON array
+        match = re.search(r"```(?:json)?\s*(\[[\s\S]+\])\s*```", json_text)
+        if match:
+            return match.group(1)
+    # 3. Bare JSON object not at start of string
     if not json_text.startswith("{"):
         brace_match = re.search(r"\{[\s\S]+\}", json_text)
         if brace_match:
             return brace_match.group(0)
+    if allow_array and not json_text.startswith("["):
+        arr_match = re.search(r"\[[\s\S]+\]", json_text)
+        if arr_match:
+            return arr_match.group(0)
     return json_text
 
 

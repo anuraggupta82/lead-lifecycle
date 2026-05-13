@@ -992,9 +992,27 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         # Non-blocking — failure must NOT affect the rest of the pipeline.
         # booked_outcome is derived from od_appointment_id (the grading prompt
         # never returned it, so it was always NULL — we set it here instead).
+        #
+        # Guard: never stamp booked_outcome='booked' on voicemail/IVR calls.
+        # An OD appointment match means the caller is a known patient, NOT that
+        # they booked the appointment during this call.
         try:
             refreshed = db.get_mango_call(uuid) or {}
-            if not refreshed.get("od_appointment_id"):
+
+            # Detect voicemail/IVR: pipeline summary starts with VOICEMAIL,
+            # or grading was skipped (grade_gradeable=0), or is_empty flag set.
+            call_summary = (refreshed.get("call_summary") or "").upper()
+            is_voicemail = (
+                call_summary.startswith("VOICEMAIL")
+                or refreshed.get("grade_gradeable") == 0
+                or refreshed.get("is_empty") == 1
+            )
+
+            if is_voicemail:
+                log.debug(
+                    "[pipeline] Step 8: skipping booked_outcome for voicemail/IVR call %s", uuid
+                )
+            elif not refreshed.get("od_appointment_id"):
                 from od_matcher import match_calls_to_od_appointments
                 od_result = match_calls_to_od_appointments(days=90, target_uuid=uuid)
                 if od_result.get("matched", 0) > 0:
@@ -1150,7 +1168,9 @@ def backfill_booked_outcome() -> dict:
         log.warning("[pipeline] backfill Phase 1 appointment match failed (non-fatal): %s", e)
         appt_result = {"error": str(e)}
 
-    # Phase 2: stamp booked_outcome on all calls with od_appointment_id
+    # Phase 2: stamp booked_outcome on all calls with od_appointment_id.
+    # Exclude voicemail/IVR calls — an OD match on a voicemail means the
+    # caller is a known patient, not that they booked during the call.
     log.info("[pipeline] backfill_booked_outcome Phase 2: stamping booked_outcome")
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
@@ -1161,6 +1181,9 @@ def backfill_booked_outcome() -> dict:
                AND od_appointment_id IS NOT NULL
                AND od_appointment_id != ''
                AND (booked_outcome IS NULL OR booked_outcome = '')
+               AND (is_empty IS NULL OR is_empty = 0)
+               AND (grade_gradeable IS NULL OR grade_gradeable != 0)
+               AND (UPPER(call_summary) NOT LIKE 'VOICEMAIL%')
         """, (now,))
         updated = cur.rowcount
     log.info("[pipeline] backfill Phase 2 done: stamped %d rows with booked_outcome='booked'", updated)

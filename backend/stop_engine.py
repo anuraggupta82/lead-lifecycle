@@ -78,12 +78,12 @@ def cancel_for_event(lead_id: str, event_type: str, reason: str = "") -> int:
 
 def handle_event(lead_id: str, event_type: str, reason: str = "") -> dict:
     """
-    Main entry point.  Logs the event to lifecycle_events and cancels queue rows
-    per STOP_RULES.
+    Main entry point.  Logs the event to lifecycle_events, sets DND flags
+    (TCPA/CAN-SPAM compliance), and cancels queue rows per STOP_RULES.
 
     Returns {"lead_id": ..., "event_type": ..., "cancelled": N}
     """
-    from database import add_lead_event
+    from database import add_lead_event, set_lead_dnd
 
     if event_type not in STOP_RULES:
         logger.warning(f"stop_engine.handle_event: unknown event_type={event_type!r} — ignoring")
@@ -96,6 +96,18 @@ def handle_event(lead_id: str, event_type: str, reason: str = "") -> dict:
         detail=json.dumps({"reason": reason}) if reason else "",
         source="stop_engine",
     )
+
+    # ST1 fix: set DND flag(s) based on event type — ensures future enqueues are blocked
+    # even if queue rows were already sent or the scheduler restarts.
+    dnd_reason = reason or event_type
+    if event_type == "sms_stop":
+        set_lead_dnd(lead_id, "sms", reason=dnd_reason)
+    elif event_type == "email_unsub":
+        set_lead_dnd(lead_id, "email", reason=dnd_reason)
+    elif event_type in ("dnd_set", "manual_pause"):
+        # Cancel both channels — set DND for both
+        set_lead_dnd(lead_id, "sms", reason=dnd_reason)
+        set_lead_dnd(lead_id, "email", reason=dnd_reason)
 
     cancelled = cancel_for_event(lead_id, event_type, reason=reason)
 
