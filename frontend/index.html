@@ -14434,7 +14434,19 @@ function AiOptimizerTab() {
   const [pushBusy, setPushBusy] = React.useState(false);
   const [pushResult, setPushResult] = React.useState(null);
   const [runMsg, setRunMsg] = React.useState('');
+  const [progressData, setProgressData] = React.useState(null);
   const [busy, setBusy] = React.useState({});
+  // Refs for progress polling — avoids stale closures and leaks on unmount
+  const pollIntervalRef = React.useRef(null);
+  const safetyTimeoutRef = React.useRef(null);
+
+  // Cleanup polling on unmount
+  React.useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      if (safetyTimeoutRef.current) clearTimeout(safetyTimeoutRef.current);
+    };
+  }, []);
   const [innerTab, setInnerTab] = React.useState('recommendations');
   const [autoExpanded, setAutoExpanded] = React.useState(false);
   const [expandedSections, setExpandedSections] = React.useState({});
@@ -14533,23 +14545,54 @@ function AiOptimizerTab() {
   };
 
   const handleRunOptimizer = async () => {
-    setRunning(true); setRunMsg('Running optimizer...');
-    setAutoExpanded(false); // allow re-expansion after new run
+    // Clear any previous polling
+    if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null; }
+    if (safetyTimeoutRef.current) { clearTimeout(safetyTimeoutRef.current); safetyTimeoutRef.current = null; }
+
+    setRunning(true);
+    setRunMsg('');
+    setProgressData(null);
+    setAutoExpanded(false);
+
+    // Must have seen running:true at least once before treating done as real
+    // (guards against stale pct:100 from a previous run)
+    let hasStarted = false;
+
     try {
+      // POST returns immediately (202) — optimizer runs in background thread server-side
       await api('/api/admin/optimize', {method:'POST'});
-      setRunMsg('Optimizer running — polling for results...');
-      let attempts = 0;
-      const poll = setInterval(async () => {
-        attempts++;
-        if (attempts >= 12) {
-          clearInterval(poll);
-          setRunMsg('Done ✓');
-          setRunning(false);
-          await loadRecs();
-          await loadQueued();
-          await loadLastRun();
+
+      // Poll progress every 2s
+      pollIntervalRef.current = setInterval(async () => {
+        try {
+          const prog = await api('/api/admin/optimizer/progress');
+          setProgressData(prog);
+          if (prog.running) hasStarted = true;
+          if (hasStarted && !prog.running && prog.pct >= 100) {
+            clearInterval(pollIntervalRef.current);
+            clearTimeout(safetyTimeoutRef.current);
+            pollIntervalRef.current = null;
+            safetyTimeoutRef.current = null;
+            setRunning(false);
+            setRunMsg('Done ✓');
+            await loadRecs();
+            await loadQueued();
+            await loadLastRun();
+          }
+        } catch(_) {}
+      }, 2000);
+
+      // Safety timeout after 10 minutes — uses ref, not stale closure
+      safetyTimeoutRef.current = setTimeout(() => {
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
         }
-      }, 3000);
+        safetyTimeoutRef.current = null;
+        setRunning(false);
+        setRunMsg('Timed out — check logs');
+      }, 600000);
+
     } catch(e) {
       setRunMsg('Error: ' + (e.message || 'Optimizer failed'));
       setRunning(false);
@@ -14606,21 +14649,95 @@ function AiOptimizerTab() {
   return (
     <div style={{padding:'16px 20px',maxWidth:960,margin:'0 auto'}}>
       {/* Header */}
-      <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
-        <div>
-          <div style={{fontSize:18,fontWeight:700,color:'var(--text)'}}>🤖 AI Optimizer</div>
-          {lastRun && (
-            <div style={{fontSize:11,color:'var(--text-muted)'}}>Last run: {timeAgoStr(lastRun)}</div>
-          )}
+      <div style={{marginBottom:16}}>
+        <div style={{display:'flex',alignItems:'center',gap:12,marginBottom: running ? 10 : 0}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:700,color:'var(--text)'}}>🤖 AI Optimizer</div>
+            {lastRun && !running && (
+              <div style={{fontSize:11,color:'var(--text-muted)'}}>Last run: {timeAgoStr(lastRun)}</div>
+            )}
+          </div>
+          <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+            {!running && runMsg && <span style={{fontSize:12,color:runMsg.startsWith('Error') ? '#ef4444' : '#16a34a',fontWeight:600}}>{runMsg}</span>}
+            <button onClick={handleRunOptimizer} disabled={running}
+              style={{padding:'8px 18px',borderRadius:6,cursor:running?'not-allowed':'pointer',
+                background:running?'#64748b':'#16a34a',color:'#fff',border:'none',fontWeight:700,fontSize:13}}>
+              {running ? '⏳ Running...' : '▶ Run AI Optimizer'}
+            </button>
+          </div>
         </div>
-        <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
-          {runMsg && <span style={{fontSize:11,color:'var(--text-muted)'}}>{runMsg}</span>}
-          <button onClick={handleRunOptimizer} disabled={running}
-            style={{padding:'8px 18px',borderRadius:6,cursor:running?'not-allowed':'pointer',
-              background:running?'#a3e635':'#16a34a',color:'#fff',border:'none',fontWeight:700,fontSize:13}}>
-            {running ? '⏳ Running...' : '▶ Run AI Optimizer'}
-          </button>
-        </div>
+
+        {/* Progress bar — shown while running */}
+        {running && (() => {
+          const pd = progressData;
+          const pct = pd ? pd.pct : 0;
+          const stepLabel = pd ? (pd.step_label || 'Starting…') : 'Starting…';
+          const stepDetail = pd ? (pd.step_detail || '') : '';
+          const elapsed = pd ? pd.elapsed_sec : 0;
+          const campCtx = pd ? (pd.campaign_context || '') : '';
+          const stepIndex = pd ? pd.step_index : 0;
+          const totalSteps = pd ? pd.total_steps : 10;
+
+          // Icons for steps 0–9 + index 10 = terminal "Complete" state
+          const stepIcons = ['🔄','📡','🔍','📊','🧠','🏷️','⚙️','🤖','🌐','💾','✅'];
+          const icon = stepIcons[stepIndex] !== undefined ? stepIcons[stepIndex] : '⏳';
+
+          const elapsedStr = elapsed >= 60
+            ? `${Math.floor(elapsed/60)}m ${elapsed%60}s`
+            : `${elapsed}s`;
+
+          return (
+            <div style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:10,padding:'12px 16px'}}>
+              {/* Step label row */}
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{fontSize:16}}>{icon}</span>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>{stepLabel}</div>
+                    {campCtx && (
+                      <div style={{fontSize:11,color:'var(--teal)',fontWeight:600}}>📍 {campCtx}</div>
+                    )}
+                    {stepDetail && !campCtx && (
+                      <div style={{fontSize:11,color:'var(--text-muted)'}}>{stepDetail}</div>
+                    )}
+                  </div>
+                </div>
+                <div style={{textAlign:'right'}}>
+                  <div style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>{pct}%</div>
+                  <div style={{fontSize:11,color:'var(--text-muted)'}}>⏱ {elapsedStr}</div>
+                </div>
+              </div>
+
+              {/* Progress bar track */}
+              <div style={{height:8,borderRadius:4,background:'var(--border)',overflow:'hidden'}}>
+                <div style={{
+                  height:'100%',
+                  width: `${pct}%`,
+                  borderRadius:4,
+                  background:'linear-gradient(90deg, #0d9488, #16a34a)',
+                  transition:'width 0.5s ease',
+                }} />
+              </div>
+
+              {/* Step dots */}
+              <div style={{display:'flex',justifyContent:'space-between',marginTop:6}}>
+                {Array.from({length: totalSteps}).map((_, i) => (
+                  <div key={i} style={{
+                    width:8, height:8, borderRadius:'50%',
+                    background: i < stepIndex ? '#16a34a' : i === stepIndex ? '#0d9488' : 'var(--border)',
+                    transition:'background 0.3s',
+                    flexShrink:0,
+                  }} />
+                ))}
+              </div>
+
+              {/* Detail line when on a campaign step */}
+              {campCtx && stepDetail && (
+                <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4}}>{stepDetail}</div>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* Inner tab bar */}

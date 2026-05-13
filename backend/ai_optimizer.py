@@ -38,6 +38,80 @@ from database import get_all_leads
 logger = logging.getLogger(__name__)
 
 
+# ── Optimizer progress tracking ───────────────────────────────────────────────
+# In-memory state written by optimize_campaign() and read by the progress endpoint.
+# Thread-safe enough for single-process use (FastAPI + APScheduler share one process).
+
+import time as _time_mod
+
+# Ordered step definitions — (label, detail_template)
+OPTIMIZER_STEPS = [
+    ("Starting",            "Expiring stale recommendations..."),
+    ("Syncing GAds Data",   "Pulling keywords, search terms, campaigns from Google Ads..."),
+    ("Fetching Negatives",  "Loading existing negative keyword lists..."),
+    ("Ad Performance",      "Fetching ad creative and ad group metrics..."),
+    ("Classifying Terms",   "Running Haiku semantic classifier on search terms..."),
+    ("Competitor Memory",   "Matching search terms against known competitor brands..."),
+    ("Rule-Based Engine",   "Applying rule-based optimization (pauses, bids, harvesting)..."),
+    ("AI Per-Campaign",     "Calling Claude Opus for per-campaign recommendations..."),
+    ("AI Account-Level",    "Calling Claude Opus for cross-campaign recommendations..."),
+    ("Finalizing",          "Staging recommendations and updating optimizer memory..."),
+]
+
+_optimizer_progress: dict = {
+    "running": False,
+    "step_index": 0,
+    "step_label": "",
+    "step_detail": "",
+    "total_steps": len(OPTIMIZER_STEPS),
+    "pct": 0,
+    "elapsed_sec": 0,
+    "started_at": None,
+    "campaign_context": "",   # e.g. "Emergency Dentistry (3/5)"
+}
+
+
+def _set_progress(step_index: int, campaign_context: str = "") -> None:
+    """Update the global optimizer progress state. Called from optimize_campaign()."""
+    global _optimizer_progress
+    total = len(OPTIMIZER_STEPS)
+    idx = max(0, min(step_index, total - 1))
+    label, detail = OPTIMIZER_STEPS[idx]
+    started = _optimizer_progress.get("started_at") or _time_mod.time()
+    _optimizer_progress.update({
+        "running": True,
+        "step_index": idx,
+        "step_label": label,
+        "step_detail": detail,
+        "total_steps": total,
+        "pct": int(((idx + 1) / total) * 100),
+        "elapsed_sec": int(_time_mod.time() - started),
+        "started_at": started,
+        "campaign_context": campaign_context,
+    })
+
+
+def _set_progress_done() -> None:
+    """Mark the optimizer run as complete."""
+    global _optimizer_progress
+    started = _optimizer_progress.get("started_at") or _time_mod.time()
+    _optimizer_progress.update({
+        "running": False,
+        "step_index": len(OPTIMIZER_STEPS),
+        "step_label": "Complete",
+        "step_detail": "All recommendations staged.",
+        "total_steps": len(OPTIMIZER_STEPS),
+        "pct": 100,
+        "elapsed_sec": int(_time_mod.time() - started),
+        "campaign_context": "",
+    })
+
+
+def get_optimizer_progress() -> dict:
+    """Return a copy of the current progress state (called by the FastAPI endpoint)."""
+    return dict(_optimizer_progress)
+
+
 # ── Google Ads official rules — injected into every Claude prompt ─────────────
 # Source: Google Ads Help + Advertising Policies (fetched May 2026)
 GOOGLE_ADS_RULES = """
@@ -4881,14 +4955,18 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     now = datetime.now(timezone.utc).isoformat()
 
     # Expire recommendations older than 48h before generating new ones
+    _optimizer_progress["started_at"] = _time_mod.time()
+    _set_progress(0)  # Starting
     expired = expire_stale_pending(max_age_hours=48)
 
     try:
+        _set_progress(1)  # Syncing GAds Data
         client = _build_client()
     except Exception as e:
         logger.error(f"Failed to create Google Ads client: {e}")
         create_optimizer_run(run_id, trigger=trigger)
         update_optimizer_run(run_id, mode="errored", error=str(e))
+        _set_progress_done()
         return {"error": str(e), "run_id": run_id}
 
     customer_id = settings.google_ads_customer_id
@@ -4985,6 +5063,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as e:
         logger.warning(f"Google recommendations fetch failed (non-fatal): {e}")
 
+    _set_progress(2)  # Fetching Negatives
     # ── Fetch and score ad performance for A/B testing loop ──────────────────
     logger.info("Fetching ad performance metrics for A/B testing analysis...")
     all_ads_with_metrics: list = []
@@ -5056,6 +5135,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _ads_err:
         logger.warning(f"Ad performance fetch failed (non-fatal): {_ads_err}")
 
+    _set_progress(3)  # Ad Performance
     # ── Fetch and score ad group performance ──────────────────────────────────
     # Derive ad_group_resource from keyword_perf (API-returned, guaranteed valid)
     # so Claude receives real resource names, not synthesised strings.
@@ -5195,6 +5275,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     if outcome_history:
         logger.info(f"Outcome history loaded: {len(outcome_history)} entity-operation pairs from last 90d")
 
+    _set_progress(6)  # Rule-Based Engine
     # Analyze
     logger.info("Analyzing and generating recommendations...")
     actions = _analyze_keywords(
@@ -5419,6 +5500,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     summary["keywords_with_call_attribution"] = len(keyword_call_attribution)
     summary["keyword_attributed_calls"] = sum(e["calls"] for e in keyword_call_attribution.values())
 
+    _set_progress(4)  # Classifying Terms
     # ── Semantic search term classification (Haiku pre-pass) ─────────────────
     # Runs BEFORE the Opus loop. For each campaign, classifies all unclassified
     # search terms using Claude Haiku so the Opus pass can focus on strategy.
@@ -5509,6 +5591,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     if _classifier_negatives_staged:
         logger.info(f"Semantic classifier staged {_classifier_negatives_staged} negative(s) total")
 
+    _set_progress(5)  # Competitor Memory
     # ── Competitor memory write-back ─────────────────────────────────────────
     # Match recent search terms against known competitor brand stems.
     # Bumps confidence for confirmed competitors; queues unknown brand-like
@@ -5529,10 +5612,12 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
     # Claude structured recommendations — run once per active campaign.
     # Returns dicts with operation + exact API parameters, not plain text.
+    _set_progress(7)  # AI Per-Campaign
     logger.info("Calling Claude (Opus) for structured recommendations...")
     # Use ALL campaigns with keyword data — not just campaign_spend keys
     # (campaign_spend only covers the allow-listed set in legacy mode; now we use all)
     all_campaign_names = sorted(active_campaigns_with_data) or list(campaign_spend.keys()) or ([primary_campaign] if primary_campaign else [])
+    _total_camps = len(all_campaign_names)
     priority_counter = 30
     advisories = []  # for report dashboard (human-readable reasons)
 
@@ -5572,7 +5657,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     # PR 5: accumulate competitor intel across all campaigns for account-level pass
     _per_camp_competitor_blocks: dict = {}  # camp_name -> competitor_intel dict
 
-    for camp_name in all_campaign_names:
+    for _camp_idx, camp_name in enumerate(all_campaign_names):
+        _set_progress(7, campaign_context=f"{camp_name} ({_camp_idx + 1}/{_total_camps})")
         camp_lower = camp_name.strip().lower()
 
         camp_kw   = [k for k in keyword_perf  if k.get("campaign","").strip().lower() == camp_lower]
@@ -5979,6 +6065,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             [f"[claude:{camp_name}] {rec.get('reason','')}" for rec in structured]
         )
 
+    _set_progress(8)  # AI Account-Level
     # ── Account-level pass (cross-campaign patterns) ─────────────────────────
     logger.info("Calling Claude (Opus) for account-level recommendations...")
     # Build campaign_spend dict with resource info for the account-level function
@@ -6285,6 +6372,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _mem_err:
         logger.warning(f"Failed to save optimizer memory (non-fatal): {_mem_err}")
 
+    _set_progress(9)  # Finalizing
     # ── Save batch impact history ─────────────────────────────────────────────
     try:
         from database import _conn as _ih_conn
@@ -6332,6 +6420,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _ih_err:
         logger.warning(f"Failed to save impact history (non-fatal): {_ih_err}")
 
+    _set_progress_done()
     return report
 
 

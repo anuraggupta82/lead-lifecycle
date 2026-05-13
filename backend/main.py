@@ -847,15 +847,49 @@ def admin_backfill_booked_outcome():
 
 @app.post("/api/admin/optimize", dependencies=[Depends(_require_admin)])
 def admin_optimize(dry_run: bool = True):
+    """
+    Kicks off the optimizer in a background thread and returns 202 immediately.
+    Progress can be polled via GET /api/admin/optimizer/progress.
+    """
+    import threading
+
+    def _run():
+        try:
+            from ai_optimizer import optimize_campaign
+            optimize_campaign(dry_run=dry_run, trigger="admin_manual")
+        except ImportError as e:
+            logger.error(f"AI optimizer import failed: {e}")
+            try:
+                from ai_optimizer import _set_progress_done
+                _set_progress_done()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"AI optimizer failed: {e}", exc_info=True)
+            try:
+                from ai_optimizer import _set_progress_done
+                _set_progress_done()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"status": "started"}
+
+
+@app.get("/api/admin/optimizer/progress", dependencies=[Depends(_require_admin)])
+def optimizer_progress():
+    """
+    Returns the current optimizer progress state.
+    Polled by the frontend every 2s while a run is in progress.
+    Returns: {running, step_index, step_label, step_detail, total_steps, pct, elapsed_sec}
+    """
     try:
-        from ai_optimizer import optimize_campaign
-        result = optimize_campaign(dry_run=dry_run, trigger="admin_manual")
-        return {"status": "ok", "result": result}
-    except ImportError as e:
-        raise HTTPException(status_code=503, detail=f"AI optimizer dependencies not installed: {e}")
-    except Exception as e:
-        logger.error(f"AI optimizer failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        from ai_optimizer import get_optimizer_progress
+        return get_optimizer_progress()
+    except Exception:
+        return {"running": False, "step_index": 0, "step_label": "", "step_detail": "",
+                "total_steps": 10, "pct": 0, "elapsed_sec": 0}
 
 
 # ─── Phase 1: Google Ads Campaign Management ───────────────────────────────��─
