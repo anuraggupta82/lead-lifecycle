@@ -5454,6 +5454,14 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
             # Stage negative verdicts as pending add_negative_keyword actions
             # Bug #1 fix: use a local set to dedup within this campaign's staging loop
+            # INVALID_ARGUMENT fix: skip staging entirely if we couldn't resolve the
+            # campaign resource — executing without it causes a gRPC INVALID_ARGUMENT error.
+            if not _clf_camp_resource:
+                logger.warning(
+                    f"[{_classify_camp}] Classifier: skipping {len(_clf_result.get('negatives',[]))} negatives — "
+                    f"could not resolve campaign_resource (campaign may not have keywords yet)"
+                )
+                continue
             _clf_staged_kws: set[str] = set()
             for neg in _clf_result.get("negatives", []):
                 kw_text = neg["search_term"].strip().lower()

@@ -1094,11 +1094,28 @@ async def gads_approve_action(action_id: str, request: Request):
             after = json.loads(row["after_state_json"] or "{}")
             keyword_text = after.get("keyword_text")
             match_type = after.get("match_type", "BROAD")
-            campaign_resource = after.get("campaign_resource") or row["entity_id"]
+            # Use campaign_resource from after_state first; fall back to entity_id only if
+            # entity_id looks like an actual resource name (contains 'customers/').
+            _raw_cr_after = after.get("campaign_resource") or ""
+            _raw_cr_entity = row["entity_id"] or ""
+            if _raw_cr_after and "customers/" in _raw_cr_after:
+                campaign_resource = _raw_cr_after
+            elif _raw_cr_entity and "customers/" in _raw_cr_entity:
+                campaign_resource = _raw_cr_entity
+            else:
+                campaign_resource = None
             if not keyword_text:
                 raise HTTPException(
                     status_code=422,
                     detail="after_state_json missing keyword_text"
+                )
+            if not campaign_resource:
+                update_gads_action_result(action_id, executed=False,
+                    execution_result="rejected: missing campaign_resource — cannot add negative without a valid campaign")
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Cannot add negative '{keyword_text}' — no valid campaign_resource in the action record. "
+                           f"Re-run the optimizer to regenerate this recommendation with a resolved campaign resource."
                 )
             client = _build_client()
             try:
