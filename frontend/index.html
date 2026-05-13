@@ -4913,6 +4913,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [sitelinkRetryCount, setSitelinkRetryCount] = useState(0); // cap AI Fix & Retry at 2
   const [sitelinkLibrary, setSitelinkLibrary] = useState([]); // [{title,url,use_count,...}]
 
+  // Competitor override state — keyed by c.name.toLowerCase().trim()
+  // value: true = negate, false = ignored (override off), null = restore to auto
+  const [compOverrides, setCompOverrides] = useState({});
+
   const [stopConfirm, setStopConfirm] = useState(null);
   const [gadsImportOpen, setGadsImportOpen] = useState(false);
   const [gadsImportList, setGadsImportList] = useState([]);
@@ -5072,6 +5076,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       setGeoEditOpen(false);
       setGeoEditDraft('');
       setGeoSaving(false);
+      // M1 fix: reset competitor overrides so stale overrides from the previous
+      // campaign don't bleed into the newly opened campaign's competitor cards
+      setCompOverrides({});
     }
     setBuildLoading('');
     setCampEditMode(false);
@@ -6955,41 +6962,153 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                 {/* PR 6: optimizer recs relevant to competitor intelligence */}
                                 {renderOptimizerCallout(['add_negative_keyword','claude_advisory'])}
 
-                                {/* Competitor cards — 2-column grid */}
-                                <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
-                                  letterSpacing:'.5px',marginBottom:8}}>Local Competitors ({competitors.length})</div>
-                                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:18}}>
-                                  {competitors.map((c,i) => {
-                                    const {bg,color} = confColor(c.confidence);
-                                    return (
-                                      <div key={i} style={{background:'#fff',border:'1px solid var(--border)',
-                                        borderRadius:8,padding:'10px 12px',boxShadow:'0 1px 3px rgba(0,0,0,.05)'}}>
-                                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:5}}>
-                                          <div style={{fontSize:12,fontWeight:700}}>{c.name}</div>
-                                          <span style={{fontSize:9,fontWeight:700,background:bg,color,
-                                            padding:'2px 6px',borderRadius:3,textTransform:'uppercase',flexShrink:0,marginLeft:6}}>
-                                            {c.confidence||'?'}
+                                {/* Competitor override helpers */}
+                                {(() => {
+                                  const effectiveNegate = (c) => {
+                                    const key = (c.name||'').toLowerCase().trim();
+                                    if (compOverrides[key] !== undefined) return compOverrides[key];
+                                    return c.negate_override !== undefined && c.negate_override !== null
+                                      ? c.negate_override
+                                      : c.negate;
+                                  };
+                                  const doOverride = async (c, val) => {
+                                    const key = (c.name||'').toLowerCase().trim();
+                                    // optimistic
+                                    setCompOverrides(prev => ({...prev, [key]: val}));
+                                    try {
+                                      await api(
+                                        `/api/admin/campaigns/${campDetail.campaign.campaign_id}/competitors/${encodeURIComponent(c.name)}/override`,
+                                        {method:'PATCH', body: JSON.stringify({negate_override: val})}
+                                      );
+                                    } catch(e) {
+                                      // revert on error
+                                      setCompOverrides(prev => {
+                                        const next = {...prev};
+                                        delete next[key];
+                                        return next;
+                                      });
+                                    }
+                                  };
+
+                                  // Ignored count for summary banner
+                                  const ignoredComps = competitors.filter(c => effectiveNegate(c) === false);
+
+                                  return (
+                                    <>
+                                      {/* Summary banner when ≥1 ignored */}
+                                      {ignoredComps.length > 0 && (
+                                        <div style={{background:'#f9fafb',border:'1px solid #d1d5db',borderRadius:7,
+                                          padding:'8px 12px',marginBottom:12,display:'flex',alignItems:'center',
+                                          gap:8,flexWrap:'wrap',fontSize:11}}>
+                                          <span style={{fontWeight:700,color:'#374151'}}>
+                                            🚫 {ignoredComps.length} competitor{ignoredComps.length>1?'s':''} ignored from negate list
                                           </span>
+                                          <div style={{display:'flex',gap:5,flexWrap:'wrap',marginLeft:4}}>
+                                            {ignoredComps.map((c,i) => (
+                                              <span key={i} style={{background:'#e5e7eb',color:'#4b5563',
+                                                borderRadius:4,padding:'2px 7px',fontSize:10,fontWeight:600,
+                                                display:'flex',alignItems:'center',gap:4}}>
+                                                {c.name}
+                                                <button
+                                                  onClick={() => doOverride(c, null)}
+                                                  style={{background:'none',border:'none',cursor:'pointer',
+                                                    color:'#7c3aed',fontWeight:700,fontSize:10,padding:0}}>
+                                                  + Restore
+                                                </button>
+                                              </span>
+                                            ))}
+                                          </div>
                                         </div>
-                                        {c.location && (
-                                          <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:5}}>📍 {c.location}</div>
-                                        )}
-                                        {c.likely_emphasis && (
-                                          <div style={{marginBottom:4}}>
-                                            <span style={{fontSize:9,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.3px'}}>Their emphasis: </span>
-                                            <span style={{fontSize:10,color:'#374151'}}>{c.likely_emphasis}</span>
-                                          </div>
-                                        )}
-                                        {c.gap_we_can_address && (
-                                          <div style={{background:'#f0fdf4',borderRadius:4,padding:'4px 7px',marginTop:4}}>
-                                            <span style={{fontSize:9,fontWeight:700,color:'#166534',textTransform:'uppercase',letterSpacing:'.3px'}}>Our angle: </span>
-                                            <span style={{fontSize:10,color:'#166534'}}>{c.gap_we_can_address}</span>
-                                          </div>
-                                        )}
+                                      )}
+
+                                      {/* Competitor cards — 2-column grid */}
+                                      <div style={{fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',
+                                        letterSpacing:'.5px',marginBottom:8}}>Local Competitors ({competitors.length})</div>
+                                      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:18}}>
+                                        {competitors.map((c,i) => {
+                                          const {bg,color} = confColor(c.confidence);
+                                          const effNegate = effectiveNegate(c);
+                                          const isIgnored = effNegate === false;
+                                          const isConquest = c.negate === false;
+                                          return (
+                                            <div key={i} style={{
+                                              background: isIgnored ? '#fafafa' : '#fff',
+                                              border: isIgnored
+                                                ? '1px solid #d1d5db'
+                                                : '1px solid var(--border)',
+                                              borderLeft: isIgnored ? '3px solid #9ca3af' : undefined,
+                                              borderRadius:8,
+                                              padding:'10px 12px',
+                                              boxShadow:'0 1px 3px rgba(0,0,0,.05)',
+                                              opacity: isIgnored ? 0.85 : 1,
+                                              position:'relative'
+                                            }}>
+                                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:5}}>
+                                                <div style={{fontSize:12,fontWeight:700}}>{c.name}</div>
+                                                <div style={{display:'flex',alignItems:'center',gap:4,flexShrink:0,marginLeft:6}}>
+                                                  {/* Confidence badge */}
+                                                  <span style={{fontSize:9,fontWeight:700,background:bg,color,
+                                                    padding:'2px 6px',borderRadius:3,textTransform:'uppercase'}}>
+                                                    {c.confidence||'?'}
+                                                  </span>
+                                                  {/* Conquest badge */}
+                                                  {isConquest && !isIgnored && (
+                                                    <span style={{fontSize:9,fontWeight:700,background:'#e0e7ff',color:'#3730a3',
+                                                      padding:'2px 6px',borderRadius:3}}>⚔ Conquest</span>
+                                                  )}
+                                                  {/* Ignore button — shown when negate===true and not yet overridden to false */}
+                                                  {c.negate === true && !isIgnored && (
+                                                    <button
+                                                      onClick={() => doOverride(c, false)}
+                                                      title="Ignore negate policy for this competitor"
+                                                      style={{background:'none',border:'1px solid #d1d5db',borderRadius:3,
+                                                        cursor:'pointer',fontSize:9,color:'#6b7280',padding:'1px 5px',fontWeight:600}}>
+                                                      ⊘ Ignore
+                                                    </button>
+                                                  )}
+                                                  {/* IGNORED badge */}
+                                                  {isIgnored && (
+                                                    <span style={{fontSize:9,fontWeight:700,background:'#e5e7eb',color:'#6b7280',
+                                                      padding:'2px 6px',borderRadius:3,textTransform:'uppercase'}}>IGNORED</span>
+                                                  )}
+                                                </div>
+                                              </div>
+                                              {c.location && (
+                                                <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:5}}>📍 {c.location}</div>
+                                              )}
+                                              {c.likely_emphasis && (
+                                                <div style={{marginBottom:4}}>
+                                                  <span style={{fontSize:9,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.3px'}}>Their emphasis: </span>
+                                                  <span style={{fontSize:10,color:'#374151'}}>{c.likely_emphasis}</span>
+                                                </div>
+                                              )}
+                                              {c.gap_we_can_address && (
+                                                <div style={{background:'#f0fdf4',borderRadius:4,padding:'4px 7px',marginTop:4}}>
+                                                  <span style={{fontSize:9,fontWeight:700,color:'#166534',textTransform:'uppercase',letterSpacing:'.3px'}}>Our angle: </span>
+                                                  <span style={{fontSize:10,color:'#166534'}}>{c.gap_we_can_address}</span>
+                                                </div>
+                                              )}
+                                              {/* Ignored footer strip */}
+                                              {isIgnored && (
+                                                <div style={{marginTop:8,paddingTop:7,borderTop:'1px solid #e5e7eb',
+                                                  fontSize:10,color:'#6b7280',display:'flex',alignItems:'center',gap:6}}>
+                                                  <span>🚫 Negate policy ignored — brand won't be added as a negative</span>
+                                                  <button
+                                                    onClick={() => doOverride(c, null)}
+                                                    style={{background:'none',border:'1px solid #d1d5db',borderRadius:3,
+                                                      cursor:'pointer',fontSize:9,color:'#7c3aed',padding:'1px 6px',
+                                                      fontWeight:700,flexShrink:0}}>
+                                                    + Restore
+                                                  </button>
+                                                </div>
+                                              )}
+                                            </div>
+                                          );
+                                        })}
                                       </div>
-                                    );
-                                  })}
-                                </div>
+                                    </>
+                                  );
+                                })()}
 
                                 {/* Our Differentiators */}
                                 {differentiators.length > 0 && (
@@ -14323,6 +14442,13 @@ function AiOptimizerTab() {
   const [impactLoading, setImpactLoading] = React.useState(false);
   const [histFilter, setHistFilter] = React.useState('all');
   const [histSelected, setHistSelected] = React.useState({});
+  // Competitor candidate queue
+  const [compQueue, setCompQueue] = React.useState({pending:[], dismissed:[], promoted:[]});
+  const [showIgnoredQueue, setShowIgnoredQueue] = React.useState(false);
+  const [promoteRow, setPromoteRow] = React.useState(null);
+  const [promoteName, setPromoteName] = React.useState('');
+  const [promoteClass, setPromoteClass] = React.useState('local_office');
+  const [promoteStems, setPromoteStems] = React.useState('');
 
   const loadLastRun = React.useCallback(async () => {
     try {
@@ -14356,11 +14482,19 @@ function AiOptimizerTab() {
     finally { setImpactLoading(false); }
   }, []);
 
+  const loadCompQueue = React.useCallback(async () => {
+    try {
+      const d = await api('/api/admin/optimizer/competitor-queue?status=all');
+      setCompQueue(d);
+    } catch(_) {}
+  }, []);
+
   React.useEffect(() => {
     loadLastRun();
     loadRecs();
     loadQueued();
-  }, [loadLastRun, loadRecs, loadQueued]);
+    loadCompQueue();
+  }, [loadLastRun, loadRecs, loadQueued, loadCompQueue]);
 
   // Load impact history when switching to Impact tab
   React.useEffect(() => {
@@ -14663,6 +14797,218 @@ function AiOptimizerTab() {
               )}
             </div>
           )}
+
+          {/* ── Competitor Candidates section ── */}
+          {(compQueue.pending.length > 0 || compQueue.dismissed.length > 0) && (() => {
+            const NATIONAL_CHAIN_TERMS = ['aspen dental','clearchoice','clear choice','nuvia','gentle dental','heartland dental','affordable dentures','smile direct','byte','candid'];
+            const titleCase = (s) => s.replace(/\w\S*/g, t => t.charAt(0).toUpperCase() + t.slice(1).toLowerCase());
+            const stripTrailing = (s) => s.replace(/\s+(near me|dentist|dental)\s*$/i, '').trim();
+
+            const handlePromoteClick = (row) => {
+              const term = (row.search_term || '').toLowerCase();
+              const stripped = stripTrailing(term);
+              const name = titleCase(stripped);
+              const cls = NATIONAL_CHAIN_TERMS.some(t => term.includes(t)) ? 'national_chain' : 'local_office';
+              const stems = stripped.toLowerCase();
+              setPromoteRow(row);
+              setPromoteName(name);
+              setPromoteClass(cls);
+              setPromoteStems(stems);
+            };
+
+            const handlePromoteSave = async () => {
+              if (!promoteRow) return;
+              try {
+                await api(`/api/admin/optimizer/competitor-queue/${promoteRow.id}/promote`, {
+                  method:'POST',
+                  body: JSON.stringify({
+                    name: promoteName,
+                    classification: promoteClass,
+                    brand_stems: promoteStems.split(',').map(s=>s.trim()).filter(Boolean)
+                  })
+                });
+                setCompQueue(prev => ({
+                  ...prev,
+                  pending: prev.pending.filter(r => r.id !== promoteRow.id),
+                  promoted: [...(prev.promoted||[]), promoteRow]
+                }));
+                setPromoteRow(null);
+              } catch(e) { alert('Promote failed: ' + (e.message||'error')); }
+            };
+
+            const handleDismiss = async (row) => {
+              // optimistic
+              setCompQueue(prev => ({
+                ...prev,
+                pending: prev.pending.filter(r => r.id !== row.id),
+                dismissed: [...prev.dismissed, {...row}]
+              }));
+              try {
+                await api(`/api/admin/optimizer/competitor-queue/${row.id}/dismiss`, {method:'POST', body:JSON.stringify({})});
+              } catch(e) {
+                // revert
+                setCompQueue(prev => ({
+                  ...prev,
+                  pending: [...prev.pending, row],
+                  dismissed: prev.dismissed.filter(r => r.id !== row.id)
+                }));
+              }
+            };
+
+            const handleRestore = async (row) => {
+              // optimistic
+              setCompQueue(prev => ({
+                ...prev,
+                dismissed: prev.dismissed.filter(r => r.id !== row.id),
+                pending: [...prev.pending, {...row}]
+              }));
+              try {
+                await api(`/api/admin/optimizer/competitor-queue/${row.id}/restore`, {method:'POST', body:JSON.stringify({})});
+              } catch(e) {
+                setCompQueue(prev => ({
+                  ...prev,
+                  dismissed: [...prev.dismissed, row],
+                  pending: prev.pending.filter(r => r.id !== row.id)
+                }));
+              }
+            };
+
+            const daysSince = (ts) => {
+              if (!ts) return null;
+              return Math.round((Date.now() - new Date(ts).getTime()) / 86400000);
+            };
+
+            return (
+              <div style={{marginTop:24}}>
+                <div style={{fontSize:13,fontWeight:700,color:'var(--text)',marginBottom:12,
+                  display:'flex',alignItems:'center',gap:8}}>
+                  <span>🕵 Competitor Candidates</span>
+                  {compQueue.pending.length > 0 && (
+                    <span style={{background:'#fbbf24',color:'#78350f',borderRadius:10,
+                      padding:'1px 7px',fontSize:10,fontWeight:700}}>
+                      {compQueue.pending.length} pending
+                    </span>
+                  )}
+                </div>
+
+                {/* Pending cards */}
+                {compQueue.pending.map(row => (
+                  <div key={row.id}>
+                    <div style={{background:'#fefce8',border:'2px solid #fde68a',borderRadius:8,
+                      padding:'10px 14px',marginBottom:8}}>
+                      <div style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:6}}>
+                        <div style={{flex:1}}>
+                          <span style={{fontFamily:'monospace',fontWeight:700,fontSize:12,color:'#1c1917'}}>
+                            "{row.search_term}"
+                          </span>
+                          {row.campaign_name && (
+                            <span style={{marginLeft:8,fontSize:10,color:'#6b7280'}}>
+                              {row.campaign_name}
+                            </span>
+                          )}
+                          {/* M2 fix: spend_micros (integer) + occurrences (not seen_count/spend) */}
+                          {(row.spend_micros != null || row.clicks != null) && (
+                            <span style={{marginLeft:8,fontSize:10,color:'#92400e',fontWeight:600}}>
+                              {row.spend_micros != null ? `$${(row.spend_micros / 1_000_000).toFixed(2)} spend` : ''}
+                              {row.spend_micros != null && row.clicks != null ? ' · ' : ''}
+                              {row.clicks != null ? `${row.clicks} clicks` : ''}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{display:'flex',gap:5,flexShrink:0}}>
+                          <button
+                            onClick={() => handlePromoteClick(row)}
+                            style={{padding:'4px 10px',borderRadius:5,border:'none',cursor:'pointer',
+                              background:'#16a34a',color:'#fff',fontSize:11,fontWeight:700}}>
+                            + Promote
+                          </button>
+                          <button
+                            onClick={() => handleDismiss(row)}
+                            style={{padding:'4px 10px',borderRadius:5,border:'1px solid #d1d5db',
+                              cursor:'pointer',background:'#f9fafb',color:'#6b7280',fontSize:11,fontWeight:600}}>
+                            ⊘ Dismiss
+                          </button>
+                        </div>
+                      </div>
+                      <div style={{fontSize:10,color:'#92400e'}}>
+                        Seen {row.occurrences||1} time{(row.occurrences||1)>1?'s':''}
+                        {row.last_seen_at ? ` · last seen ${daysSince(row.last_seen_at)}d ago` : ''}
+                      </div>
+                    </div>
+                    {/* Inline promote form */}
+                    {promoteRow && promoteRow.id === row.id && (
+                      <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:7,
+                        padding:'12px 14px',marginBottom:8,marginTop:-4}}>
+                        <div style={{fontSize:11,fontWeight:700,color:'#14532d',marginBottom:8}}>
+                          Promote as Competitor
+                        </div>
+                        <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'flex-end'}}>
+                          <div>
+                            <div style={{fontSize:10,color:'#374151',marginBottom:3}}>Name</div>
+                            <input value={promoteName} onChange={e=>setPromoteName(e.target.value)}
+                              style={{border:'1px solid #d1d5db',borderRadius:4,padding:'4px 8px',fontSize:11,width:180}}/>
+                          </div>
+                          <div>
+                            <div style={{fontSize:10,color:'#374151',marginBottom:3}}>Classification</div>
+                            <select value={promoteClass} onChange={e=>setPromoteClass(e.target.value)}
+                              style={{border:'1px solid #d1d5db',borderRadius:4,padding:'4px 8px',fontSize:11}}>
+                              <option value="local_office">local_office</option>
+                              <option value="national_chain">national_chain</option>
+                            </select>
+                          </div>
+                          <div style={{flex:1}}>
+                            <div style={{fontSize:10,color:'#374151',marginBottom:3}}>Brand stems (comma-separated)</div>
+                            <input value={promoteStems} onChange={e=>setPromoteStems(e.target.value)}
+                              style={{border:'1px solid #d1d5db',borderRadius:4,padding:'4px 8px',fontSize:11,width:'100%'}}/>
+                          </div>
+                        </div>
+                        <div style={{display:'flex',gap:6,marginTop:10}}>
+                          <button onClick={handlePromoteSave}
+                            style={{padding:'5px 14px',borderRadius:5,border:'none',cursor:'pointer',
+                              background:'#16a34a',color:'#fff',fontSize:11,fontWeight:700}}>
+                            Save &amp; Promote
+                          </button>
+                          <button onClick={()=>setPromoteRow(null)}
+                            style={{padding:'5px 12px',borderRadius:5,border:'1px solid #d1d5db',
+                              cursor:'pointer',background:'#fff',color:'#374151',fontSize:11}}>
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {/* Show dismissed toggle */}
+                {compQueue.dismissed.length > 0 && (
+                  <div>
+                    <button onClick={()=>setShowIgnoredQueue(p=>!p)}
+                      style={{background:'none',border:'none',cursor:'pointer',fontSize:11,
+                        color:'#6b7280',padding:0,marginBottom:8}}>
+                      {showIgnoredQueue ? '▾' : '▸'} Show {compQueue.dismissed.length} ignored
+                    </button>
+                    {showIgnoredQueue && compQueue.dismissed.map(row => (
+                      <div key={row.id} style={{background:'#f9fafb',border:'1px solid #e5e7eb',
+                        borderRadius:8,padding:'8px 12px',marginBottom:6,opacity:0.8,
+                        display:'flex',alignItems:'center',gap:8}}>
+                        <span style={{fontFamily:'monospace',fontSize:11,color:'#6b7280',flex:1}}>
+                          "{row.search_term}"
+                        </span>
+                        {row.campaign_name && (
+                          <span style={{fontSize:10,color:'#9ca3af'}}>{row.campaign_name}</span>
+                        )}
+                        <button onClick={()=>handleRestore(row)}
+                          style={{padding:'3px 9px',borderRadius:4,border:'1px solid #d1d5db',
+                            cursor:'pointer',background:'#fff',color:'#7c3aed',fontSize:10,fontWeight:700}}>
+                          + Restore
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
 

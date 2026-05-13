@@ -3861,6 +3861,44 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
         except Exception:
             strategy = {}
 
+    # Load competitor analysis from build JSON for context injection
+    _competitor_analysis = {}
+    _conquest_keywords: list = []
+    try:
+        _full_build = get_campaign_build(campaign_id) if body.step != "competitor_analysis" else {}
+        _raw_ca = _full_build.get("competitor_analysis") or {}
+        if isinstance(_raw_ca, str):
+            _raw_ca = _json.loads(_raw_ca)
+        _competitor_analysis = _raw_ca if isinstance(_raw_ca, dict) else {}
+        _conquest_keywords = _competitor_analysis.get("conquest_keywords", []) or []
+    except Exception as _ca_err:
+        logger.warning(f"build-step-refine: competitor_analysis load failed (non-fatal): {_ca_err}")
+
+    # Build competitor context block for prompt injection
+    _competitor_section = ""
+    if _competitor_analysis:
+        _comp_list = _competitor_analysis.get("competitors", []) or []
+        _comp_names = [c.get("name", "") for c in _comp_list if c.get("name")]
+        _differentiators = _competitor_analysis.get("differentiators", []) or []
+        _positioning = _competitor_analysis.get("positioning_strategy", "") or _competitor_analysis.get("positioning_notes", "") or ""
+        _negate_stems = _competitor_analysis.get("competitor_negatives", []) or []
+        _lines = []
+        if _comp_names:
+            _lines.append(f"Local competitors: {', '.join(_comp_names)}")
+        if _conquest_keywords:
+            _lines.append(f"Conquest keywords (protected — do NOT add these as negatives): {', '.join(_conquest_keywords)}")
+        if _negate_stems:
+            _lines.append(
+                f"Local competitor brand stems (ALWAYS keep in negative list — contact-lookup intent): "
+                f"{', '.join(_negate_stems)}"
+            )
+        if _differentiators:
+            _lines.append(f"Our differentiators: {'; '.join(_differentiators[:5])}")
+        if _positioning:
+            _lines.append(f"Positioning: {_positioning[:300]}")
+        if _lines:
+            _competitor_section = "\n\n=== Competitor Intelligence ===\n" + "\n".join(_lines)
+
     # Site intelligence for refinement context
     _refine_landing = camp.get("landing_page") or ""
     _refine_site = get_setting("practice_website") or ""
@@ -3883,6 +3921,7 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
 Campaign: {camp.get("campaign_name", "")}
 Service Focus: {camp.get("service_focus", "")}
 {_refine_site_section}
+{_competitor_section}
 Current strategy:
 {_json.dumps(current, indent=2)}
 
@@ -3907,6 +3946,7 @@ Campaign: {camp.get("campaign_name", "")}
 Service Focus: {camp.get("service_focus", "")}
 Objective: {strategy.get("objective", "")}
 {_refine_site_section}
+{_competitor_section}
 Current {body.step} content:
 {_json.dumps(current, indent=2)}
 
@@ -3918,6 +3958,10 @@ Rules:
 - Keep all existing items unless the user asked to remove specific ones
 - Add new items where instructed
 - Maintain the exact same JSON structure/schema as the current content
+- If the user asks to add competitor names as negatives, use the brand stems from "Local competitor brand stems" in the Competitor Intelligence section above
+- NEVER remove items from "Local competitor brand stems" from the negative list — they are contact-lookup intent and always waste budget
+- NEVER add conquest keywords as negatives — those are intentional targets for comparison-shopping patients
+- If user asks to "negate all competitors", add all brand stems from the Competitor Intelligence section that are not already present
 - Return ONLY the JSON object, no explanation."""
 
     try:
@@ -4402,9 +4446,38 @@ def admin_campaign_build_step_save(campaign_id: str, body: CampaignBuildStepSave
             try:
                 from search_term_classifier import _detect_campaign_type as _dtct_save
                 data_to_save = dict(data_to_save)  # copy; don't mutate request body
-                data_to_save["campaign_type"] = _dtct_save(camp.get("campaign_name", ""))
-            except Exception:
-                pass  # leave data_to_save as-is if import fails
+                _ctype_save = _dtct_save(camp.get("campaign_name", ""))
+                data_to_save["campaign_type"] = _ctype_save
+            except Exception as _ct_err:
+                logger.warning(f"build-step-save: campaign_type detect failed: {_ct_err}")
+                _ctype_save = "general"
+            # Re-apply competitor policy on every save so overrides + derived arrays stay in sync.
+            # C4 fix: snapshot any manually-added competitor_negatives that are not derivable
+            # from the policy engine (e.g. stems the user typed by hand), then re-add them after
+            # apply_competitor_policy rebuilds the derived arrays.
+            try:
+                from competitor_policy import apply_competitor_policy as _apply_cp_save, get_effective_negatives as _gen_save, normalize as _cnorm_save
+                # Collect stems that policy will derive on its own (brand_stems of all competitors)
+                _policy_stems: set[str] = set()
+                for _c4c in (data_to_save.get("competitors") or []):
+                    for _s in (_c4c.get("brand_stems") or []):
+                        _policy_stems.add(_cnorm_save(_s))
+                # Manual negatives = anything in the current list NOT covered by policy
+                _manual_negs: list[str] = [
+                    n for n in (data_to_save.get("competitor_negatives") or [])
+                    if _cnorm_save(n) not in _policy_stems
+                ]
+                _apply_cp_save(data_to_save, _ctype_save)
+                # Re-add manual negatives that policy would have dropped
+                if _manual_negs:
+                    _current_negs: list[str] = data_to_save.get("competitor_negatives") or []
+                    _current_neg_set = {_cnorm_save(n) for n in _current_negs}
+                    for _mn in _manual_negs:
+                        if _cnorm_save(_mn) not in _current_neg_set:
+                            _current_negs.append(_mn)
+                    data_to_save["competitor_negatives"] = sorted(set(_current_negs))
+            except Exception as _cp_err:
+                logger.warning(f"build-step-save: apply_competitor_policy failed (non-fatal): {_cp_err}")
         save_campaign_build_step(campaign_id, body.step, data_to_save)
     return {"ok": True, "step": body.step}
 
@@ -5043,25 +5116,26 @@ Rules:
         except Exception:
             _camp_type = "general"
 
-        # Pull conquest brands already known for this campaign type
-        _conquest_brand_map = {
-            "implants":   ["clearchoice", "aspen dental", "affordable dentures", "teeth today", "smile again"],
-            "invisalign": ["smile direct", "smiledirectclub", "byte", "candid"],
-            "cosmetic":   ["smile direct", "smiledirectclub", "byte"],
-        }
-        _known_conquest = _conquest_brand_map.get(_camp_type, [])
-        _conquest_note = ""
-        if _known_conquest:
-            _conquest_note = (
-                f"\nKnown conquest brands for {_camp_type} campaigns (consider as conquest_keywords): "
-                + ", ".join(_known_conquest)
-            )
-        _conquest_instruction = (
-            "conquest_keywords: bare brand name stems only, lowercase, no 'near me' suffix "
-            f"(e.g. 'aspen dental' not 'aspen dental near me'). Only for {_camp_type} campaigns."
-            if _known_conquest else
-            "conquest_keywords: empty array — conquest targeting not recommended for this campaign type."
+        # Import competitor policy module
+        from competitor_policy import (
+            apply_competitor_policy as _apply_comp_policy,
+            merge_overrides_on_regenerate as _merge_overrides,
+            CONQUEST_ELIGIBLE_TYPES as _CONQUEST_ELIGIBLE,
         )
+
+        # Build conquest eligibility note for Claude
+        _conquest_instruction = (
+            "conquest_keywords: leave empty — the server will derive conquest targets from "
+            "competitor classification. Do NOT populate this field."
+        )
+        _conquest_note = ""
+        if _camp_type in _CONQUEST_ELIGIBLE:
+            _conquest_note = (
+                f"\nThis is a {_camp_type} campaign. National destination chains "
+                "(e.g. ClearChoice, Nuvia, Affordable Dentures & Implants) are comparison-shopping "
+                "targets for this service — mark them as 'national_chain'. Local offices are "
+                "contact-lookup intent only — mark them as 'local_office'."
+            )
 
         # Target towns for geo context
         _target_towns = (
@@ -5088,9 +5162,14 @@ TASK: Identify 4–6 dental practices that realistically compete for the same pa
 IMPORTANT RULES:
 1. Only name practices you have HIGH confidence exist in this specific area. If unsure, use a generic descriptor like "Independent implant specialist in Shrewsbury" and mark confidence: "low".
 2. Focus on the SERVICE TYPE — for implants, name implant-focused competitors; for emergency, name practices advertising same-day care.
-3. Large chains (Aspen Dental, Gentle Dental, Heartland Dental) may be included if they have locations in Worcester County.
-4. our_differentiators must be specific to Grafton Dental Care — not generic dental tropes. Use the website intelligence and service focus above.
-5. {_conquest_instruction}
+3. For EACH competitor, classify it:
+   - "local_office": a specific physical dental office within driving distance (independent or chain branch).
+   - "national_chain": a destination brand whose patients comparison-shop across providers
+     (e.g. ClearChoice, Nuvia, Affordable Dentures & Implants, Smile Direct Club, Byte, Candid).
+4. For EACH competitor, provide brand_stems: 1-3 lowercase tokens used for keyword matching
+   (e.g. ["aspen dental", "aspendental"] for "Aspen Dental Worcester").
+5. our_differentiators must be specific to Grafton Dental Care — not generic dental tropes. Use the website intelligence and service focus above.
+6. {_conquest_instruction}
 
 Return ONLY a JSON object with this exact structure:
 {{
@@ -5100,6 +5179,8 @@ Return ONLY a JSON object with this exact structure:
       "name": "Practice Name",
       "location": "City, MA",
       "confidence": "high|medium|low",
+      "classification": "local_office|national_chain",
+      "brand_stems": ["practice name", "practice"],
       "likely_emphasis": "What they probably lead with in ads (e.g. price, convenience, technology)",
       "gap_we_can_address": "Positioning angle we can use against them"
     }}
@@ -5109,6 +5190,7 @@ Return ONLY a JSON object with this exact structure:
     "Specific differentiator 2"
   ],
   "conquest_keywords": [],
+  "competitor_negatives": [],
   "positioning_notes": "Overall positioning strategy for this campaign given the competitive landscape"
 }}
 
@@ -5127,10 +5209,24 @@ No markdown, no explanation outside the JSON."""
         _json_text = _extract_json_from_ai_response(raw)
         data = _json.loads(_json_text)
 
-        # For competitor_analysis: inject campaign_type server-side so the frontend
-        # conquest/no-conquest branching never depends on Sonnet echoing it back correctly
+        # For competitor_analysis: apply policy + preserve user overrides from prior generation
         if step == "competitor_analysis" and isinstance(data, dict):
             data["campaign_type"] = _camp_type  # always authoritative
+            # Merge user negate_override values from previous save (survive regeneration)
+            try:
+                _old_build = get_campaign_build(campaign_id)
+                _old_comps = ((_old_build.get("competitor_analysis") or {}).get("competitors") or [])
+                if _old_comps:
+                    data["competitors"] = _merge_overrides(
+                        data.get("competitors") or [], _old_comps
+                    )
+            except Exception as _merge_err:
+                logger.warning(f"build-step: override merge failed (non-fatal): {_merge_err}")
+            # Apply classification-based negate/conquest policy
+            try:
+                _apply_comp_policy(data, _camp_type)
+            except Exception as _policy_err:
+                logger.warning(f"build-step: apply_competitor_policy failed (non-fatal): {_policy_err}")
 
     except Exception as e:
         logger.error(f"build-step AI call failed ({step}): {e}")
@@ -5139,6 +5235,143 @@ No markdown, no explanation outside the JSON."""
     save_campaign_build_step(campaign_id, step, data)
     logger.info(f"Campaign {campaign_id} build step '{step}' generated and saved")
     return {"ok": True, "step": step, "data": data}
+
+
+# ── Competitor negate-override endpoint ──────────────────────────────────────
+
+class CompetitorOverrideRequest(BaseModel):
+    negate_override: Optional[bool] = None  # None = clear override, True = force-negate, False = force-allow
+
+
+@app.patch(
+    "/api/admin/campaigns/{campaign_id}/competitors/{competitor_name}/override",
+    dependencies=[Depends(_require_admin)],
+)
+def admin_competitor_override(
+    campaign_id: str,
+    competitor_name: str,
+    body: CompetitorOverrideRequest,
+):
+    """
+    Set or clear the negate_override on a specific competitor in a campaign's
+    competitor_analysis. Rebuilds derived competitor_negatives / conquest_keywords.
+    """
+    from database import get_campaign_by_id, get_campaign_build, save_campaign_build_step
+    from competitor_policy import apply_competitor_policy as _acp, normalize as _norm_cp
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    build = get_campaign_build(campaign_id)
+    ca = build.get("competitor_analysis")
+    if not ca or not isinstance(ca, dict):
+        raise HTTPException(status_code=404, detail="No competitor_analysis for this campaign")
+
+    # Find matching competitor (case-insensitive normalized name)
+    target_norm = _norm_cp(competitor_name)
+    matched = None
+    for c in (ca.get("competitors") or []):
+        if _norm_cp(c.get("name", "")) == target_norm:
+            matched = c
+            break
+
+    if matched is None:
+        raise HTTPException(status_code=404, detail=f"Competitor '{competitor_name}' not found")
+
+    matched["negate_override"] = body.negate_override
+
+    # Re-derive campaign_type
+    try:
+        from search_term_classifier import _detect_campaign_type as _dtct_ov
+        ctype = _dtct_ov(camp.get("campaign_name", "")) or "general"
+    except Exception:
+        ctype = ca.get("campaign_type", "general")
+
+    _acp(ca, ctype)
+    save_campaign_build_step(campaign_id, "competitor_analysis", ca)
+
+    return {
+        "ok": True,
+        "competitor": matched,
+        "competitor_negatives": ca.get("competitor_negatives", []),
+        "conquest_keywords": ca.get("conquest_keywords", []),
+    }
+
+
+# ── Competitor review queue endpoints ────────────────────────────────────────
+
+class CompetitorPromoteRequest(BaseModel):
+    name: str
+    classification: str
+    brand_stems: list
+    notes: Optional[str] = ""
+
+
+@app.get("/api/admin/optimizer/competitor-queue", dependencies=[Depends(_require_admin)])
+def admin_competitor_queue_list(status: str = "pending"):
+    """
+    List competitor_review_queue rows.
+    status: 'pending' | 'dismissed' | 'promoted' | 'all'
+    """
+    from database import list_competitor_queue
+    if status == "all":
+        return {
+            "pending":   list_competitor_queue("pending"),
+            "dismissed": list_competitor_queue("dismissed"),
+            "promoted":  list_competitor_queue("promoted"),
+        }
+    return {"rows": list_competitor_queue(status), "status": status}
+
+
+@app.post(
+    "/api/admin/optimizer/competitor-queue/{row_id}/dismiss",
+    dependencies=[Depends(_require_admin)],
+)
+def admin_competitor_queue_dismiss(row_id: int, body: dict = Body(default={})):
+    """Dismiss a competitor review queue candidate. Sticky — won't resurface."""
+    from database import dismiss_competitor_candidate
+    note = (body.get("note") or "") if isinstance(body, dict) else ""
+    ok = dismiss_competitor_candidate(row_id, decided_by="admin", note=note)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Row not found or already promoted")
+    return {"ok": True, "id": row_id, "status": "dismissed"}
+
+
+@app.post(
+    "/api/admin/optimizer/competitor-queue/{row_id}/restore",
+    dependencies=[Depends(_require_admin)],
+)
+def admin_competitor_queue_restore(row_id: int):
+    """Restore a dismissed competitor candidate back to pending."""
+    from database import restore_competitor_candidate
+    ok = restore_competitor_candidate(row_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Row not found")
+    return {"ok": True, "id": row_id, "status": "pending"}
+
+
+@app.post(
+    "/api/admin/optimizer/competitor-queue/{row_id}/promote",
+    dependencies=[Depends(_require_admin)],
+)
+def admin_competitor_queue_promote(row_id: int, body: CompetitorPromoteRequest):
+    """
+    Promote a competitor candidate to confirmed competitor_practices.
+    Classification + brand_stems come from the user (pre-filled by frontend heuristic).
+    """
+    from database import promote_competitor_candidate
+    practice = promote_competitor_candidate(
+        row_id=row_id,
+        name=body.name,
+        classification=body.classification,
+        brand_stems=body.brand_stems,
+        notes=body.notes or "",
+        decided_by="admin",
+    )
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Queue row not found")
+    return {"ok": True, "queue_id": row_id, "practice": practice}
 
 
 @app.patch("/api/admin/campaigns/{campaign_id}/strategy", dependencies=[Depends(_require_admin)])

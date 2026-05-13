@@ -2152,6 +2152,76 @@ GROUP BY a.campaign_id, c.campaign_name;
         ON gads_geo_cache(location_name, campaign_name, days, view_type)
     """)
 
+    # ── Competitor memory — confirmed practices + optimizer review queue ──────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_practices (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT NOT NULL,
+            name_normalized TEXT NOT NULL,
+            classification  TEXT NOT NULL DEFAULT 'local_office',
+            brand_stems     TEXT NOT NULL DEFAULT '[]',
+            place_id        TEXT DEFAULT '',
+            notes           TEXT DEFAULT '',
+            source          TEXT DEFAULT 'manual',
+            created_at      TEXT NOT NULL,
+            created_by      TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_competitor_practices_norm
+        ON competitor_practices(name_normalized)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_campaign_policy (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            practice_id         INTEGER NOT NULL,
+            campaign_type       TEXT NOT NULL,
+            negate              INTEGER NOT NULL DEFAULT 1,
+            is_conquest_target  INTEGER NOT NULL DEFAULT 0,
+            confidence          INTEGER NOT NULL DEFAULT 10,
+            threat_level        TEXT DEFAULT '',
+            spend_seen_micros   INTEGER NOT NULL DEFAULT 0,
+            clicks_seen         INTEGER NOT NULL DEFAULT 0,
+            last_confirmed_at   TEXT DEFAULT '',
+            last_updated_at     TEXT NOT NULL,
+            FOREIGN KEY (practice_id) REFERENCES competitor_practices(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ccp_practice_type
+        ON competitor_campaign_policy(practice_id, campaign_type)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_review_queue (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_term         TEXT NOT NULL,
+            term_normalized     TEXT NOT NULL,
+            campaign_id         TEXT DEFAULT '',
+            campaign_name       TEXT DEFAULT '',
+            campaign_type       TEXT DEFAULT '',
+            spend_micros        INTEGER DEFAULT 0,
+            clicks              INTEGER DEFAULT 0,
+            occurrences         INTEGER DEFAULT 1,
+            first_seen_at       TEXT NOT NULL,
+            last_seen_at        TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'pending',
+            decided_at          TEXT DEFAULT '',
+            decided_by          TEXT DEFAULT '',
+            notes               TEXT DEFAULT '',
+            promoted_practice_id INTEGER DEFAULT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_crq_term_campaign
+        ON competitor_review_queue(term_normalized, COALESCE(campaign_id, ''))
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_crq_status
+        ON competitor_review_queue(status, last_seen_at DESC)
+    """)
+
 
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
@@ -7236,6 +7306,211 @@ def update_domain(domain_id: int, **fields) -> None:
             f"UPDATE domain_registry SET {set_clause} WHERE id=?",
             (*cols.values(), domain_id),
         )
+
+
+# ─── Competitor Memory helpers ────────────────────────────────────────────────
+
+import json as _json_mod
+
+
+def list_competitor_queue(status: str = "pending") -> list:
+    """
+    Return competitor_review_queue rows filtered by status.
+    status: 'pending' | 'dismissed' | 'promoted' | 'all'
+    Ordered by spend_micros DESC so highest-spend candidates surface first.
+    """
+    with _conn() as conn:
+        if status == "all":
+            rows = conn.execute(
+                "SELECT * FROM competitor_review_queue ORDER BY spend_micros DESC, last_seen_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM competitor_review_queue WHERE status=? "
+                "ORDER BY spend_micros DESC, last_seen_at DESC",
+                (status,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_competitor_queue_row(row_id: int) -> Optional[dict]:
+    """Return a single competitor_review_queue row by id, or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM competitor_review_queue WHERE id=?", (row_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_competitor_candidate(
+    search_term: str,
+    campaign_id: str = "",
+    campaign_name: str = "",
+    campaign_type: str = "",
+    spend_micros: int = 0,
+    clicks: int = 0,
+) -> None:
+    """
+    Insert or update a competitor_review_queue row for a search term observed
+    in optimizer search-term scans. Does NOT touch rows with status='promoted'
+    or status='dismissed' — those decisions are sticky.
+    """
+    import re as _re
+    now = _now()
+    term_norm = _re.sub(r"[^a-z0-9 ]+", " ", (search_term or "").lower()).strip()
+    term_norm = _re.sub(r" {2,}", " ", term_norm)
+    camp_id_safe = campaign_id or ""
+
+    with _conn() as conn:
+        existing = conn.execute(
+            "SELECT id, status FROM competitor_review_queue "
+            "WHERE term_normalized=? AND COALESCE(campaign_id,'')=?",
+            (term_norm, camp_id_safe),
+        ).fetchone()
+
+        if existing:
+            if existing["status"] in ("promoted", "dismissed"):
+                return  # Never resurface decided rows
+            conn.execute(
+                "UPDATE competitor_review_queue SET "
+                "occurrences=occurrences+1, spend_micros=spend_micros+?, "
+                "clicks=clicks+?, last_seen_at=? WHERE id=?",
+                (spend_micros, clicks, now, existing["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO competitor_review_queue "
+                "(search_term, term_normalized, campaign_id, campaign_name, campaign_type, "
+                " spend_micros, clicks, occurrences, first_seen_at, last_seen_at, status) "
+                "VALUES (?,?,?,?,?,?,?,1,?,?,'pending')",
+                (search_term, term_norm, camp_id_safe or None,
+                 campaign_name, campaign_type, spend_micros, clicks, now, now),
+            )
+
+
+def dismiss_competitor_candidate(row_id: int, decided_by: str = "admin", note: str = "") -> bool:
+    """
+    Mark a competitor_review_queue row as dismissed.
+    Returns True if the row was updated, False if not found or already decided.
+    """
+    now = _now()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, status FROM competitor_review_queue WHERE id=?", (row_id,)
+        ).fetchone()
+        if not row or row["status"] == "promoted":
+            return False
+        conn.execute(
+            "UPDATE competitor_review_queue SET status='dismissed', decided_at=?, "
+            "decided_by=?, notes=? WHERE id=?",
+            (now, decided_by, note, row_id),
+        )
+    return True
+
+
+def restore_competitor_candidate(row_id: int) -> bool:
+    """
+    Move a dismissed competitor_review_queue row back to 'pending'.
+    Clears decided_at / decided_by so it surfaces normally again.
+    Returns True if updated, False if not found.
+    """
+    now = _now()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, status FROM competitor_review_queue WHERE id=?", (row_id,)
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE competitor_review_queue SET status='pending', decided_at='', "
+            "decided_by='', last_seen_at=? WHERE id=?",
+            (now, row_id),
+        )
+    return True
+
+
+def promote_competitor_candidate(
+    row_id: int,
+    name: str,
+    classification: str,
+    brand_stems: list,
+    notes: str = "",
+    decided_by: str = "admin",
+) -> Optional[dict]:
+    """
+    Promote a review_queue row to a confirmed competitor_practices entry.
+    Returns the practice dict on success, None if the queue row is not found.
+    Idempotent on name_normalized — if the practice already exists, updates brand_stems.
+    """
+    import re as _re
+    now = _now()
+    name_norm = _re.sub(r"[^a-z0-9 ]+", " ", (name or "").lower()).strip()
+    name_norm = _re.sub(r" {2,}", " ", name_norm)
+    stems_json = _json_mod.dumps(sorted(set(brand_stems)))
+
+    with _conn() as conn:
+        queue_row = conn.execute(
+            "SELECT id, status FROM competitor_review_queue WHERE id=?", (row_id,)
+        ).fetchone()
+        if not queue_row:
+            return None
+
+        # Upsert into competitor_practices
+        existing_practice = conn.execute(
+            "SELECT id FROM competitor_practices WHERE name_normalized=?", (name_norm,)
+        ).fetchone()
+
+        if existing_practice:
+            practice_id = existing_practice["id"]
+            conn.execute(
+                "UPDATE competitor_practices SET brand_stems=?, notes=? WHERE id=?",
+                (stems_json, notes, practice_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO competitor_practices "
+                "(name, name_normalized, classification, brand_stems, notes, source, created_at, created_by) "
+                "VALUES (?,?,?,?,?,'optimizer_promote',?,?)",
+                (name, name_norm, classification, stems_json, notes, now, decided_by),
+            )
+            practice_id = cur.lastrowid
+
+        # Mark queue row as promoted
+        conn.execute(
+            "UPDATE competitor_review_queue SET status='promoted', decided_at=?, "
+            "decided_by=?, promoted_practice_id=? WHERE id=?",
+            (now, decided_by, practice_id, row_id),
+        )
+
+        practice = conn.execute(
+            "SELECT * FROM competitor_practices WHERE id=?", (practice_id,)
+        ).fetchone()
+
+    return dict(practice) if practice else None
+
+
+def get_all_competitor_practices() -> list:
+    """Return all confirmed competitor_practices rows."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM competitor_practices ORDER BY name ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_practices_with_stems() -> list:
+    """
+    Return competitor_practices rows with brand_stems parsed from JSON.
+    Used by write_back_competitor_memory() for stem-matching against search terms.
+    """
+    practices = get_all_competitor_practices()
+    for p in practices:
+        stems = p.get("brand_stems") or "[]"
+        try:
+            p["brand_stems"] = _json_mod.loads(stems) if isinstance(stems, str) else stems
+        except Exception:
+            p["brand_stems"] = []
+    return practices
 
 
 def delete_domain(domain_id: int) -> None:

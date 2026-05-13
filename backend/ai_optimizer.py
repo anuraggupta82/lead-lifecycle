@@ -1244,6 +1244,130 @@ def _score_tier(impr: int, clicks: int, cost_usd: float, conv: float, avg_ctr: f
     return "average"
 
 
+def _write_back_competitor_memory(
+    run_id: str,
+    search_terms: list,
+) -> dict:
+    """
+    Match recent search terms against known competitor brand stems in
+    competitor_practices. Bumps confidence + spend for confirmed matches.
+    Queues brand-like terms tagged 'conquest' by the semantic classifier
+    (via st_classifications table) for human review.
+
+    C2 fix: search_term rows use cost (dollars float) not cost_micros;
+            campaign key is campaign_resource not campaign_id.
+    C3 fix: query st_classifications table to get verdict per (term, campaign).
+
+    Returns: {"confirmed": [...], "new_candidates": [...]}
+    """
+    import re as _re
+    from database import get_all_practices_with_stems, upsert_competitor_candidate
+
+    # ── 1. Load all known competitor brand stems ──────────────────────────────
+    practices = []
+    try:
+        practices = get_all_practices_with_stems()
+    except Exception:
+        pass
+
+    # Build stem → practice_id map for fast lookup
+    stem_to_pid: dict[str, int] = {}
+    for p in practices:
+        for stem in (p.get("brand_stems") or []):
+            s = stem.strip().lower()
+            if s:
+                stem_to_pid[s] = p["id"]
+
+    # ── 2. Load classifier verdicts from st_classifications (C3 fix) ─────────
+    # Build map: (normalized_term, campaign_name_lower) → verdict
+    # so we can detect conquest-tagged terms without relying on inline row fields.
+    verdict_map: dict[tuple, str] = {}
+    try:
+        from database import _conn
+        with _conn() as _vc:
+            rows_v = _vc.execute(
+                "SELECT search_term, campaign_name, verdict FROM st_classifications "
+                "WHERE verdict = 'conquest'"
+            ).fetchall()
+        for rv in rows_v:
+            k = (rv[0].strip().lower(), (rv[1] or "").strip().lower())
+            verdict_map[k] = rv[2]
+    except Exception:
+        pass  # no st_classifications table yet — silently skip
+
+    # ── 3. Walk search terms ──────────────────────────────────────────────────
+    confirmed: list[dict] = []
+    new_candidates: list[dict] = []
+
+    for row in (search_terms or []):
+        term = (row.get("search_term") or "").strip().lower()
+        if not term or len(term) < 4:
+            continue
+
+        # C2 fix: cost is stored as dollars (float); convert to micros for the DB
+        cost_dollars = float(row.get("cost") or 0.0)
+        spend_micros = int(round(cost_dollars * 1_000_000))
+        clicks = int(row.get("clicks") or 0)
+        campaign_name = (row.get("campaign") or row.get("campaign_name") or "").strip()
+        # C2 fix: use campaign_resource (the full resource string) as campaign_id
+        campaign_resource = row.get("campaign_resource") or ""
+
+        # Try to match against known stems (word-boundary to avoid false positives)
+        matched_pid: int | None = None
+        for stem, pid in stem_to_pid.items():
+            if len(stem) < 4:
+                continue
+            if _re.search(r"\b" + _re.escape(stem) + r"\b", term):
+                matched_pid = pid
+                break
+
+        if matched_pid is not None:
+            # Known competitor — bump confidence/spend in campaign policy
+            try:
+                from database import _now
+                from search_term_classifier import _detect_campaign_type as _detect_ct_cm
+                ctype = _detect_ct_cm(campaign_name) or "general"
+                now = _now()
+                with _conn() as _c:
+                    _c.execute("""
+                        INSERT INTO competitor_campaign_policy
+                            (practice_id, campaign_type, negate, confidence,
+                             spend_seen_micros, clicks_seen, last_confirmed_at, last_updated_at)
+                        VALUES (?,?,1,10,?,?,?,?)
+                        ON CONFLICT(practice_id, campaign_type) DO UPDATE SET
+                            confidence = MIN(100, confidence + 5),
+                            spend_seen_micros = spend_seen_micros + excluded.spend_seen_micros,
+                            clicks_seen = clicks_seen + excluded.clicks_seen,
+                            last_confirmed_at = excluded.last_confirmed_at,
+                            last_updated_at = excluded.last_updated_at
+                    """, (matched_pid, ctype, spend_micros, clicks, now, now))
+            except Exception as _upd_err:
+                logger.debug(f"Competitor memory update failed for pid={matched_pid}: {_upd_err}")
+            confirmed.append({"term": term, "practice_id": matched_pid, "spend_micros": spend_micros})
+
+        else:
+            # C3 fix: check verdict from st_classifications table (not inline row field)
+            camp_key = campaign_name.strip().lower()
+            verdict = verdict_map.get((term, camp_key), "")
+            if verdict == "conquest" and spend_micros > 0:
+                try:
+                    from search_term_classifier import _detect_campaign_type as _detect_ct_cm2
+                    ctype2 = _detect_ct_cm2(campaign_name) or "general"
+                    upsert_competitor_candidate(
+                        search_term=term,
+                        campaign_id=campaign_resource,
+                        campaign_name=campaign_name,
+                        campaign_type=ctype2,
+                        spend_micros=spend_micros,
+                        clicks=clicks,
+                    )
+                    new_candidates.append({"term": term, "campaign_name": campaign_name, "spend_micros": spend_micros})
+                except Exception as _cand_err:
+                    logger.debug(f"Competitor candidate upsert failed for '{term}': {_cand_err}")
+
+    return {"confirmed": confirmed, "new_candidates": new_candidates}
+
+
 def _compute_budget_click_signal(
     planned_ad_groups: list,
     monthly_budget: float,
@@ -5376,6 +5500,24 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
     if _classifier_negatives_staged:
         logger.info(f"Semantic classifier staged {_classifier_negatives_staged} negative(s) total")
+
+    # ── Competitor memory write-back ─────────────────────────────────────────
+    # Match recent search terms against known competitor brand stems.
+    # Bumps confidence for confirmed competitors; queues unknown brand-like
+    # terms for human review. Must run BEFORE Claude advisories so the
+    # enriched memory is available in competitor_intel context.
+    try:
+        _comp_memory_result = _write_back_competitor_memory(
+            run_id=run_id,
+            search_terms=search_terms,
+        )
+        if _comp_memory_result.get("confirmed"):
+            logger.info(
+                f"Competitor memory: confirmed {len(_comp_memory_result['confirmed'])} brand term(s), "
+                f"queued {len(_comp_memory_result.get('new_candidates', []))} new candidate(s)"
+            )
+    except Exception as _cm_err:
+        logger.warning(f"Competitor memory write-back failed (non-fatal): {_cm_err}")
 
     # Claude structured recommendations — run once per active campaign.
     # Returns dicts with operation + exact API parameters, not plain text.
