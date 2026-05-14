@@ -4057,7 +4057,7 @@ function CallsSubView() {
                     const matched = !!c.mango_uuid;
                     // Build a call-shaped object for rows that came from a matched Mango record
                     // For unmatched rows we still render the row but greyed out / no actions
-                    const isConv = (c.gads_duration_sec||0) >= 60;
+                    const isConv = !!(c.od_appointment_id);
                     const callObj = matched ? {
                       ...c,
                       uuid: c.mango_uuid,
@@ -4248,7 +4248,7 @@ function CallsSubView() {
                     background:drawerCall&&drawerCall.uuid===call.uuid?'#dbeafe':call.status==='missed'?'#fef2f2':'#fff'}}>
                   <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
                     {_fmtTime(call.started_at)}
-                    {(call.gads_duration_sec||0)>=60 && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
+                    {!!(call.od_appointment_id) && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
                     {call.gads_call_id && (() => {
                       const conf = call.match_confidence || 0;
                       const [bg, col] = conf >= 0.75 ? ['#dbeafe','#1d4ed8'] : conf >= 0.60 ? ['#fef3c7','#92400e'] : ['#fee2e2','#991b1b'];
@@ -14783,7 +14783,25 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
   const allChecked = recs.length > 0 && selectedIds.length === recs.length;
   const someChecked = selectedIds.length > 0 && selectedIds.length < recs.length;
 
-  const toggle = (id) => setSelected(p => ({...p, [id]: !p[id]}));
+  const lastCheckedRef = React.useRef(null);
+  const toggle = (id, e) => {
+    if (e && e.shiftKey && lastCheckedRef.current && lastCheckedRef.current !== id) {
+      const ids = recs.map(r => r.action_id);
+      const a = ids.indexOf(lastCheckedRef.current);
+      const b = ids.indexOf(id);
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      const rangeIds = ids.slice(lo, hi + 1);
+      const newVal = !selected[id];
+      setSelected(p => {
+        const next = {...p};
+        rangeIds.forEach(rid => { next[rid] = newVal; });
+        return next;
+      });
+    } else {
+      setSelected(p => ({...p, [id]: !p[id]}));
+    }
+    lastCheckedRef.current = id;
+  };
   const toggleAll = () => {
     if (allChecked) setSelected({});
     else { const n = {}; recs.forEach(r => { n[r.action_id] = true; }); setSelected(n); }
@@ -14893,7 +14911,7 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
                       borderColor: selected[rec.action_id] ? 'var(--teal)' : 'var(--border)'}}>
                     <input type="checkbox"
                       checked={!!selected[rec.action_id]}
-                      onChange={() => toggle(rec.action_id)}
+                      onChange={(e) => toggle(rec.action_id, e)}
                       style={{marginTop:3,cursor:'pointer',flexShrink:0}} />
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:3}}>

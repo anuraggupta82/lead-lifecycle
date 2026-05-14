@@ -683,7 +683,9 @@ def sync_call_view(days_back: int = 14) -> int:
             call_view.start_call_date_time,
             call_view.end_call_date_time,
             campaign.id,
-            campaign.name
+            campaign.name,
+            ad_group.id,
+            ad_group.name
         FROM call_view
         ORDER BY call_view.start_call_date_time DESC
         LIMIT 500
@@ -705,6 +707,8 @@ def sync_call_view(days_back: int = 14) -> int:
                 "customer_id": customer_id,
                 "campaign_id": str(row.campaign.id),
                 "campaign_name": row.campaign.name,
+                "ad_group_id": str(row.ad_group.id) if row.ad_group.id else "",
+                "ad_group_name": row.ad_group.name or "",
                 "caller_country_code": cv.caller_country_code or "",
                 "caller_area_code": cv.caller_area_code or "",
                 "call_duration_sec": int(cv.call_duration_seconds or 0),

@@ -29,6 +29,7 @@ from database import (
     get_gads_call_view,
     get_all_leads,
     update_mango_call_attribution,
+    backfill_call_keyword_attribution,
     _conn as _db_conn,
 )
 
@@ -618,7 +619,7 @@ def _flag_unattributed_missed_new_patients(days: int = 7) -> int:
     return created
 
 
-def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
+def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_token: Optional[str] = None) -> int:
     """
     Match unattributed inbound Mango calls against:
       1. Google Ads call_view rows (ad-driven calls by area code + time window)
@@ -847,7 +848,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                 match_method=best_method,
             )
             attributed += 1
-            _queue_process_if_needed(mc)
+            _queue_process_if_needed(mc, mango_token=mango_token)
 
             # Create call flag if this GAds call was missed or short
             try:
@@ -872,9 +873,19 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "") -> int:
                     match_method="phone_exact",
                 )
                 attributed += 1
-                _queue_process_if_needed(mc)
+                _queue_process_if_needed(mc, mango_token=mango_token)
 
     logger.info(f"Mango reconcile: attributed {attributed}/{len(unmatched)} calls")
+
+    # Backfill keyword attribution on any calls matched to a GAds call_view row
+    # (call_view doesn't expose the triggering keyword directly — we derive it from
+    # the best keyword in the matched ad group using gads_keyword_perf cache)
+    try:
+        kw_backfilled = backfill_call_keyword_attribution()
+        if kw_backfilled:
+            logger.info(f"Backfilled keyword attribution on {kw_backfilled} call(s)")
+    except Exception as _kwe:
+        logger.warning(f"backfill_call_keyword_attribution failed (non-fatal): {_kwe}")
 
     # Backfill flags for previously-attributed GAds calls that may have missed flag creation
     _backfill_call_flags_for_attributed(days=days)
@@ -921,12 +932,16 @@ def _backfill_call_flags_for_attributed(days: int = 7) -> int:
     return created
 
 
-def _queue_process_if_needed(mc: dict) -> None:
+def _queue_process_if_needed(mc: dict, mango_token: Optional[str] = None) -> None:
     """
     If a newly-matched call hasn't been transcribed yet, queue it for full
     pipeline processing (transcription → summary → grading) in a background
     thread. Skips calls that are already done, in-progress, or too short to
     be worth transcribing (<15s).
+
+    mango_token must be passed so process_call can fetch a fresh pre-signed
+    recording URL from Mango. Without it, process_call immediately writes
+    transcription_status='skipped_no_audio' and aborts.
     """
     status = mc.get("transcription_status") or ""
     duration = int(mc.get("duration_sec") or 0)
@@ -938,6 +953,10 @@ def _queue_process_if_needed(mc: dict) -> None:
         logger.debug(f"[reconcile] Skipping auto-process for {uuid[:8]} — too short ({duration}s)")
         return
 
+    if not mango_token:
+        logger.warning(f"[reconcile] No mango_token available — call {uuid[:8]} will remain pending for pipeline tick")
+        return
+
     logger.info(f"[reconcile] Queuing auto-process for newly matched call {uuid[:8]} ({duration}s)")
 
     def _run():
@@ -946,7 +965,7 @@ def _queue_process_if_needed(mc: dict) -> None:
             from database import get_mango_call
             call_row = get_mango_call(uuid)
             if call_row:
-                process_call(call_row)
+                process_call(call_row, mango_token=mango_token)
         except Exception as e:
             logger.warning(f"[reconcile] Auto-process failed for {uuid[:8]}: {e}")
 

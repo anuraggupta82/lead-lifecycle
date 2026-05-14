@@ -42,7 +42,7 @@ from database import (
     get_campaign_stats, get_google_ads_campaigns, get_distinct_sources, get_keyword_stats,
     get_search_term_stats, get_st_classifications, get_geo_stats, get_geo_stats_by_campaign, get_schedule_stats,
     get_geo_json_for_campaign_resource, update_geo_json_for_campaign_resource,
-    add_deleted_lead_tombstone, backfill_communication_log,
+    add_deleted_lead_tombstone, backfill_communication_log, backfill_call_keyword_attribution,
     get_or_create_conversation, get_conversation, get_messages, get_all_conversations,
     get_daily_stats, get_ad_group_stats,
     save_outbound_message, get_lead_messages,
@@ -111,6 +111,25 @@ async def lifespan(app: FastAPI):
         logger.info(f"communication_log backfill: inserted {n} row(s)")
     except Exception as e:
         logger.warning(f"communication_log backfill failed (non-fatal): {e}")
+
+    # Rescue any calls that were stranded as 'skipped_no_audio' due to missing
+    # Mango token during reconciliation — reset them so the pipeline tick can
+    # retry transcription on the next cycle.
+    try:
+        from database import reset_skipped_no_audio_calls
+        n_rescued = reset_skipped_no_audio_calls()
+        if n_rescued:
+            logger.info(f"Rescued {n_rescued} skipped_no_audio call(s) — reset to pending for pipeline retry")
+    except Exception as e:
+        logger.warning(f"reset_skipped_no_audio_calls failed (non-fatal): {e}")
+
+    # Backfill keyword attribution on any calls already matched to GAds call_view rows
+    try:
+        n_kw = backfill_call_keyword_attribution()
+        if n_kw:
+            logger.info(f"Startup: backfilled keyword attribution on {n_kw} call(s)")
+    except Exception as e:
+        logger.warning(f"backfill_call_keyword_attribution failed (non-fatal): {e}")
 
     # Auto-sync Firestore leads on startup (non-blocking — ignore errors)
     try:
@@ -242,7 +261,8 @@ async def lifespan(app: FastAPI):
             def _mango_reconcile_job():
                 _stamp("mango_reconcile")
                 try:
-                    n = reconcile_attribution(days=7)
+                    _tok = _mango_token_mgr.get_token()
+                    n = reconcile_attribution(days=7, mango_token=_tok)
                     if n > 0:
                         logger.info(f"Mango reconcile: {n} calls attributed")
                 except Exception as e:
@@ -2721,10 +2741,17 @@ def account_recommendations(status: str = "all", limit: int = 500):
 
     with _db_conn() as conn:
         if status == "all":
-            rows = conn.execute(
-                "SELECT * FROM gads_audit_log ORDER BY priority ASC, created_at DESC LIMIT ?",
-                (limit,)
+            # Always surface pending_approval rows first so they are never crowded
+            # out by the limit when there are many success/history rows in the DB.
+            pending_rows = conn.execute(
+                "SELECT * FROM gads_audit_log WHERE execution_result='pending_approval' ORDER BY priority ASC, created_at DESC",
             ).fetchall()
+            remaining = max(0, limit - len(pending_rows))
+            history_rows = conn.execute(
+                "SELECT * FROM gads_audit_log WHERE execution_result != 'pending_approval' ORDER BY priority ASC, created_at DESC LIMIT ?",
+                (remaining,)
+            ).fetchall()
+            rows = list(pending_rows) + list(history_rows)
         else:
             rows = conn.execute(
                 "SELECT * FROM gads_audit_log WHERE execution_result=? ORDER BY priority ASC, created_at DESC LIMIT ?",
@@ -5117,18 +5144,16 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
         _brand_neg_rule = ""
         try:
             from database import get_brand_negatives_for_campaign as _get_brand_negs
-            _brand_stems = _get_brand_negs(campaign_type=_kw_camp_type, max_miles=20.0)
+            # Cap to 10 miles + 50 stems max to keep prompt size manageable
+            _brand_stems = _get_brand_negs(campaign_type=_kw_camp_type, max_miles=10.0)[:50]
             if _brand_stems:
                 _brand_neg_block = (
-                    f"\n\n=== NEARBY PRACTICE BRAND NEGATIVES (MANDATORY — add ALL to negative_keywords) ===\n"
-                    f"These {len(_brand_stems)} brand stems come from real dental practices within 20 miles.\n"
-                    f"They MUST be in negative_keywords to prevent accidental clicks from patients\n"
-                    f"searching for a competitor's contact info or phone number:\n"
-                    + "\n".join(f"  - \"{s}\"" for s in _brand_stems)
+                    f"\n\n=== NEARBY PRACTICE BRAND NEGATIVES (add to negative_keywords) ===\n"
+                    f"Top {len(_brand_stems)} brand stems from nearby dental practices (within 10 miles):\n"
+                    + ", ".join(f'"{s}"' for s in _brand_stems)
                 )
                 _brand_neg_rule = (
-                    f"\n- BRAND NEGATIVES (mandatory): Add ALL {len(_brand_stems)} nearby practice brand stems "
-                    f"listed above to negative_keywords. Do not omit any."
+                    f" Include the {len(_brand_stems)} brand stems listed above."
                 )
         except Exception as _bne:
             logger.warning(f"build-step keywords: brand negatives load failed (non-fatal): {_bne}")
@@ -5445,7 +5470,7 @@ No markdown, no explanation outside the JSON."""
     try:
         response = ai_client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=2000,
+            max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
@@ -7485,7 +7510,8 @@ def admin_mango_reconcile_now(days: int = 14):
     try:
         from mango_service import reconcile_attribution
         days = max(1, min(int(days), 90))
-        n = reconcile_attribution(days=days)
+        _tok = app.state.mango_token_mgr.get_token() if hasattr(app.state, "mango_token_mgr") else None
+        n = reconcile_attribution(days=days, mango_token=_tok)
         return {"attributed": n, "days": days}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -7617,7 +7643,8 @@ def admin_gads_match_and_transcribe(call_id: str, request: Request, background_t
         mango_uuid = already["uuid"]
     else:
         # 3. Run reconciler with 90-day window + targeted mode for detailed logging
-        reconcile_attribution(days=90, target_gads_call_id=call_id)
+        _tok = app.state.mango_token_mgr.get_token() if hasattr(app.state, "mango_token_mgr") else None
+        reconcile_attribution(days=90, target_gads_call_id=call_id, mango_token=_tok)
         # Also run keyword attribution so the newly-matched call gets attributed
         try:
             from call_keyword_attribution import attribute_calls_to_keywords
@@ -7679,6 +7706,18 @@ def admin_gads_sync_call_view():
         from google_ads_sync import sync_call_view
         n = sync_call_view(days_back=14)
         return {"synced": n}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/backfill-keyword-attribution", dependencies=[Depends(_require_admin)])
+def admin_backfill_call_keyword_attribution():
+    """Backfill attributed_keyword on calls matched to GAds call_view rows.
+    Uses the best keyword from the matched ad group in gads_keyword_perf.
+    Safe to run repeatedly — only updates calls with no keyword yet."""
+    try:
+        n = backfill_call_keyword_attribution()
+        return {"updated": n}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

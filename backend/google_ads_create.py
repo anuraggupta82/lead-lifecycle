@@ -678,7 +678,12 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         exact_kws  = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("exact_match", [])]
         phrase_kws = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("phrase_match", [])]
         broad_kws  = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("broad_match_modifier", [])]
-        neg_kws    = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("negative_keywords", [])]
+        neg_kws_raw = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("negative_keywords", [])]
+        # Google Ads rejects negatives with more than 10 words (KEYWORD_HAS_TOO_MANY_WORDS)
+        neg_kws = [kw for kw in neg_kws_raw if kw.strip() and len(kw.split()) <= 10]
+        if len(neg_kws) < len(neg_kws_raw):
+            _skipped = [kw for kw in neg_kws_raw if len(kw.split()) > 10]
+            logger.warning(f"[create] Skipped {len(_skipped)} negative keywords exceeding 10-word limit: {_skipped[:5]}")
 
         # Split keywords evenly across ad groups if multiple groups
         # (Simple approach: all groups get all keywords — Google doesn't mind)

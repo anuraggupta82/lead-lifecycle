@@ -718,6 +718,8 @@ CREATE TABLE IF NOT EXISTS gads_call_view (
     customer_id                  TEXT,
     campaign_id                  TEXT,
     campaign_name                TEXT,
+    ad_group_id                  TEXT DEFAULT '',
+    ad_group_name                TEXT DEFAULT '',
     caller_country_code          TEXT,
     caller_area_code             TEXT,
     call_duration_sec            INTEGER DEFAULT 0,
@@ -2322,6 +2324,15 @@ GROUP BY a.campaign_id, c.campaign_name;
         CREATE INDEX IF NOT EXISTS idx_crq_status
         ON competitor_review_queue(status, last_seen_at DESC)
     """)
+
+    # ── gads_call_view: add ad_group columns (migration for existing DBs) ─────
+    _gcv_cols = {row[1] for row in conn.execute("PRAGMA table_info(gads_call_view)").fetchall()}
+    for _col, _def in [("ad_group_id", "TEXT DEFAULT ''"), ("ad_group_name", "TEXT DEFAULT ''")]:
+        if _col not in _gcv_cols:
+            try:
+                conn.execute(f"ALTER TABLE gads_call_view ADD COLUMN {_col} {_def}")
+            except Exception:
+                pass
 
 
 def _seed_call_grading_criteria(conn):
@@ -5373,10 +5384,10 @@ def get_pending_approvals() -> list:
         return [dict(r) for r in rows]
 
 
-def expire_stale_audit_rows(max_age_hours: int = 48) -> int:
+def expire_stale_audit_rows(max_age_hours: int = 336) -> int:
     """
     Mark pending_approval rows older than max_age_hours as 'expired'.
-    Returns count of rows expired.
+    Returns count of rows expired. Default is 14 days (336h).
     """
     now = _now()
     with _conn() as conn:
@@ -5386,6 +5397,31 @@ def expire_stale_audit_rows(max_age_hours: int = 48) -> int:
              WHERE execution_result='pending_approval'
                AND created_at < datetime('now', ? || ' hours')
         """, (now, f"-{max_age_hours}"))
+        return cursor.rowcount
+
+
+def reset_skipped_no_audio_calls() -> int:
+    """
+    Reset stranded mango_calls with transcription_status='skipped_no_audio' back
+    to 'pending' so the pipeline tick can pick them up with a fresh Mango token.
+
+    Only resets inbound calls ≥15 seconds that are not missed/busy/voicemail
+    (i.e., calls that actually have a recording to transcribe).
+    Returns count of rows reset.
+    """
+    now = _now()
+    with _conn() as conn:
+        cursor = conn.execute("""
+            UPDATE mango_calls
+               SET transcription_status = 'pending',
+                   pipeline_error = '',
+                   pipeline_attempts = 0,
+                   updated_at = ?
+             WHERE transcription_status = 'skipped_no_audio'
+               AND direction = 'inbound'
+               AND duration_sec >= 15
+               AND status NOT IN ('missed', 'busy', 'voicemail')
+        """, (now,))
         return cursor.rowcount
 
 
@@ -6642,11 +6678,14 @@ def upsert_gads_call_view(call: dict) -> None:
         conn.execute(
             """INSERT INTO gads_call_view
                (call_id, customer_id, campaign_id, campaign_name,
+                ad_group_id, ad_group_name,
                 caller_country_code, caller_area_code,
                 call_duration_sec, call_status, call_type,
                 start_call_date_time, synced_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(call_id) DO UPDATE SET
+                 ad_group_id=COALESCE(excluded.ad_group_id, ad_group_id),
+                 ad_group_name=COALESCE(excluded.ad_group_name, ad_group_name),
                  call_duration_sec=excluded.call_duration_sec,
                  call_status=excluded.call_status,
                  synced_at=excluded.synced_at""",
@@ -6655,6 +6694,8 @@ def upsert_gads_call_view(call: dict) -> None:
                 call.get("customer_id", ""),
                 call.get("campaign_id", ""),
                 call.get("campaign_name", ""),
+                call.get("ad_group_id", ""),
+                call.get("ad_group_name", ""),
                 call.get("caller_country_code", ""),
                 call.get("caller_area_code", ""),
                 int(call.get("call_duration_sec", 0)),
@@ -6717,6 +6758,90 @@ def get_gads_call_view(days: int = 30) -> list:
             (cutoff,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def backfill_call_keyword_attribution() -> int:
+    """
+    Backfill attributed_keyword / attributed_ad_group / attributed_campaign_name on
+    mango_calls rows that have a gads_call_id but no attributed_keyword yet.
+
+    Strategy (best-effort — call_view doesn't expose the triggering keyword):
+      1. Join mango_calls → gads_call_view via gads_call_id to get campaign_id + ad_group_id.
+      2. Look up the top keyword in that ad_group from gads_keyword_perf (highest clicks).
+      3. If no keyword perf row exists for that ad_group, fall back to campaign_name only.
+
+    Sets attributed_keyword_method = 'ad_group_best_keyword' or 'campaign_only'.
+    Returns count of rows updated.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    with _conn() as conn:
+        # Fetch all matched calls with no keyword attribution
+        rows = conn.execute("""
+            SELECT mc.uuid, mc.gads_call_id,
+                   gcv.campaign_id, gcv.campaign_name, gcv.ad_group_id, gcv.ad_group_name
+            FROM mango_calls mc
+            JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+            WHERE mc.gads_call_id IS NOT NULL
+              AND mc.gads_call_id != ''
+              AND (mc.attributed_keyword IS NULL OR mc.attributed_keyword = '')
+        """).fetchall()
+
+        for row in rows:
+            uuid = row[0]
+            campaign_id = row[2] or ""
+            campaign_name = row[3] or ""
+            ad_group_id = row[4] or ""
+            ad_group_name = row[5] or ""
+
+            keyword = ""
+            method = "campaign_only"
+
+            # Try to find best keyword in this ad group from keyword perf cache
+            # gads_keywords_cache has ad_group_name but not ad_group_id, so match by name
+            if ad_group_name:
+                kw_row = conn.execute("""
+                    SELECT keyword_text FROM gads_keywords_cache
+                    WHERE ad_group_name = ?
+                      AND keyword_text != ''
+                    ORDER BY clicks DESC, impressions DESC
+                    LIMIT 1
+                """, (ad_group_name,)).fetchone()
+                if kw_row and kw_row[0]:
+                    keyword = kw_row[0]
+                    method = "ad_group_best_keyword"
+
+            # Fallback: best keyword for the campaign overall
+            if not keyword and campaign_name:
+                kw_row = conn.execute("""
+                    SELECT keyword_text FROM gads_keywords_cache
+                    WHERE campaign_name = ?
+                      AND keyword_text != ''
+                    ORDER BY clicks DESC, impressions DESC
+                    LIMIT 1
+                """, (campaign_name,)).fetchone()
+                if kw_row and kw_row[0]:
+                    keyword = kw_row[0]
+                    method = "campaign_only"
+
+            # Last resort: use campaign name itself as the attribution label
+            if not keyword and campaign_name:
+                keyword = campaign_name
+                method = "campaign_only"
+
+            # Store ad_group as "CampaignName > AdGroupName" for display clarity
+            ag_display = f"{campaign_name} > {ad_group_name}" if ad_group_name else campaign_name
+            conn.execute("""
+                UPDATE mango_calls SET
+                    attributed_keyword=?,
+                    attributed_ad_group=?,
+                    attributed_keyword_method=?,
+                    updated_at=?
+                WHERE uuid=?
+            """, (keyword, ag_display, method, now, uuid))
+            updated += 1
+
+    return updated
 
 
 def get_gads_call_conversions(days: int = 30, min_duration_sec: int = 0) -> list:
@@ -7888,7 +8013,9 @@ def get_brand_negatives_for_campaign(
 
         for s in (p.get("brand_stems") or []):
             s_clean = (s or "").strip().lower()
-            if s_clean and s_clean not in seen:
+            # Google Ads rejects negatives with > 10 words; skip stems that are too long
+            # (common for doctor names like "dr matthew r annese d m d")
+            if s_clean and s_clean not in seen and len(s_clean.split()) <= 4:
                 seen.add(s_clean)
                 stems.append(s_clean)
 

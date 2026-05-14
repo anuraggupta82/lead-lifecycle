@@ -182,6 +182,49 @@ _HARD_NEGATIVES = [
 ]
 _SOFT_NEGATIVES = []
 
+# Services GDC does NOT offer at all — terms containing these should become
+# account-level negatives, never suggested as new exact keywords.
+_OUT_OF_SCOPE_SERVICES = [
+    "oral surgeon", "oral surgery",
+    "wisdom teeth removal", "wisdom tooth removal", "wisdom teeth extraction",
+    "tooth extraction near", "extractions near",
+    "orthodontist", "orthodontists",   # GDC does clear aligners but is NOT an orthodontist
+    "braces", "metal braces", "ceramic braces",
+    "invisalign",                      # competitor aligner brand
+    "periodontist", "periodontists",
+    "endodontist", "endodontists",
+    "prosthodontist",
+    "pediatric dentist", "kids dentist", "children dentist", "children's dentist",
+    "dental school", "dental college",
+    "medicaid dentist", "masshealth dentist", "medicaid dental", "masshealth dental",
+    "medicaid", "masshealth", "mass health", "chip dental",
+]
+
+# Terms that could be valid — but ONLY in the context of a clear aligner campaign.
+# The rule-based harvester should NOT add these as account-level keywords.
+_ALIGNER_ONLY_TERMS = [
+    "orthodontics", "orthodontic",
+    "clear aligner", "clear aligners",
+    "teeth straightening", "teeth alignment",
+    "aligner",
+]
+
+
+def _is_out_of_scope(term: str) -> str:
+    """Returns a reason string if the term is out of scope for GDC, else empty string."""
+    t = term.lower()
+    for signal in _OUT_OF_SCOPE_SERVICES:
+        if signal in t:
+            return f"Out-of-scope service: '{signal}' — GDC does not offer this"
+    return ""
+
+
+def _is_aligner_only(term: str) -> bool:
+    """Returns True if this term should only be added in a clear aligner campaign context."""
+    t = term.lower()
+    return any(sig in t for sig in _ALIGNER_ONLY_TERMS)
+
+
 _COMPETITOR_NAMES = [
     # Direct local competitors
     "grace dental", "grace smiles",
@@ -666,6 +709,9 @@ def _is_negative_intent(term: str) -> str:
     comp_reason = _is_competitor_term(t)
     if comp_reason:
         return comp_reason
+    oos_reason = _is_out_of_scope(t)
+    if oos_reason:
+        return oos_reason
     for signal in _HARD_NEGATIVES:
         if signal in t:
             return f"Negative intent: '{signal}'"
@@ -3266,6 +3312,11 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                 "reason": neg_reason,
             })
         elif st["conversions"] > 0 and term not in existing_keywords:
+            # Skip aligner-only terms at account level — only valid in a clear aligner campaign
+            if _is_aligner_only(term):
+                logger.info(f"  SKIP harvest '{term}' — aligner-only term, not appropriate as account-level keyword")
+                continue
+
             # Count as real acquisition if: form lead attribution OR keyword-level call attribution
             term_has_real_leads = any(
                 term in a_kw.lower() or a_kw.lower() in term
@@ -5050,10 +5101,11 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    # Expire recommendations older than 48h before generating new ones
+    # Expire recommendations older than 14 days before generating new ones
+    # (was 48h — too aggressive; users need more time to review and approve)
     _optimizer_progress["started_at"] = _time_mod.time()
     _set_progress(0)  # Starting
-    expired = expire_stale_pending(max_age_hours=48)
+    expired = expire_stale_pending(max_age_hours=336)
 
     try:
         _set_progress(1)  # Syncing GAds Data
@@ -5504,7 +5556,23 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         kw["action_id"] = aid
         actions_pending += 1
 
+    # Fetch already-pending exact keyword terms to avoid duplicates across runs
+    _pending_exact_terms: set = set()
+    try:
+        from database import _conn as _dedup_conn
+        with _dedup_conn() as _dc:
+            _dup_rows = _dc.execute(
+                "SELECT entity_name FROM gads_audit_log WHERE operation='add_exact_keyword' AND execution_result='pending_approval'"
+            ).fetchall()
+            _pending_exact_terms = {r[0].lower() for r in _dup_rows}
+    except Exception as _de:
+        logger.warning(f"Could not load pending exact terms for dedup: {_de}")
+
     for st in actions["new_exact"]:
+        # Skip if this exact term is already pending approval from a previous run
+        if st["search_term"].lower() in _pending_exact_terms:
+            logger.info(f"  DEDUP skip add_exact_keyword '{st['search_term']}' — already pending approval")
+            continue
         aid = log_pending(
             operation="add_exact_keyword",
             entity_type="keyword",
