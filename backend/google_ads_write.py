@@ -491,3 +491,80 @@ def replace_campaign_locations(
         "added": added,
         "errors": errors,
     }
+
+
+# ── 6. Remove a campaign-level negative keyword ───────────────────────────────
+
+def remove_negative_keyword_from_campaign(
+    campaign_resource: str,
+    keyword_text: str,
+    match_type: str = "PHRASE",
+) -> bool:
+    """
+    Remove a campaign-level negative keyword if it exists.
+
+    First fetches the campaign_criterion resource_name via GAQL, then issues
+    a remove mutation. Returns True if removed or if the keyword did not exist
+    (idempotent). Raises on API-level errors.
+
+    Used by the competitor intel engine to suppress brand negatives for national
+    chains that are actively advertising the same service (conquest intent).
+    """
+    match_type = (match_type or "PHRASE").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise ValueError(f"Invalid match_type '{match_type}'")
+
+    customer_id = _customer_id_from_resource(campaign_resource)
+    client = _build_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    # Step 1: find the criterion resource_name
+    # Escape single quotes for GAQL by doubling them
+    _kw_escaped = keyword_text.replace("'", "''")
+    # Note: campaign_criterion.type is an enum — must NOT be quoted in GAQL.
+    # Filter by match_type to avoid removing the wrong criterion when the same
+    # text exists as both PHRASE and EXACT negatives.
+    query = f"""
+        SELECT campaign_criterion.resource_name
+        FROM campaign_criterion
+        WHERE campaign_criterion.campaign = '{campaign_resource}'
+          AND campaign_criterion.negative = TRUE
+          AND campaign_criterion.keyword.text = '{_kw_escaped}'
+          AND campaign_criterion.keyword.match_type = {match_type}
+          AND campaign_criterion.type = KEYWORD
+        LIMIT 1
+    """
+    try:
+        response = ga_service.search(customer_id=customer_id, query=query)
+        criterion_rn = None
+        for row in response:
+            criterion_rn = row.campaign_criterion.resource_name
+            break
+    except Exception as e:
+        logger.error(f"remove_negative_keyword_from_campaign GAQL failed: {e}")
+        raise
+
+    if not criterion_rn:
+        logger.info(
+            f"remove_negative_keyword_from_campaign: '{keyword_text}' not found on "
+            f"{campaign_resource} — idempotent success"
+        )
+        return True  # already absent — idempotent
+
+    # Step 2: remove the criterion
+    service = client.get_service("CampaignCriterionService")
+    operation = client.get_type("CampaignCriterionOperation")
+    operation.remove = criterion_rn
+
+    try:
+        service.mutate_campaign_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(
+            f"Removed negative '{keyword_text}' [{match_type}] from {campaign_resource}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"remove_negative_keyword_from_campaign mutate failed: {e}")
+        raise

@@ -2405,6 +2405,195 @@ function LandingPagesView({ ga4Data }) {
   );
 }
 
+// ─── CompetitorIntelView ───────────────────────────────────────────────────
+function CompetitorIntelView() {
+  const [tab, setTab] = React.useState('actions');
+  const [feed, setFeed] = React.useState([]);
+  const [actions, setActions] = React.useState([]);
+  const [stats, setStats] = React.useState({});
+  const [loading, setLoading] = React.useState(true);
+  const [scanning, setScanning] = React.useState(false);
+  const [msg, setMsg] = React.useState('');
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [feedRes, actRes] = await Promise.all([
+        api('/api/admin/competitor-intel/feed?limit=100'),
+        api('/api/admin/competitor-intel/actions'),
+      ]);
+      setFeed(feedRes.feed || []);
+      setActions(actRes.actions || []);
+      setStats(actRes.stats || feedRes.stats || {});
+    } catch(e) { setMsg('Error loading intel data'); }
+    setLoading(false);
+  };
+
+  React.useEffect(() => { load(); }, []);
+
+  const runScan = async () => {
+    setScanning(true); setMsg('');
+    try {
+      const r = await api('/api/admin/competitor-intel/scan', { method: 'POST' });
+      setMsg(`Scan complete: ${r.result?.intel_written || 0} intel rows, ${r.result?.actions_staged || 0} actions staged`);
+      await load();
+    } catch(e) { setMsg('Scan failed: ' + (e.message || e)); }
+    setScanning(false);
+  };
+
+  const applyAction = async (id) => {
+    try {
+      await api(`/api/admin/competitor-intel/actions/${id}/apply`, { method: 'POST' });
+      setMsg('Action applied to Google Ads');
+      setActions(prev => prev.filter(a => a.id !== id));
+    } catch(e) { setMsg('Apply failed: ' + (e.message || e)); }
+  };
+
+  const dismissAction = async (id) => {
+    try {
+      await api(`/api/admin/competitor-intel/actions/${id}/dismiss`, { method: 'POST' });
+      setActions(prev => prev.filter(a => a.id !== id));
+    } catch(e) { setMsg('Dismiss failed: ' + (e.message || e)); }
+  };
+
+  const CONF_COLORS = { auction_data: '#22c55e', claude_dso: '#a78bfa', claude_haiku_high: '#60a5fa', claude_haiku_medium: '#93c5fd', none: '#6b7280' };
+  const confBadge = (c) => <span style={{fontSize:10,padding:'2px 6px',borderRadius:10,background:(CONF_COLORS[c]||'#6b7280')+'22',color:CONF_COLORS[c]||'#6b7280',border:`1px solid ${CONF_COLORS[c]||'#6b7280'}44`,fontWeight:600}}>{c||'unknown'}</span>;
+
+  const actionTypeBadge = (t) => {
+    const colors = { suppress_negative: '#f59e0b', add_conquest_keyword: '#22c55e' };
+    const labels = { suppress_negative: '🚫→✅ Remove Negative', add_conquest_keyword: '🎯 Add Conquest KW' };
+    return <span style={{fontSize:10,padding:'2px 7px',borderRadius:10,background:(colors[t]||'#6b7280')+'22',color:colors[t]||'#6b7280',border:`1px solid ${colors[t]||'#6b7280'}44`,fontWeight:600}}>{labels[t]||t}</span>;
+  };
+
+  return (
+    <div style={{padding:'0 4px'}}>
+      {/* Header */}
+      <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+        <div style={{flex:1}}>
+          <div style={{fontWeight:700,fontSize:15,color:'var(--text)'}}>Competitor Advertising Intelligence</div>
+          <div style={{fontSize:12,color:'var(--text-muted)',marginTop:2}}>
+            Detects which nearby competitors are actively advertising via Google Ads Auction Insights.
+            Runs automatically on the 1st and 16th of each month.
+          </div>
+        </div>
+        <button onClick={runScan} disabled={scanning} style={{padding:'6px 14px',background:'var(--teal)',color:'#fff',border:'none',borderRadius:6,fontWeight:600,fontSize:12,cursor:'pointer',opacity:scanning?0.6:1}}>
+          {scanning ? '⏳ Scanning…' : '▶ Run Scan Now'}
+        </button>
+        <button onClick={load} style={{padding:'6px 10px',background:'transparent',border:'1px solid var(--border)',borderRadius:6,fontSize:12,color:'var(--text-muted)',cursor:'pointer'}}>↺</button>
+      </div>
+
+      {/* Stats strip */}
+      {stats && (
+        <div style={{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap'}}>
+          {[
+            ['Actively Advertising', stats.actively_advertising ?? '—'],
+            ['Pending Actions', stats.pending_actions ?? '—'],
+            ['Total Intel Rows', stats.total_intel_rows ?? '—'],
+            ['Last Scan', stats.last_run_id ? stats.last_run_id.slice(0,10) : '—'],
+          ].map(([label,val]) => (
+            <div key={label} style={{background:'var(--card-bg)',border:'1px solid var(--border)',borderRadius:8,padding:'8px 14px',minWidth:110}}>
+              <div style={{fontSize:11,color:'var(--text-muted)'}}>{label}</div>
+              <div style={{fontSize:16,fontWeight:700,color:'var(--text)',marginTop:2}}>{val}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {msg && <div style={{padding:'8px 12px',background:'#0ea5e922',border:'1px solid #0ea5e944',borderRadius:6,fontSize:12,color:'#0ea5e9',marginBottom:12}}>{msg}</div>}
+
+      {/* Tab toggle */}
+      <div style={{display:'flex',gap:4,marginBottom:12}}>
+        {[['actions','Pending Actions'],['feed','Intel Feed']].map(([k,l]) => (
+          <button key={k} onClick={()=>setTab(k)} style={{padding:'5px 14px',fontSize:11,fontWeight:500,border:'1px solid var(--border)',borderRadius:6,cursor:'pointer',background:tab===k?'var(--teal)':'transparent',color:tab===k?'#fff':'var(--text-muted)'}}>
+            {l}{k==='actions' && actions.length>0 ? ` (${actions.length})` : ''}
+          </button>
+        ))}
+      </div>
+
+      {loading && <div style={{padding:24,color:'var(--text-muted)',fontSize:13}}>Loading…</div>}
+
+      {/* Pending Actions tab */}
+      {!loading && tab==='actions' && (
+        <div>
+          {actions.length === 0 ? (
+            <div style={{padding:24,textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
+              No pending actions. Run a scan to detect competitor advertising activity.
+            </div>
+          ) : (
+            <div style={{overflowX:'auto'}}>
+              <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+                <thead>
+                  <tr style={{background:'var(--table-header-bg)'}}>
+                    {['Competitor','Campaign Type','Action','Brand Stem','Confidence','Requested','Apply'].map(h=>(
+                      <th key={h} style={{padding:'8px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)',whiteSpace:'nowrap'}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {actions.map((a,i) => (
+                    <tr key={a.id} style={{background:i%2===0?'transparent':'var(--row-alt-bg)',borderBottom:'1px solid var(--border)'}}>
+                      <td style={{padding:'8px 10px',fontWeight:600}}>{a.practice_name || a.place_id}</td>
+                      <td style={{padding:'8px 10px'}}><span style={{background:'var(--teal)22',color:'var(--teal)',padding:'2px 7px',borderRadius:8,fontWeight:600,fontSize:11}}>{a.campaign_type}</span></td>
+                      <td style={{padding:'8px 10px'}}>{actionTypeBadge(a.action_type)}</td>
+                      <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:11}}>{a.brand_stem}</td>
+                      <td style={{padding:'8px 10px'}}>{confBadge(a.confidence || 'none')}</td>
+                      <td style={{padding:'8px 10px',color:'var(--text-muted)'}}>{(a.requested_at||'').slice(0,10)}</td>
+                      <td style={{padding:'8px 10px'}}>
+                        <div style={{display:'flex',gap:4}}>
+                          <button onClick={()=>applyAction(a.id)} style={{padding:'3px 10px',background:'var(--teal)',color:'#fff',border:'none',borderRadius:5,fontSize:11,fontWeight:600,cursor:'pointer'}}>Apply</button>
+                          <button onClick={()=>dismissAction(a.id)} style={{padding:'3px 8px',background:'transparent',color:'var(--text-muted)',border:'1px solid var(--border)',borderRadius:5,fontSize:11,cursor:'pointer'}}>✕</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Intel Feed tab */}
+      {!loading && tab==='feed' && (
+        <div style={{overflowX:'auto'}}>
+          {feed.length === 0 ? (
+            <div style={{padding:24,textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
+              No intel data yet. Run a scan first.
+            </div>
+          ) : (
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+              <thead>
+                <tr style={{background:'var(--table-header-bg)'}}>
+                  {['Practice','Domain','Campaign Type','Impr. Share','Overlap','Confidence','Detected','Reviewed'].map(h=>(
+                    <th key={h} style={{padding:'8px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)',whiteSpace:'nowrap'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {feed.map((row,i) => (
+                  <tr key={row.id} style={{background:i%2===0?'transparent':'var(--row-alt-bg)',borderBottom:'1px solid var(--border)'}}>
+                    <td style={{padding:'8px 10px',fontWeight:600,maxWidth:180,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{row.practice_name || row.place_id}</td>
+                    <td style={{padding:'8px 10px',color:'var(--text-muted)',fontFamily:'monospace',fontSize:11}}>{row.domain}</td>
+                    <td style={{padding:'8px 10px'}}><span style={{background:'var(--teal)22',color:'var(--teal)',padding:'2px 7px',borderRadius:8,fontWeight:600,fontSize:11}}>{row.campaign_type}</span></td>
+                    <td style={{padding:'8px 10px'}}>{row.impression_share > 0 ? (row.impression_share*100).toFixed(0)+'%' : '—'}</td>
+                    <td style={{padding:'8px 10px'}}>{row.overlap_rate > 0 ? (row.overlap_rate*100).toFixed(0)+'%' : '—'}</td>
+                    <td style={{padding:'8px 10px'}}>{confBadge(row.confidence)}</td>
+                    <td style={{padding:'8px 10px',color:'var(--text-muted)'}}>{(row.detected_at||'').slice(0,10)}</td>
+                    <td style={{padding:'8px 10px'}}>
+                      {row.admin_reviewed ? <span style={{color:'#22c55e',fontWeight:600,fontSize:11}}>✓ {row.admin_decision}</span>
+                        : <span style={{color:'var(--text-muted)',fontSize:11}}>—</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── NearbyPracticesView ───────────────────────────────────────────────────
 function NearbyPracticesView() {
   const [data, setData] = useState(null);
@@ -5764,7 +5953,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages'],['nearby','Nearby Practices']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages'],['nearby','Nearby Practices'],['competitor-intel','Competitor Intel']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -5804,6 +5993,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
       {/* ── Nearby Practices view ── */}
       {view==='nearby' && <NearbyPracticesView />}
+      {view==='competitor-intel' && <CompetitorIntelView />}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>

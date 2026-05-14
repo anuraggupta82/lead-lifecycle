@@ -399,8 +399,31 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Competitor advertising intelligence scan — 1st and 16th of each month at 4 AM.
+    # Fetches Google Ads Auction Insights to detect which nearby competitors are
+    # actively advertising specific services, then stages pending actions for review.
+    def _competitor_intel_job():
+        _stamp("competitor_intel")
+        try:
+            from competitor_intel_engine import run_competitor_intel_scan
+            result = run_competitor_intel_scan()
+            logger.info(
+                f"[intel] Scan complete: intel={result.get('intel_written',0)} "
+                f"actions={result.get('actions_staged',0)} run_id={result.get('run_id','?')}"
+            )
+        except Exception as e:
+            logger.error(f"Competitor intel scan failed: {e}")
+
+    ads_scheduler.add_job(
+        _competitor_intel_job,
+        CronTrigger(day="1,16", hour=4, minute=0),
+        id="competitor_intel",
+        name="Competitor Advertising Intelligence Scan (15-day)",
+        replace_existing=True,
+    )
+
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (quarterly nearby-practices sync, 1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
+    logger.info("Scheduled jobs started (15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
 
     yield
 
@@ -11132,6 +11155,90 @@ def get_brand_negatives(max_miles: float = 20.0, campaign_type: str = "general")
         "campaign_type": campaign_type,
         "max_miles": max_miles,
     }
+
+
+# ── Competitor advertising intelligence admin endpoints ───────────────────────
+
+@app.post("/api/admin/competitor-intel/scan", dependencies=[Depends(_require_admin)])
+def trigger_competitor_intel_scan():
+    """
+    Manually trigger a competitor advertising intelligence scan.
+    Runs the full Auction Insights + domain-matching pipeline.
+    Returns a summary of what was detected and staged.
+    """
+    try:
+        from competitor_intel_engine import run_competitor_intel_scan
+        result = run_competitor_intel_scan()
+        return {"ok": True, "result": result}
+    except Exception as e:
+        logger.error(f"Manual competitor intel scan failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/competitor-intel/feed", dependencies=[Depends(_require_admin)])
+def get_competitor_intel_feed(limit: int = 100):
+    """
+    Return the recent competitor_ad_intel rows (intel feed).
+    Includes practice name, domain, campaign type, confidence, and admin review state.
+    """
+    from database import get_competitor_intel_feed, get_intel_scan_stats
+    feed = get_competitor_intel_feed(limit=limit)
+    stats = get_intel_scan_stats()
+    return {"feed": feed, "stats": stats}
+
+
+@app.get("/api/admin/competitor-intel/actions", dependencies=[Depends(_require_admin)])
+def get_competitor_intel_actions():
+    """Return all pending competitor_intel_actions for admin review."""
+    from database import get_pending_intel_actions, get_intel_scan_stats
+    actions = get_pending_intel_actions(limit=200)
+    stats = get_intel_scan_stats()
+    return {"actions": actions, "stats": stats}
+
+
+@app.post(
+    "/api/admin/competitor-intel/actions/{action_id}/apply",
+    dependencies=[Depends(_require_admin)],
+)
+def apply_competitor_intel_action(action_id: int):
+    """
+    Apply a single pending competitor_intel_actions row.
+    For suppress_negative: removes the brand negative from the campaign in Google Ads.
+    For add_conquest_keyword: returns guidance to use AI Refine panel instead.
+    """
+    from competitor_intel_engine import apply_intel_action
+    result = apply_intel_action(action_id=action_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "Unknown error"))
+    return result
+
+
+@app.post(
+    "/api/admin/competitor-intel/actions/{action_id}/dismiss",
+    dependencies=[Depends(_require_admin)],
+)
+def dismiss_competitor_intel_action(action_id: int):
+    """Dismiss (reject) a pending competitor_intel_actions row."""
+    from database import update_intel_action_status
+    ok = update_intel_action_status(action_id, "rejected", applied_by="admin")
+    if not ok:
+        raise HTTPException(status_code=404, detail="Action not found")
+    return {"ok": True, "action_id": action_id, "status": "rejected"}
+
+
+@app.post(
+    "/api/admin/competitor-intel/intel/{intel_id}/review",
+    dependencies=[Depends(_require_admin)],
+)
+def review_competitor_intel_row(intel_id: int, decision: str = "confirm"):
+    """Mark a competitor_ad_intel row as admin-reviewed (confirm or dismiss)."""
+    from database import update_intel_admin_decision
+    if decision not in ("confirm", "dismiss"):
+        raise HTTPException(status_code=400, detail="decision must be 'confirm' or 'dismiss'")
+    ok = update_intel_admin_decision(intel_id, decision)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Intel row not found")
+    return {"ok": True, "intel_id": intel_id, "decision": decision}
 
 
 if __name__ == "__main__":

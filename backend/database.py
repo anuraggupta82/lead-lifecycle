@@ -2183,6 +2183,76 @@ GROUP BY a.campaign_id, c.campaign_name;
         ON nearby_practices(distance_miles, is_excluded)
     """)
 
+    # ── Competitor advertising intelligence — auction insights + action pipeline ─
+    # Tracks which nearby competitors are actively advertising specific services,
+    # derived from Google Ads Auction Insights API (15-day scan cadence).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_ad_intel (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            place_id            TEXT NOT NULL,
+            run_id              TEXT NOT NULL,
+            detected_at         TEXT NOT NULL,
+            domain              TEXT DEFAULT '',
+            campaign_type       TEXT NOT NULL,
+            impression_share    REAL DEFAULT 0.0,
+            overlap_rate        REAL DEFAULT 0.0,
+            confidence          TEXT NOT NULL DEFAULT 'none',
+            action_taken        TEXT DEFAULT '',
+            admin_reviewed      INTEGER DEFAULT 0,
+            admin_decision      TEXT DEFAULT '',
+            admin_reviewed_at   TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cai_place_campaign
+        ON competitor_ad_intel(place_id, campaign_type, detected_at DESC)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cai_run
+        ON competitor_ad_intel(run_id, detected_at DESC)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_intel_actions (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            intel_id            INTEGER,
+            place_id            TEXT NOT NULL,
+            campaign_resource   TEXT NOT NULL DEFAULT '',
+            campaign_type       TEXT NOT NULL DEFAULT '',
+            action_type         TEXT NOT NULL,
+            brand_stem          TEXT NOT NULL,
+            keyword_text        TEXT DEFAULT '',
+            match_type          TEXT DEFAULT 'PHRASE',
+            status              TEXT NOT NULL DEFAULT 'pending',
+            requested_at        TEXT NOT NULL,
+            applied_at          TEXT DEFAULT '',
+            applied_by          TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cia_status
+        ON competitor_intel_actions(status, requested_at DESC)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cia_place
+        ON competitor_intel_actions(place_id, status)
+    """)
+
+    # Add advertising intel columns to nearby_practices (idempotent ALTER TABLE)
+    _np_cols = {row[1] for row in conn.execute("PRAGMA table_info(nearby_practices)").fetchall()}
+    for _col, _def in [
+        ("is_advertising",          "INTEGER DEFAULT 0"),
+        ("advertising_services",    "TEXT DEFAULT '[]'"),
+        ("advertising_domain",      "TEXT DEFAULT ''"),
+        ("advertising_confidence",  "TEXT DEFAULT 'none'"),
+        ("advertising_last_checked_at", "TEXT DEFAULT ''"),
+    ]:
+        if _col not in _np_cols:
+            try:
+                conn.execute(f"ALTER TABLE nearby_practices ADD COLUMN {_col} {_def}")
+            except Exception:
+                pass
+
     # ── Competitor memory — confirmed practices + optimizer review queue ──────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS competitor_practices (
@@ -7769,25 +7839,59 @@ def get_nearby_practices(
 def get_brand_negatives_for_campaign(
     campaign_type: str = "general",
     max_miles: float = 20.0,
+    suppress_advertising_nationals: bool = True,
 ) -> list[str]:
     """
-    Return a deduplicated flat list of brand stem strings for all non-excluded
-    nearby practices within max_miles. These should be added as negative keywords
-    to prevent accidental clicks from patients searching for a competitor's contact info.
+    Return a deduplicated flat list of brand stem strings to negate for this
+    campaign type.
 
-    All campaign types use all practices within max_miles — the is_excluded flag
-    is the only way to carve out exceptions (e.g. conquest targets the user wants
-    to keep visible).
+    Default behaviour (suppress_advertising_nationals=True):
+      - Local offices within max_miles are ALWAYS negated (contact-lookup intent).
+      - National chains that are actively advertising the same campaign_type are
+        SUPPRESSED from the negative list so GDC's ad can show for comparison
+        searches (conquest intent). Only applies to CONQUEST_ELIGIBLE_TYPES.
+      - National chains NOT advertising the same service are still negated.
+
+    The is_excluded flag is the manual escape hatch — excluded practices are
+    never negated regardless of this logic.
     """
+    from competitor_policy import CONQUEST_ELIGIBLE_TYPES, classify
+    import json as _j
+
     practices = get_nearby_practices(max_miles=max_miles, include_excluded=False)
+    ctype = (campaign_type or "general").strip().lower()
+    is_conquest_eligible_type = ctype in CONQUEST_ELIGIBLE_TYPES
+
     seen: set[str] = set()
     stems: list[str] = []
+
     for p in practices:
+        classification = classify(p.get("name", ""))
+
+        # For national chains in conquest-eligible campaign types, check if they
+        # are actively advertising that service. If yes, suppress the negative.
+        if (
+            suppress_advertising_nationals
+            and classification == "national_chain"
+            and is_conquest_eligible_type
+            and p.get("is_advertising", 0) == 1
+        ):
+            adv_services: list[str] = []
+            try:
+                adv_services = _j.loads(p.get("advertising_services") or "[]")
+            except Exception:
+                pass
+            if ctype in adv_services:
+                # This national chain is actively bidding on this service type —
+                # omit their brand stems so GDC appears for competitor searches.
+                continue
+
         for s in (p.get("brand_stems") or []):
             s_clean = (s or "").strip().lower()
             if s_clean and s_clean not in seen:
                 seen.add(s_clean)
                 stems.append(s_clean)
+
     return sorted(stems)
 
 
@@ -7829,4 +7933,212 @@ def get_nearby_sync_stats() -> dict:
         "last_synced_at": last_sync or "",
         "last_run_id": last_run_id[0] if last_run_id else "",
         "by_band": {str(r["radius_band"]): r["cnt"] for r in band_counts},
+    }
+
+
+# ── Competitor advertising intelligence CRUD ─────────────────────────────────
+
+def upsert_competitor_ad_intel(
+    place_id: str,
+    run_id: str,
+    domain: str,
+    campaign_type: str,
+    impression_share: float,
+    overlap_rate: float,
+    confidence: str,
+) -> int:
+    """
+    Insert or update a competitor_ad_intel row for this run.
+    Returns the row id.
+    """
+    import json as _j
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO competitor_ad_intel
+                (place_id, run_id, detected_at, domain, campaign_type,
+                 impression_share, overlap_rate, confidence, action_taken,
+                 admin_reviewed, admin_decision, admin_reviewed_at)
+            VALUES (?,?,?,?,?,?,?,?,'',0,'','')
+            """,
+            (place_id, run_id, now, domain, campaign_type,
+             impression_share, overlap_rate, confidence),
+        )
+        row_id = cur.lastrowid
+
+        # Update the nearby_practices row with latest advertising state
+        # Merge this campaign_type into advertising_services JSON list
+        row = conn.execute(
+            "SELECT advertising_services FROM nearby_practices WHERE place_id=?",
+            (place_id,),
+        ).fetchone()
+        if row:
+            try:
+                existing: list = _j.loads(row["advertising_services"] or "[]")
+            except Exception:
+                existing = []
+            if campaign_type not in existing:
+                existing.append(campaign_type)
+            conn.execute(
+                """
+                UPDATE nearby_practices
+                SET is_advertising=1,
+                    advertising_services=?,
+                    advertising_domain=?,
+                    advertising_confidence=?,
+                    advertising_last_checked_at=?
+                WHERE place_id=?
+                """,
+                (_j.dumps(sorted(existing)), domain, confidence, now, place_id),
+            )
+    return row_id
+
+
+def reset_advertising_state(run_id: str) -> None:
+    """
+    Called at the START of a new scan run. Resets is_advertising=0 and
+    advertising_services=[] on all nearby_practices rows so stale intel
+    from previous runs doesn't linger. The scan re-populates them.
+    """
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE nearby_practices
+            SET is_advertising=0,
+                advertising_services='[]',
+                advertising_domain='',
+                advertising_confidence='none',
+                advertising_last_checked_at=?
+            """,
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+
+
+def add_competitor_intel_action(
+    intel_id: int,
+    place_id: str,
+    campaign_resource: str,
+    campaign_type: str,
+    action_type: str,
+    brand_stem: str,
+    keyword_text: str = "",
+    match_type: str = "PHRASE",
+) -> int:
+    """
+    Stage a competitor intel action (suppress_negative or add_conquest_keyword).
+    Returns the row id.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO competitor_intel_actions
+                (intel_id, place_id, campaign_resource, campaign_type,
+                 action_type, brand_stem, keyword_text, match_type,
+                 status, requested_at, applied_at, applied_by)
+            VALUES (?,?,?,?,?,?,?,?,'pending',?,'','')
+            """,
+            (intel_id, place_id, campaign_resource, campaign_type,
+             action_type, brand_stem, keyword_text, match_type, now),
+        )
+        return cur.lastrowid
+
+
+def get_pending_intel_actions(limit: int = 200) -> list[dict]:
+    """Return all pending competitor_intel_actions, newest first.
+    Joins competitor_ad_intel to surface the confidence badge in the UI."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT cia.*,
+                   np.name as practice_name,
+                   np.distance_miles,
+                   cai.confidence as confidence,
+                   cai.domain as intel_domain,
+                   cai.impression_share as intel_impression_share
+            FROM competitor_intel_actions cia
+            LEFT JOIN nearby_practices np ON np.place_id = cia.place_id
+            LEFT JOIN competitor_ad_intel cai ON cai.id = cia.intel_id
+            WHERE cia.status = 'pending'
+            ORDER BY cia.requested_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_competitor_intel_feed(limit: int = 100) -> list[dict]:
+    """Return recent competitor_ad_intel rows with practice name, newest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT cai.*, np.name as practice_name, np.distance_miles,
+                   np.advertising_services
+            FROM competitor_ad_intel cai
+            LEFT JOIN nearby_practices np ON np.place_id = cai.place_id
+            ORDER BY cai.detected_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_intel_action_status(
+    action_id: int,
+    status: str,
+    applied_by: str = "admin",
+) -> bool:
+    """Update a competitor_intel_actions row status. Returns True if updated."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE competitor_intel_actions
+            SET status=?, applied_at=?, applied_by=?
+            WHERE id=?
+            """,
+            (status, now, applied_by, action_id),
+        )
+    return cur.rowcount > 0
+
+
+def update_intel_admin_decision(intel_id: int, decision: str) -> bool:
+    """Mark a competitor_ad_intel row as admin-reviewed."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE competitor_ad_intel
+            SET admin_reviewed=1, admin_decision=?, admin_reviewed_at=?
+            WHERE id=?
+            """,
+            (decision, now, intel_id),
+        )
+    return cur.rowcount > 0
+
+
+def get_intel_scan_stats() -> dict:
+    """Return summary stats for the competitor ad intel system."""
+    with _conn() as conn:
+        total_intel = conn.execute(
+            "SELECT COUNT(*) FROM competitor_ad_intel"
+        ).fetchone()[0]
+        pending_actions = conn.execute(
+            "SELECT COUNT(*) FROM competitor_intel_actions WHERE status='pending'"
+        ).fetchone()[0]
+        advertising_count = conn.execute(
+            "SELECT COUNT(*) FROM nearby_practices WHERE is_advertising=1"
+        ).fetchone()[0]
+        last_run = conn.execute(
+            "SELECT run_id, MAX(detected_at) as last_at FROM competitor_ad_intel"
+        ).fetchone()
+    return {
+        "total_intel_rows": total_intel,
+        "pending_actions": pending_actions,
+        "actively_advertising": advertising_count,
+        "last_run_id": last_run["run_id"] if last_run and last_run["run_id"] else "",
+        "last_detected_at": last_run["last_at"] if last_run else "",
     }
