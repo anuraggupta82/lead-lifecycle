@@ -5,11 +5,12 @@ Also syncs treatment plan stages for matched patients.
 Runs as a nightly job. Never stores raw PHI — uses SHA-256 hashes for comparison.
 Only accessible on the office LAN (GraftonServer).
 
-Four functions:
+Five functions:
   1. match_leads_to_od()              — match unmatched leads to OD patients
   2. sync_treatment_stages()          — update stages for already-matched leads
-  3. run_full_od_sync()               — runs both (called by scheduler)
-  4. match_calls_to_od_appointments() — link booked Mango calls → OD appointments
+  3. sync_scheduler_direct_leads()    — auto-create leads for scheduler (visitgdc.com) bookings
+  4. run_full_od_sync()               — runs 1-3 (called by nightly scheduler)
+  5. match_calls_to_od_appointments() — link booked Mango calls → OD appointments
 """
 import hashlib
 import logging
@@ -45,6 +46,47 @@ CDT_IMPLANT_CODES = {
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()
+
+
+def _parse_attr_marker(note_text: str) -> dict:
+    """
+    Parse the ATTR: attribution marker written by the scheduler backend into
+    an OD appointment Note field.
+
+    Format written by stripe_router.py:
+        ATTR:gclid=abc123;utm_source=google;utm_medium=cpc;utm_campaign=implants;
+             utm_term=dental+implants;utm_content=ad1;fbclid=;msclkid=;
+             landing_url=https://visitgdc.com/?gclid=abc123;ga4_client_id=GA1.1.xxx
+
+    Returns a dict with string values for all recognised keys, or {} if no
+    ATTR: block is found.
+    """
+    if not note_text:
+        return {}
+    # Find the ATTR: block — it may appear after a patient message
+    idx = note_text.find("ATTR:")
+    if idx == -1:
+        return {}
+    attr_str = note_text[idx + 5:]  # everything after "ATTR:"
+    result = {}
+    for part in attr_str.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            continue
+        key, _, val = part.partition("=")
+        key = key.strip()
+        val = val.strip()
+        # Only capture known attribution keys; skip empty values
+        if key in ("gclid", "fbclid", "msclkid", "gbraid", "wbraid",
+                   "utm_source", "utm_medium", "utm_campaign",
+                   "utm_term", "utm_content", "landing_url", "ga4_client_id"):
+            if val:
+                # Reverse the percent-encoding applied by _build_attr_marker in stripe_router.py
+                val = val.replace("%3B", ";").replace("%3D", "=")
+                result[key] = val
+    return result
 
 
 def _get_db():
@@ -597,6 +639,8 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
     Get appointment status for a patient.
     AptStatus: 1=Scheduled, 2=Complete, 3=UnschedList, 4=ASAP, 5=Broken
     last_complete_date: datetime of most recent completed appointment (for reactivation check).
+    latest_scheduled_note: Note field from the most recent Scheduled appointment —
+        used by sync_scheduler_direct_leads() to recover attribution from the ATTR: marker.
     """
     result = {
         "has_scheduled": False,
@@ -604,15 +648,18 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
         "has_broken": False,
         "broken_count": 0,
         "next_apt_date": "",
+        "next_apt_datetime": "",   # full ISO datetime of next scheduled appointment
         "status": "",
         "last_complete_date": None,  # datetime | None — used by _compute_od_relationship
+        "latest_scheduled_note": "",  # Note text of most recent Scheduled apt (for ATTR: marker)
     }
     try:
         with conn.cursor() as cur:
             # Rows ordered DESC by AptDateTime — first complete row is the most recent.
             # LIMIT 50: covers all clinically relevant appointments without full scan.
+            # Note column added to recover ATTR: attribution marker written by the scheduler.
             cur.execute("""
-                SELECT AptStatus, AptDateTime
+                SELECT AptStatus, AptDateTime, Note
                 FROM appointment
                 WHERE PatNum = %s
                 ORDER BY AptDateTime DESC
@@ -623,6 +670,7 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
             for row in rows:
                 status = int(row[0])
                 apt_date = row[1]  # datetime object from pymysql
+                note_text = row[2] or ""
 
                 if status == 5:  # Broken
                     result["has_broken"] = True
@@ -636,6 +684,10 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
                     result["has_scheduled"] = True
                     if apt_date:
                         result["next_apt_date"] = str(apt_date)[:10]  # YYYY-MM-DD
+                        result["next_apt_datetime"] = str(apt_date)   # full datetime string
+                    # Capture Note from the FIRST (most recent) scheduled apt only
+                    if not result["latest_scheduled_note"] and note_text:
+                        result["latest_scheduled_note"] = note_text
 
             # Determine overall status string
             if result["has_scheduled"]:
@@ -651,15 +703,201 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
     return result
 
 
+# ── Part 3: Auto-create leads for scheduler bookings ────────────────────────
+
+def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
+    """
+    Scan OpenDental appointments for recent bookings that were created via the
+    visitgdc.com online scheduler (identified by an ATTR: marker in the Note
+    field), and auto-create a lead in the marketing pipeline for each one that
+    doesn't already have a matching lead.
+
+    Why OD directly (not the scheduler DB):
+      The scheduler backend runs on Cloud Run with Cloud SQL (Postgres). That DB
+      is not directly accessible from the lead lifecycle service, which runs
+      locally on the Mac. OpenDental IS accessible on the office LAN and is
+      already the integration substrate — the scheduler writes an ATTR: marker
+      into every appointment's Note field. The nightly OD sync is the bridge.
+
+    The function is idempotent: it checks email and phone against existing leads
+    before creating anything, so re-runs are safe.
+
+    Args:
+        lookback_days: How far back to look for OD appointments. Defaults to 30 days.
+
+    Returns:
+        dict with created/skipped/errors counts.
+    """
+    import uuid
+
+    od_conn = _get_db()
+    if not od_conn:
+        return {"created": 0, "skipped": 0, "errors": 0,
+                "error": "OpenDental MySQL unavailable (office network required)"}
+
+    # ── Query recent OD appointments whose Note contains ATTR: ───────────────
+    # Filter by DateTStamp (record creation time) not AptDateTime so we catch
+    # appointments created recently even if scheduled in the past or far future.
+    cutoff = (datetime.now(_EASTERN) - timedelta(days=lookback_days)).replace(tzinfo=None)
+    try:
+        with od_conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.AptNum, a.PatNum, a.AptDateTime, a.Note,
+                       p.FName, p.LName,
+                       LOWER(p.Email) AS email,
+                       p.HmPhone, p.WirelessPhone
+                FROM appointment a
+                JOIN patient p ON a.PatNum = p.PatNum
+                WHERE a.DateTStamp >= %s
+                  AND a.Note LIKE %s
+                ORDER BY a.DateTStamp DESC
+            """, (cutoff, "%ATTR:%"))
+            rows = cur.fetchall()
+    except Exception as e:
+        od_conn.close()
+        logger.warning(f"[sched_leads] OD query failed: {e}")
+        return {"created": 0, "skipped": 0, "errors": 0, "error": str(e)}
+
+    if not rows:
+        od_conn.close()
+        logger.info("[sched_leads] No scheduler-sourced OD appointments found")
+        return {"created": 0, "skipped": 0, "errors": 0}
+
+    logger.info(f"[sched_leads] Found {len(rows)} scheduler-sourced OD apts (last {lookback_days}d)")
+
+    from database import find_lead_by_identifiers, upsert_lead, is_deleted_lead
+
+    created = skipped = errors = 0
+
+    try:
+        for row in rows:
+            try:
+                apt_num    = str(row[0])
+                pat_num    = str(row[1])
+                apt_dt     = row[2]   # datetime from pymysql
+                note_text  = row[3] or ""
+                first_name = row[4] or ""
+                last_name  = row[5] or ""
+                email      = (row[6] or "").strip().lower()
+                hm_phone   = row[7] or ""
+                cell_phone = row[8] or ""
+
+                # Use cell phone preferentially, fall back to home
+                raw_phone = cell_phone.strip() or hm_phone.strip()
+                phone_digits = "".join(c for c in raw_phone if c.isdigit())
+                phone = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+
+                if not email and not phone:
+                    logger.debug(f"[sched_leads] AptNum={apt_num} missing email+phone — skipping")
+                    skipped += 1
+                    continue
+
+                # Skip tombstoned leads
+                if email and is_deleted_lead("", email=email):
+                    logger.debug(f"[sched_leads] {email} is tombstoned — skipping")
+                    skipped += 1
+                    continue
+
+                # Check for existing lead
+                existing = find_lead_by_identifiers(email=email, phone=phone)
+                if existing:
+                    logger.debug(
+                        f"[sched_leads] Lead already exists for {email or phone} "
+                        f"(id={existing['id'][:8]}) — skipping"
+                    )
+                    skipped += 1
+                    continue
+
+                # ── Parse ATTR: attribution from OD appointment Note ──────────
+                attr = _parse_attr_marker(note_text)
+
+                # ── Derive appointment type from Note (first non-ATTR line) ───
+                apt_type = ""
+                for line in note_text.splitlines():
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("ATTR:") and "=" not in stripped:
+                        apt_type = stripped
+                        break
+
+                apt_datetime_str = str(apt_dt) if apt_dt else ""
+
+                # ── Build lead payload ────────────────────────────────────────
+                new_id = str(uuid.uuid4())
+                created_at = datetime.now(timezone.utc).isoformat()
+
+                lead_data = {
+                    "id": new_id,
+                    "created_at": created_at,
+                    "source": "scheduler",
+                    "stage": "scheduled",
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "email": email,
+                    "phone": phone,
+                    "goals": [apt_type] if apt_type else [],
+                    "notes": (
+                        f"Auto-created from visitgdc.com scheduler booking. "
+                        f"OD AptNum: {apt_num}. "
+                        f"Appointment type: {apt_type or 'unknown'}. "
+                        f"Scheduled: {apt_datetime_str[:10] if apt_datetime_str else 'unknown'}."
+                    ),
+                    # Attribution from ATTR: marker
+                    "gclid":         attr.get("gclid", ""),
+                    "fbclid":        attr.get("fbclid", ""),
+                    "msclkid":       attr.get("msclkid", ""),
+                    "utm_source":    attr.get("utm_source", ""),
+                    "utm_medium":    attr.get("utm_medium", ""),
+                    "utm_campaign":  attr.get("utm_campaign", ""),
+                    "utm_term":      attr.get("utm_term", ""),
+                    "utm_content":   attr.get("utm_content", ""),
+                    "landing_url":   attr.get("landing_url", ""),
+                    "ga4_client_id": attr.get("ga4_client_id", ""),
+                    # Appointment metadata
+                    "appointment_date":   apt_datetime_str[:10] if apt_datetime_str else "",
+                    "appointment_status": "scheduled",
+                    "od_patient_num":     pat_num,
+                }
+
+                upsert_lead(lead_data)
+                add_event(new_id, "lead_created", source="od_matcher",
+                          detail=json.dumps({
+                              "source": "scheduler",
+                              "od_apt_num": apt_num,
+                              "od_pat_num": pat_num,
+                              "appointment_type": apt_type,
+                              "apt_datetime": apt_datetime_str,
+                              "has_attribution": bool(attr.get("gclid") or attr.get("utm_campaign")),
+                          }))
+
+                logger.info(
+                    f"[sched_leads] Created lead {new_id[:8]} for {email or phone} "
+                    f"AptNum={apt_num} apt_type={apt_type!r} "
+                    f"gclid={'yes' if attr.get('gclid') else 'no'}"
+                )
+                created += 1
+
+            except Exception as e:
+                logger.error(f"[sched_leads] Error processing AptNum row: {e}", exc_info=True)
+                errors += 1
+
+    finally:
+        od_conn.close()
+
+    logger.info(f"[sched_leads] Done: created={created} skipped={skipped} errors={errors}")
+    return {"created": created, "skipped": skipped, "errors": errors, "total": len(rows)}
+
+
 # ── Combined runner ──────────────────────────────────────────────────────────
 
 def run_full_od_sync() -> dict:
     """Run both matching and treatment stage sync. Called by nightly scheduler."""
     match_result = match_leads_to_od()
     stage_result = sync_treatment_stages()
+    direct_result = sync_scheduler_direct_leads(lookback_days=30)
     return {
         "match": match_result,
         "treatment_stages": stage_result,
+        "scheduler_leads": direct_result,
     }
 
 

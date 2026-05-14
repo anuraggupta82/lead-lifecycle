@@ -2396,8 +2396,9 @@ def upsert_lead(data: dict) -> dict:
                     goals, gclid, fbclid, msclkid, utm_source, utm_medium,
                     utm_campaign, utm_term, utm_content, landing_url,
                     smile_image_url, smile_blob_name, smile_composite_blob_name,
-                    notes, tags, ga4_client_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    notes, tags, ga4_client_id,
+                    appointment_date, appointment_status, od_patient_num)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
                 data.get("source") or "unknown", data.get("stage", "new"),
@@ -2415,6 +2416,9 @@ def upsert_lead(data: dict) -> dict:
                 data.get("notes", ""),
                 data.get("tags", "[]"),
                 data.get("ga4_client_id", ""),  # browser _ga cookie for GA4 Measurement Protocol stitching
+                data.get("appointment_date", ""),
+                data.get("appointment_status", ""),
+                data.get("od_patient_num", "") or "",
             ))
             # Auto-note: inline into same connection so no nested-transaction risk
             try:
@@ -5558,6 +5562,26 @@ def get_lead_by_phone(phone: str) -> Optional[dict]:
             (f"%{suffix}",)
         ).fetchone()
         return dict(row) if row else None
+
+
+def find_lead_by_identifiers(email: str = "", phone: str = "") -> Optional[dict]:
+    """
+    Look up a lead by email OR phone — whichever is provided and matches first.
+    Used by sync_scheduler_direct_leads() to check whether a scheduler booking
+    already has a corresponding lead before auto-creating one.
+
+    Priority: email match first (more reliable), then phone hash match.
+    Returns the most-recently-created matching lead, or None.
+    """
+    if email:
+        lead = get_lead_by_email(email)
+        if lead:
+            return lead
+    if phone:
+        lead = get_lead_by_phone(phone)
+        if lead:
+            return lead
+    return None
 
 
 def set_lead_dnd(lead_id: str, channel: str, reason: str = "STOP keyword") -> None:
