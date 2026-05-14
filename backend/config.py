@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     # Add new domains here as new landing pages are created.
     ga4_properties: str = "{}"
 
+    # Google Places API (competitor discovery)
+    google_places_api_key: str = ""
+
     # Google Ads API
     google_ads_client_id: str = ""
     google_ads_client_secret: str = ""

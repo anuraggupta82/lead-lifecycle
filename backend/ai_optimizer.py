@@ -52,6 +52,7 @@ OPTIMIZER_STEPS = [
     ("Ad Performance",      "Fetching ad creative and ad group metrics..."),
     ("Classifying Terms",   "Running Haiku semantic classifier on search terms..."),
     ("Competitor Memory",   "Matching search terms against known competitor brands..."),
+    ("Brand Negatives",     "Checking nearby practice brand stems against campaign negatives..."),
     ("Rule-Based Engine",   "Applying rule-based optimization (pauses, bids, harvesting)..."),
     ("AI Per-Campaign",     "Calling Claude Opus for per-campaign recommendations..."),
     ("AI Account-Level",    "Calling Claude Opus for cross-campaign recommendations..."),
@@ -392,6 +393,101 @@ def _classify_campaign(campaign_name: str) -> str:
         if any(tok in name for tok in tokens):
             return ctype
     return "general"
+
+
+def _build_institutional_memory_note(campaign: str = "") -> str:
+    """
+    Load the full optimizer_memory table + recent rejection history and format
+    as a structured text block to inject into every Claude prompt. This gives
+    Claude the complete institutional knowledge of what has been approved,
+    rejected, and why — so it can make better recommendations each run.
+
+    campaign: scopes rejection_pattern entries to this campaign (plus global ones).
+              Pass "" for account-level prompts.
+    """
+    try:
+        from database import get_optimizer_memory
+        all_entries = get_optimizer_memory(active_only=True)  # ALL categories
+    except Exception as _e:
+        import logging as _log
+        _log.getLogger(__name__).warning(f"[institutional_memory] load failed: {_e}")
+        return ""
+
+    if not all_entries:
+        return ""
+
+    lines = ["\n\n=== INSTITUTIONAL MEMORY (read every run — apply all rules) ==="]
+
+    camp_lower = (campaign or "").lower()
+
+    # Group by category for readability
+    by_cat: dict = {}
+    for e in all_entries:
+        cat = e.get("category", "general")
+        by_cat.setdefault(cat, []).append(e)
+
+    def _is_in_scope(e: dict) -> bool:
+        """Return True if entry is global or belongs to the current campaign."""
+        entry_camp = (e.get("campaign") or "").lower()
+        return not entry_camp or entry_camp == camp_lower
+
+    # 1. Keyword overrides — never pause / always pause (scoped to global + this campaign)
+    if "keyword_override" in by_cat:
+        scoped = [e for e in by_cat["keyword_override"] if _is_in_scope(e)]
+        if scoped:
+            lines.append("\nKEYWORD OVERRIDES (permanent rules — never violate):")
+            for e in scoped:
+                scope = f" [{e['campaign']}]" if e.get("campaign") else " [global]"
+                lines.append(f"  • {e['key']}: {e['value']} — {e['reason']}{scope}")
+
+    # 2. Term classifications — good / negative / irrelevant (scoped, capped at 50 most recent)
+    if "term_classification" in by_cat:
+        scoped = [e for e in by_cat["term_classification"] if _is_in_scope(e)]
+        if scoped:
+            lines.append("\nTERM CLASSIFICATIONS (treat these search terms accordingly):")
+            for e in scoped[:50]:
+                scope = f" [{e['campaign']}]" if e.get("campaign") else " [global]"
+                lines.append(f"  • \"{e['key']}\": {e['value']} — {e['reason']}{scope}")
+
+    # 3. Campaign rules (scoped to global + this campaign)
+    if "campaign_rule" in by_cat:
+        scoped = [e for e in by_cat["campaign_rule"] if _is_in_scope(e)]
+        if scoped:
+            lines.append("\nCAMPAIGN RULES:")
+            for e in scoped:
+                scope = f" [{e['campaign']}]" if e.get("campaign") else " [global]"
+                lines.append(f"  • {e['key']} = {e['value']} — {e['reason']}{scope}")
+
+    # 4. Rejection patterns — most actionable for avoiding repeated bad suggestions
+    rejection_entries = by_cat.get("rejection_pattern", [])
+    if rejection_entries:
+        # Filter to global + this campaign's rejections
+        camp_lower = (campaign or "").lower()
+        relevant = [
+            e for e in rejection_entries
+            if not e.get("campaign") or (e.get("campaign") or "").lower() == camp_lower
+        ]
+        if relevant:
+            lines.append(
+                "\nADMIN REJECTION PATTERNS (do NOT re-suggest these — the admin has explicitly rejected them):"
+            )
+            for e in relevant[:30]:  # cap at 30 to avoid prompt bloat
+                scope = f" [campaign: {e['campaign']}]" if e.get("campaign") else " [all campaigns]"
+                lines.append(f"  ✗ {e['key']}: {e['reason']}{scope}")
+
+    # 5. General notes (capped at 30 most recent)
+    if "general" in by_cat:
+        lines.append("\nGENERAL NOTES:")
+        for e in by_cat["general"][:30]:
+            lines.append(f"  • {e['key']}: {e['reason']}")
+
+    lines.append(
+        "\nAPPLY ALL OF THE ABOVE before generating recommendations. "
+        "Rejection patterns are hard blocks — the admin has seen the data and made a deliberate choice. "
+        "Do not re-suggest rejected actions even if the performance data looks compelling."
+    )
+
+    return "\n".join(lines)
 
 
 def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: dict,
@@ -2138,7 +2234,7 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
-ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + feedback_block
+ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + _build_institutional_memory_note(campaign) + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -2661,7 +2757,7 @@ The "competitor_intel_union" field contains the union of all conquest keywords a
 - all_conquest_keywords: these are INTENTIONAL competitor brand targets — NEVER recommend them as cross-campaign add_negative_keyword.
 - all_differentiators: the practice's committed positioning themes — use these when writing account-wide advisory framing.
 - by_campaign: per-campaign breakdown for reference.
-If you see a search term that appears in all_conquest_keywords, treat it as intentional targeting, not waste."""
+If you see a search term that appears in all_conquest_keywords, treat it as intentional targeting, not waste.""" + _build_institutional_memory_note("")
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -5275,7 +5371,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     if outcome_history:
         logger.info(f"Outcome history loaded: {len(outcome_history)} entity-operation pairs from last 90d")
 
-    _set_progress(6)  # Rule-Based Engine
+    _set_progress(7)  # Rule-Based Engine
     # Analyze
     logger.info("Analyzing and generating recommendations...")
     actions = _analyze_keywords(
@@ -5610,9 +5706,88 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _cm_err:
         logger.warning(f"Competitor memory write-back failed (non-fatal): {_cm_err}")
 
+    # ── Nearby-practice brand-negative cross-check ───────────────────────────
+    # Compare the brand stems from all nearby_practices (within 20 miles) against
+    # the active campaign-level negative keywords. Stage any missing ones as
+    # add_negative_keyword pending_approval items so the admin can apply them in one click.
+    _set_progress(6)  # Brand Negative Check
+    try:
+        from database import get_brand_negatives_for_campaign
+        _nearby_stems = get_brand_negatives_for_campaign(max_miles=20.0)
+        if _nearby_stems:
+            # C3 fix: live_negatives is a set of lowercased negative keyword texts already
+            # fetched from Google Ads at startup — no need to re-iterate keywords list.
+            _existing_negs_lower: set[str] = set(s.lower().strip() for s in live_negatives)
+
+            # Also scan existing pending_approval add_negative_keyword rows so we
+            # don't re-stage the same brand negative multiple times.
+            from database import get_pending_actions
+            _pending = get_pending_actions(limit=500)
+            for _pa in _pending:
+                if _pa.get("operation") == "add_negative_keyword":
+                    _after = _pa.get("after_state") or {}
+                    if isinstance(_after, str):
+                        try:
+                            import json as _j; _after = _j.loads(_after)
+                        except Exception:
+                            _after = {}
+                    _kt = (_after.get("keyword_text") or "").lower().strip()
+                    if _kt:
+                        _existing_negs_lower.add(_kt)
+
+            # C2 fix: build all_campaign_names_for_brand_check from campaign_settings
+            # (campaign_settings is keyed by resource_name and already available in scope).
+            # We do NOT use the all_campaign_names variable which is defined 40 lines later.
+            _all_camp_for_brand = sorted(
+                {s["campaign_name"] for s in campaign_settings.values() if s.get("campaign_name")}
+            ) or ([primary_campaign] if primary_campaign else [])
+
+            # C4 fix: build a name→resource_name lookup from campaign_settings dict
+            # (keyed by resource_name → {"campaign_name": ..., "resource_name": ..., ...})
+            _camp_name_to_res: dict[str, str] = {
+                s["campaign_name"].lower(): rn
+                for rn, s in campaign_settings.items()
+                if s.get("campaign_name")
+            }
+
+            _brand_staged = 0
+            for _stem in _nearby_stems:
+                _stem_lower = _stem.lower().strip()
+                if not _stem_lower or _stem_lower in _existing_negs_lower:
+                    continue
+                # Stage as pending for every active campaign (brand negatives apply account-wide)
+                for _camp_name in _all_camp_for_brand:
+                    if not _camp_name:
+                        continue
+                    _camp_res = _camp_name_to_res.get(_camp_name.lower(), "")
+                    if not _camp_res:
+                        continue
+                    # C1 fix: use log_pending() from campaign_audit (already imported at top of function)
+                    log_pending(
+                        operation="add_negative_keyword",
+                        entity_type="keyword",
+                        entity_id=_camp_res,
+                        entity_name=_stem_lower,
+                        before_state={"source": "nearby_practices_db"},
+                        after_state={"keyword_text": _stem_lower, "match_type": "PHRASE", "campaign_resource": _camp_res},
+                        optimizer_run_id=run_id,
+                        reason=f"Brand negative: nearby practice stem '{_stem_lower}' missing from campaign negatives — prevents accidental clicks from patients searching for a competitor's contact info.",
+                        campaign_name=_camp_name,
+                        priority=5,
+                        impact_estimate={"savings_30d_usd": 0},
+                    )
+                    _existing_negs_lower.add(_stem_lower)  # don't re-stage across campaigns
+                    _brand_staged += 1
+                    break  # one pending row per stem (applied account-wide when approved)
+
+            if _brand_staged:
+                logger.info(f"[brand_neg_check] Staged {_brand_staged} missing brand negative(s) as pending_approval")
+    except Exception as _bnc_err:
+        logger.warning(f"Brand-negative cross-check failed (non-fatal): {_bnc_err}")
+
     # Claude structured recommendations — run once per active campaign.
     # Returns dicts with operation + exact API parameters, not plain text.
-    _set_progress(7)  # AI Per-Campaign
+    _set_progress(8)  # AI Per-Campaign
     logger.info("Calling Claude (Opus) for structured recommendations...")
     # Use ALL campaigns with keyword data — not just campaign_spend keys
     # (campaign_spend only covers the allow-listed set in legacy mode; now we use all)
@@ -5658,7 +5833,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     _per_camp_competitor_blocks: dict = {}  # camp_name -> competitor_intel dict
 
     for _camp_idx, camp_name in enumerate(all_campaign_names):
-        _set_progress(7, campaign_context=f"{camp_name} ({_camp_idx + 1}/{_total_camps})")
+        _set_progress(8, campaign_context=f"{camp_name} ({_camp_idx + 1}/{_total_camps})")
         camp_lower = camp_name.strip().lower()
 
         camp_kw   = [k for k in keyword_perf  if k.get("campaign","").strip().lower() == camp_lower]
@@ -6065,7 +6240,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             [f"[claude:{camp_name}] {rec.get('reason','')}" for rec in structured]
         )
 
-    _set_progress(8)  # AI Account-Level
+    _set_progress(9)  # AI Account-Level
     # ── Account-level pass (cross-campaign patterns) ─────────────────────────
     logger.info("Calling Claude (Opus) for account-level recommendations...")
     # Build campaign_spend dict with resource info for the account-level function
@@ -6372,7 +6547,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _mem_err:
         logger.warning(f"Failed to save optimizer memory (non-fatal): {_mem_err}")
 
-    _set_progress(9)  # Finalizing
+    _set_progress(10)  # Finalizing
     # ── Save batch impact history ─────────────────────────────────────────────
     try:
         from database import _conn as _ih_conn

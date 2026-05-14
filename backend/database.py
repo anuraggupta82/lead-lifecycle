@@ -2152,6 +2152,37 @@ GROUP BY a.campaign_id, c.campaign_name;
         ON gads_geo_cache(location_name, campaign_name, days, view_type)
     """)
 
+    # ── Nearby practices — Google Places quarterly sync (all 4 radius bands) ───
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nearby_practices (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            place_id        TEXT NOT NULL UNIQUE,
+            name            TEXT NOT NULL,
+            name_normalized TEXT NOT NULL,
+            vicinity        TEXT DEFAULT '',
+            lat             REAL DEFAULT 0.0,
+            lng             REAL DEFAULT 0.0,
+            distance_miles  REAL DEFAULT 0.0,
+            radius_band     INTEGER DEFAULT 20,    -- 5 | 10 | 15 | 20 (miles)
+            rating          REAL DEFAULT 0.0,
+            review_count    INTEGER DEFAULT 0,
+            business_status TEXT DEFAULT 'OPERATIONAL',
+            brand_stems     TEXT NOT NULL DEFAULT '[]',  -- JSON array of lowercase strings
+            is_excluded     INTEGER DEFAULT 0,     -- 1 = manually excluded from brand negatives
+            exclusion_note  TEXT DEFAULT '',
+            last_synced_at  TEXT NOT NULL,
+            sync_run_id     TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_nearby_practices_radius
+        ON nearby_practices(radius_band, is_excluded)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_nearby_practices_distance
+        ON nearby_practices(distance_miles, is_excluded)
+    """)
+
     # ── Competitor memory — confirmed practices + optimizer review queue ──────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS competitor_practices (
@@ -7640,3 +7671,162 @@ def finish_crawl_log(
                WHERE id=?""",
             (now, pages_crawled, pages_failed, status, error_msg, log_id),
         )
+
+
+# ── Nearby practices (Google Places quarterly sync) ───────────────────────────
+
+def upsert_nearby_practice(
+    place_id: str,
+    name: str,
+    vicinity: str = "",
+    lat: float = 0.0,
+    lng: float = 0.0,
+    distance_miles: float = 0.0,
+    radius_band: int = 20,
+    rating: float = 0.0,
+    review_count: int = 0,
+    business_status: str = "OPERATIONAL",
+    brand_stems: list = None,
+    sync_run_id: str = "",
+) -> None:
+    """
+    Insert or update a nearby practice by place_id.
+    Preserves is_excluded and exclusion_note on updates (manual overrides survive re-syncs).
+    brand_stems is stored as a JSON array string.
+    """
+    import re as _re
+
+    def _norm(s: str) -> str:
+        n = _re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).strip()
+        return _re.sub(r" {2,}", " ", n)
+
+    now = _now()
+    name_norm = _norm(name)
+    stems_json = _json_mod.dumps(brand_stems or [])
+
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO nearby_practices
+               (place_id, name, name_normalized, vicinity, lat, lng,
+                distance_miles, radius_band, rating, review_count,
+                business_status, brand_stems, last_synced_at, sync_run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(place_id) DO UPDATE SET
+                   name=excluded.name,
+                   name_normalized=excluded.name_normalized,
+                   vicinity=excluded.vicinity,
+                   lat=excluded.lat,
+                   lng=excluded.lng,
+                   distance_miles=excluded.distance_miles,
+                   radius_band=excluded.radius_band,
+                   rating=excluded.rating,
+                   review_count=excluded.review_count,
+                   business_status=excluded.business_status,
+                   brand_stems=excluded.brand_stems,
+                   last_synced_at=excluded.last_synced_at,
+                   sync_run_id=excluded.sync_run_id
+               """,
+            (place_id, name, name_norm, vicinity, lat, lng,
+             distance_miles, radius_band, rating, review_count,
+             business_status, stems_json, now, sync_run_id),
+        )
+
+
+def get_nearby_practices(
+    max_miles: float = 20.0,
+    include_excluded: bool = False,
+    operational_only: bool = False,
+) -> list[dict]:
+    """
+    Return nearby_practices rows within max_miles.
+    By default excludes manually-excluded practices and returns all business statuses.
+    Ordered by distance ascending.
+    """
+    with _conn() as conn:
+        clauses = ["distance_miles <= ?"]
+        params: list = [max_miles]
+        if not include_excluded:
+            clauses.append("is_excluded = 0")
+        if operational_only:
+            clauses.append("business_status = 'OPERATIONAL'")
+        where = " AND ".join(clauses)
+        rows = conn.execute(
+            f"SELECT * FROM nearby_practices WHERE {where} ORDER BY distance_miles ASC",
+            params,
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        stems = d.get("brand_stems") or "[]"
+        try:
+            d["brand_stems"] = _json_mod.loads(stems) if isinstance(stems, str) else stems
+        except Exception:
+            d["brand_stems"] = []
+        result.append(d)
+    return result
+
+
+def get_brand_negatives_for_campaign(
+    campaign_type: str = "general",
+    max_miles: float = 20.0,
+) -> list[str]:
+    """
+    Return a deduplicated flat list of brand stem strings for all non-excluded
+    nearby practices within max_miles. These should be added as negative keywords
+    to prevent accidental clicks from patients searching for a competitor's contact info.
+
+    All campaign types use all practices within max_miles — the is_excluded flag
+    is the only way to carve out exceptions (e.g. conquest targets the user wants
+    to keep visible).
+    """
+    practices = get_nearby_practices(max_miles=max_miles, include_excluded=False)
+    seen: set[str] = set()
+    stems: list[str] = []
+    for p in practices:
+        for s in (p.get("brand_stems") or []):
+            s_clean = (s or "").strip().lower()
+            if s_clean and s_clean not in seen:
+                seen.add(s_clean)
+                stems.append(s_clean)
+    return sorted(stems)
+
+
+def set_nearby_practice_excluded(
+    place_id: str,
+    excluded: bool,
+    note: str = "",
+) -> bool:
+    """Toggle the is_excluded flag on a nearby practice. Returns True if a row was updated."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE nearby_practices SET is_excluded=?, exclusion_note=? WHERE place_id=?",
+            (1 if excluded else 0, note, place_id),
+        )
+    return cur.rowcount > 0
+
+
+def get_nearby_sync_stats() -> dict:
+    """Return summary stats for the most recent nearby_practices sync."""
+    with _conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM nearby_practices").fetchone()[0]
+        excluded = conn.execute(
+            "SELECT COUNT(*) FROM nearby_practices WHERE is_excluded=1"
+        ).fetchone()[0]
+        last_sync = conn.execute(
+            "SELECT MAX(last_synced_at) FROM nearby_practices"
+        ).fetchone()[0]
+        last_run_id = conn.execute(
+            "SELECT sync_run_id FROM nearby_practices ORDER BY last_synced_at DESC LIMIT 1"
+        ).fetchone()
+        band_counts = conn.execute(
+            "SELECT radius_band, COUNT(*) as cnt FROM nearby_practices "
+            "WHERE is_excluded=0 GROUP BY radius_band ORDER BY radius_band"
+        ).fetchall()
+    return {
+        "total": total,
+        "excluded": excluded,
+        "active": total - excluded,
+        "last_synced_at": last_sync or "",
+        "last_run_id": last_run_id[0] if last_run_id else "",
+        "by_band": {str(r["radius_band"]): r["cnt"] for r in band_counts},
+    }

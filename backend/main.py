@@ -371,8 +371,36 @@ async def lifespan(app: FastAPI):
     ads_scheduler.add_job(_domain_crawl_job, CronTrigger(day=1, hour=2, minute=0),
                           id="domain_crawl", name="Domain Crawler (monthly)", replace_existing=True)
 
+    # Quarterly nearby-practices sync — 1st of Jan, Apr, Jul, Oct at 3 AM.
+    # Fetches all 4 radius bands (5/10/15/20 mi) from Google Places and
+    # upserts into nearby_practices DB for brand-negative keyword generation.
+    def _nearby_practices_sync_job():
+        _stamp("nearby_practices_sync")
+        try:
+            from places_client import sync_nearby_practices as _sync_nearby
+            _places_key = get_settings().google_places_api_key
+            if not _places_key:
+                logger.warning("[nearby_sync] No GOOGLE_PLACES_API_KEY — skipping")
+                return
+            result = _sync_nearby(_places_key)
+            logger.info(
+                f"[nearby_sync] Quarterly sync complete: "
+                f"synced={result.get('synced',0)} errors={result.get('errors',0)} "
+                f"run_id={result.get('run_id','?')} bands={result.get('bands',{})}"
+            )
+        except Exception as e:
+            logger.error(f"Nearby practices sync failed: {e}")
+
+    ads_scheduler.add_job(
+        _nearby_practices_sync_job,
+        CronTrigger(month="1,4,7,10", day=1, hour=3, minute=0),
+        id="nearby_practices_sync",
+        name="Nearby Practices Quarterly Sync",
+        replace_existing=True,
+    )
+
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
+    logger.info("Scheduled jobs started (quarterly nearby-practices sync, 1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
 
     yield
 
@@ -1819,7 +1847,28 @@ async def gads_reject_action(action_id: str, request: Request):
         record_reject_reason(action_id, reject_reason)
         logger.info(f"[phase_a] Rejection recorded for {action_id[:8]}: {reject_reason[:80]}")
 
-    # Update optimizer memory with rejection decision
+        # Auto-write rejection pattern to optimizer_memory so future runs learn from it
+        try:
+            from database import add_optimizer_memory
+            _entity_name = (row.get("entity_name") or "").strip()
+            _operation   = (row.get("operation") or "").strip()
+            _campaign    = (row.get("campaign_name") or "").strip()
+            if _entity_name and _operation:
+                _mem_key    = f"{_operation}:{_entity_name.lower()}"
+                _mem_reason = f"Admin rejected '{_operation}' on '{_entity_name}': {reject_reason}"
+                add_optimizer_memory(
+                    category="rejection_pattern",
+                    key=_mem_key,
+                    value="rejected_by_admin",
+                    reason=_mem_reason,
+                    campaign=_campaign,
+                    author="admin",
+                )
+                logger.info(f"[phase_a] Wrote rejection_pattern to optimizer_memory: {_mem_key[:60]}")
+        except Exception as _omem_err:
+            logger.debug(f"optimizer_memory write on reject failed (non-fatal): {_omem_err}")
+
+    # Update optimizer run memory with rejection decision (MemoryStore file)
     try:
         from optimizer_memory import MemoryStore
         _mem = MemoryStore()
@@ -5039,6 +5088,28 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
             + ", ".join(_neg_intent)
         )
 
+        # Load brand negatives from nearby_practices DB (all non-excluded within 20 miles).
+        # These prevent accidental clicks from patients searching for a competitor's contact info.
+        _brand_neg_block = ""
+        _brand_neg_rule = ""
+        try:
+            from database import get_brand_negatives_for_campaign as _get_brand_negs
+            _brand_stems = _get_brand_negs(campaign_type=_kw_camp_type, max_miles=20.0)
+            if _brand_stems:
+                _brand_neg_block = (
+                    f"\n\n=== NEARBY PRACTICE BRAND NEGATIVES (MANDATORY — add ALL to negative_keywords) ===\n"
+                    f"These {len(_brand_stems)} brand stems come from real dental practices within 20 miles.\n"
+                    f"They MUST be in negative_keywords to prevent accidental clicks from patients\n"
+                    f"searching for a competitor's contact info or phone number:\n"
+                    + "\n".join(f"  - \"{s}\"" for s in _brand_stems)
+                )
+                _brand_neg_rule = (
+                    f"\n- BRAND NEGATIVES (mandatory): Add ALL {len(_brand_stems)} nearby practice brand stems "
+                    f"listed above to negative_keywords. Do not omit any."
+                )
+        except Exception as _bne:
+            logger.warning(f"build-step keywords: brand negatives load failed (non-fatal): {_bne}")
+
         from ai_optimizer import GOOGLE_ADS_RULES as _GAR
         prompt = _GAR + f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
 
@@ -5049,7 +5120,7 @@ Monthly Budget: ${budget}
 Objective: {objective}
 Target Audience: {target_audience}
 Key Messages: {', '.join(key_messages)}
-Implementation Notes: {impl_notes}{_intent_block}{_site_section}{_source_kw_block}{_source_neg_block}{_optimizer_memory_block}{_comp_context_block}
+Implementation Notes: {impl_notes}{_intent_block}{_site_section}{_source_kw_block}{_source_neg_block}{_optimizer_memory_block}{_comp_context_block}{_brand_neg_block}
 
 Return a JSON object with this exact structure:
 {{
@@ -5063,7 +5134,7 @@ Rules:
 - exact_match: 8-12 high-intent keywords — must include "near me", "same day", "[service] cost", and "[town] [service]" variants using the intent patterns above
 - phrase_match: 10-15 moderate-intent phrases covering service variations and location modifiers
 - broad_match_modifier: 5-8 broader terms to capture volume (service category + location area)
-- negative_keywords: Include ALL source campaign negatives above PLUS optimizer memory negatives PLUS {_neg_intent_note}
+- negative_keywords: Include ALL source campaign negatives above PLUS optimizer memory negatives PLUS {_neg_intent_note}{_brand_neg_rule}
 - Geographic targeting towns: Grafton, Shrewsbury, Westborough, Northborough, Millbury, Auburn, Worcester area{_conquest_rule}
 - Return ONLY the JSON object, no explanation."""
 
@@ -5088,6 +5159,17 @@ Rules:
             if _adcopy_pos:
                 _adcopy_diff_block += f"\nPositioning Strategy: {_adcopy_pos}"
 
+        # Detect audience constraint — if target specifies adults/age-specific, inject hard rule
+        _audience_constraint = ""
+        _ta_lower = (target_audience or "").lower()
+        if any(kw in _ta_lower for kw in ["adult", "18+", "18 +", "over 18", "grown", "senior", "age "]):
+            _audience_constraint = (
+                "\n\nAUDIENCE HARD CONSTRAINT: This campaign targets ADULTS ONLY. "
+                "Do NOT use any family, children, pediatric, or all-ages language in any headline or description. "
+                "No references to 'family', 'kids', 'children', 'pediatric', 'whole family', 'all ages'. "
+                "Focus exclusively on language that resonates with adult patients making their own dental decisions."
+            )
+
         from ai_optimizer import GOOGLE_ADS_RULES as _GAR
         prompt = _GAR + f"""You are a Google Ads copywriter. Generate complete RSA ad copy for this dental campaign.
 
@@ -5098,7 +5180,7 @@ Target Audience: {target_audience}
 {kw_context}
 Strategy Headlines: {', '.join(headlines_from_strategy)}
 Strategy Descriptions: {'; '.join(descs_from_strategy)}
-Implementation Notes: {impl_notes}{_adcopy_diff_block}{_site_section}
+Implementation Notes: {impl_notes}{_adcopy_diff_block}{_site_section}{_audience_constraint}
 
 Return a JSON object with this exact structure:
 {{
@@ -5174,6 +5256,93 @@ Rules:
             CONQUEST_ELIGIBLE_TYPES as _CONQUEST_ELIGIBLE,
         )
 
+        # Load nearby dentists from DB (quarterly-synced nearby_practices table).
+        # Falls back to a live Places API call if the DB is empty (first run before first sync).
+        _nearby_dentists = []
+        try:
+            from database import get_nearby_practices as _get_nearby_db
+            _db_practices = _get_nearby_db(max_miles=20.0, include_excluded=True)
+            if _db_practices:
+                # Convert DB rows to the format format_for_claude expects
+                _nearby_dentists = [
+                    {
+                        "name": p["name"],
+                        "place_id": p["place_id"],
+                        "vicinity": p["vicinity"],
+                        "rating": p.get("rating"),
+                        "user_ratings_total": p.get("review_count", 0),
+                        "business_status": p.get("business_status", "OPERATIONAL"),
+                        "types": [],
+                        "distance_miles": p.get("distance_miles", 0),
+                        "is_excluded": p.get("is_excluded", 0),
+                    }
+                    for p in _db_practices
+                ]
+                logger.info(f"[competitor_analysis] Loaded {len(_nearby_dentists)} practices from DB")
+            else:
+                # DB empty — fall back to live Places API (will populate after first quarterly sync)
+                logger.info("[competitor_analysis] DB empty — falling back to live Places API")
+                from places_client import fetch_nearby_dentists as _fetch_places
+                _places_key = get_settings().google_places_api_key
+                _nearby_dentists = _fetch_places(_places_key) if _places_key else []
+        except Exception as _places_err:
+            logger.warning(f"[competitor_analysis] Nearby practices load failed (non-fatal): {_places_err}")
+            _nearby_dentists = []
+
+        # Build campaign-type-specific filtering guidance for Claude
+        _camp_type_filter = {
+            "implants": (
+                "Focus on implant-relevant competitors: practices advertising dental implants or "
+                "all-on-4, national implant chains (ClearChoice, Nuvia, Affordable Dentures & Implants), "
+                "and oral surgeons in the area. General dentistry offices without implant emphasis are "
+                "lower priority unless they are very close geographically."
+            ),
+            "invisalign": (
+                "Focus on orthodontic and Invisalign competitors: practices advertising Invisalign, "
+                "clear aligners, or braces. National aligner brands (SmileDirectClub, Byte, Candid) "
+                "are national_chain competitors. Local orthodontists and Invisalign providers are "
+                "local_office competitors."
+            ),
+            "emergency": (
+                "Focus on emergency dental competitors: practices advertising same-day or emergency "
+                "dental care, urgent dental clinics, and any office with prominent emergency hours. "
+                "These are all local_office competitors — no national chain plays in emergency dental."
+            ),
+            "dentures": (
+                "Focus on denture-relevant competitors: Aspen Dental, Affordable Dentures & Implants, "
+                "and local practices advertising full or partial dentures. National denture chains are "
+                "national_chain; local practices are local_office."
+            ),
+            "cosmetic": (
+                "Focus on cosmetic dental competitors: practices advertising veneers, whitening, smile "
+                "makeovers, or cosmetic dentistry. Look for high-end cosmetic practices and any office "
+                "with prominent cosmetic branding."
+            ),
+        }.get(_camp_type, (
+            "This is a general dentistry campaign. Focus on full-service dental practices "
+            "that compete for new patient acquisition across all services. Prioritize offices "
+            "within 10 miles that accept new patients. Chains like Aspen Dental are national_chain; "
+            "independent practices are local_office."
+        ))
+
+        # Build Places context block for prompt injection
+        _places_block = ""
+        if _nearby_dentists:
+            _places_block = (
+                f"\nREAL DENTAL PRACTICES NEAR GRAFTON MA (from Google Places — {len(_nearby_dentists)} found within 15 miles):\n"
+                + _fmt_places(_nearby_dentists)
+                + "\n\nSELECTION RULE: You MUST select competitors from this real list. Do NOT invent "
+                "practices not in this list. If a national chain (ClearChoice, Nuvia, etc.) does not "
+                "appear in the list, you may add it as a national_chain competitor with confidence: 'high' "
+                "since they advertise nationally. For local_office competitors, only name practices that "
+                "appear in the list above.\n"
+            )
+        else:
+            _places_block = (
+                "\nNOTE: Real-time Places data unavailable. Use your best knowledge of dental practices "
+                "in the Worcester County MA area, but mark confidence carefully.\n"
+            )
+
         # Build conquest eligibility note for Claude
         _conquest_instruction = (
             "conquest_keywords: leave empty — the server will derive conquest targets from "
@@ -5207,12 +5376,15 @@ OBJECTIVE: {objective}
 TARGET AUDIENCE: {target_audience}
 KEY MESSAGES: {', '.join(key_messages)}
 {_site_section}{_conquest_note}
+{_places_block}
+CAMPAIGN-TYPE COMPETITOR SELECTION GUIDANCE:
+{_camp_type_filter}
 
-TASK: Identify 4–6 dental practices that realistically compete for the same patients in this service area for this specific service. Then identify how we can differentiate.
+TASK: Identify 8–12 dental practices that compete for the same patients for THIS SPECIFIC SERVICE TYPE. Use the real Places list above as your source for local competitors. Then identify how we can differentiate.
 
 IMPORTANT RULES:
-1. Only name practices you have HIGH confidence exist in this specific area. If unsure, use a generic descriptor like "Independent implant specialist in Shrewsbury" and mark confidence: "low".
-2. Focus on the SERVICE TYPE — for implants, name implant-focused competitors; for emergency, name practices advertising same-day care.
+1. GROUND YOUR ANSWER IN REALITY: Use the real Places list for local_office competitors. Do not invent local offices. For national_chain competitors, you may add chains not in the list if they are known to advertise in this market.
+2. Focus on the SERVICE TYPE — pick competitors relevant to "{_camp_type}" specifically, not just any dental office nearby.
 3. For EACH competitor, classify it:
    - "local_office": a specific physical dental office within driving distance (independent or chain branch).
    - "national_chain": a destination brand whose patients comparison-shop across providers
@@ -10874,6 +11046,92 @@ def admin_domain_context(domain_id: int, max_pages: int = 10):
     if not context:
         return {"context": "", "message": "No crawled pages yet. Trigger a crawl first."}
     return {"context": context, "char_count": len(context)}
+
+
+# ─── Nearby Practices (Google Places quarterly sync) ─────────────────────────
+
+@app.get("/api/admin/nearby-practices", dependencies=[Depends(_require_admin)])
+def list_nearby_practices(max_miles: float = 20.0, include_excluded: bool = False):
+    """
+    Return all nearby dental practices within max_miles from Google Places DB.
+    Groups by radius_band for the admin UI.
+    """
+    from database import get_nearby_practices, get_nearby_sync_stats
+    practices = get_nearby_practices(max_miles=max_miles, include_excluded=include_excluded)
+    stats = get_nearby_sync_stats()
+    # Group by radius band
+    by_band: dict = {}
+    for p in practices:
+        band = str(p["radius_band"])
+        by_band.setdefault(band, []).append(p)
+    return {
+        "practices": practices,
+        "by_band": by_band,
+        "stats": stats,
+        "total": len(practices),
+    }
+
+
+@app.post("/api/admin/nearby-practices/sync", dependencies=[Depends(_require_admin)])
+def trigger_nearby_sync():
+    """
+    Manually trigger a nearby-practices sync (runs in background thread).
+    Same job that runs quarterly — fetches all 4 radius bands from Google Places.
+    """
+    import threading
+
+    def _run():
+        try:
+            from places_client import sync_nearby_practices as _sync
+            _places_key = get_settings().google_places_api_key
+            if not _places_key:
+                logger.warning("[nearby_sync] Manual trigger: no API key configured")
+                return
+            result = _sync(_places_key)
+            logger.info(f"[nearby_sync] Manual sync complete: {result}")
+        except Exception as e:
+            logger.error(f"[nearby_sync] Manual sync failed: {e}")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"status": "started", "message": "Sync running in background — refresh in ~30 seconds"}
+
+
+@app.post(
+    "/api/admin/nearby-practices/{place_id}/exclude",
+    dependencies=[Depends(_require_admin)],
+)
+def exclude_nearby_practice(place_id: str, body: dict = Body(default={})):
+    """
+    Toggle is_excluded on a nearby practice (manual override).
+    Body: {"excluded": true/false, "note": "reason"}
+    Excluded practices are NOT used for brand-negative keyword generation.
+    """
+    from database import set_nearby_practice_excluded
+    excluded = bool(body.get("excluded", True))
+    note = str(body.get("note", ""))
+    updated = set_nearby_practice_excluded(place_id, excluded, note)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    return {"ok": True, "place_id": place_id, "excluded": excluded}
+
+
+@app.get("/api/admin/nearby-practices/brand-negatives", dependencies=[Depends(_require_admin)])
+def get_brand_negatives(max_miles: float = 20.0, campaign_type: str = "general"):
+    """
+    Return the full list of brand-negative keyword stems for a given campaign type.
+    Used by the campaign wizard keywords step to preview what will be injected.
+    """
+    from database import get_brand_negatives_for_campaign, get_nearby_sync_stats
+    stems = get_brand_negatives_for_campaign(campaign_type=campaign_type, max_miles=max_miles)
+    stats = get_nearby_sync_stats()
+    return {
+        "stems": stems,
+        "count": len(stems),
+        "last_synced_at": stats.get("last_synced_at", ""),
+        "campaign_type": campaign_type,
+        "max_miles": max_miles,
+    }
 
 
 if __name__ == "__main__":

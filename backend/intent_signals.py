@@ -54,7 +54,12 @@ NEG_INTENT_BY_TYPE: dict[str, list[str]] = {
     ],
     "cosmetic":   ["jobs", "free", "insurance", "medicaid", "DIY", "at home", "school"],
     "gum":        ["jobs", "free", "home remedy", "oil pulling", "DIY", "insurance only", "school"],
-    "general":    ["jobs", "free", "medicaid only", "school", "DIY", "veterinary", "animal"],
+    # General dentistry negatives: only true non-dental / career / irrelevant queries.
+    # DO NOT include specialty services (implants, emergency, cosmetic, veneers, etc.) —
+    # those are services GDC actually offers and should appear in general campaigns.
+    "general":    ["jobs", "salary", "career", "free", "medicaid only", "school", "DIY",
+                   "veterinary", "animal", "dog", "cat", "pet", "dental assistant",
+                   "dental school", "dental hygienist", "receptionist"],
 }
 
 

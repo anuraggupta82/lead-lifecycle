@@ -2405,6 +2405,195 @@ function LandingPagesView({ ga4Data }) {
   );
 }
 
+// ─── NearbyPracticesView ───────────────────────────────────────────────────
+function NearbyPracticesView() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [bandFilter, setBandFilter] = useState('all');
+  const [showExcluded, setShowExcluded] = useState(false);
+  const [togglingId, setTogglingId] = useState(null);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const r = await api(`/api/admin/nearby-practices?max_miles=20&include_excluded=true`);
+      setData(r);
+    } catch(e) { console.error(e); }
+    setLoading(false);
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function triggerSync() {
+    if (!confirm('Run a full Google Places sync now? This will fetch all 4 radius bands (5/10/15/20 mi). Takes ~30 seconds.')) return;
+    setSyncing(true);
+    try {
+      await api('/api/admin/nearby-practices/sync', { method: 'POST' });
+      setTimeout(() => { load(); setSyncing(false); }, 35000);
+    } catch(e) { alert('Sync failed: ' + e.message); setSyncing(false); }
+  }
+
+  async function toggleExclude(placeId, currentlyExcluded) {
+    setTogglingId(placeId);
+    try {
+      await api(`/api/admin/nearby-practices/${placeId}/exclude`, {
+        method: 'POST',
+        body: JSON.stringify({ excluded: !currentlyExcluded })
+      });
+      await load();
+    } catch(e) { alert('Toggle failed: ' + e.message); }
+    setTogglingId(null);
+  }
+
+  if (loading) return <div style={{padding:24,color:'var(--text-muted)',fontSize:13}}>Loading nearby practices…</div>;
+
+  const stats = data?.stats || {};
+  const allPractices = data?.practices || [];
+  const filtered = allPractices.filter(p => {
+    if (!showExcluded && p.is_excluded) return false;
+    if (bandFilter !== 'all' && String(p.radius_band) !== bandFilter) return false;
+    return true;
+  });
+
+  const bandCounts = { '5': 0, '10': 0, '15': 0, '20': 0 };
+  allPractices.forEach(p => { bandCounts[String(p.radius_band)] = (bandCounts[String(p.radius_band)] || 0) + 1; });
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:12}}>
+        <div>
+          <div className="report-title" style={{marginBottom:2}}>Nearby Practices</div>
+          <div style={{fontSize:11,color:'var(--text-muted)'}}>
+            {stats.active || 0} active practices · {stats.excluded || 0} excluded · last synced {stats.last_synced_at ? new Date(stats.last_synced_at).toLocaleDateString() : 'never'}
+          </div>
+        </div>
+        <button
+          className="btn btn-teal btn-sm"
+          onClick={triggerSync}
+          disabled={syncing}
+          style={{fontSize:11}}
+        >
+          {syncing ? '⏳ Syncing…' : '🔄 Sync Now'}
+        </button>
+      </div>
+
+      {/* Stats strip */}
+      <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+        {[['5 mi', stats.by_band?.['5'] || 0], ['10 mi', stats.by_band?.['10'] || 0],
+          ['15 mi', stats.by_band?.['15'] || 0], ['20 mi', stats.by_band?.['20'] || 0]].map(([label, count]) => (
+          <div key={label} style={{background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:6,padding:'6px 12px',fontSize:12,textAlign:'center',minWidth:60}}>
+            <div style={{fontWeight:600,fontSize:14}}>{count}</div>
+            <div style={{color:'var(--text-muted)',fontSize:10}}>{label}</div>
+          </div>
+        ))}
+        <div style={{background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:6,padding:'6px 12px',fontSize:12,textAlign:'center',minWidth:70}}>
+          <div style={{fontWeight:600,fontSize:14,color:'#e74c3c'}}>{stats.excluded || 0}</div>
+          <div style={{color:'var(--text-muted)',fontSize:10}}>excluded</div>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10,flexWrap:'wrap'}}>
+        <span style={{fontSize:11,color:'var(--text-muted)'}}>Radius band:</span>
+        {[['all','All'], ['5','≤ 5 mi'], ['10','6–10 mi'], ['15','11–15 mi'], ['20','16–20 mi']].map(([v,l]) => (
+          <button key={v} onClick={() => setBandFilter(v)}
+            style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+              background:bandFilter===v?'var(--teal)':'#fff',color:bandFilter===v?'#fff':'var(--text-muted)'}}>
+            {l}
+          </button>
+        ))}
+        <label style={{fontSize:11,color:'var(--text-muted)',display:'flex',alignItems:'center',gap:4,cursor:'pointer',marginLeft:8}}>
+          <input type="checkbox" checked={showExcluded} onChange={e=>setShowExcluded(e.target.checked)} />
+          Show excluded
+        </label>
+      </div>
+
+      {/* No data callout */}
+      {allPractices.length === 0 && (
+        <div style={{padding:20,textAlign:'center',color:'var(--text-muted)',fontSize:13,border:'1px dashed var(--border)',borderRadius:6}}>
+          No nearby practices in DB yet. Click <strong>Sync Now</strong> to fetch from Google Places.
+        </div>
+      )}
+
+      {/* Table */}
+      {filtered.length > 0 && (
+        <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+          <thead>
+            <tr style={{borderBottom:'2px solid var(--border)',background:'var(--bg-header)'}}>
+              <th style={{padding:'6px 8px',textAlign:'left',fontWeight:600,fontSize:11}}>Practice</th>
+              <th style={{padding:'6px 8px',textAlign:'left',fontWeight:600,fontSize:11}}>Address</th>
+              <th style={{padding:'6px 8px',textAlign:'center',fontWeight:600,fontSize:11}}>Dist</th>
+              <th style={{padding:'6px 8px',textAlign:'center',fontWeight:600,fontSize:11}}>Band</th>
+              <th style={{padding:'6px 8px',textAlign:'center',fontWeight:600,fontSize:11}}>Rating</th>
+              <th style={{padding:'6px 8px',textAlign:'left',fontWeight:600,fontSize:11}}>Brand stems (negatives)</th>
+              <th style={{padding:'6px 8px',textAlign:'center',fontWeight:600,fontSize:11}}>Exclude</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(p => (
+              <tr key={p.place_id} style={{
+                borderBottom:'1px solid var(--border)',
+                opacity: p.is_excluded ? 0.45 : 1,
+                background: p.is_excluded ? '#fff5f5' : undefined,
+              }}>
+                <td style={{padding:'6px 8px',fontWeight:p.is_excluded?400:500}}>
+                  {p.name}
+                  {p.is_excluded && <span style={{marginLeft:4,fontSize:9,color:'#e74c3c',border:'1px solid #e74c3c',borderRadius:3,padding:'1px 4px'}}>excluded</span>}
+                </td>
+                <td style={{padding:'6px 8px',color:'var(--text-muted)',maxWidth:180,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.vicinity}</td>
+                <td style={{padding:'6px 8px',textAlign:'center',color:'var(--text-muted)'}}>{p.distance_miles ? p.distance_miles.toFixed(1)+' mi' : '—'}</td>
+                <td style={{padding:'6px 8px',textAlign:'center'}}>
+                  <span style={{background:'var(--teal)',color:'#fff',borderRadius:10,padding:'1px 6px',fontSize:10}}>{p.radius_band} mi</span>
+                </td>
+                <td style={{padding:'6px 8px',textAlign:'center',color:'var(--text-muted)'}}>
+                  {p.rating > 0 ? `★ ${p.rating} (${p.review_count})` : '—'}
+                </td>
+                <td style={{padding:'6px 8px',maxWidth:240}}>
+                  <div style={{display:'flex',flexWrap:'wrap',gap:3}}>
+                    {(p.brand_stems || []).map(s => (
+                      <span key={s} style={{background:'#f0f4ff',border:'1px solid #c5d0f0',borderRadius:3,padding:'1px 5px',fontSize:10,color:'#444',fontFamily:'monospace'}}>
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                </td>
+                <td style={{padding:'6px 8px',textAlign:'center'}}>
+                  <button
+                    onClick={() => toggleExclude(p.place_id, !!p.is_excluded)}
+                    disabled={togglingId === p.place_id}
+                    title={p.is_excluded ? 'Re-include in brand negatives' : 'Exclude from brand negatives'}
+                    style={{
+                      padding:'2px 8px',fontSize:10,cursor:'pointer',borderRadius:4,
+                      border: p.is_excluded ? '1px solid #27ae60' : '1px solid #e74c3c',
+                      background: p.is_excluded ? '#f0fff4' : '#fff5f5',
+                      color: p.is_excluded ? '#27ae60' : '#e74c3c',
+                    }}
+                  >
+                    {togglingId === p.place_id ? '…' : p.is_excluded ? 'Re-include' : 'Exclude'}
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {filtered.length === 0 && allPractices.length > 0 && (
+        <div style={{padding:16,textAlign:'center',color:'var(--text-muted)',fontSize:12}}>
+          No practices match the current filter.
+        </div>
+      )}
+
+      <div style={{marginTop:12,padding:10,background:'#f8f9ff',border:'1px solid #d0d9f0',borderRadius:6,fontSize:11,color:'#555'}}>
+        <strong>How this works:</strong> All non-excluded brand stems are automatically added as negative keywords when you create a new campaign, preventing accidental clicks from patients searching for a competitor's contact info.
+        The quarterly sync runs every Jan 1, Apr 1, Jul 1, Oct 1. You can also trigger it manually above. Excluded practices are preserved across syncs.
+      </div>
+    </div>
+  );
+}
+
 // ─── AdGroupsView ──────────────────────────────────────────────────────────
 function AdGroupsView({ adGroupStats, dailyStats }) {
   const [campFilter, setCampFilter] = useState('all');
@@ -4928,6 +5117,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [campDetail, setCampDetail] = useState(null);
   const [campDetailLoading, setCampDetailLoading] = useState(false);
   const [campDetailOptimizerRecs, setCampDetailOptimizerRecs] = useState([]);
+  const [campDetailRejectModal, setCampDetailRejectModal] = useState(null); // {action_id, entity_name, operation}
   const [campDetailDays, setCampDetailDays] = useState(30);
   const [syncPerfLoading, setSyncPerfLoading] = useState(false);
   const [syncPerfResult, setSyncPerfResult] = useState(null);
@@ -5574,7 +5764,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages'],['nearby','Nearby Practices']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -5611,6 +5801,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
 
       {/* ── Landing Pages view ── */}
       {view==='landingpages' && <LandingPagesView ga4Data={ga4Data} />}
+
+      {/* ── Nearby Practices view ── */}
+      {view==='nearby' && <NearbyPracticesView />}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>
@@ -6262,6 +6455,24 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         </div>
       )}
 
+      {/* ── Campaign Detail reject-reason modal ── */}
+      {campDetailRejectModal && (
+        <RejectReasonModal
+          actionId={campDetailRejectModal.action_id}
+          entityName={campDetailRejectModal.entity_name}
+          operation={campDetailRejectModal.operation}
+          onConfirm={async (reason) => {
+            const aid = campDetailRejectModal.action_id;
+            setCampDetailRejectModal(null);
+            try {
+              await api(`/api/admin/gads/reject/${aid}`, {method:'POST', body:JSON.stringify({reason})});
+              setCampDetailOptimizerRecs(prev => prev.filter(x => x.action_id !== aid));
+            } catch(e) { alert('Reject failed: ' + (e?.detail || e?.message)); }
+          }}
+          onCancel={() => setCampDetailRejectModal(null)}
+        />
+      )}
+
       {/* ── Campaign Detail Drawer ── */}
       {(campDetail || campDetailLoading) && (
         <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.35)',
@@ -6313,11 +6524,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                 catch(e){alert('Approve failed: '+(e?.detail||e?.message));}
                               }}>✓ Approve</button>
                             <button style={{background:'#f3f4f6',color:'#374151',border:'1px solid var(--border)',borderRadius:4,padding:'3px 9px',fontSize:10,cursor:'pointer'}}
-                              onClick={async()=>{
-                                try{await api(`/api/admin/gads/reject/${r.action_id}`,{method:'POST',body:JSON.stringify({reason:''})});
-                                  setCampDetailOptimizerRecs(prev=>prev.filter(x=>x.action_id!==r.action_id));}
-                                catch(e){alert('Reject failed: '+(e?.detail||e?.message));}
-                              }}>✕ Ignore</button>
+                              onClick={()=>setCampDetailRejectModal({action_id: r.action_id, entity_name: r.entity_name, operation: r.operation})}
+                            >✕ Ignore</button>
                           </div>
                         </div>
                       </div>
@@ -13823,11 +14031,105 @@ function ODConnectionCard() {
 }
 
 
+// ── Rejection Reason Modal ─────────────────────────────────────────────────────
+const REJECT_CHIPS = [
+  "Still testing — needs more data",
+  "This term converts for us, keep it",
+  "Too aggressive right now",
+  "Wrong campaign context",
+  "Budget constraint — not now",
+  "Will handle manually",
+];
+
+function RejectReasonModal({ actionId, entityName, operation, onConfirm, onCancel }) {
+  const [selected, setSelected] = React.useState([]);
+  const [freeText, setFreeText] = React.useState('');
+
+  function toggleChip(chip) {
+    setSelected(prev => prev.includes(chip) ? prev.filter(c => c !== chip) : [...prev, chip]);
+  }
+
+  function buildReason() {
+    const parts = [...selected];
+    if (freeText.trim()) parts.push(freeText.trim());
+    return parts.join(' | ');
+  }
+
+  return (
+    <div style={{
+      position:'fixed',inset:0,background:'rgba(0,0,0,0.45)',zIndex:9999,
+      display:'flex',alignItems:'center',justifyContent:'center',padding:16
+    }}>
+      <div style={{
+        background:'#fff',borderRadius:10,padding:20,maxWidth:440,width:'100%',
+        boxShadow:'0 8px 32px rgba(0,0,0,0.18)'
+      }}>
+        <div style={{fontSize:14,fontWeight:700,color:'#111',marginBottom:4}}>Reject Recommendation</div>
+        <div style={{fontSize:11,color:'#6b7280',marginBottom:12}}>
+          <strong>{operation?.replace(/_/g,' ')}</strong>{entityName ? ` — "${entityName}"` : ''}
+        </div>
+
+        <div style={{fontSize:11,fontWeight:600,color:'#374151',marginBottom:6}}>
+          Why are you rejecting this? <span style={{fontWeight:400,color:'#9ca3af'}}>(optional — helps the AI learn)</span>
+        </div>
+
+        {/* Chips */}
+        <div style={{display:'flex',flexWrap:'wrap',gap:5,marginBottom:10}}>
+          {REJECT_CHIPS.map(chip => (
+            <button key={chip}
+              onClick={() => toggleChip(chip)}
+              style={{
+                fontSize:10,padding:'4px 9px',borderRadius:20,cursor:'pointer',
+                border: selected.includes(chip) ? '1.5px solid #2563eb' : '1px solid #d1d5db',
+                background: selected.includes(chip) ? '#eff6ff' : '#f9fafb',
+                color: selected.includes(chip) ? '#1d4ed8' : '#374151',
+                fontWeight: selected.includes(chip) ? 600 : 400,
+              }}
+            >{chip}</button>
+          ))}
+        </div>
+
+        {/* Free text */}
+        <textarea
+          value={freeText}
+          onChange={e => setFreeText(e.target.value)}
+          placeholder="Add more context for the AI…"
+          maxLength={300}
+          style={{
+            width:'100%',boxSizing:'border-box',height:60,fontSize:11,padding:'6px 8px',
+            borderRadius:5,border:'1px solid #d1d5db',resize:'vertical',
+            fontFamily:'inherit',color:'#374151'
+          }}
+        />
+        <div style={{fontSize:9,color:'#9ca3af',textAlign:'right',marginTop:2}}>
+          {freeText.length}/300
+        </div>
+
+        {/* Buttons */}
+        <div style={{display:'flex',gap:8,marginTop:12,justifyContent:'flex-end'}}>
+          <button onClick={onCancel}
+            style={{fontSize:11,padding:'5px 14px',borderRadius:5,border:'1px solid #d1d5db',
+              background:'#f9fafb',color:'#374151',cursor:'pointer'}}>
+            Cancel
+          </button>
+          <button onClick={() => onConfirm(buildReason())}
+            style={{fontSize:11,padding:'5px 14px',borderRadius:5,border:'none',
+              background:'#dc2626',color:'#fff',fontWeight:600,cursor:'pointer'}}>
+            ❌ Reject
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 // ── Pending Approvals Panel ────────────────────────────────────────────────────
 function PendingApprovalsPanel() {
   const [rows, setRows]     = useState(null);   // null = loading
   const [acting, setActing] = useState({});     // {action_id: 'apply'|'reject'}
   const [error, setError]   = useState(null);
+  const [rejectModal, setRejectModal] = useState(null); // {action_id, entity_name, operation}
 
   async function load() {
     try {
@@ -13856,11 +14158,19 @@ function PendingApprovalsPanel() {
     setActing(prev => ({...prev, [action_id]: null}));
   }
 
-  async function handleReject(action_id) {
-    if (!confirm('Reject and dismiss this recommendation?')) return;
+  function handleReject(action_id) {
+    const row = (rows || []).find(r => r.action_id === action_id);
+    setRejectModal({ action_id, entity_name: row?.entity_name, operation: row?.operation });
+  }
+
+  async function confirmReject(action_id, reason) {
+    setRejectModal(null);
     setActing(prev => ({...prev, [action_id]: 'reject'}));
     try {
-      await api(`/api/admin/gads/reject/${action_id}`, { method: 'POST' });
+      await api(`/api/admin/gads/reject/${action_id}`, {
+        method: 'POST',
+        body: JSON.stringify({ reason }),
+      });
       setRows(prev => prev.map(r => r.action_id === action_id
         ? {...r, _result: 'rejected'} : r));
     } catch(e) {
@@ -13904,6 +14214,16 @@ function PendingApprovalsPanel() {
   }
 
   return (
+    <>
+    {rejectModal && (
+      <RejectReasonModal
+        actionId={rejectModal.action_id}
+        entityName={rejectModal.entity_name}
+        operation={rejectModal.operation}
+        onConfirm={(reason) => confirmReject(rejectModal.action_id, reason)}
+        onCancel={() => setRejectModal(null)}
+      />
+    )}
     <div className="report-section">
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
         <div className="report-title" style={{marginBottom:0}}>Pending Recommendations</div>
@@ -14006,6 +14326,7 @@ function PendingApprovalsPanel() {
         );
       })}
     </div>
+    </>
   );
 }
 
@@ -14454,6 +14775,7 @@ function AiOptimizerTab() {
   const [impactLoading, setImpactLoading] = React.useState(false);
   const [histFilter, setHistFilter] = React.useState('all');
   const [histSelected, setHistSelected] = React.useState({});
+  const [rejectModal, setRejectModal] = React.useState(null); // {actionId, entity_name, operation}
   // Competitor candidate queue
   const [compQueue, setCompQueue] = React.useState({pending:[], dismissed:[], promoted:[]});
   const [showIgnoredQueue, setShowIgnoredQueue] = React.useState(false);
@@ -14609,10 +14931,18 @@ function AiOptimizerTab() {
     finally { setBusy(p => { const n={...p}; delete n[actionId]; return n; }); }
   };
 
-  const handleIgnore = async (actionId) => {
+  const handleIgnore = (actionId) => {
+    // Find the rec to show in the modal
+    const allR = recs ? Object.values(recs.recommendations || {}).flat() : [];
+    const rec = allR.find(r => r.action_id === actionId);
+    setRejectModal({ actionId, entity_name: rec?.entity_name, operation: rec?.operation });
+  };
+
+  const confirmIgnore = async (actionId, reason) => {
+    setRejectModal(null);
     setBusy(p => ({...p, [actionId]: 'ignore'}));
     try {
-      await api(`/api/admin/gads/reject/${actionId}`, {method:'POST', body:JSON.stringify({reason:''})});
+      await api(`/api/admin/gads/reject/${actionId}`, {method:'POST', body:JSON.stringify({reason})});
       await loadRecs();
     } catch(e) { alert('Ignore failed: ' + (e.message || e)); }
     finally { setBusy(p => { const n={...p}; delete n[actionId]; return n; }); }
@@ -14647,6 +14977,16 @@ function AiOptimizerTab() {
   const totalHistory = historyRecs.length;
 
   return (
+    <>
+    {rejectModal && (
+      <RejectReasonModal
+        actionId={rejectModal.actionId}
+        entityName={rejectModal.entity_name}
+        operation={rejectModal.operation}
+        onConfirm={(reason) => confirmIgnore(rejectModal.actionId, reason)}
+        onCancel={() => setRejectModal(null)}
+      />
+    )}
     <div style={{padding:'16px 20px',maxWidth:960,margin:'0 auto'}}>
       {/* Header */}
       <div style={{marginBottom:16}}>
@@ -15539,6 +15879,7 @@ function AiOptimizerTab() {
         );
       })()}
     </div>
+    </>
   );
 }
 
