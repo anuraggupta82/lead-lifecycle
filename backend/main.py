@@ -5282,6 +5282,7 @@ Rules:
         # Load nearby dentists from DB (quarterly-synced nearby_practices table).
         # Falls back to a live Places API call if the DB is empty (first run before first sync).
         _nearby_dentists = []
+        from places_client import fetch_nearby_dentists as _fetch_places, format_for_claude as _fmt_places
         try:
             from database import get_nearby_practices as _get_nearby_db
             _db_practices = _get_nearby_db(max_miles=20.0, include_excluded=True)
@@ -5305,7 +5306,6 @@ Rules:
             else:
                 # DB empty — fall back to live Places API (will populate after first quarterly sync)
                 logger.info("[competitor_analysis] DB empty — falling back to live Places API")
-                from places_client import fetch_nearby_dentists as _fetch_places
                 _places_key = get_settings().google_places_api_key
                 _nearby_dentists = _fetch_places(_places_key) if _places_key else []
         except Exception as _places_err:

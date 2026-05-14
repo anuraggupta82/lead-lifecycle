@@ -24,6 +24,7 @@ Nothing auto-applies. All actions land in competitor_intel_actions as 'pending'.
 from __future__ import annotations
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -301,6 +302,7 @@ def run_competitor_intel_scan(
         get_intel_scan_stats,
     )
     from config import get_settings
+    from database import get_setting
 
     settings = get_settings()
     run_id = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
@@ -320,7 +322,7 @@ def run_competitor_intel_scan(
         )
 
     if not anthropic_key:
-        anthropic_key = settings.anthropic_api_key or ""
+        anthropic_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
 
     logger.info(f"[intel] Starting competitor intel scan run_id={run_id}")
 
