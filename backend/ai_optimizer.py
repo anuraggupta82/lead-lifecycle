@@ -556,7 +556,36 @@ def _build_institutional_memory_note(campaign: str = "") -> str:
                 scope = f" [campaign: {e['campaign']}]" if e.get("campaign") else " [all campaigns]"
                 lines.append(f"  ✗ {e['key']}: {e['reason']}{scope}")
 
-    # 5. General notes (capped at 30 most recent)
+    # 5. Reclassification patterns — admin has moved recs between campaign/account level
+    reclass_entries = by_cat.get("reclassification_pattern", [])
+    if reclass_entries:
+        relevant_reclass = [
+            e for e in reclass_entries
+            if not e.get("campaign") or (e.get("campaign") or "").lower() == camp_lower
+        ]
+        if relevant_reclass:
+            # Determine context: are we in a per-campaign call or account-level call?
+            is_account_level_call = not camp_lower
+            lines.append(
+                "\nRECLASSIFICATION PREFERENCES (admin has explicitly moved these recs to the correct level):"
+            )
+            for e in relevant_reclass[:20]:
+                preferred_level = "ACCOUNT LEVEL" if e.get("value") == "prefer_account_level" else "CAMPAIGN LEVEL"
+                scope = f" [campaign: {e['campaign']}]" if e.get("campaign") else " [global]"
+                if preferred_level == "ACCOUNT LEVEL" and not is_account_level_call:
+                    # Per-campaign run: suppress this rec — it belongs at account level
+                    lines.append(f"  ✗ DO NOT emit {e['key']} at campaign level — admin moved it to ACCOUNT LEVEL. {e['reason']}{scope}")
+                elif preferred_level == "CAMPAIGN LEVEL" and is_account_level_call:
+                    # Account-level run: suppress this rec — it belongs per-campaign
+                    lines.append(f"  ✗ DO NOT emit {e['key']} account-wide — admin scoped it to CAMPAIGN LEVEL. {e['reason']}{scope}")
+                else:
+                    # Same level as current run — emit normally at this level
+                    lines.append(f"  → Emit {e['key']} at {preferred_level}. {e['reason']}{scope}")
+            lines.append(
+                "  Apply the above before generating recommendations — these are hard admin directives, not suggestions."
+            )
+
+    # 6. General notes (capped at 30 most recent)
     if "general" in by_cat:
         lines.append("\nGENERAL NOTES:")
         for e in by_cat["general"][:30]:

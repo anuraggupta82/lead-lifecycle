@@ -2054,6 +2054,132 @@ async def gads_reject_action(action_id: str, request: Request):
     return {"status": "ok", "action_id": action_id, "reject_reason": reject_reason}
 
 
+@app.patch("/api/admin/gads/reclassify/{action_id}", dependencies=[Depends(_require_admin)])
+async def gads_reclassify_action(action_id: str, request: Request):
+    """
+    Move a recommendation between campaign-level and account-level.
+    Body: { "target_level": "account"|"campaign", "campaign_name": str, "reason": str }
+    - target_level="account" → sets campaign_name to "" (account-wide)
+    - target_level="campaign" → sets campaign_name to the provided campaign_name
+    Writes reclassification_pattern to optimizer_memory so Claude learns over time.
+    Memory scoping:
+      - account move: write one global entry (campaign="") — visible to both per-campaign and account-level runs
+      - campaign move: write one campaign-scoped entry + one global entry so account-level run also learns
+    """
+    from database import get_audit_row, _conn as _db_conn, add_optimizer_memory
+    row = get_audit_row(action_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Action not found")
+
+    body = await request.json()
+    target_level = str(body.get("target_level", "")).strip().lower()
+    if target_level not in ("account", "campaign"):
+        raise HTTPException(status_code=422, detail="target_level must be 'account' or 'campaign'")
+
+    campaign_name = str(body.get("campaign_name", "")).strip()
+    if target_level == "campaign" and not campaign_name:
+        raise HTTPException(status_code=422, detail="campaign_name is required when target_level='campaign'")
+    reason = str(body.get("reason", "")).strip()[:300]
+
+    # account-level recs have empty campaign_name
+    new_campaign_name = "" if target_level == "account" else campaign_name
+
+    # H4: detect no-op (already at the requested level)
+    old_campaign = (row.get("campaign_name") or "").strip()
+    old_level = "account" if not old_campaign else f"campaign:{old_campaign}"
+    new_level  = "account" if not new_campaign_name else f"campaign:{new_campaign_name}"
+    if old_campaign == new_campaign_name:
+        raise HTTPException(status_code=400, detail=f"Recommendation is already at {old_level} — no change needed")
+
+    # H3: warn when mutating a terminal-state row (history-altering)
+    terminal_states = ("success", "rejected", "blocked", "failed")
+    if row.get("execution_result") in terminal_states:
+        logger.warning(
+            f"[reclassify] Mutating campaign_name on terminal-state row "
+            f"action_id={action_id[:8]} state={row['execution_result']} — "
+            f"this alters historical attribution data"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _db_conn() as conn:
+        cur = conn.execute(
+            "UPDATE gads_audit_log SET campaign_name=?, updated_at=? WHERE action_id=?",
+            (new_campaign_name, now, action_id)
+        )
+        # H2: verify the row was actually updated
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Action not found (row may have been deleted)")
+
+    logger.info(f"[reclassify] {action_id[:8]} moved from {old_level} → {new_level} reason={reason[:60]}")
+
+    # Write to optimizer_memory so future Claude runs learn from this correction
+    # C3 fix: always write a global (campaign="") entry so the account-level prompt sees it.
+    #         For campaign moves, also write a campaign-scoped entry for the per-campaign prompt.
+    memory_written = False
+    try:
+        operation   = (row.get("operation") or "").strip()
+        entity_name = (row.get("entity_name") or "").strip()
+        if operation:
+            mem_key   = f"reclassify:{operation}:{entity_name.lower()}" if entity_name else f"reclassify:{operation}"
+            mem_value = f"prefer_{target_level}_level"
+            mem_reason = (
+                f"Admin moved '{operation}'"
+                + (f" on '{entity_name}'" if entity_name else "")
+                + f" from {old_level} to {new_level}"
+                + (f": {reason}" if reason else "")
+            )
+
+            if target_level == "account":
+                # account move: global entry — per-campaign runs should NOT generate this rec,
+                # account-level run SHOULD. Phrasing: suppress at campaign level, emit at account.
+                add_optimizer_memory(
+                    category="reclassification_pattern",
+                    key=mem_key,
+                    value="prefer_account_level",
+                    reason=mem_reason,
+                    campaign="",  # global = visible to all runs
+                    author="admin",
+                )
+            else:
+                # campaign move: one global entry (account-level run learns "don't emit account-wide")
+                add_optimizer_memory(
+                    category="reclassification_pattern",
+                    key=mem_key,
+                    value="prefer_campaign_level",
+                    reason=mem_reason + f" [belongs to campaign: {new_campaign_name}]",
+                    campaign="",  # global — visible to account-level run
+                    author="admin",
+                )
+                # plus a campaign-scoped entry for the per-campaign run
+                add_optimizer_memory(
+                    category="reclassification_pattern",
+                    key=mem_key,
+                    value="prefer_campaign_level",
+                    reason=mem_reason,
+                    campaign=new_campaign_name,
+                    author="admin",
+                )
+
+            memory_written = True
+            logger.info(f"[reclassify] Wrote reclassification_pattern to optimizer_memory: {mem_key[:60]}")
+    except Exception as _mem_err:
+        # M5: promote to warning so failures are visible in production logs
+        logger.warning(f"[reclassify] optimizer_memory write failed for {action_id[:8]} (non-fatal): {_mem_err}")
+
+    # Return updated row
+    updated = get_audit_row(action_id)
+    return {
+        "status": "ok",
+        "action_id": action_id,
+        "target_level": target_level,
+        "campaign_name": new_campaign_name,
+        "old_level": old_level,
+        "new_level": new_level,
+        "memory_written": memory_written,
+        "row": updated or {},
+    }
+
+
 @app.post("/api/admin/gads/refine/{action_id}", dependencies=[Depends(_require_admin)])
 async def gads_refine_action(action_id: str, request: Request):
     """

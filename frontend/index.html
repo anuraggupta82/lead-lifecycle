@@ -5340,7 +5340,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [campDetail, setCampDetail] = useState(null);
   const [campDetailLoading, setCampDetailLoading] = useState(false);
   const [campDetailOptimizerRecs, setCampDetailOptimizerRecs] = useState([]);
-  const [campDetailRejectModal, setCampDetailRejectModal] = useState(null); // {action_id, entity_name, operation}
+  const [campDetailRejectModal, setCampDetailRejectModal] = useState(null);      // {action_id, entity_name, operation}
+  const [campDetailReclassifyModal, setCampDetailReclassifyModal] = useState(null); // {action_id, entity_name, operation, campaign_name}
   const [campDetailDays, setCampDetailDays] = useState(30);
   const [syncPerfLoading, setSyncPerfLoading] = useState(false);
   const [syncPerfResult, setSyncPerfResult] = useState(null);
@@ -6877,6 +6878,32 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         />
       )}
 
+      {/* ── Campaign Detail reclassify modal ── */}
+      {campDetailReclassifyModal && (
+        <ReclassifyModal
+          actionId={campDetailReclassifyModal.action_id}
+          entityName={campDetailReclassifyModal.entity_name}
+          operation={campDetailReclassifyModal.operation}
+          currentCampaign={campDetailReclassifyModal.campaign_name}
+          campaignOptions={[campDetailReclassifyModal.campaign_name].filter(Boolean)}
+          onConfirm={async ({ target_level, campaign_name, reason }) => {
+            const aid = campDetailReclassifyModal.action_id;
+            setCampDetailReclassifyModal(null);
+            try {
+              await api(`/api/admin/gads/reclassify/${aid}`, {
+                method:'PATCH',
+                body:JSON.stringify({ target_level, campaign_name, reason }),
+              });
+              // Update the rec in place (keep it visible but show new level)
+              setCampDetailOptimizerRecs(prev => prev.map(x =>
+                x.action_id === aid ? {...x, campaign_name, _reclassified: target_level} : x
+              ));
+            } catch(e) { alert('Move failed: ' + (e?.detail || e?.message)); }
+          }}
+          onCancel={() => setCampDetailReclassifyModal(null)}
+        />
+      )}
+
       {/* ── Campaign Detail Drawer ── */}
       {(campDetail || campDetailLoading) && (
         <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,.35)',
@@ -6920,7 +6947,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             {r.entity_name && <span style={{background:'#f3f4f6',borderRadius:3,padding:'1px 5px',fontSize:10,marginRight:4}}>{r.entity_name}</span>}
                             <div style={{color:'#6b7280',marginTop:3,lineHeight:1.4}}>{r.reason||r.insight}</div>
                           </div>
-                          <div style={{display:'flex',gap:5,flexShrink:0}}>
+                          <div style={{display:'flex',gap:5,flexShrink:0,flexWrap:'wrap'}}>
                             <button style={{background:'#059669',color:'#fff',border:'none',borderRadius:4,padding:'3px 9px',fontSize:10,cursor:'pointer'}}
                               onClick={async()=>{
                                 try{await api(`/api/admin/gads/approve/${r.action_id}`,{method:'POST'});
@@ -6930,6 +6957,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                             <button style={{background:'#f3f4f6',color:'#374151',border:'1px solid var(--border)',borderRadius:4,padding:'3px 9px',fontSize:10,cursor:'pointer'}}
                               onClick={()=>setCampDetailRejectModal({action_id: r.action_id, entity_name: r.entity_name, operation: r.operation})}
                             >✕ Ignore</button>
+                            <button style={{background:'#eff6ff',color:'#2563eb',border:'1px solid #bfdbfe',borderRadius:4,padding:'3px 9px',fontSize:10,cursor:'pointer'}}
+                              onClick={()=>setCampDetailReclassifyModal({action_id: r.action_id, entity_name: r.entity_name, operation: r.operation, campaign_name: r.campaign_name||''})}
+                              title="Move between campaign-level and account-level"
+                            >↔ Move</button>
                           </div>
                         </div>
                       </div>
@@ -14636,6 +14667,137 @@ const REJECT_CHIPS = [
   "Will handle manually",
 ];
 
+// ReclassifyModal — move a rec between campaign-level and account-level
+function ReclassifyModal({ actionId, entityName, operation, currentCampaign, campaignOptions, onConfirm, onCancel }) {
+  // currentCampaign="" means it's currently account-level
+  const isCurrentlyAccountLevel = !currentCampaign;
+  // Default to the opposite of where it currently is
+  const [targetLevel, setTargetLevel] = React.useState(isCurrentlyAccountLevel ? 'campaign' : 'account');
+  const [selectedCampaign, setSelectedCampaign] = React.useState(
+    isCurrentlyAccountLevel ? (campaignOptions[0] || '') : ''
+  );
+  const [customCampaign, setCustomCampaign] = React.useState('');
+  const [reason, setReason] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+
+  async function handleConfirm() {
+    const camp = targetLevel === 'campaign'
+      ? (selectedCampaign === '__custom__' ? customCampaign.trim() : selectedCampaign)
+      : '';
+    if (targetLevel === 'campaign' && !camp) {
+      alert('Please select or enter a campaign name.');
+      return;
+    }
+    setSaving(true);
+    try {
+      await onConfirm({ target_level: targetLevel, campaign_name: camp, reason });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={{
+      position:'fixed',inset:0,background:'rgba(0,0,0,0.45)',zIndex:9999,
+      display:'flex',alignItems:'center',justifyContent:'center',padding:16
+    }}>
+      <div style={{
+        background:'#fff',borderRadius:10,padding:20,maxWidth:440,width:'100%',
+        boxShadow:'0 8px 32px rgba(0,0,0,0.18)'
+      }}>
+        <div style={{fontSize:14,fontWeight:700,color:'#111',marginBottom:4}}>Move Recommendation</div>
+        <div style={{fontSize:11,color:'#6b7280',marginBottom:12}}>
+          <strong>{operation?.replace(/_/g,' ')}</strong>{entityName ? ` — "${entityName}"` : ''}
+          <span style={{marginLeft:8,fontSize:10,color:'#9ca3af'}}>
+            Currently: <strong>{isCurrentlyAccountLevel ? '🌐 Account Level' : `📁 ${currentCampaign}`}</strong>
+          </span>
+        </div>
+
+        <div style={{fontSize:11,fontWeight:600,color:'#374151',marginBottom:8}}>Move to:</div>
+
+        {/* Level selector */}
+        <div style={{display:'flex',gap:8,marginBottom:12}}>
+          <button
+            onClick={() => setTargetLevel('account')}
+            style={{
+              flex:1, fontSize:11, padding:'8px 12px', borderRadius:6, cursor:'pointer',
+              border: targetLevel==='account' ? '2px solid #2563eb' : '1px solid #d1d5db',
+              background: targetLevel==='account' ? '#eff6ff' : '#f9fafb',
+              color: targetLevel==='account' ? '#1d4ed8' : '#374151',
+              fontWeight: targetLevel==='account' ? 700 : 400,
+            }}
+          >🌐 Account Level<div style={{fontSize:9,color:'#6b7280',fontWeight:400,marginTop:2}}>Applies across all campaigns</div></button>
+          <button
+            onClick={() => setTargetLevel('campaign')}
+            style={{
+              flex:1, fontSize:11, padding:'8px 12px', borderRadius:6, cursor:'pointer',
+              border: targetLevel==='campaign' ? '2px solid #2563eb' : '1px solid #d1d5db',
+              background: targetLevel==='campaign' ? '#eff6ff' : '#f9fafb',
+              color: targetLevel==='campaign' ? '#1d4ed8' : '#374151',
+              fontWeight: targetLevel==='campaign' ? 700 : 400,
+            }}
+          >📁 Campaign Level<div style={{fontSize:9,color:'#6b7280',fontWeight:400,marginTop:2}}>Scoped to one campaign</div></button>
+        </div>
+
+        {/* Campaign picker (only when campaign-level selected) */}
+        {targetLevel === 'campaign' && (
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:600,color:'#374151',marginBottom:5}}>Campaign:</div>
+            <select
+              value={selectedCampaign}
+              onChange={e => setSelectedCampaign(e.target.value)}
+              style={{width:'100%',fontSize:11,padding:'5px 8px',borderRadius:5,border:'1px solid #d1d5db',boxSizing:'border-box'}}
+            >
+              {campaignOptions.map(c => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+              <option value="__custom__">— Enter manually…</option>
+            </select>
+            {selectedCampaign === '__custom__' && (
+              <input
+                type="text"
+                value={customCampaign}
+                onChange={e => setCustomCampaign(e.target.value)}
+                placeholder="e.g. grafton_nxtsmile_dental_implants"
+                style={{width:'100%',boxSizing:'border-box',marginTop:5,fontSize:11,padding:'5px 8px',borderRadius:5,border:'1px solid #d1d5db'}}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Reason */}
+        <div style={{fontSize:11,fontWeight:600,color:'#374151',marginBottom:4}}>
+          Why? <span style={{fontWeight:400,color:'#9ca3af'}}>(optional — helps AI learn)</span>
+        </div>
+        <textarea
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+          placeholder="e.g. This negative should block across all campaigns, not just one"
+          maxLength={300}
+          style={{
+            width:'100%',boxSizing:'border-box',height:52,fontSize:11,padding:'6px 8px',
+            borderRadius:5,border:'1px solid #d1d5db',resize:'vertical',fontFamily:'inherit',color:'#374151'
+          }}
+        />
+
+        {/* Buttons */}
+        <div style={{display:'flex',gap:8,marginTop:12,justifyContent:'flex-end'}}>
+          <button onClick={onCancel}
+            style={{fontSize:11,padding:'5px 14px',borderRadius:5,border:'1px solid #d1d5db',
+              background:'#f9fafb',color:'#374151',cursor:'pointer'}}>
+            Cancel
+          </button>
+          <button onClick={handleConfirm} disabled={saving}
+            style={{fontSize:11,padding:'5px 14px',borderRadius:5,border:'none',
+              background:'#2563eb',color:'#fff',fontWeight:600,cursor:'pointer',opacity:saving?0.6:1}}>
+            {saving ? '…' : '↔ Move'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function RejectReasonModal({ actionId, entityName, operation, onConfirm, onCancel }) {
   const [selected, setSelected] = React.useState([]);
   const [freeText, setFreeText] = React.useState('');
@@ -14722,9 +14884,10 @@ function RejectReasonModal({ actionId, entityName, operation, onConfirm, onCance
 // ── Pending Approvals Panel ────────────────────────────────────────────────────
 function PendingApprovalsPanel() {
   const [rows, setRows]     = useState(null);   // null = loading
-  const [acting, setActing] = useState({});     // {action_id: 'apply'|'reject'}
+  const [acting, setActing] = useState({});     // {action_id: 'apply'|'reject'|'reclassify'}
   const [error, setError]   = useState(null);
-  const [rejectModal, setRejectModal] = useState(null); // {action_id, entity_name, operation}
+  const [rejectModal, setRejectModal] = useState(null);     // {action_id, entity_name, operation}
+  const [reclassifyModal, setReclassifyModal] = useState(null); // {action_id, entity_name, operation, campaign_name}
 
   async function load() {
     try {
@@ -14774,6 +14937,33 @@ function PendingApprovalsPanel() {
     setActing(prev => ({...prev, [action_id]: null}));
   }
 
+  function handleReclassify(action_id) {
+    const row = (rows || []).find(r => r.action_id === action_id);
+    setReclassifyModal({
+      action_id,
+      entity_name:   row?.entity_name,
+      operation:     row?.operation,
+      campaign_name: row?.campaign_name || '',
+    });
+  }
+
+  async function confirmReclassify(action_id, { target_level, campaign_name, reason }) {
+    setReclassifyModal(null);
+    setActing(prev => ({...prev, [action_id]: 'reclassify'}));
+    try {
+      const result = await api(`/api/admin/gads/reclassify/${action_id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ target_level, campaign_name, reason }),
+      });
+      // Update the row in place with the new campaign_name
+      setRows(prev => prev.map(r => r.action_id === action_id
+        ? {...r, campaign_name: result.campaign_name, _reclassified: result.new_level} : r));
+    } catch(e) {
+      alert('Reclassify failed: ' + e.message);
+    }
+    setActing(prev => ({...prev, [action_id]: null}));
+  }
+
   const OP_ICONS = {
     pause_keyword:       '⛔',
     increase_bid:        '⬆️',
@@ -14808,6 +14998,12 @@ function PendingApprovalsPanel() {
     } catch { return json_str.slice(0,80); }
   }
 
+  // Build unique campaign list from current rows for the reclassify dropdown
+  const _campaignOptions = React.useMemo(() => {
+    const names = (rows || []).map(r => r.campaign_name).filter(Boolean);
+    return [...new Set(names)].sort();
+  }, [rows]);
+
   return (
     <>
     {rejectModal && (
@@ -14817,6 +15013,17 @@ function PendingApprovalsPanel() {
         operation={rejectModal.operation}
         onConfirm={(reason) => confirmReject(rejectModal.action_id, reason)}
         onCancel={() => setRejectModal(null)}
+      />
+    )}
+    {reclassifyModal && (
+      <ReclassifyModal
+        actionId={reclassifyModal.action_id}
+        entityName={reclassifyModal.entity_name}
+        operation={reclassifyModal.operation}
+        currentCampaign={reclassifyModal.campaign_name}
+        campaignOptions={_campaignOptions}
+        onConfirm={(opts) => confirmReclassify(reclassifyModal.action_id, opts)}
+        onCancel={() => setReclassifyModal(null)}
       />
     )}
     <div className="report-section">
@@ -14890,14 +15097,29 @@ function PendingApprovalsPanel() {
               <strong>Reason:</strong> {row.reason}
             </div>
 
-            <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
+            <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>
               <strong>Change:</strong> {fmtState(row.after_state_json || row.before_state_json, row.operation)}
               &nbsp;&nbsp;
               <strong>Requested:</strong> {new Date(row.created_at).toLocaleString()}
             </div>
 
+            {/* Level badge */}
+            <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:6}}>
+              <strong>Level:</strong>&nbsp;
+              {row._reclassified ? (
+                <span style={{color:'#2563eb',fontWeight:600}}>
+                  ↔ {row._reclassified === 'account' ? '🌐 Account' : `📁 ${row.campaign_name}`}
+                  <span style={{color:'#9ca3af',fontWeight:400}}> (moved)</span>
+                </span>
+              ) : row.campaign_name ? (
+                <span>📁 {row.campaign_name}</span>
+              ) : (
+                <span>🌐 Account Level</span>
+              )}
+            </div>
+
             {!done && (
-              <div style={{display:'flex',gap:6}}>
+              <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
                 <button
                   className="btn btn-teal"
                   style={{fontSize:10,padding:'3px 12px'}}
@@ -14914,6 +15136,15 @@ function PendingApprovalsPanel() {
                   disabled={!!busy}
                 >
                   {busy==='reject' ? '…' : '❌ Reject'}
+                </button>
+                <button
+                  className="btn"
+                  style={{fontSize:10,padding:'3px 12px',background:'#eff6ff',color:'#2563eb',border:'1px solid #bfdbfe'}}
+                  onClick={()=>handleReclassify(row.action_id)}
+                  disabled={!!busy}
+                  title="Move this rec between campaign-level and account-level"
+                >
+                  {busy==='reclassify' ? '…' : '↔ Move'}
                 </button>
               </div>
             )}
