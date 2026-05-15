@@ -5284,7 +5284,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [acctBudgetEdit, setAcctBudgetEdit] = useState(false);
   const [acctBudgetDraft, setAcctBudgetDraft] = useState('');
   const [acctBudgetSaving, setAcctBudgetSaving] = useState(false);
-  const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts}}
+  const [budgetConstrained, setBudgetConstrained] = useState(false);
+  const [budgetConstrainedSaving, setBudgetConstrainedSaving] = useState(false);
+  const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts, new_appts}}
   const [apptModal, setApptModal] = useState(null); // {campaign_name, rows: [...]} or null
   const [apptFilter, setApptFilter] = useState('new'); // 'new' | 'existing' | 'all'
   const [aiReviewSaving, setAiReviewSaving] = useState({});
@@ -5382,7 +5384,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         api(`/api/admin/calls/campaign-attribution?days=${unifiedDays}`).catch(()=>[]),
       ]);
       setUnifiedCamps(d.campaigns || []);
-      if (d.budget_summary) setBudgetSummary(d.budget_summary);
+      if (d.budget_summary) {
+        setBudgetSummary(d.budget_summary);
+        if (typeof d.budget_summary.budget_constrained === 'boolean') {
+          setBudgetConstrained(d.budget_summary.budget_constrained);
+        }
+      }
       // Build lookup: campaign_id → call stats (also index by name for fallback)
       const attrib = {};
       (callRows || []).forEach(r => {
@@ -5416,16 +5423,39 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     if (isNaN(val) || val < 0) { alert('Enter a valid budget amount'); return; }
     setAcctBudgetSaving(true);
     try {
-      await api('/api/admin/account-budget', {
+      const resp = await api('/api/admin/account-budget', {
         method: 'POST',
         body: JSON.stringify({ account_monthly_budget: val }),
       });
-      setBudgetSummary(s => s ? {...s, account_monthly_budget: val} : s);
+      const serverBudget = typeof resp?.account_monthly_budget === 'number' ? resp.account_monthly_budget : val;
+      setBudgetSummary(s => s ? {...s, account_monthly_budget: serverBudget} : s);
       setAcctBudgetEdit(false);
     } catch(e) {
       alert('Save failed: ' + (e?.detail || e?.message || 'error'));
     } finally {
       setAcctBudgetSaving(false);
+    }
+  }
+
+  async function toggleBudgetConstrained() {
+    const next = !budgetConstrained;
+    setBudgetConstrained(next);  // optimistic
+    setBudgetConstrainedSaving(true);
+    try {
+      // Only send budget_constrained — do NOT send account_monthly_budget to avoid zeroing it out
+      const resp = await api('/api/admin/account-budget', {
+        method: 'POST',
+        body: JSON.stringify({ budget_constrained: next }),
+      });
+      // Sync from server-authoritative response
+      const serverVal = typeof resp?.budget_constrained === 'boolean' ? resp.budget_constrained : next;
+      setBudgetConstrained(serverVal);
+      setBudgetSummary(s => s ? {...s, budget_constrained: serverVal} : s);
+    } catch(e) {
+      setBudgetConstrained(!next); // revert on error
+      alert('Save failed: ' + (e?.detail || e?.message || 'error'));
+    } finally {
+      setBudgetConstrainedSaving(false);
     }
   }
 
@@ -6278,6 +6308,25 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                       {totalBudget > acctBudget ? '⚠️' : '✓'} Campaign total: ${totalBudget.toLocaleString()}/mo
                     </div>
                   )}
+                  {/* Budget Constrained toggle */}
+                  <label style={{display:'flex',alignItems:'center',gap:5,marginTop:6,cursor:'pointer',
+                    userSelect:'none',opacity: budgetConstrainedSaving ? 0.6 : 1}}>
+                    <input
+                      type="checkbox"
+                      checked={budgetConstrained}
+                      onChange={toggleBudgetConstrained}
+                      disabled={budgetConstrainedSaving}
+                      style={{accentColor:'var(--teal)',width:13,height:13,cursor:'pointer'}}
+                    />
+                    <span style={{fontSize:10,fontWeight:600,color: budgetConstrained ? 'var(--teal)' : 'var(--text-muted)'}}>
+                      {budgetConstrained ? '🔒 Budget Constrained' : 'Budget Constrained'}
+                    </span>
+                  </label>
+                  {budgetConstrained && (
+                    <div style={{fontSize:9,color:'var(--text-muted)',marginTop:2,lineHeight:1.4}}>
+                      AI optimizes within current spend — no budget increases
+                    </div>
+                  )}
                 </div>
 
                 {/* Campaign budgets total */}
@@ -6385,7 +6434,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               <th className="num">Daily Budget</th>
               <th className="num">Leads</th>
               <th className="num" title="Inbound calls attributed to this campaign">Calls</th>
-              <th className="num" title="Calls graded booked that matched an OD appointment">Appts</th>
+              <th className="num" title="New patient OD appointment matches from calls">Appts</th>
               <th className="num">Cost</th>
               <th className="num">CPL</th>
               <th className="num">ROI</th>
@@ -6483,10 +6532,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                               : <span style={{color:'var(--text-muted)'}}>—</span>}
                           </td>
                           <td className="num">
-                            {ca.confirmed_appts > 0
+                            {(ca.new_appts > 0 || ca.confirmed_appts > 0)
                               ? <span
                                   style={{color:'#059669',fontWeight:600,cursor:'pointer',textDecoration:'underline dotted'}}
-                                  title="Click to see appointment details"
+                                  title={`${ca.new_appts||0} new patient appts · ${ca.confirmed_appts||0} total OD matches — click for details`}
                                   onClick={()=>{
                                     const campName = c.campaign_name;
                                     setApptFilter('new');
@@ -6494,7 +6543,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                       .then(rows=>setApptModal({campaign_name:campName,rows}))
                                       .catch(()=>setApptModal({campaign_name:campName,rows:[]}));
                                   }}
-                                >{ca.confirmed_appts}</span>
+                                >{ca.new_appts||0}</span>
                               : ca.booked_calls > 0
                                 ? <span style={{color:'#92400e'}} title="Booked calls, OD match pending">~{ca.booked_calls}</span>
                                 : <span style={{color:'var(--text-muted)'}}>—</span>}

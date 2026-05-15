@@ -3834,12 +3834,14 @@ def admin_campaigns_unified(days: int = 30, include_inactive: bool = False):
         total_actual_spend * days_in_month / max(day_of_month, 1), 2
     ) if total_actual_spend > 0 else 0.0
     account_monthly_budget = float(get_setting("account_monthly_budget") or 0.0)
+    budget_constrained = (get_setting("budget_constrained") or "false") == "true"
     budget_summary = {
         "total_monthly_budget":   round(total_monthly_budget, 2),
         "total_daily_budget":     round(total_daily_budget, 2),
         "total_actual_spend":     round(total_actual_spend, 2),
         "projected_month_end":    projected_month_end,
         "account_monthly_budget": account_monthly_budget,
+        "budget_constrained":     budget_constrained,
         "days_elapsed":           day_of_month,
         "days_in_month":          days_in_month,
         "active_campaign_count":  len(active_rows),
@@ -7597,7 +7599,10 @@ def admin_calls_campaign_attribution_early(days: int = 30):
                  COUNT(*) AS total_calls,
                  SUM(CASE WHEN mc.booked_outcome='booked' THEN 1 ELSE 0 END) AS booked_calls,
                  SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
-                           AND mc.od_appointment_id != '' THEN 1 ELSE 0 END) AS confirmed_appts
+                           AND mc.od_appointment_id != '' THEN 1 ELSE 0 END) AS confirmed_appts,
+                 SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
+                           AND mc.od_appointment_id != ''
+                           AND mc.od_patient_status = 'new_patient' THEN 1 ELSE 0 END) AS new_appts
                FROM mango_calls mc
                LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
                LEFT JOIN leads l ON l.id = mc.lead_id
@@ -11105,21 +11110,36 @@ def admin_save_practice_settings(body: PracticeSettingsRequest):
 # ─── Account Monthly Budget ──────────────────────────────────────────────────
 
 class AccountBudgetRequest(BaseModel):
-    account_monthly_budget: float
+    account_monthly_budget: float | None = None  # None = don't change budget amount
+    budget_constrained: bool | None = None        # None = don't change constraint flag
 
 @app.get("/api/admin/account-budget", dependencies=[Depends(_require_admin)])
 def admin_get_account_budget():
     from database import get_setting
     val = get_setting("account_monthly_budget") or "0"
-    return {"account_monthly_budget": float(val)}
+    constrained = get_setting("budget_constrained") or "false"
+    return {
+        "account_monthly_budget": float(val),
+        "budget_constrained": constrained == "true",
+    }
 
 @app.post("/api/admin/account-budget", dependencies=[Depends(_require_admin)])
 def admin_save_account_budget(body: AccountBudgetRequest):
-    from database import save_setting
-    if body.account_monthly_budget < 0:
-        raise HTTPException(status_code=422, detail="Budget cannot be negative")
-    save_setting("account_monthly_budget", str(round(body.account_monthly_budget, 2)))
-    return {"ok": True, "account_monthly_budget": round(body.account_monthly_budget, 2)}
+    from database import save_setting, get_setting
+    if body.account_monthly_budget is not None:
+        if body.account_monthly_budget < 0:
+            raise HTTPException(status_code=422, detail="Budget cannot be negative")
+        save_setting("account_monthly_budget", str(round(body.account_monthly_budget, 2)))
+    if body.budget_constrained is not None:
+        save_setting("budget_constrained", "true" if body.budget_constrained else "false")
+    # Return authoritative values from DB (avoids stale-read on concurrent requests)
+    current_budget = float(get_setting("account_monthly_budget") or "0")
+    constrained_val = (get_setting("budget_constrained") or "false") == "true"
+    return {
+        "ok": True,
+        "account_monthly_budget": current_budget,
+        "budget_constrained": constrained_val,
+    }
 
 
 # ─── AI Generate Single Message ──────────────────────────────────────────────

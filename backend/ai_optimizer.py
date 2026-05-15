@@ -172,6 +172,44 @@ OPERATIONS REFERENCE (for replace_ad / ad_copy_suggestion):
 === END GOOGLE ADS HARD RULES ===
 """
 
+# ── Campaign lifecycle rules — injected into every per-campaign Claude prompt ──
+LIFECYCLE_RULES = """
+=== CAMPAIGN LIFECYCLE RULES (MANDATORY — DO NOT VIOLATE) ===
+
+The "lifecycle" field in the campaign data contains: stage, days_since_launch, in_learning_period.
+
+STAGE = new (days_since_launch <= 30) OR stage = unknown:
+  ALLOWED operations: add_negative_keyword, claude_advisory
+  FORBIDDEN: increase_bid, decrease_bid, pause_keyword, add_exact_keyword,
+             replace_ad, change_bid_strategy, pause_ad_group, update_geo_targeting,
+             change_budget, change_match_type, ad_copy_suggestion
+  REASON: Google's algorithm needs 14–30 days of uninterrupted data collection to
+          optimize delivery. Bid or structural changes reset the learning phase and
+          degrade impression quality. During this period, ONLY add clearly-irrelevant
+          negative keywords (zero-risk) and provide observational commentary.
+  ACTION: If data suggests a change you'd normally make, instead emit a claude_advisory
+          describing WHAT you would do and WHEN (e.g. "After day 30, consider...").
+          Prefix that advisory reason with "LIFECYCLE_ADVISORY: ".
+
+STAGE = ramping (31 <= days_since_launch <= 90):
+  ALLOWED: add_negative_keyword, increase_bid, decrease_bid, pause_keyword,
+           ad_copy_suggestion, replace_ad, claude_advisory, update_geo_targeting,
+           change_budget, change_match_type, add_asset
+  FORBIDDEN:
+    - change_bid_strategy UNLESS gads_conversions_30d >= 15 (insufficient conversion history)
+    - add_exact_keyword (no match-type expansion until campaign is mature and bidding is stable)
+    - pause_ad_group UNLESS the ad group has >= 50 clicks AND 0 conversions (clear waste)
+  REASON: Enough data for tactical changes; not enough for Smart Bidding strategy switches.
+
+STAGE = mature (days_since_launch > 90):
+  All operations allowed — apply full optimization judgment.
+
+WHEN REFUSING AN OPERATION due to lifecycle stage, emit a claude_advisory with
+reason starting with "LIFECYCLE_BLOCKED: [operation_name] — " followed by the
+reason you would have given if the campaign were mature.
+=== END LIFECYCLE RULES ===
+"""
+
 # ── Negative keyword signals (module-level so all functions can use them) ─────
 
 _HARD_NEGATIVES = [
@@ -1677,6 +1715,179 @@ def _compute_budget_click_signal(
     }
 
 
+def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float) -> list:
+    """
+    Defense-in-depth post-filter: ensure Claude didn't violate lifecycle rules.
+    Blocked ops are converted to claude_advisory rows with 'LIFECYCLE_BLOCKED:' prefix
+    so they remain visible in the approval queue.
+
+    lifecycle — the dict from build_lifecycle_block()
+    conversions_30d — from campaign_stats (used for ramping change_bid_strategy guard)
+
+    Fails OPEN: if lifecycle is absent or has no stage, ops pass through unchanged.
+    """
+    from lifecycle import STAGE_NEW, STAGE_RAMPING, STAGE_UNKNOWN
+
+    # Fail-open: no lifecycle data → don't block anything
+    if not lifecycle or not lifecycle.get("stage"):
+        return ops
+
+    stage = lifecycle.get("stage")
+
+    # Operations always safe in any stage (zero-risk)
+    _ALWAYS_ALLOWED = {"add_negative_keyword", "claude_advisory"}
+
+    # Operations forbidden in new/unknown
+    _FORBIDDEN_NEW = {
+        "increase_bid", "decrease_bid", "pause_keyword", "add_exact_keyword",
+        "replace_ad", "change_bid_strategy", "pause_ad_group", "update_geo_targeting",
+        "change_budget", "change_match_type", "ad_copy_suggestion", "add_asset",
+    }
+
+    filtered = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        op_type = op.get("operation", "")
+        original_reason = op.get("reason", "")
+
+        # --- new / unknown: only negatives + advisory ---
+        if stage in (STAGE_NEW, STAGE_UNKNOWN) and op_type in _FORBIDDEN_NEW:
+            filtered.append({
+                "operation": "claude_advisory",
+                "reason": (
+                    f"LIFECYCLE_BLOCKED: {op_type} suppressed — campaign in '{stage}' stage "
+                    f"(learning period active). Original intent: {original_reason}"
+                ),
+                "estimated_monthly_impact": {
+                    "savings_usd": 0,
+                    "impact_type": "waste_reduction",   # prevents learning-phase disruption, not a conversion lift
+                    "confidence": "low",
+                    "benchmark_gap": f"lifecycle gate: {op_type} deferred until day 31+",
+                },
+            })
+            logger.info(f"[lifecycle_sieve] Blocked '{op_type}' during {stage} stage")
+            continue
+
+        # --- ramping: no change_bid_strategy without conversions, no add_exact_keyword ---
+        if stage == STAGE_RAMPING:
+            if op_type == "change_bid_strategy" and float(conversions_30d or 0) < 15:
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"LIFECYCLE_BLOCKED: change_bid_strategy requires 15+ conversions "
+                        f"(have {conversions_30d:.0f}) — campaign still ramping. "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0,
+                        "impact_type": "bid_efficiency",
+                        "confidence": "low",
+                        "benchmark_gap": "need 15+ conversions for Smart Bidding",
+                    },
+                })
+                logger.info(f"[lifecycle_sieve] Blocked change_bid_strategy — only {conversions_30d} conv in ramping stage")
+                continue
+            if op_type == "add_exact_keyword":
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"LIFECYCLE_BLOCKED: add_exact_keyword (match-type expansion) deferred "
+                        f"until mature stage. Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0,
+                        "impact_type": "coverage_gain",
+                        "confidence": "low",
+                        "benchmark_gap": "match expansion deferred to mature stage",
+                    },
+                })
+                logger.info(f"[lifecycle_sieve] Blocked add_exact_keyword in ramping stage")
+                continue
+
+            # B6: pause_ad_group in ramping — only allowed when ad group has ≥50 clicks AND 0 conversions.
+            # The sieve can't inspect per-ad-group clicks, so we enforce the conservative read:
+            # If campaign-level conversions_30d > 0, the ad group MIGHT have conversions — don't block.
+            # If conversions_30d == 0, the campaign has zero conv, so any ad group is a genuine waste.
+            # The prompt already enforces the ≥50-clicks threshold per-ad-group; here we catch strategy flips.
+            if op_type == "pause_ad_group":
+                # Allow only when there are zero campaign-level conversions (clearest waste signal)
+                # or when conversions_30d is unknown (fail-open for ramping)
+                if float(conversions_30d or 0) > 0:
+                    filtered.append({
+                        "operation": "claude_advisory",
+                        "reason": (
+                            f"LIFECYCLE_BLOCKED: pause_ad_group deferred during ramping stage "
+                            f"(campaign has {conversions_30d:.0f} conversions — ad group may be contributing). "
+                            f"Original intent: {original_reason}"
+                        ),
+                        "estimated_monthly_impact": {
+                            "savings_usd": 0,
+                            "impact_type": "waste_reduction",
+                            "confidence": "low",
+                            "benchmark_gap": "pause_ad_group blocked until conversion attribution is clear (mature stage)",
+                        },
+                    })
+                    logger.info(
+                        f"[lifecycle_sieve] Blocked pause_ad_group in ramping stage "
+                        f"(campaign has {conversions_30d} conversions)"
+                    )
+                    continue
+
+        filtered.append(op)
+
+    return filtered
+
+
+# Per-run cache for _fetch_first_impression_date — avoids re-querying GAds for the same resource
+_first_impression_cache: dict = {}
+
+
+def _fetch_first_impression_date(campaign_resource: str) -> str | None:
+    """
+    Query Google Ads for the earliest segment.date for this campaign.
+    Returns a 'YYYY-MM-DD' string or None on failure.
+
+    Results are cached in _first_impression_cache for the lifetime of the process
+    (optimizer run). On success, the caller should write the date back to the DB
+    via database.set_campaign_launch_date() so future runs don't need this API call.
+    """
+    if not campaign_resource:
+        return None
+    if campaign_resource in _first_impression_cache:
+        return _first_impression_cache[campaign_resource]
+    try:
+        from config import get_settings as _gs
+        _sett = _gs()
+        _client_cfg = {
+            "developer_token": _sett.google_ads_developer_token,
+            "client_id": _sett.google_ads_client_id,
+            "client_secret": _sett.google_ads_client_secret,
+            "refresh_token": _sett.google_ads_refresh_token,
+            "login_customer_id": str(_sett.google_ads_customer_id).replace("-", ""),
+            "use_proto_plus": True,
+        }
+        _client = GoogleAdsClient.load_from_dict(_client_cfg, version="v18")
+        _svc = _client.get_service("GoogleAdsService")
+        _cid = str(_sett.google_ads_customer_id).replace("-", "")
+        _q = (
+            f"SELECT segments.date FROM campaign "
+            f"WHERE campaign.resource_name = '{campaign_resource}' "
+            f"AND segments.date DURING LAST_365_DAYS "
+            f"ORDER BY segments.date ASC LIMIT 1"
+        )
+        _resp = _svc.search(customer_id=_cid, query=_q)
+        for _row in _resp:
+            date_str = _row.segments.date
+            if date_str:
+                _first_impression_cache[campaign_resource] = date_str
+                return date_str
+    except Exception as _e:
+        logger.debug(f"[lifecycle] _fetch_first_impression_date failed for {campaign_resource}: {_e}")
+    _first_impression_cache[campaign_resource] = None
+    return None
+
+
 def _build_lqi_campaign_slice(campaign: str, lqi: dict) -> dict:
     """
     Filter the account-wide LQI signals down to what's relevant for a single campaign.
@@ -1741,7 +1952,11 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              # PR 3: intent signals
                              intent_signals: dict | None = None,
                              # PR 7: conquest keyword protection (set of lowercase terms)
-                             conquest_keywords_protected: set | None = None) -> list:
+                             conquest_keywords_protected: set | None = None,
+                             # Lifecycle: age + stage classification block
+                             lifecycle: dict | None = None,
+                             # Budget constraint: True = no budget increases allowed
+                             budget_constrained: bool = False) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -1883,6 +2098,8 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "budget_feasibility": budget_feasibility or {},
             # PR 3: keyword intent signals (same vocabulary as creation wizard)
             "keyword_intent_signals": intent_signals or {},
+            # Lifecycle: age + stage classification
+            "lifecycle": lifecycle or {},
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -2043,6 +2260,42 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                     f"  → Any search term containing these tokens with ≥$5 spend → add_negative_keyword (PHRASE).\n"
                 )
 
+        # ── Lifecycle note (load-bearing — Claude must respect stage rules) ────
+        lifecycle_note = ""
+        if lifecycle:
+            _lc_stage  = lifecycle.get("stage", "unknown")
+            _lc_days   = lifecycle.get("days_since_launch")
+            _lc_src    = lifecycle.get("source", "none")
+            _lc_learn  = lifecycle.get("in_learning_period", False)
+            _lc_day_str = f"day {_lc_days}" if _lc_days is not None else "age unknown"
+            _lc_warning = ""
+            if _lc_stage in ("new", "unknown"):
+                _lc_warning = "\n⚠️  LEARNING PERIOD ACTIVE — only add_negative_keyword and claude_advisory are permitted."
+            elif _lc_stage == "ramping":
+                _lc_warning = "\n⚠️  RAMPING — no change_bid_strategy unless conversions_30d ≥ 15; no add_exact_keyword."
+            lifecycle_note = (
+                f"\n\nCAMPAIGN LIFECYCLE (apply LIFECYCLE_RULES above)\n"
+                f"Stage: {_lc_stage} ({_lc_day_str}, source={_lc_src})\n"
+                f"In learning period: {_lc_learn}{_lc_warning}\n"
+            )
+
+        # ── Budget constraint note ────────────────────────────────────────────
+        budget_constrained_note = ""
+        if budget_constrained:
+            budget_constrained_note = (
+                "\n\n=== BUDGET CONSTRAINED MODE (MANDATORY) ===\n"
+                "The practice has enabled Budget Constrained mode. This means:\n"
+                "1. DO NOT recommend change_budget to increase any campaign's daily budget.\n"
+                "2. DO NOT recommend change_bid_strategy that is expected to increase spend "
+                "(e.g. MAXIMIZE_CLICKS without a target CPC cap, or removing a MANUAL_CPC constraint).\n"
+                "3. Instead of budget increases, recommend bid adjustments, ad copy improvements, "
+                "negative keywords, geo refinements, schedule changes, and ad group optimizations "
+                "to improve ROI WITHIN the current budget.\n"
+                "4. If a campaign is budget-limited and cannot improve without more spend, say so in "
+                "a claude_advisory — do NOT generate a change_budget rec.\n"
+                "=== END BUDGET CONSTRAINED MODE ===\n"
+            )
+
         # ── SKAG attribution opportunity note ─────────────────────────────────
         # Collected per campaign — returns empty string if no candidates qualify.
         # Only present when there is genuine signal (call convs or OD appts).
@@ -2055,7 +2308,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
         except Exception as _skag_err:
             logger.warning("SKAG signals failed for %r (non-fatal): %s", campaign, _skag_err)
 
-        prompt = excellence_block + GOOGLE_ADS_RULES + """
+        prompt = excellence_block + GOOGLE_ADS_RULES + LIFECYCLE_RULES + """
 You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
 
@@ -2319,7 +2572,7 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
-ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + skag_note + _build_institutional_memory_note(campaign) + feedback_block
+ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + _build_institutional_memory_note(campaign) + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -2533,10 +2786,155 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
                         item["geo_rationale"] = item.get("reason", "Geo optimization based on performance data")
                 validated.append(item)
             logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
-            return validated
+            # Lifecycle sieve — defense in depth: convert any violated ops to advisories
+            _conv_30d = sum(k.get("conversions", 0) for k in keyword_perf)
+            sieved = _lifecycle_sieve(validated, lifecycle or {}, _conv_30d)
+            if len(sieved) != len(validated):
+                logger.info(
+                    f"[lifecycle_sieve] {len(validated) - len(sieved)} ops blocked, "
+                    f"{len(sieved)} recs after sieve"
+                )
+            # Budget constraint sieve — convert change_budget increases to advisories
+            if budget_constrained:
+                sieved = _budget_constraint_sieve(sieved, camp_settings or {})
+            return sieved
     except Exception as e:
         logger.warning(f"Claude advisory call failed (non-fatal): {e}")
     return []
+
+
+def _budget_constraint_sieve(
+    ops: list,
+    camp_settings: dict,
+    budget_by_campaign: dict | None = None,
+) -> list:
+    """
+    Post-filter when budget_constrained=True.
+
+    Per-campaign mode (budget_by_campaign=None):
+      - camp_settings is the single campaign's settings dict with 'daily_budget_usd'.
+      - Any change_budget rec increasing daily budget → converted to claude_advisory.
+      - If daily_budget_usd is missing/zero, skip sieving (unknown baseline, don't block).
+
+    Account-level mode (budget_by_campaign is a dict of campaign_name → daily_budget_usd):
+      - Each rec's current budget is resolved from budget_by_campaign keyed by campaign_name.
+      - If a campaign's budget can't be looked up, the rec passes through unchanged.
+
+    Budget reductions are always allowed.
+    Spend-increasing change_bid_strategy (MAXIMIZE_CLICKS/MAXIMIZE_CONVERSIONS without a cap)
+    are also converted to advisories.
+    """
+    # Strategies that increase spend when used without a bid cap
+    _UNCAPPED_SPEND_STRATEGIES = {"MAXIMIZE_CLICKS", "MAXIMIZE_CONVERSIONS"}
+
+    # Per-campaign: resolve current budget once
+    _per_camp_budget: float | None = None
+    if budget_by_campaign is None:
+        raw = camp_settings.get("daily_budget_usd")
+        if raw is None or float(raw or 0) <= 0.0:
+            # Unknown current budget — cannot safely determine what's an increase; pass everything
+            logger.warning(
+                "[budget_constraint_sieve] camp_settings missing daily_budget_usd — skipping sieve"
+            )
+            return ops
+        _per_camp_budget = float(raw)
+
+    filtered = []
+    for op in ops:
+        operation = op.get("operation", "")
+
+        # ── change_budget guard ───────────────────────────────────────────────
+        if operation == "change_budget":
+            # Resolve current budget for this rec
+            if budget_by_campaign is not None:
+                cn = op.get("campaign_name", "")
+                raw_b = budget_by_campaign.get(cn)
+                if raw_b is None:
+                    filtered.append(op)  # unknown campaign — pass through
+                    continue
+                current_budget = float(raw_b or 0.0)
+                if current_budget <= 0.0:
+                    filtered.append(op)  # unknown baseline — pass through
+                    continue
+            else:
+                current_budget = _per_camp_budget  # already validated above
+
+            # Validate proposed value
+            proposed_raw = op.get("new_daily_budget_usd")
+            if proposed_raw is None:
+                filtered.append(op)  # missing field — let executor handle it
+                continue
+            try:
+                proposed = float(proposed_raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"[budget_constraint_sieve] Non-numeric new_daily_budget_usd: {proposed_raw!r}"
+                )
+                filtered.append(op)
+                continue
+
+            if proposed <= 0.0:
+                logger.warning(
+                    f"[budget_constraint_sieve] Dropping change_budget — invalid proposed=${proposed:.2f}"
+                )
+                continue  # drop nonsense, not even advisory
+
+            if proposed == current_budget:
+                continue  # no-op, drop silently
+
+            if proposed > current_budget:
+                reason = op.get("reason", "")
+                camp_lbl = op.get("campaign_name", "?")
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "insight": (
+                        f"BUDGET_CONSTRAINED: change_budget to ${proposed:.2f}/day suppressed "
+                        f"(Budget Constrained mode is ON — current budget ${current_budget:.2f}/day). "
+                        f"Original reasoning: {reason}"
+                    ),
+                    "reason": reason,
+                    "campaign_name": op.get("campaign_name", ""),
+                    "estimated_monthly_impact": op.get("estimated_monthly_impact", {}),
+                })
+                logger.info(
+                    f"[budget_constraint_sieve] Blocked change_budget increase for "
+                    f"'{camp_lbl}': ${current_budget:.2f} → ${proposed:.2f}/day"
+                )
+                continue
+            # proposed < current_budget → decrease is allowed, pass through
+            filtered.append(op)
+            continue
+
+        # ── change_bid_strategy guard — block uncapped spend-increasing strategies ──
+        if operation == "change_bid_strategy":
+            new_strat = (op.get("bid_strategy") or "").upper()
+            has_cap = bool(
+                op.get("target_cpa_micros") or
+                op.get("target_roas") or
+                op.get("cpc_bid_ceiling_micros")
+            )
+            if new_strat in _UNCAPPED_SPEND_STRATEGIES and not has_cap:
+                reason = op.get("reason", "")
+                camp_lbl = op.get("campaign_name", "?")
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "insight": (
+                        f"BUDGET_CONSTRAINED: change_bid_strategy to {new_strat} (uncapped) suppressed "
+                        f"(Budget Constrained mode is ON — this strategy typically increases spend). "
+                        f"Original reasoning: {reason}"
+                    ),
+                    "reason": reason,
+                    "campaign_name": op.get("campaign_name", ""),
+                    "estimated_monthly_impact": op.get("estimated_monthly_impact", {}),
+                })
+                logger.info(
+                    f"[budget_constraint_sieve] Blocked uncapped change_bid_strategy to "
+                    f"{new_strat} for '{camp_lbl}'"
+                )
+                continue
+
+        filtered.append(op)
+    return filtered
 
 
 def _build_lqi_account_summary(lqi: dict) -> dict:
@@ -2599,10 +2997,15 @@ def _call_claude_account_level(
     google_recs: list | None = None,
     optimizer_run_id: str = "",
     existing_negatives: set | None = None,
+    existing_negatives_by_campaign: dict | None = None,
     memory_digest: dict | None = None,
     lqi: dict | None = None,
     # PR 5: account-wide competitor intel union
     competitor_intel_union: dict | None = None,
+    # Budget constraint: True = no budget increases allowed
+    budget_constrained: bool = False,
+    # campaign_name → daily_budget_usd map — used by budget sieve to allow decreases
+    budget_by_campaign: dict | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -2699,6 +3102,12 @@ def _call_claude_account_level(
             "od_production_summary": od_production,
             "google_recommendations": (google_recs or [])[:20],
             "existing_negative_keywords": sorted(existing_negatives)[:200] if existing_negatives else [],
+            # Per-campaign negatives: {campaign_name: [list of negative keyword texts]}
+            # Used by STANDING NEGATIVE POLICY check to identify which campaigns are missing required negatives
+            "negatives_by_campaign": {
+                cn: sorted(kws)
+                for cn, kws in (existing_negatives_by_campaign or {}).items()
+            } if existing_negatives_by_campaign else {},
             "optimizer_memory": memory_digest or {},
             "call_quality_flags": _call_quality_flags,
             "lqi": _build_lqi_account_summary(lqi or {}),
@@ -2709,12 +3118,29 @@ def _call_claude_account_level(
         # Account-level: use aggregate summary, no specific camp_settings
         acct_excellence_block = _build_excellence_block("", summary, {})
 
-        prompt = acct_excellence_block + GOOGLE_ADS_RULES + """
+        # Budget constraint block for account-level prompt
+        _acct_budget_constrained_note = ""
+        if budget_constrained:
+            _acct_budget_constrained_note = """
+
+=== BUDGET CONSTRAINED MODE (MANDATORY) ===
+The practice has enabled Budget Constrained mode. This means:
+1. DO NOT recommend change_budget to increase any campaign's daily budget.
+2. Budget reductions (trimming over-spending campaigns) are still allowed.
+3. Google's recommendations that increase spend (RAISE_TARGET_CPA, EXPAND_TARGETING,
+   MARGINAL_ROI_CAMPAIGN_BUDGET, CAMPAIGN_BUDGET) must be converted to claude_advisory
+   observations, NOT change_budget or change_bid_strategy recs.
+4. Focus on waste elimination, negative keywords, bid adjustments within current caps,
+   and ad quality improvements to maximize ROI at current spend levels.
+=== END BUDGET CONSTRAINED MODE ===
+"""
+
+        prompt = acct_excellence_block + GOOGLE_ADS_RULES + _acct_budget_constrained_note + """
 You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
 
 You have already reviewed individual campaigns. Now identify issues and opportunities that span the whole account or cannot be attributed to one campaign.
 
-Return up to 6 ACCOUNT-LEVEL recommendations as a JSON array. Each must have:
+Return up to 15 ACCOUNT-LEVEL recommendations as a JSON array (standing policy negatives may consume several slots). Each must have:
 - "operation": one of: add_negative_keyword | change_bid_strategy | change_budget | add_asset | claude_advisory
 - "reason": 1-2 sentences with specific numbers. For cross-campaign negatives, cite which campaigns the term appeared in.
 - "estimated_monthly_impact": object with keys:
@@ -2754,6 +3180,20 @@ Focus areas for account-level recs:
    specific campaigns bleeding qualified leads at the phone, cite exact counts, and suggest whether
    the issue is likely after-hours coverage, IVR routing, or call handling. Do NOT recommend pausing
    those campaigns — the spend is generating calls; the problem is downstream of the click.
+
+STANDING NEGATIVE POLICY — GDC does NOT accept these patients (insurance/program restrictions):
+The following terms must ALWAYS be negatives on EVERY active campaign. If any campaign in
+"existing_negative_keywords" is missing one of these terms, recommend add_negative_keyword for that
+campaign immediately — do not wait for it to appear in search terms:
+  masshealth, mass health, medicaid, medicaid dentist, medicaid dental, medicare, chip dental,
+  masshealth dentist, masshealth dental, free dental, low income dental, sliding scale dental,
+  dental assistance program, state dental insurance
+
+CHECK: For each active campaign in "campaign_resources", look up that campaign's negatives in
+"negatives_by_campaign" (dict of campaign_name → list of negative keywords). If a campaign is
+missing any of the required terms above, generate one add_negative_keyword rec per missing term
+(BROAD match, campaign_resource from "campaign_resources"). This takes priority over all other
+recommendations — fill these gaps first before considering other account-level issues.
 
 IMPORTANT:
 - Only flag competitor negatives here if they appear in multiple campaigns (single-campaign terms were already handled per-campaign)
@@ -2868,6 +3308,8 @@ If you see a search term that appears in all_conquest_keywords, treat it as inte
         if m:
             arr = json.loads(m.group(0))
             valid_camp_resources = set(camp_resources.values())
+            # Operations valid at account level — anything else is a campaign-level op that leaked
+            _ACCOUNT_LEVEL_OPS = {"add_negative_keyword", "change_bid_strategy", "change_budget", "add_asset", "claude_advisory"}
             # PR 5: build conquest keyword protection set for account-level
             _acct_conquest: set = {
                 k.strip().lower()
@@ -2901,6 +3343,10 @@ If you see a search term that appears in all_conquest_keywords, treat it as inte
                             f"matches conquest keyword"
                         )
                         continue
+                # Drop any operation that is not valid at account level
+                if op not in _ACCOUNT_LEVEL_OPS:
+                    logger.warning(f"Account-level: dropping '{op}' — campaign-level operation leaked into account pass (should come from per-campaign Claude)")
+                    continue
                 cr = item.get("campaign_resource", "")
                 if op in ("add_negative_keyword", "change_bid_strategy", "change_budget", "add_asset"):
                     if cr and cr not in valid_camp_resources:
@@ -2917,6 +3363,19 @@ If you see a search term that appears in all_conquest_keywords, treat it as inte
                     continue
                 validated.append(item)
             logger.info(f"Account-level Claude returned {len(arr)} recs, {len(validated)} passed validation")
+            # Budget constraint sieve — block change_budget increases at account level too
+            if budget_constrained:
+                pre_len = len(validated)
+                validated = _budget_constraint_sieve(
+                    validated,
+                    camp_settings={},          # unused in account-level mode
+                    budget_by_campaign=budget_by_campaign,  # name→daily_budget_usd map
+                )
+                if len(validated) != pre_len:
+                    logger.info(
+                        f"[budget_constraint_sieve][account] {pre_len - len(validated)} "
+                        f"change_budget increases/strategy changes converted to advisories"
+                    )
             return validated
     except Exception as e:
         logger.warning(f"Account-level Claude call failed (non-fatal): {e}")
@@ -3027,12 +3486,18 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
                       call_attribution: dict | None = None,
                       keyword_call_attribution: dict | None = None,
                       campaign: str = "",
-                      outcome_history: dict | None = None) -> dict:
+                      outcome_history: dict | None = None,
+                      lifecycle: dict | None = None,
+                      lifecycle_by_campaign: dict | None = None) -> dict:
     """
     Apply optimization rules. Returns recommended actions.
     campaign: name of the campaign being evaluated — used to scope memory lookups.
               Empty string = global memory only.
     outcome_history: pre-loaded from _load_outcome_history(); if None, loaded here.
+    lifecycle: dict from build_lifecycle_block() for the primary campaign — if
+               in_learning_period, bid and pause rules are suppressed for that campaign.
+    lifecycle_by_campaign: dict[campaign_name → lifecycle_block] for per-keyword campaign
+               lookup; overrides the primary lifecycle when present.
     """
     # Load persistent memory — what the optimizer has been taught
     try:
@@ -3091,8 +3556,35 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
     total_booked_calls = sum(c["booked_calls"] for c in call_attribution.values())
     total_confirmed_appts = sum(c["confirmed_appts"] for c in call_attribution.values())
 
+    # Lifecycle guard — suppress bid and pause rules during learning period
+    _in_learning = (lifecycle or {}).get("in_learning_period", False)
+    _lc_stage    = (lifecycle or {}).get("stage", "unknown")
+    _lc_by_camp  = lifecycle_by_campaign or {}
+    if _in_learning:
+        logger.info(
+            f"[rules] '{campaign}' in learning period (stage={_lc_stage}) — "
+            f"Rule 1 (pause) and Rule 2 (bid) suppressed; negatives still active"
+        )
+
+    def _kw_in_learning(kw: dict) -> bool:
+        """Check if a keyword's campaign is in the learning period."""
+        camp = kw.get("campaign", "")
+        if camp in _lc_by_camp:
+            return _lc_by_camp[camp].get("in_learning_period", False)
+        # Campaign not found in lifecycle map — default to False (fail-open).
+        # This covers cross-campaign keywords where we don't have a separate lifecycle block.
+        if camp and camp != campaign:
+            logger.warning(
+                f"[rules] _kw_in_learning: no lifecycle entry for campaign '{camp}' "
+                f"— defaulting to in_learning=False (fail-open)"
+            )
+        return False
+
     # Rule 1: Pause keywords with spend > threshold and zero leads/calls
+    # Suppressed per-keyword during learning period — pausing during learning resets Google's algorithm
     for kw in keyword_perf:
+        if _kw_in_learning(kw):
+            continue  # skip pause check for keywords in learning campaigns
         keyword = kw["keyword"]
         keyword_lower = keyword.lower()
         attr = attribution.get(keyword, {"leads": 0, "booked": 0, "production": 0})
@@ -3154,7 +3646,10 @@ def _analyze_keywords(keyword_perf: list, attribution: dict, search_terms: list,
             })
 
     # Rule 2: Increase bids on keywords with production or strong call conversions
+    # Suppressed per-keyword during learning period — bid changes reset Google's learning algorithm
     for kw in keyword_perf:
+        if _kw_in_learning(kw):
+            continue  # skip bid increase for keywords in learning campaigns
         keyword = kw["keyword"]
         attr = attribution.get(keyword, {"leads": 0, "booked": 0, "production": 0})
         kw_calls = _kw_calls_for(keyword)
@@ -5165,15 +5660,18 @@ def _get_active_rsa_resources(client, customer_id: str, campaign_resource: str) 
 
 # ── Google Ads live negative keyword fetch ────────────────────────────────────
 
-def _fetch_existing_negatives(client, customer_id: str) -> set:
+def _fetch_existing_negatives(client, customer_id: str) -> tuple:
     """
     Pull all negative keywords currently live in Google Ads — both campaign-level
     and from shared negative keyword lists (e.g. 'GDC Competitor Negatives').
-    Returns a set of lowercased keyword texts.
+    Returns (flat_set, negatives_by_campaign) where:
+      flat_set              — set of lowercased keyword texts (account-wide union)
+      negatives_by_campaign — dict[campaign_name → set of lowercased keyword texts]
     Also saves them to gads_negative_keywords table for offline reference.
     """
     ga_service = client.get_service("GoogleAdsService")
     existing: set = set()
+    negatives_by_campaign: dict = {}   # campaign_name → set of lowercase keyword texts
     rows_to_save = []
 
     # 1. Campaign-level negatives
@@ -5191,11 +5689,13 @@ def _fetch_existing_negatives(client, customer_id: str) -> set:
     try:
         for row in ga_service.search(customer_id=customer_id, query=camp_query):
             text = row.campaign_criterion.keyword.text.strip().lower()
+            camp_name = row.campaign.name
             if text:
                 existing.add(text)
+                negatives_by_campaign.setdefault(camp_name, set()).add(text)
                 rows_to_save.append((text,
                                      row.campaign_criterion.keyword.match_type.name,
-                                     row.campaign.name,
+                                     camp_name,
                                      row.campaign.resource_name))
     except Exception as e:
         logger.warning(f"Could not fetch campaign-level negative keywords: {e}")
@@ -5222,7 +5722,7 @@ def _fetch_existing_negatives(client, customer_id: str) -> set:
         logger.warning(f"Could not fetch shared list negatives: {e}")
 
     logger.info(f"Fetched {len(existing)} unique existing negative keywords from Google Ads "
-                f"(campaign-level + shared lists)")
+                f"(campaign-level + shared lists); {len(negatives_by_campaign)} campaigns have negatives")
     if existing:
         logger.info(f"Live negatives sample: {sorted(existing)[:20]}")
 
@@ -5252,7 +5752,7 @@ def _fetch_existing_negatives(client, customer_id: str) -> set:
     except Exception as e:
         logger.warning(f"Could not save negative keywords to DB: {e}")
 
-    return existing
+    return existing, negatives_by_campaign
 
 
 # ── Deduplication helpers ─────────────────────────────────────────────────────
@@ -5344,11 +5844,17 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    # Expire recommendations older than 14 days before generating new ones
-    # (was 48h — too aggressive; users need more time to review and approve)
+    # Read budget constraint setting
+    _budget_constrained = (get_setting("budget_constrained") or "false") == "true"
+    if _budget_constrained:
+        logger.info("Budget Constrained mode is ON — change_budget increases will be suppressed")
+
+    # Expire recommendations older than 48 hours before generating new ones.
+    # This keeps the queue clean — each optimizer run produces a fresh set.
+    # Users have 48h to review and apply recommendations before they're swept.
     _optimizer_progress["started_at"] = _time_mod.time()
     _set_progress(0)  # Starting
-    expired = expire_stale_pending(max_age_hours=336)
+    expired = expire_stale_pending(max_age_hours=48)
 
     try:
         _set_progress(1)  # Syncing GAds Data
@@ -5389,7 +5895,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
     # Fetch live negative keywords from Google Ads — used throughout run to skip already-applied negatives
     logger.info("Fetching existing negative keywords from Google Ads...")
-    live_negatives = _fetch_existing_negatives(client, customer_id)
+    live_negatives, live_negatives_by_campaign = _fetch_existing_negatives(client, customer_id)
 
     # Collect data
     logger.info("Collecting campaign settings (budget, bidding strategy, impression share)...")
@@ -5453,6 +5959,32 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         logger.info(f"Stored {len(google_recs)} Google recommendations")
     except Exception as e:
         logger.warning(f"Google recommendations fetch failed (non-fatal): {e}")
+
+    # When budget constrained: filter Google Recs that recommend budget/bid increases
+    if _budget_constrained and google_recs:
+        _BUDGET_INCREASE_REC_TYPES = {
+            "CAMPAIGN_BUDGET",
+            "MARGINAL_ROI_CAMPAIGN_BUDGET",
+            # MOVE_UNUSED_BUDGET is neutral (redistributes, not increases total) — excluded
+            "RAISE_TARGET_CPA",             # was RAISE_TARGET_CPA_BID_TOO_LOW — not a valid type
+            "TARGET_CPA_OPT_IN",            # opt-in often requires budget bump
+            "MAXIMIZE_CONVERSIONS_OPT_IN",  # recommends a higher budget
+            "MAXIMIZE_CLICKS_OPT_IN",       # uncapped strategy increases spend
+            "USE_BROAD_MATCH_KEYWORD",      # broad match significantly increases reach/spend
+            "FORECASTING_CAMPAIGN_BUDGET",
+            "FORECASTING_SET_TARGET_ROAS",
+        }
+        _before = len(google_recs)
+        google_recs = [
+            gr for gr in google_recs
+            if gr.get("rec_type", "") not in _BUDGET_INCREASE_REC_TYPES
+        ]
+        _filtered_count = _before - len(google_recs)
+        if _filtered_count:
+            logger.info(
+                f"[budget_constraint] Filtered {_filtered_count} Google Recs that increase spend "
+                f"({_before} → {len(google_recs)} remaining)"
+            )
 
     _set_progress(2)  # Fetching Negatives
     # ── Fetch and score ad performance for A/B testing loop ──────────────────
@@ -5694,12 +6226,34 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     _set_progress(7)  # Rule-Based Engine
     # Analyze
     logger.info("Analyzing and generating recommendations...")
+    # Build per-campaign lifecycle map for the rule engine guard
+    # (rule engine runs once over all campaigns' keywords combined)
+    from lifecycle import build_lifecycle_block as _blc, compute_days_since_launch as _cdsl
+    from database import get_campaign_by_name as _gcbn, get_campaign_launch_date as _gcld
+    _rule_lifecycle_by_camp: dict = {}
+    for _rc in set(kw.get("campaign","") for kw in keyword_perf if kw.get("campaign")):
+        try:
+            _rc_row = _gcbn(_rc)
+            _rc_ld = _gcld(_rc_row["campaign_id"]) if _rc_row else None
+            _rc_clicks = sum(k.get("clicks",0) for k in keyword_perf if k.get("campaign")==_rc)
+            _rc_conv   = sum(k.get("conversions",0) for k in keyword_perf if k.get("campaign")==_rc)
+            _rule_lifecycle_by_camp[_rc] = _blc(
+                launch_date=_rc_ld,
+                conversions_30d=_rc_conv,
+                clicks_30d=_rc_clicks,
+            )
+        except Exception as _rule_lc_err:
+            logger.debug(f"[lifecycle] rule engine camp lookup failed for '{_rc}': {_rule_lc_err}")
+            _rule_lifecycle_by_camp[_rc] = {}
+
     actions = _analyze_keywords(
         keyword_perf, attribution, search_terms,
         call_attribution=call_attribution,
         keyword_call_attribution=keyword_call_attribution,
         campaign=primary_campaign,
         outcome_history=outcome_history,
+        lifecycle=_rule_lifecycle_by_camp.get(primary_campaign, {}),
+        lifecycle_by_campaign=_rule_lifecycle_by_camp,
     )
 
     # ── Phase A: Suppress recently-rejected recommendations ───────────────────
@@ -5792,6 +6346,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         _conv = _kw_conv_map.get(kw.get("resource_name", ""), kw.get("conversions", 0))
         _pct = _bid_confidence_pct(_conv)
         new_bid = int(current_bid * (1 + _pct)) if current_bid > 0 else 0
+        _kw_camp = kw.get("campaign", "") or primary_campaign  # fallback: keyword resource determines campaign
         aid = log_pending(
             operation="increase_bid",
             entity_type="keyword",
@@ -5809,7 +6364,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
-            campaign_name=kw.get("campaign", ""),
+            campaign_name=_kw_camp,
             priority=30,
         )
         kw["action_id"] = aid
@@ -5821,6 +6376,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         _conv = _kw_conv_map.get(kw.get("resource_name", ""), kw.get("conversions", 0))
         _pct = _bid_confidence_pct(_conv)
         new_bid = max(int(current_bid * (1 - _pct)), 10_000) if current_bid > 0 else 0  # floor at $0.01
+        _kw_camp = kw.get("campaign", "") or primary_campaign  # fallback: use primary campaign
         aid = log_pending(
             operation="decrease_bid",
             entity_type="keyword",
@@ -5837,7 +6393,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
-            campaign_name=kw.get("campaign", ""),
+            campaign_name=_kw_camp,
             priority=40,
         )
         kw["action_id"] = aid
@@ -6322,6 +6878,34 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             "planned_ad_groups": (_camp_build.get("ad_groups") or {}).get("ad_groups") or [],
         }
 
+        # ── Lifecycle classification ──────────────────────────────────────────
+        from lifecycle import build_lifecycle_block as _build_lifecycle
+        _launch_date_db = (_camp_local_row or {}).get("launch_date") or None
+        _first_imp_date = None
+        _camp_id_for_lifecycle = (_camp_local_row or {}).get("campaign_id") or ""
+        if not _launch_date_db and camp_resource:
+            # Fallback: query GAds for earliest segment date in LAST_365_DAYS (cached per run)
+            # NOTE: We do NOT write this back to DB — GAds only reports LAST_365_DAYS, so
+            # a campaign launched >365 days ago would get a wrong date persisted permanently.
+            # The backfill script (scripts/backfill_launch_dates.py) handles DB population
+            # for campaigns that were launched via our wizard and have a real launch_date.
+            _first_imp_date = _fetch_first_impression_date(camp_resource)
+            if _first_imp_date:
+                logger.info(f"[lifecycle] using first_impression_date '{_first_imp_date}' for '{camp_name}' (in-memory only)")
+
+        _camp_lifecycle = _build_lifecycle(
+            launch_date=_launch_date_db,
+            first_impression_date=_first_imp_date,
+            conversions_30d=sum(k.get("conversions", 0) for k in camp_kw),
+            clicks_30d=sum(k.get("clicks", 0) for k in camp_kw),
+        )
+        logger.info(
+            f"[lifecycle] '{camp_name}': stage={_camp_lifecycle['stage']}, "
+            f"days={_camp_lifecycle['days_since_launch']}, "
+            f"source={_camp_lifecycle['source']}, "
+            f"in_learning={_camp_lifecycle['in_learning_period']}"
+        )
+
         # ── PR 2: budget feasibility signal ──────────────────────────────────
         _live_cpc_avg = 0.0
         _camp_clicks_total = sum(k.get("clicks", 0) for k in camp_kw)
@@ -6372,6 +6956,10 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             intent_signals=_intent_signals,
             # PR 7
             conquest_keywords_protected=_conquest_kws,
+            # Lifecycle
+            lifecycle=_camp_lifecycle,
+            # Budget constraint
+            budget_constrained=_budget_constrained,
         )
         if not structured:
             continue
@@ -6680,6 +7268,22 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         },
     }
 
+    # Build campaign_name → daily_budget_usd map for budget sieve at account level
+    # Sources in priority order: campaign_settings (resource-keyed) → camp_spend_for_acct
+    _acct_budget_by_campaign: dict = {}
+    for cn in all_campaign_names:
+        # campaign_settings is keyed by resource name; we need name-keyed lookup
+        # camp_spend_for_acct has daily_budget_usd from keyword_perf daily_budget_micros
+        bud = (camp_spend_for_acct.get(cn) or {}).get("daily_budget_usd")
+        if bud is None:
+            # Fallback: scan campaign_settings for a matching name
+            for cs in campaign_settings.values():
+                if cs.get("campaign_name", "").strip().lower() == cn.strip().lower():
+                    bud = cs.get("daily_budget_usd")
+                    break
+        if bud is not None:
+            _acct_budget_by_campaign[cn] = float(bud or 0.0)
+
     acct_structured = _call_claude_account_level(
         all_keyword_perf=keyword_perf,
         all_search_terms=search_terms,
@@ -6690,9 +7294,12 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         google_recs=[r for r in google_recs if not r.get("campaign_name")],
         optimizer_run_id=run_id,
         existing_negatives=live_negatives,
+        existing_negatives_by_campaign=live_negatives_by_campaign,
         memory_digest=memory_digest,
         lqi=lqi_signals,
         competitor_intel_union=_competitor_intel_union,
+        budget_constrained=_budget_constrained,
+        budget_by_campaign=_acct_budget_by_campaign if _budget_constrained else None,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")

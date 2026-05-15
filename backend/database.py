@@ -3951,6 +3951,42 @@ def get_campaign_by_id(campaign_id: str):
         return dict(row) if row else None
 
 
+def get_campaign_launch_date(campaign_id: str) -> Optional[str]:
+    """
+    Return the launch_date string for a campaign, or None if not set / not found.
+    The value is an ISO-8601 string (e.g. '2026-05-03T12:00:00Z') or a plain
+    'YYYY-MM-DD' date; lifecycle.compute_days_since_launch() handles both forms.
+    Returns None for empty strings as well.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT launch_date FROM campaigns WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()
+    if not row:
+        return None
+    val = row[0]
+    return val if val else None
+
+
+def set_campaign_launch_date(campaign_id: str, launch_date_str: str) -> None:
+    """
+    Write-through: persist a GAds-derived first-impression date so subsequent
+    optimizer runs don't need to re-query the Google Ads API.
+    Only writes if current value is NULL / empty and the new value is non-empty.
+    """
+    if not launch_date_str:
+        return
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT launch_date FROM campaigns WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()
+        if row and not row[0]:
+            conn.execute(
+                "UPDATE campaigns SET launch_date=? WHERE campaign_id=?",
+                (launch_date_str, campaign_id),
+            )
+
+
 def delete_campaign(campaign_id: str) -> bool:
     """Permanently delete a campaign row. Returns True if a row was deleted."""
     with _conn() as conn:
