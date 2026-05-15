@@ -20,7 +20,7 @@ from database import (
     get_all_leads, upsert_lead, save_gads_keywords_cache,
     save_gads_geo_cache, save_gads_schedule_cache,
     save_gads_daily_stats, save_gads_ads, save_gads_ad_metrics,
-    upsert_gads_call_view, upsert_gads_clicks,
+    upsert_gads_call_view, upsert_gads_clicks, upsert_call_search_terms,
 )
 
 logger = logging.getLogger(__name__)
@@ -654,6 +654,71 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result
+
+
+def sync_call_search_terms(days: int = 30) -> int:
+    """
+    Fetch all search terms from search_term_view for the last N days.
+
+    Note: Google's GAQL does NOT allow segments.click_type on search_term_view
+    (PROHIBITED_SEGMENT_IN_SELECT_OR_WHERE_CLAUSE), so we pull all search terms
+    and rely on ad_group-level matching in backfill_call_keyword_attribution()
+    to connect search terms to calls.
+
+    Returns count of rows upserted.
+    """
+    try:
+        client = _build_client()
+    except Exception as e:
+        logger.error(f"sync_call_search_terms: failed to build client: {e}")
+        return 0
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id.replace("-", "")
+    ga_service = client.get_service("GoogleAdsService")
+
+    # Note: ad_group_criterion is INCOMPATIBLE with search_term_view FROM clause.
+    # We only select from search_term_view, campaign, ad_group, and metrics.
+    query = f"""
+        SELECT
+            search_term_view.search_term,
+            campaign.id,
+            campaign.name,
+            ad_group.name,
+            metrics.clicks,
+            metrics.conversions
+        FROM search_term_view
+        WHERE
+            segments.date DURING LAST_{days}_DAYS
+            AND metrics.clicks > 0
+        ORDER BY metrics.clicks DESC
+    """
+
+    rows_to_upsert = []
+    try:
+        response = ga_service.search(customer_id=customer_id, query=query)
+        for row in response:
+            rows_to_upsert.append({
+                "search_term": row.search_term_view.search_term or "",
+                "keyword_text": "",
+                "keyword_match_type": "",
+                "campaign_id": str(row.campaign.id),
+                "campaign_name": row.campaign.name or "",
+                "ad_group_name": row.ad_group.name or "",
+                "conversions": float(row.metrics.conversions or 0),
+                "days": days,
+            })
+    except Exception as e:
+        logger.error(f"sync_call_search_terms: API error: {e}")
+        return 0
+
+    if rows_to_upsert:
+        n = upsert_call_search_terms(rows_to_upsert)
+        logger.info(f"sync_call_search_terms: upserted {n} rows ({len(rows_to_upsert)} fetched)")
+        return n
+
+    logger.info("sync_call_search_terms: no search terms found")
+    return 0
 
 
 def sync_call_view(days_back: int = 14) -> int:

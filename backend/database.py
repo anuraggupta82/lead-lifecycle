@@ -732,6 +732,26 @@ CREATE INDEX IF NOT EXISTS idx_gads_cv_started  ON gads_call_view(start_call_dat
 CREATE INDEX IF NOT EXISTS idx_gads_cv_area     ON gads_call_view(caller_area_code);
 CREATE INDEX IF NOT EXISTS idx_gads_cv_campaign ON gads_call_view(campaign_id);
 
+-- Search terms that drove AD_CALL conversions, per campaign/ad group.
+-- Populated by sync_call_search_terms() in google_ads_sync.py.
+-- Used for keyword attribution on matched Mango calls.
+CREATE TABLE IF NOT EXISTS gads_call_search_terms (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_term     TEXT NOT NULL,
+    keyword_text    TEXT DEFAULT '',
+    keyword_match_type TEXT DEFAULT '',
+    campaign_id     TEXT DEFAULT '',
+    campaign_name   TEXT DEFAULT '',
+    ad_group_name   TEXT DEFAULT '',
+    conversions     REAL DEFAULT 0.0,
+    days            INTEGER DEFAULT 30,
+    synced_at       TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gcst_term_campaign
+    ON gads_call_search_terms(search_term, campaign_id);
+CREATE INDEX IF NOT EXISTS idx_gcst_campaign ON gads_call_search_terms(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_gcst_ad_group ON gads_call_search_terms(ad_group_name);
+
 CREATE TABLE IF NOT EXISTS gads_google_recs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fetched_at TEXT NOT NULL,
@@ -801,6 +821,62 @@ CREATE TABLE IF NOT EXISTS domain_crawl_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_crawl_log_domain ON domain_crawl_log(domain_id, started_at DESC);
+
+-- ── SKAG Recommendation System ──────────────────────────────────────────────
+-- Tracks every SKAG (Single Keyword Ad Group) recommendation, its approval
+-- state, and the Google Ads resources created when it executes.
+-- See skag_signals.py for signal collection and scoring logic.
+
+CREATE TABLE IF NOT EXISTS skag_recommendations (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    recommendation_id       TEXT UNIQUE NOT NULL,   -- FK-style link to optimizer_queue action_id
+    created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+    campaign_id             TEXT NOT NULL,
+    campaign_name           TEXT NOT NULL DEFAULT '',
+    source_ad_group_id      TEXT NOT NULL DEFAULT '',
+    source_ad_group_name    TEXT NOT NULL,
+    keyword_text            TEXT NOT NULL,
+    match_type              TEXT NOT NULL DEFAULT 'EXACT',
+    new_ad_group_name       TEXT NOT NULL,
+    new_ad_group_id         TEXT DEFAULT '',        -- populated after creation in GAds
+    score                   REAL DEFAULT 0.0,
+    score_breakdown         TEXT DEFAULT '{}',      -- JSON
+    signal_snapshot         TEXT DEFAULT '{}',      -- JSON frozen at recommendation time
+    status                  TEXT NOT NULL DEFAULT 'pending',
+        -- pending | approved | rejected | created | failed | locked | reverted
+    approved_at             TEXT DEFAULT '',
+    created_in_gads_at      TEXT DEFAULT '',        -- when GAds ad group was actually created
+    locked_at               TEXT DEFAULT '',        -- when source-side negative was added (stage 2)
+    reverted_at             TEXT DEFAULT '',
+    error                   TEXT DEFAULT '',
+    steps_completed         TEXT DEFAULT '[]'       -- JSON list of [step, resource_id] pairs
+);
+
+CREATE INDEX IF NOT EXISTS idx_skag_status    ON skag_recommendations(status);
+CREATE INDEX IF NOT EXISTS idx_skag_campaign  ON skag_recommendations(campaign_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skag_kw_ag
+    ON skag_recommendations(keyword_text, source_ad_group_name)
+    WHERE status NOT IN ('rejected', 'reverted');
+
+-- Nightly performance snapshots for each live SKAG (populated by a scheduled job).
+-- Used to measure whether SKAGs actually improve attribution + conversion rates,
+-- and to surface zombie SKAGs (live 30d, <50 impressions) for cleanup.
+CREATE TABLE IF NOT EXISTS skag_outcomes_30d (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    skag_recommendation_id  INTEGER NOT NULL REFERENCES skag_recommendations(id) ON DELETE CASCADE,
+    snapshot_date           TEXT NOT NULL,          -- ISO date YYYY-MM-DD
+    days_live               INTEGER DEFAULT 0,
+    impressions             INTEGER DEFAULT 0,
+    clicks                  INTEGER DEFAULT 0,
+    cost_micros             INTEGER DEFAULT 0,
+    call_conversions        REAL DEFAULT 0.0,
+    confirmed_od_appointments INTEGER DEFAULT 0,
+    avg_grade               REAL DEFAULT 0.0,
+    UNIQUE(skag_recommendation_id, snapshot_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skag_outcomes_rec
+    ON skag_outcomes_30d(skag_recommendation_id, snapshot_date DESC);
 """
 
 LIFECYCLE_STAGES = [
@@ -2333,6 +2409,68 @@ GROUP BY a.campaign_id, c.campaign_name;
                 conn.execute(f"ALTER TABLE gads_call_view ADD COLUMN {_col} {_def}")
             except Exception:
                 pass
+
+    # ── SKAG recommendation tables (migration for existing DBs) ──────────────
+    _existing_tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "skag_recommendations" not in _existing_tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS skag_recommendations (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                recommendation_id       TEXT UNIQUE NOT NULL,
+                created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+                campaign_id             TEXT NOT NULL,
+                campaign_name           TEXT NOT NULL DEFAULT '',
+                source_ad_group_id      TEXT NOT NULL DEFAULT '',
+                source_ad_group_name    TEXT NOT NULL,
+                keyword_text            TEXT NOT NULL,
+                match_type              TEXT NOT NULL DEFAULT 'EXACT',
+                new_ad_group_name       TEXT NOT NULL,
+                new_ad_group_id         TEXT DEFAULT '',
+                score                   REAL DEFAULT 0.0,
+                score_breakdown         TEXT DEFAULT '{}',
+                signal_snapshot         TEXT DEFAULT '{}',
+                status                  TEXT NOT NULL DEFAULT 'pending',
+                approved_at             TEXT DEFAULT '',
+                created_in_gads_at      TEXT DEFAULT '',
+                locked_at               TEXT DEFAULT '',
+                reverted_at             TEXT DEFAULT '',
+                error                   TEXT DEFAULT '',
+                steps_completed         TEXT DEFAULT '[]'
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_skag_status   ON skag_recommendations(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_skag_campaign ON skag_recommendations(campaign_id)")
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_skag_kw_ag
+            ON skag_recommendations(keyword_text, source_ad_group_name)
+            WHERE status NOT IN ('rejected', 'reverted')
+        """)
+
+    if "skag_outcomes_30d" not in _existing_tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS skag_outcomes_30d (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                skag_recommendation_id  INTEGER NOT NULL
+                                        REFERENCES skag_recommendations(id) ON DELETE CASCADE,
+                snapshot_date           TEXT NOT NULL,
+                days_live               INTEGER DEFAULT 0,
+                impressions             INTEGER DEFAULT 0,
+                clicks                  INTEGER DEFAULT 0,
+                cost_micros             INTEGER DEFAULT 0,
+                call_conversions        REAL DEFAULT 0.0,
+                confirmed_od_appointments INTEGER DEFAULT 0,
+                avg_grade               REAL DEFAULT 0.0,
+                UNIQUE(skag_recommendation_id, snapshot_date)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_skag_outcomes_rec
+            ON skag_outcomes_30d(skag_recommendation_id, snapshot_date DESC)
+        """)
 
 
 def _seed_call_grading_criteria(conn):
@@ -6707,6 +6845,46 @@ def upsert_gads_call_view(call: dict) -> None:
         )
 
 
+def upsert_call_search_terms(rows: list) -> int:
+    """Bulk-upsert call search term rows into gads_call_search_terms.
+    rows: list of dicts with keys: search_term, keyword_text, keyword_match_type,
+          campaign_id, campaign_name, ad_group_name, conversions, days
+    Returns count of rows upserted.
+    """
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    with _conn() as conn:
+        for r in rows:
+            conn.execute(
+                """INSERT INTO gads_call_search_terms
+                   (search_term, keyword_text, keyword_match_type, campaign_id,
+                    campaign_name, ad_group_name, conversions, days, synced_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(search_term, campaign_id) DO UPDATE SET
+                     keyword_text=excluded.keyword_text,
+                     keyword_match_type=excluded.keyword_match_type,
+                     ad_group_name=excluded.ad_group_name,
+                     conversions=excluded.conversions,
+                     days=excluded.days,
+                     synced_at=excluded.synced_at""",
+                (
+                    r["search_term"],
+                    r.get("keyword_text", ""),
+                    r.get("keyword_match_type", ""),
+                    r.get("campaign_id", ""),
+                    r.get("campaign_name", ""),
+                    r.get("ad_group_name", ""),
+                    float(r.get("conversions", 0)),
+                    int(r.get("days", 30)),
+                    now,
+                ),
+            )
+            count += 1
+    return count
+
+
 def upsert_gads_clicks(clicks: list) -> int:
     """
     Bulk-upsert click_view rows into gads_clicks table.
@@ -6762,29 +6940,41 @@ def get_gads_call_view(days: int = 30) -> list:
 
 def backfill_call_keyword_attribution() -> int:
     """
-    Backfill attributed_keyword / attributed_ad_group / attributed_campaign_name on
-    mango_calls rows that have a gads_call_id but no attributed_keyword yet.
+    Backfill / upgrade attributed_keyword / attributed_ad_group on mango_calls rows
+    that have a matched gads_call_id.
 
     Strategy (best-effort — call_view doesn't expose the triggering keyword):
-      1. Join mango_calls → gads_call_view via gads_call_id to get campaign_id + ad_group_id.
-      2. Look up the top keyword in that ad_group from gads_keyword_perf (highest clicks).
-      3. If no keyword perf row exists for that ad_group, fall back to campaign_name only.
+      1. Join mango_calls → gads_call_view via gads_call_id to get campaign_id + ad_group.
+      2. Priority 1: real search term that drove AD_CALL conversions in this ad group.
+      3. Priority 2: real search term at campaign level (any ad group).
+      4. Priority 3: best keyword in this ad group from keyword perf cache.
+      5. Priority 4: best keyword for the campaign overall from keyword perf cache.
+      6. Last resort: campaign name itself.
 
-    Sets attributed_keyword_method = 'ad_group_best_keyword' or 'campaign_only'.
-    Returns count of rows updated.
+    Re-processes rows whose current method is weaker than 'call_search_term' so
+    that newly-synced search term data can upgrade earlier campaign_only /
+    ad_group_best_keyword attributions. Only skips rows already at the highest
+    quality ('call_search_term').
+
+    Returns count of rows actually changed (not rows touched).
     """
     now = datetime.now(timezone.utc).isoformat()
     updated = 0
     with _conn() as conn:
-        # Fetch all matched calls with no keyword attribution
+        # Fetch all matched calls EXCEPT those already at the best quality method.
+        # This lets us upgrade campaign_only / ad_group_best_keyword (and any
+        # other non-call_search_term method) to call_search_term when search term
+        # data is now available.
         rows = conn.execute("""
             SELECT mc.uuid, mc.gads_call_id,
-                   gcv.campaign_id, gcv.campaign_name, gcv.ad_group_id, gcv.ad_group_name
+                   gcv.campaign_id, gcv.campaign_name, gcv.ad_group_id, gcv.ad_group_name,
+                   mc.attributed_keyword, mc.attributed_ad_group, mc.attributed_keyword_method
             FROM mango_calls mc
             JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
             WHERE mc.gads_call_id IS NOT NULL
               AND mc.gads_call_id != ''
-              AND (mc.attributed_keyword IS NULL OR mc.attributed_keyword = '')
+              AND (mc.attributed_keyword_method IS NULL
+                   OR mc.attributed_keyword_method != 'call_search_term')
         """).fetchall()
 
         for row in rows:
@@ -6793,17 +6983,43 @@ def backfill_call_keyword_attribution() -> int:
             campaign_name = row[3] or ""
             ad_group_id = row[4] or ""
             ad_group_name = row[5] or ""
+            current_keyword = row[6] or ""
+            current_ag = row[7] or ""
+            current_method = row[8] or ""
 
             keyword = ""
             method = "campaign_only"
 
-            # Try to find best keyword in this ad group from keyword perf cache
-            # gads_keywords_cache has ad_group_name but not ad_group_id, so match by name
-            if ad_group_name:
+            # Priority 1: actual search term that drove AD_CALL conversions in this ad group
+            if ad_group_name and campaign_id:
+                st_row = conn.execute("""
+                    SELECT search_term FROM gads_call_search_terms
+                    WHERE campaign_id = ? AND ad_group_name = ?
+                      AND search_term != ''
+                    ORDER BY conversions DESC
+                    LIMIT 1
+                """, (campaign_id, ad_group_name)).fetchone()
+                if st_row and st_row[0]:
+                    keyword = st_row[0]
+                    method = "call_search_term"
+
+            # Priority 2: search term at campaign level (any ad group)
+            if not keyword and campaign_id:
+                st_row = conn.execute("""
+                    SELECT search_term FROM gads_call_search_terms
+                    WHERE campaign_id = ? AND search_term != ''
+                    ORDER BY conversions DESC
+                    LIMIT 1
+                """, (campaign_id,)).fetchone()
+                if st_row and st_row[0]:
+                    keyword = st_row[0]
+                    method = "call_search_term"
+
+            # Priority 3: best keyword in this ad group from keyword perf cache
+            if not keyword and ad_group_name:
                 kw_row = conn.execute("""
                     SELECT keyword_text FROM gads_keywords_cache
-                    WHERE ad_group_name = ?
-                      AND keyword_text != ''
+                    WHERE ad_group_name = ? AND keyword_text != ''
                     ORDER BY clicks DESC, impressions DESC
                     LIMIT 1
                 """, (ad_group_name,)).fetchone()
@@ -6811,12 +7027,11 @@ def backfill_call_keyword_attribution() -> int:
                     keyword = kw_row[0]
                     method = "ad_group_best_keyword"
 
-            # Fallback: best keyword for the campaign overall
+            # Priority 4: best keyword for the campaign overall
             if not keyword and campaign_name:
                 kw_row = conn.execute("""
                     SELECT keyword_text FROM gads_keywords_cache
-                    WHERE campaign_name = ?
-                      AND keyword_text != ''
+                    WHERE campaign_name = ? AND keyword_text != ''
                     ORDER BY clicks DESC, impressions DESC
                     LIMIT 1
                 """, (campaign_name,)).fetchone()
@@ -6831,6 +7046,26 @@ def backfill_call_keyword_attribution() -> int:
 
             # Store ad_group as "CampaignName > AdGroupName" for display clarity
             ag_display = f"{campaign_name} > {ad_group_name}" if ad_group_name else campaign_name
+
+            # Quality ranking: only write if the new method is at least as good as
+            # what's already there, AND something actually changed. This prevents
+            # us from downgrading a row (e.g. overwriting an existing
+            # ad_group_best_keyword with a weaker campaign_only result) and from
+            # bumping updated_at on no-op rewrites.
+            quality_rank = {
+                "call_search_term": 3,
+                "ad_group_best_keyword": 2,
+                "campaign_only": 1,
+            }
+            new_rank = quality_rank.get(method, 0)
+            cur_rank = quality_rank.get(current_method, 0)
+            if new_rank < cur_rank:
+                continue
+            if (keyword == current_keyword
+                    and ag_display == current_ag
+                    and method == current_method):
+                continue
+
             conn.execute("""
                 UPDATE mango_calls SET
                     attributed_keyword=?,

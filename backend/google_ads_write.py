@@ -568,3 +568,192 @@ def remove_negative_keyword_from_campaign(
     except Exception as e:
         logger.error(f"remove_negative_keyword_from_campaign mutate failed: {e}")
         raise
+
+
+# ── SKAG: Create Single Keyword Ad Group ──────────────────────────────────────
+
+def create_skag_ad_group(
+    customer_id: str,
+    campaign_resource: str,
+    new_ad_group_name: str,
+    keyword_text: str,
+    source_ad_group_resource: str = "",
+    cpc_bid_micros: int = 0,
+) -> dict:
+    """
+    Create a SKAG (Single Keyword Ad Group) in Google Ads.
+
+    Steps:
+    1. Create a new ENABLED ad group under `campaign_resource`.
+    2. Add the keyword as EXACT match (NEVER BROAD or PHRASE for a SKAG).
+    3. Copy the first ENABLED RSA from the source ad group verbatim.
+       RSA headlines/descriptions are copied as-is (per SKAG rule: no editing).
+
+    Args:
+        customer_id:            GAds customer ID string (digits only, no dashes)
+        campaign_resource:      e.g. customers/NNN/campaigns/MMM
+        new_ad_group_name:      Ad group name (max 255 chars)
+        keyword_text:           The single keyword for this SKAG
+        source_ad_group_resource: resource of the source ad group (for RSA copy)
+        cpc_bid_micros:         CPC bid; 0 = inherit from campaign
+
+    Returns:
+        {
+          "ad_group_resource": str,    # new ad group resource name
+          "keyword_resource":  str,    # new keyword criterion resource name
+          "ad_resource":       str,    # new RSA resource name (empty if none copied)
+          "rsa_copied":        bool,   # True if an RSA was copied
+        }
+
+    Raises ValueError on bad inputs; raises GoogleAdsException on API failure.
+    Does NOT check kill switch — caller must check first.
+    """
+    if not campaign_resource or not campaign_resource.startswith("customers/"):
+        raise ValueError(f"Invalid campaign_resource: '{campaign_resource}'")
+    if not new_ad_group_name or not new_ad_group_name.strip():
+        raise ValueError("new_ad_group_name is required")
+    if not keyword_text or not keyword_text.strip():
+        raise ValueError("keyword_text is required")
+    if len(new_ad_group_name) > 255:
+        new_ad_group_name = new_ad_group_name[:255]
+
+    client = _build_client()
+
+    # ── Step 1: Create the ad group ──────────────────────────────────────────
+    ag_service = client.get_service("AdGroupService")
+    ag_op = client.get_type("AdGroupOperation")
+    ag = ag_op.create
+    ag.name = new_ad_group_name.strip()
+    ag.campaign = campaign_resource
+    ag.status = client.enums.AdGroupStatusEnum.ENABLED
+    if cpc_bid_micros > 0:
+        ag.cpc_bid_micros = cpc_bid_micros
+
+    try:
+        ag_response = ag_service.mutate_ad_groups(
+            customer_id=customer_id,
+            operations=[ag_op],
+        )
+        new_ag_resource = ag_response.results[0].resource_name
+        logger.info(
+            "SKAG: created ad group '%s' → %s", new_ad_group_name, new_ag_resource
+        )
+    except Exception as e:
+        logger.error("SKAG: create_ad_group failed: %s", e)
+        raise
+
+    # ── Step 2: Add keyword as EXACT match ───────────────────────────────────
+    crit_service = client.get_service("AdGroupCriterionService")
+    crit_op = client.get_type("AdGroupCriterionOperation")
+    crit = crit_op.create
+    crit.ad_group = new_ag_resource
+    crit.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+    crit.keyword.text = keyword_text.strip()
+    crit.keyword.match_type = client.enums.KeywordMatchTypeEnum.EXACT
+
+    try:
+        crit_response = crit_service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=[crit_op],
+        )
+        kw_resource = crit_response.results[0].resource_name
+        logger.info(
+            "SKAG: added keyword [EXACT] '%s' → %s", keyword_text, kw_resource
+        )
+    except Exception as e:
+        logger.error("SKAG: add_keyword failed for '%s': %s", keyword_text, e)
+        raise
+
+    # ── Step 3: Copy first RSA from source ad group ──────────────────────────
+    ad_resource = ""
+    rsa_copied = False
+
+    if source_ad_group_resource:
+        try:
+            _ag_id = source_ad_group_resource.split("/adGroups/")[-1]
+            ga_service = client.get_service("GoogleAdsService")
+            rsa_query = f"""
+                SELECT
+                    ad_group_ad.ad.responsive_search_ad.headlines,
+                    ad_group_ad.ad.responsive_search_ad.descriptions,
+                    ad_group_ad.ad.final_urls,
+                    ad_group_ad.ad.display_url,
+                    ad_group_ad.ad.responsive_search_ad.path1,
+                    ad_group_ad.ad.responsive_search_ad.path2
+                FROM ad_group_ad
+                WHERE ad_group.resource_name = '{source_ad_group_resource}'
+                  AND ad_group_ad.status = 'ENABLED'
+                  AND ad_group_ad.ad.type = 'RESPONSIVE_SEARCH_AD'
+                LIMIT 1
+            """
+            rsa_rows = list(ga_service.search(customer_id=customer_id, query=rsa_query))
+
+            if rsa_rows:
+                src = rsa_rows[0].ad_group_ad.ad
+                src_rsa = src.responsive_search_ad
+                final_urls = list(src.final_urls)
+
+                if final_urls and src_rsa.headlines and src_rsa.descriptions:
+                    ad_service = client.get_service("AdGroupAdService")
+                    ad_op = client.get_type("AdGroupAdOperation")
+                    new_ad = ad_op.create
+                    new_ad.ad_group = new_ag_resource
+                    new_ad.status = client.enums.AdGroupAdStatusEnum.ENABLED
+                    new_rsa = new_ad.ad.responsive_search_ad
+
+                    # Copy headlines verbatim (SKAG rule: do not edit RSAs)
+                    for h in src_rsa.headlines:
+                        new_h = new_rsa.headlines.add()
+                        new_h.text = h.text
+                        if h.HasField("pinned_field"):
+                            new_h.pinned_field = h.pinned_field
+
+                    # Copy descriptions verbatim
+                    for d in src_rsa.descriptions:
+                        new_d = new_rsa.descriptions.add()
+                        new_d.text = d.text
+                        if d.HasField("pinned_field"):
+                            new_d.pinned_field = d.pinned_field
+
+                    # Copy paths if present
+                    if src_rsa.path1:
+                        new_rsa.path1 = src_rsa.path1
+                    if src_rsa.path2:
+                        new_rsa.path2 = src_rsa.path2
+
+                    # Copy final URLs (IMMUTABLE — must be set at creation)
+                    new_ad.ad.final_urls.extend(final_urls)
+
+                    try:
+                        ad_response = ad_service.mutate_ad_group_ads(
+                            customer_id=customer_id,
+                            operations=[ad_op],
+                        )
+                        ad_resource = ad_response.results[0].resource_name
+                        rsa_copied = True
+                        logger.info(
+                            "SKAG: copied RSA from '%s' → %s",
+                            source_ad_group_resource, ad_resource
+                        )
+                    except Exception as e:
+                        # Non-fatal — ad group + keyword already created; RSA copy failure
+                        # is logged and handled gracefully (ad can be added manually).
+                        logger.warning(
+                            "SKAG: RSA copy failed (non-fatal) for '%s': %s",
+                            new_ag_resource, e
+                        )
+                else:
+                    logger.info(
+                        "SKAG: source ad group has no complete RSA to copy from %s",
+                        source_ad_group_resource
+                    )
+        except Exception as e:
+            # Non-fatal — ad group + keyword already created
+            logger.warning("SKAG: RSA fetch/copy failed (non-fatal): %s", e)
+
+    return {
+        "ad_group_resource": new_ag_resource,
+        "keyword_resource":  kw_resource,
+        "ad_resource":       ad_resource,
+        "rsa_copied":        rsa_copied,
+    }

@@ -278,9 +278,17 @@ async def lifespan(app: FastAPI):
             def _mango_gads_call_view_job():
                 _stamp("mango_call_view")
                 try:
-                    from google_ads_sync import sync_call_view
+                    from google_ads_sync import sync_call_view, sync_call_search_terms
                     n = sync_call_view(days_back=14)
                     logger.info(f"GAds call_view sync: {n} rows")
+                    # Also refresh call search terms for keyword attribution
+                    m = sync_call_search_terms(days=30)
+                    logger.info(f"GAds call search terms sync: {m} rows")
+                    # Re-run backfill with fresh search term data
+                    from database import backfill_call_keyword_attribution
+                    updated = backfill_call_keyword_attribution()
+                    if updated:
+                        logger.info(f"Keyword attribution backfill: {updated} calls updated")
                 except Exception as e:
                     logger.error(f"GAds call_view sync failed: {e}")
 
@@ -1700,6 +1708,86 @@ async def gads_approve_action(action_id: str, request: Request):
             logger.info(
                 f"set_ad_schedule approved: {camp_rn_sched} '{schedule_text}' "
                 f"pushed={result.get('pushed',0)} removed={result.get('removed',0)} ({action_id[:8]})"
+            )
+
+        elif operation == "create_skag":
+            # ── SKAG creation: isolate one keyword into its own ad group ──────
+            from ai_optimizer import _execute_create_skag, _build_client as _skag_build_client
+            from database import get_campaign_by_id as _skag_get_campaign
+            after = json.loads(row["after_state_json"] or "{}")
+            skag_kw_text       = after.get("keyword_text", "").strip()
+            skag_source_ag     = after.get("source_ad_group_name", "").strip()
+            skag_campaign_id   = after.get("campaign_id", "").strip()
+            skag_new_ag_name   = (after.get("new_ad_group_name") or f"SKAG — {skag_kw_text}").strip()
+            skag_rec_id        = (after.get("recommendation_id") or "").strip()
+
+            if not skag_kw_text:
+                raise HTTPException(status_code=422, detail="create_skag missing keyword_text")
+            if not skag_source_ag:
+                raise HTTPException(status_code=422, detail="create_skag missing source_ad_group_name")
+            if not skag_rec_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="create_skag missing recommendation_id — only optimizer-surfaced candidates can be executed"
+                )
+
+            # Resolve campaign_resource from our campaigns table
+            skag_camp_resource = ""
+            if skag_campaign_id:
+                _camp_row = _skag_get_campaign(skag_campaign_id)
+                if _camp_row:
+                    skag_camp_resource = _camp_row.get("gads_campaign_resource") or ""
+            # Fallback: try entity_id if it looks like a campaign resource
+            if not skag_camp_resource:
+                _eid = row.get("entity_id") or ""
+                if _eid.startswith("customers/"):
+                    skag_camp_resource = _eid
+
+            if not skag_camp_resource:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"create_skag cannot resolve campaign_resource for campaign_id={skag_campaign_id!r}"
+                )
+
+            _skag_cid = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+            _skag_client = _skag_build_client()
+            skag_result = _execute_create_skag(
+                _skag_client,
+                _skag_cid,
+                skag_camp_resource,
+                skag_source_ag,
+                skag_kw_text,
+                skag_new_ag_name,
+                skag_rec_id,
+                action_id,
+                [],   # skag_created_this_run — no per-run cap for manual approvals
+            )
+
+            if skag_result.get("blocked"):
+                reason = skag_result.get("reason", "blocked")
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"blocked: {reason[:200]}")
+                raise HTTPException(status_code=409, detail=reason)
+
+            if skag_result.get("error"):
+                err = skag_result["error"]
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {err[:200]}", error_detail=err[:500])
+                raise HTTPException(status_code=502, detail=f"SKAG creation error: {err}")
+
+            new_ag_resource = skag_result.get("ad_group_resource", "")
+            if not new_ag_resource:
+                # Unexpected: no error but also no resource — treat as failure
+                _detail = "SKAG creation returned no ad_group_resource (unexpected empty result)"
+                update_gads_action_result(action_id, executed=False,
+                    execution_result=f"failed: {_detail[:200]}")
+                raise HTTPException(status_code=502, detail=_detail)
+
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(
+                f"create_skag approved: kw={skag_kw_text!r} source_ag={skag_source_ag!r} "
+                f"new_ag={new_ag_resource!r} rsa_copied={skag_result.get('rsa_copied')} ({action_id[:8]})"
             )
 
         else:
@@ -7706,6 +7794,21 @@ def admin_gads_sync_call_view():
         from google_ads_sync import sync_call_view
         n = sync_call_view(days_back=14)
         return {"synced": n}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/gads/sync-call-search-terms", dependencies=[Depends(_require_admin)])
+def admin_gads_sync_call_search_terms(days: int = 30):
+    """Fetch search terms that drove AD_CALL conversions from search_term_view.
+    Stores them in gads_call_search_terms for keyword attribution on matched calls.
+    Then re-runs the keyword attribution backfill to upgrade any calls using fallback attribution."""
+    try:
+        from google_ads_sync import sync_call_search_terms
+        n = sync_call_search_terms(days=days)
+        # Re-run backfill to upgrade calls with new search term data
+        upgraded = backfill_call_keyword_attribution()
+        return {"synced": n, "calls_upgraded": upgraded}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

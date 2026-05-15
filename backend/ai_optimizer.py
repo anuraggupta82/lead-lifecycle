@@ -2016,6 +2016,18 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                     f"  → Any search term containing these tokens with ≥$5 spend → add_negative_keyword (PHRASE).\n"
                 )
 
+        # ── SKAG attribution opportunity note ─────────────────────────────────
+        # Collected per campaign — returns empty string if no candidates qualify.
+        # Only present when there is genuine signal (call convs or OD appts).
+        skag_note = ""
+        try:
+            from skag_signals import get_skag_candidates_text as _skag_text
+            _raw_skag = _skag_text(campaign)
+            if _raw_skag:
+                skag_note = "\n\n" + _raw_skag
+        except Exception as _skag_err:
+            logger.warning("SKAG signals failed for %r (non-fatal): %s", campaign, _skag_err)
+
         prompt = excellence_block + GOOGLE_ADS_RULES + """
 You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
@@ -2280,7 +2292,7 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
-ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + _build_institutional_memory_note(campaign) + feedback_block
+ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + skag_note + _build_institutional_memory_note(campaign) + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -4048,6 +4060,210 @@ def _execute_change_match_type(client, customer_id: str, resource_name: str,
     except Exception as e:
         logger.error(f"Failed to change match type for '{keyword_text}': {e}")
         raise
+
+
+
+def _execute_create_skag(
+    client,
+    customer_id: str,
+    campaign_resource: str,
+    source_ad_group_name: str,
+    keyword_text: str,
+    new_ad_group_name: str,
+    recommendation_id: str,
+    action_id: str,
+    skag_created_this_run: list,
+) -> dict:
+    """
+    Execute a SKAG creation: create the ad group, add the EXACT keyword,
+    copy the source ad group's RSA verbatim, and update skag_recommendations.
+
+    Safety guards:
+    1. Max 2 SKAGs per optimizer run (checked via skag_created_this_run list).
+    2. Idempotency: if recommendation_id already has status=created, skip.
+    3. Requires non-empty campaign_resource.
+
+    Args:
+        client:               GoogleAdsClient
+        customer_id:          digits-only customer ID string
+        campaign_resource:    customers/NNN/campaigns/MMM
+        source_ad_group_name: human-readable source ad group name (for resource lookup)
+        keyword_text:         the single keyword to isolate
+        new_ad_group_name:    name for the new SKAG ad group
+        recommendation_id:    FK to skag_recommendations.recommendation_id
+        action_id:            optimizer queue action_id (for audit log)
+        skag_created_this_run: mutable list accumulating created rec_ids this run
+
+    Returns:
+        {"ad_group_resource": str, "keyword_resource": str,
+         "ad_resource": str, "rsa_copied": bool, "blocked": bool, "reason": str}
+    """
+    from datetime import datetime, timezone
+    from database import get_db_connection
+
+    # ── Guard 1: per-run cap ─────────────────────────────────────────────────
+    MAX_SKAGS_PER_RUN = 2
+    if len(skag_created_this_run) >= MAX_SKAGS_PER_RUN:
+        reason = (
+            f"SKAG per-run cap reached ({MAX_SKAGS_PER_RUN}) — "
+            f"'{keyword_text}' deferred to next run"
+        )
+        logger.info("_execute_create_skag: %s", reason)
+        return {"blocked": True, "reason": reason, "ad_group_resource": "",
+                "keyword_resource": "", "ad_resource": "", "rsa_copied": False}
+
+    # ── Guard 2: idempotency + atomic in-flight claim ───────────────────────
+    # Use a single connection for both the read and the optimistic status flip
+    # so that concurrent approvals can't both pass the "status != created" check.
+    # We atomically claim the row with UPDATE...WHERE status NOT IN ('created','approved')
+    # and then verify rowcount to detect a race.
+    with get_db_connection() as conn:
+        rec = conn.execute(
+            "SELECT status, new_ad_group_id FROM skag_recommendations "
+            "WHERE recommendation_id = ?",
+            (recommendation_id,)
+        ).fetchone()
+
+    if rec is None:
+        reason = (
+            f"recommendation_id={recommendation_id!r} not found in skag_recommendations. "
+            "Only optimizer-surfaced candidates can be SKAG-created."
+        )
+        logger.warning("_execute_create_skag: %s", reason)
+        return {"blocked": True, "reason": reason, "ad_group_resource": "",
+                "keyword_resource": "", "ad_resource": "", "rsa_copied": False}
+
+    if rec["status"] == "created":
+        reason = f"SKAG already created (recommendation_id={recommendation_id})"
+        logger.info("_execute_create_skag: %s", reason)
+        return {"blocked": True, "reason": reason,
+                "ad_group_resource": rec["new_ad_group_id"] or "",
+                "keyword_resource": "", "ad_resource": "", "rsa_copied": False}
+
+    if rec["status"] == "approved":
+        reason = (
+            f"SKAG is already in-flight (status=approved) — "
+            f"recommendation_id={recommendation_id}"
+        )
+        logger.info("_execute_create_skag: %s", reason)
+        return {"blocked": True, "reason": reason, "ad_group_resource": "",
+                "keyword_resource": "", "ad_resource": "", "rsa_copied": False}
+
+    # ── Guard 3: campaign_resource required ──────────────────────────────────
+    if not campaign_resource or not campaign_resource.startswith("customers/"):
+        reason = f"Missing or invalid campaign_resource: '{campaign_resource}'"
+        logger.warning("_execute_create_skag: %s", reason)
+        _mark_skag_failed(recommendation_id, reason)
+        return {"blocked": True, "reason": reason, "ad_group_resource": "",
+                "keyword_resource": "", "ad_resource": "", "rsa_copied": False}
+
+    # ── Atomic in-flight claim: flip to 'approved' ONLY if still 'pending'/'locked' ─
+    # rowcount==0 means another process claimed it between our read and now.
+    with get_db_connection() as conn:
+        cur = conn.execute(
+            "UPDATE skag_recommendations SET status = 'approved' "
+            "WHERE recommendation_id = ? AND status NOT IN ('created', 'approved', 'rejected', 'reverted')",
+            (recommendation_id,)
+        )
+        claimed = cur.rowcount > 0
+
+    if not claimed:
+        reason = (
+            f"SKAG concurrent claim rejected — recommendation_id={recommendation_id} "
+            "was claimed by another process or has a terminal status"
+        )
+        logger.warning("_execute_create_skag: %s", reason)
+        return {"blocked": True, "reason": reason, "ad_group_resource": "",
+                "keyword_resource": "", "ad_resource": "", "rsa_copied": False}
+
+    # ── Resolve source ad group resource name ────────────────────────────────
+    source_ag_resource = ""
+    try:
+        ga_service = client.get_service("GoogleAdsService")
+        _ag_escaped = source_ad_group_name.replace("'", "''")
+        ag_query = f"""
+            SELECT ad_group.resource_name
+            FROM ad_group
+            WHERE ad_group.campaign = '{campaign_resource}'
+              AND ad_group.name = '{_ag_escaped}'
+              AND ad_group.status != 'REMOVED'
+            LIMIT 1
+        """
+        for row in ga_service.search(customer_id=customer_id, query=ag_query):
+            source_ag_resource = row.ad_group.resource_name
+            break
+    except Exception as e:
+        logger.warning(
+            "_execute_create_skag: could not resolve source ag resource for '%s': %s",
+            source_ad_group_name, e
+        )
+
+    # ── Execute: call create_skag_ad_group ───────────────────────────────────
+    try:
+        from google_ads_write import create_skag_ad_group
+        result = create_skag_ad_group(
+            customer_id=customer_id,
+            campaign_resource=campaign_resource,
+            new_ad_group_name=new_ad_group_name,
+            keyword_text=keyword_text,
+            source_ad_group_resource=source_ag_resource,
+        )
+    except Exception as e:
+        err_str = str(e)[:500]
+        logger.error(
+            "_execute_create_skag failed for '%s': %s", keyword_text, err_str
+        )
+        _mark_skag_failed(recommendation_id, err_str)
+        return {"blocked": False, "error": err_str, "ad_group_resource": "",
+                "keyword_resource": "", "ad_resource": "", "rsa_copied": False}
+
+    # ── Update DB: mark created ───────────────────────────────────────────────
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_db_connection() as conn:
+        conn.execute("""
+            UPDATE skag_recommendations
+            SET status = 'created',
+                new_ad_group_id = ?,
+                created_in_gads_at = ?,
+                steps_completed = json_insert(
+                    COALESCE(steps_completed, '[]'),
+                    '$[#]', json_array('create_ad_group', ?)
+                )
+            WHERE recommendation_id = ?
+        """, (
+            result["ad_group_resource"],
+            now_iso,
+            result["ad_group_resource"],
+            recommendation_id,
+        ))
+
+    skag_created_this_run.append(recommendation_id)
+    logger.info(
+        "_execute_create_skag: '%s' [EXACT] → %s (rsa_copied=%s)",
+        keyword_text, result["ad_group_resource"], result["rsa_copied"]
+    )
+    return {**result, "blocked": False, "reason": "", "error": ""}
+
+
+def _update_skag_status(recommendation_id: str, status: str) -> None:
+    """Update skag_recommendations.status; no-op if recommendation_id not found."""
+    from database import get_db_connection
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE skag_recommendations SET status = ? WHERE recommendation_id = ?",
+            (status, recommendation_id)
+        )
+
+
+def _mark_skag_failed(recommendation_id: str, error: str) -> None:
+    """Mark a SKAG recommendation as failed with an error message."""
+    from database import get_db_connection
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE skag_recommendations SET status = 'failed', error = ? "
+            "WHERE recommendation_id = ?",
+            (error[:500], recommendation_id)
+        )
 
 
 def _get_rsa_current_assets(client, customer_id: str, ad_group_ad_resource: str) -> dict:
@@ -5884,6 +6100,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         "add_asset":            ("campaign", "campaign_resource",  "asset_type"),
         "replace_ad":           ("ad",       "old_ad_group_ad_resource", "old_ad_group_ad_resource"),
         "pause_ad_group":       ("ad_group", "ad_group_resource",        "ad_group_name"),
+        "create_skag":          ("ad_group", "source_ad_group_name",     "keyword_text"),
     }
 
     # Geo candidates for Grafton Dental Care (Worcester area, MA)

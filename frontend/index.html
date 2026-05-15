@@ -4650,6 +4650,32 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                   </React.Fragment>
                 )}
 
+                {/* Keyword Attribution */}
+                {call.attributed_keyword && call.attributed_keyword !== (call.effective_campaign_name || call.gads_campaign_name) && (
+                  <React.Fragment>
+                    <div style={{color:'var(--text-muted)',fontWeight:500}}>Top Search Term</div>
+                    <div style={{fontWeight:600,color:'#166534'}}>
+                      {call.attributed_keyword}
+                      {call.attributed_keyword_method && (() => {
+                        const m = call.attributed_keyword_method;
+                        const label = m === 'call_search_term' ? 'ad group avg'
+                                    : m === 'ad_group_best_keyword' ? 'ad group kw'
+                                    : 'estimated';
+                        const bg = m === 'call_search_term' ? '#fef9c3' : '#f0fdf4';
+                        const col = m === 'call_search_term' ? '#92400e' : '#166534';
+                        return <span style={{marginLeft:6,fontSize:10,background:bg,color:col,padding:'1px 5px',borderRadius:3}}>{label}</span>;
+                      })()}
+                    </div>
+                  </React.Fragment>
+                )}
+
+                {call.attributed_ad_group && call.attributed_ad_group !== (call.effective_campaign_name || call.gads_campaign_name) && (
+                  <React.Fragment>
+                    <div style={{color:'var(--text-muted)',fontWeight:500}}>Ad Group</div>
+                    <div style={{color:'var(--text-secondary)'}}>{call.attributed_ad_group}</div>
+                  </React.Fragment>
+                )}
+
                 {/* OD Appointment */}
                 {call.od_appointment_id ? (
                   <React.Fragment>
