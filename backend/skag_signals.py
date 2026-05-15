@@ -515,6 +515,415 @@ def get_skag_candidates_text(
     return "\n".join(lines)
 
 
+# ── PR 5: lock_skag_traffic — deferred source-side negative ──────────────────
+
+SKAG_LOCK_DELAY_DAYS: int = 7   # Days after SKAG creation before adding negative
+
+
+def lock_skag_traffic(db_path: str = "", dry_run: bool = False) -> int:
+    """
+    Nightly job: for every SKAG that was created in Google Ads 7+ days ago
+    and is still status='created' (not yet locked), add an EXACT negative
+    keyword to the SOURCE ad group so all traffic routes through the SKAG.
+
+    Strategy:
+    - Only acts on rows where status='created' AND created_in_gads_at is old enough.
+    - Requires new_ad_group_id (source ad group resource) to resolve the source
+      ad group resource via a GAds GAQL query.
+    - On success: sets status='locked' and locked_at timestamp.
+    - On failure: logs error, leaves status='created' so the next run retries.
+    - dry_run=True: logs what would happen without touching GAds or the DB.
+
+    Returns: number of SKAGs successfully locked this run.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    if not db_path:
+        db_path = _db_path()
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=SKAG_LOCK_DELAY_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    conn = _get_conn(db_path)
+    try:
+        with conn:
+            rows = conn.execute("""
+                SELECT recommendation_id, campaign_id, campaign_name,
+                       keyword_text, source_ad_group_name, new_ad_group_id,
+                       created_in_gads_at
+                FROM skag_recommendations
+                WHERE status = 'created'
+                  AND created_in_gads_at != ''
+                  AND created_in_gads_at < ?
+            """, (cutoff,)).fetchall()
+    except Exception:
+        logger.exception("lock_skag_traffic: DB query failed")
+        return 0
+    finally:
+        conn.close()
+
+    if not rows:
+        logger.info("lock_skag_traffic: no SKAGs eligible for locking (< %d days old or none created)", SKAG_LOCK_DELAY_DAYS)
+        return 0
+
+    logger.info("lock_skag_traffic: %d SKAG(s) eligible for source-side negative", len(rows))
+
+    locked_count = 0
+    for row in rows:
+        rec_id       = row["recommendation_id"]
+        campaign_id  = row["campaign_id"]
+        kw_text      = row["keyword_text"]
+        source_ag    = row["source_ad_group_name"]
+        new_ag_id    = row["new_ad_group_id"] or ""  # resource name of the NEW SKAG ad group
+        created_at   = row["created_in_gads_at"]
+
+        if not new_ag_id:
+            logger.warning(
+                "lock_skag_traffic: rec=%s has no new_ad_group_id — skipping '%s'",
+                rec_id[:8], kw_text
+            )
+            continue
+
+        # Resolve the SOURCE ad group resource name via GAds.
+        # new_ag_id is the SKAG ad group resource (customers/NNN/adGroups/MMM).
+        # We need to find the source ad group by name within the same campaign.
+        source_ag_resource = ""
+        try:
+            from ai_optimizer import _build_client as _lock_build_client
+            from config import get_settings as _lock_settings
+            _s = _lock_settings()
+            _cid = "".join(ch for ch in (_s.google_ads_customer_id or "") if ch.isdigit())
+
+            # Derive campaign_resource from new_ag_id: customers/NNN/adGroups/MMM
+            # → campaign resource is in the campaigns table
+            _camp_resource = ""
+            _conn2 = _get_conn(db_path)
+            try:
+                with _conn2:
+                    _cr = _conn2.execute(
+                        "SELECT gads_campaign_resource FROM campaigns WHERE campaign_id = ?",
+                        (campaign_id,)
+                    ).fetchone()
+                    if _cr:
+                        _camp_resource = _cr[0] or ""
+            finally:
+                _conn2.close()
+
+            if not _camp_resource:
+                logger.warning(
+                    "lock_skag_traffic: cannot resolve campaign_resource for campaign_id=%s — skipping '%s'",
+                    campaign_id, kw_text
+                )
+                continue
+
+            _client = _lock_build_client()
+            ga_service = _client.get_service("GoogleAdsService")
+            _ag_escaped = source_ag.replace("'", "''")
+            ag_q = f"""
+                SELECT ad_group.resource_name
+                FROM ad_group
+                WHERE ad_group.campaign = '{_camp_resource}'
+                  AND ad_group.name = '{_ag_escaped}'
+                  AND ad_group.status != 'REMOVED'
+                LIMIT 1
+            """
+            for r in ga_service.search(customer_id=_cid, query=ag_q):
+                source_ag_resource = r.ad_group.resource_name
+                break
+
+        except Exception as e:
+            logger.error(
+                "lock_skag_traffic: could not resolve source ag '%s' for rec=%s: %s",
+                source_ag, rec_id[:8], e
+            )
+            continue
+
+        if not source_ag_resource:
+            logger.warning(
+                "lock_skag_traffic: source ag '%s' not found in GAds for rec=%s — skipping",
+                source_ag, rec_id[:8]
+            )
+            continue
+
+        if dry_run:
+            logger.info(
+                "lock_skag_traffic [DRY RUN]: would negate '%s' [EXACT] on ag '%s' (%s) for rec=%s",
+                kw_text, source_ag, source_ag_resource, rec_id[:8]
+            )
+            locked_count += 1
+            continue
+
+        # Add the negative to the source ad group
+        try:
+            from google_ads_write import add_negative_keyword_to_ad_group
+            add_negative_keyword_to_ad_group(
+                ad_group_resource=source_ag_resource,
+                keyword_text=kw_text,
+                match_type="EXACT",
+            )
+        except Exception as e:
+            logger.error(
+                "lock_skag_traffic: failed to negate '%s' on '%s' (rec=%s): %s",
+                kw_text, source_ag, rec_id[:8], e
+            )
+            continue
+
+        # Mark locked in DB
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _conn3 = _get_conn(db_path)
+        try:
+            with _conn3:
+                _conn3.execute("""
+                    UPDATE skag_recommendations
+                    SET status = 'locked',
+                        locked_at = ?,
+                        steps_completed = json_insert(
+                            COALESCE(steps_completed, '[]'),
+                            '$[#]', json_array('lock_traffic', ?)
+                        )
+                    WHERE recommendation_id = ?
+                """, (now_iso, source_ag_resource, rec_id))
+        except Exception as e:
+            logger.error(
+                "lock_skag_traffic: DB update failed for rec=%s: %s — negative was pushed, status not updated",
+                rec_id[:8], e
+            )
+            # The negative is live even though the DB didn't update.
+            # The next run will try again and hit KEYWORD_ALREADY_EXISTS (idempotent).
+        finally:
+            _conn3.close()
+
+        logger.info(
+            "lock_skag_traffic: locked '%s' — negated on '%s' (%s) [created %s]",
+            kw_text, source_ag, source_ag_resource, created_at
+        )
+        locked_count += 1
+
+    logger.info("lock_skag_traffic: %d/%d SKAG(s) locked this run", locked_count, len(rows))
+    return locked_count
+
+
+# ── PR 6: skag_outcomes snapshot + zombie revert ─────────────────────────────
+
+SKAG_ZOMBIE_DAYS:        int = 30   # Days live before zombie check
+SKAG_ZOMBIE_MIN_IMPR:    int = 50   # Min impressions expected in zombie window
+SKAG_ZOMBIE_MIN_CALLS:   float = 0.5  # Min call conversions expected in zombie window
+
+
+def snapshot_skag_outcomes(db_path: str = "") -> int:
+    """
+    Nightly job: pull 30-day performance metrics from GAds for every SKAG
+    that is currently 'created' or 'locked', and write a row to skag_outcomes_30d.
+
+    Uses the GAds search_stream on 'ad_group' resource filtered by the SKAG
+    ad group resource name. Idempotent: UNIQUE(rec_id, snapshot_date) prevents
+    duplicates on the same day.
+
+    Returns: number of snapshots written.
+    """
+    from datetime import datetime, timezone
+
+    if not db_path:
+        db_path = _db_path()
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Fetch all live SKAGs
+    conn = _get_conn(db_path)
+    try:
+        with conn:
+            rows = conn.execute("""
+                SELECT id, recommendation_id, new_ad_group_id, created_in_gads_at
+                FROM skag_recommendations
+                WHERE status IN ('created', 'locked')
+                  AND new_ad_group_id != ''
+                  AND new_ad_group_id IS NOT NULL
+            """).fetchall()
+    except Exception:
+        logger.exception("snapshot_skag_outcomes: DB query failed")
+        return 0
+    finally:
+        conn.close()
+
+    if not rows:
+        logger.info("snapshot_skag_outcomes: no live SKAGs to snapshot")
+        return 0
+
+    logger.info("snapshot_skag_outcomes: snapshotting %d SKAG(s)", len(rows))
+
+    try:
+        from ai_optimizer import _build_client as _snap_build
+        from config import get_settings as _snap_settings
+        _s = _snap_settings()
+        _cid = "".join(ch for ch in (_s.google_ads_customer_id or "") if ch.isdigit())
+        _client = _snap_build()
+        ga_service = _client.get_service("GoogleAdsService")
+    except Exception as e:
+        logger.error("snapshot_skag_outcomes: could not build GAds client: %s", e)
+        return 0
+
+    written = 0
+    for row in rows:
+        db_id     = row["id"]
+        rec_id    = row["recommendation_id"]
+        ag_res    = row["new_ad_group_id"]
+        created   = row["created_in_gads_at"] or ""
+
+        # Compute days_live
+        days_live = 0
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            days_live = max(0, (datetime.now(timezone.utc) - created_dt).days)
+        except Exception:
+            pass
+
+        # Pull 30-day metrics from GAds
+        impr = clicks = cost_micros = 0
+        call_convs = 0.0
+        gads_pull_ok = True
+        try:
+            _ag_escaped = ag_res.replace("'", "''")
+            q = f"""
+                SELECT
+                    metrics.impressions,
+                    metrics.clicks,
+                    metrics.cost_micros,
+                    metrics.conversions
+                FROM ad_group
+                WHERE ad_group.resource_name = '{_ag_escaped}'
+                  AND segments.date DURING LAST_30_DAYS
+            """
+            for r in ga_service.search(customer_id=_cid, query=q):
+                impr        += r.metrics.impressions
+                clicks      += r.metrics.clicks
+                cost_micros += r.metrics.cost_micros
+                call_convs  += r.metrics.conversions
+        except Exception as e:
+            logger.warning("snapshot_skag_outcomes: GAds query failed for %s: %s", ag_res[:30], e)
+            gads_pull_ok = False
+
+        # Skip insert if GAds pull failed — don't write zero-metric rows that
+        # could falsely trigger zombie detection on a transient API outage.
+        if not gads_pull_ok:
+            continue
+
+        # Write to skag_outcomes_30d
+        _conn2 = _get_conn(db_path)
+        try:
+            with _conn2:
+                _conn2.execute("""
+                    INSERT OR IGNORE INTO skag_outcomes_30d
+                        (skag_recommendation_id, snapshot_date, days_live,
+                         impressions, clicks, cost_micros, call_conversions)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (db_id, today, days_live, impr, clicks, cost_micros, call_convs))
+            written += 1
+        except Exception as e:
+            logger.error("snapshot_skag_outcomes: DB insert failed for rec=%s: %s", rec_id[:8], e)
+        finally:
+            _conn2.close()
+
+    logger.info("snapshot_skag_outcomes: wrote %d/%d snapshot(s) for %s", written, len(rows), today)
+    return written
+
+
+def revert_zombie_skags(db_path: str = "", dry_run: bool = False) -> int:
+    """
+    Nightly job: find SKAGs that have been live for 30+ days with fewer than
+    50 impressions AND fewer than 0.5 call conversions — these are 'zombies'
+    that never received traffic. Mark them 'reverted' so the signal collector
+    can re-surface them if traffic conditions change.
+
+    Note: this does NOT remove the SKAG ad group from Google Ads (that requires
+    manual cleanup or a separate admin action). It only updates the DB status
+    so future optimizer runs stop treating the keyword as 'already handled'.
+
+    Returns: number of zombies reverted.
+    """
+    if not db_path:
+        db_path = _db_path()
+
+    conn = _get_conn(db_path)
+    try:
+        with conn:
+            # Find SKAGs with a recent snapshot showing zombie conditions
+            zombie_rows = conn.execute("""
+                SELECT sr.recommendation_id, sr.keyword_text, sr.source_ad_group_name,
+                       sr.campaign_name, o.impressions, o.clicks, o.call_conversions,
+                       o.days_live
+                FROM skag_recommendations sr
+                JOIN skag_outcomes_30d o ON o.skag_recommendation_id = sr.id
+                WHERE sr.status IN ('created', 'locked')
+                  AND o.days_live >= ?
+                  AND o.snapshot_date = (
+                      SELECT MAX(snapshot_date) FROM skag_outcomes_30d
+                      WHERE skag_recommendation_id = sr.id
+                  )
+                  AND o.impressions < ?
+                  AND o.call_conversions < ?
+            """, (SKAG_ZOMBIE_DAYS, SKAG_ZOMBIE_MIN_IMPR, SKAG_ZOMBIE_MIN_CALLS)).fetchall()
+    except Exception:
+        logger.exception("revert_zombie_skags: DB query failed")
+        return 0
+    finally:
+        conn.close()
+
+    if not zombie_rows:
+        logger.info("revert_zombie_skags: no zombie SKAGs found")
+        return 0
+
+    logger.info("revert_zombie_skags: %d zombie SKAG(s) found", len(zombie_rows))
+
+    reverted = 0
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for row in zombie_rows:
+        rec_id = row["recommendation_id"]
+        kw     = row["keyword_text"]
+        ag     = row["source_ad_group_name"]
+        impr   = row["impressions"]
+        calls  = row["call_conversions"]
+        d_live = row["days_live"]
+
+        if dry_run:
+            logger.info(
+                "revert_zombie_skags [DRY RUN]: would revert '%s' from '%s' "
+                "(impr=%d calls=%.1f days_live=%d)",
+                kw, ag, impr, calls, d_live
+            )
+            reverted += 1
+            continue
+
+        _conn2 = _get_conn(db_path)
+        try:
+            with _conn2:
+                _conn2.execute("""
+                    UPDATE skag_recommendations
+                    SET status = 'reverted',
+                        reverted_at = ?,
+                        error = ?
+                    WHERE recommendation_id = ?
+                """, (
+                    now_iso,
+                    f"Zombie: {d_live}d live, {impr} impr, {calls:.1f} call_convs — below threshold",
+                    rec_id,
+                ))
+            logger.info(
+                "revert_zombie_skags: reverted '%s' from '%s' (impr=%d calls=%.1f days_live=%d rec=%s)",
+                kw, ag, impr, calls, d_live, rec_id[:8]
+            )
+            reverted += 1
+        except Exception as e:
+            logger.error("revert_zombie_skags: DB update failed for rec=%s: %s", rec_id[:8], e)
+        finally:
+            _conn2.close()
+
+    logger.info("revert_zombie_skags: reverted %d/%d zombie SKAG(s)", reverted, len(zombie_rows))
+    return reverted
+
+
 # ── CLI dump ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

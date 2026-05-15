@@ -508,10 +508,36 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
         camp.campaign_budget = budget_resource
 
-        # Manual CPC bidding — setting any field on camp.manual_cpc activates
-        # the bidding_strategy oneof in proto-plus. enhanced_cpc_enabled=False
-        # is the explicit field assignment that marks the oneof as selected.
-        camp.manual_cpc.enhanced_cpc_enabled = False
+        # Bidding strategy — read from build JSON (ad_groups step writes launch_bidding_strategy).
+        # Supported at launch: MANUAL_CPC (default), MAXIMIZE_CLICKS.
+        # MAXIMIZE_CONVERSIONS is intentionally excluded — Google rejects smart bidding
+        # on new campaigns with no conversion history.
+        _launch_bid_strategy = (ag_data.get("launch_bidding_strategy") or {}) if isinstance(ag_data, dict) else {}
+        _launch_strategy_type = (_launch_bid_strategy.get("strategy_type") or "MANUAL_CPC").upper().strip()
+        if _launch_strategy_type not in ("MANUAL_CPC", "MAXIMIZE_CLICKS"):
+            logger.warning(f"[create] Unsupported launch_bidding_strategy '{_launch_strategy_type}' — falling back to MANUAL_CPC")
+            _launch_strategy_type = "MANUAL_CPC"
+
+        if _launch_strategy_type == "MAXIMIZE_CLICKS":
+            # target_spend activates Maximize Clicks in the proto-plus oneof.
+            # IMPORTANT: proto-plus may not select the oneof when cpc_bid_ceiling_micros = 0
+            # (zero is the proto3 default and may not register as an explicit assignment).
+            # When no cap is desired, use 1 micro ($0.000001) as a sentinel so the oneof
+            # is reliably selected while effectively imposing no real ceiling.
+            _max_cpc_cap = _launch_bid_strategy.get("max_cpc_cap_usd") or 0.0
+            try:
+                _max_cpc_cap = float(str(_max_cpc_cap).replace("$", "").replace(",", "").strip()) if _max_cpc_cap else 0.0
+            except (ValueError, TypeError):
+                _max_cpc_cap = 0.0
+            _ceiling_micros = int(_max_cpc_cap * 1_000_000) if _max_cpc_cap > 0 else 1
+            camp.target_spend.cpc_bid_ceiling_micros = _ceiling_micros
+            log.append(f"  ℹ Bidding: MAXIMIZE_CLICKS" + (f" (max CPC cap ${_max_cpc_cap:.2f})" if _max_cpc_cap else " (no CPC cap)"))
+        else:
+            # Manual CPC bidding — setting any field on camp.manual_cpc activates
+            # the bidding_strategy oneof in proto-plus. enhanced_cpc_enabled=False
+            # is the explicit field assignment that marks the oneof as selected.
+            camp.manual_cpc.enhanced_cpc_enabled = False
+            log.append("  ℹ Bidding: MANUAL_CPC")
 
         # Required in Google Ads API v24+ — this is an ENUM, not a bool.
         # UNSPECIFIED (0) is the proto-plus default so Google rejects it as
@@ -666,10 +692,16 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         # build.ad_groups has: ad_groups[{name, keywords[], cpc_bid}]
         # Strategy: one ad group per build.ad_groups entry; assign keywords to it
 
-        ag_entries = ag_data.get("ad_groups", [])
+        ag_entries = ag_data.get("ad_groups", []) if isinstance(ag_data, dict) else []
         if not ag_entries:
-            # Fallback: single ad group with all keywords
-            ag_entries = [{"name": f"{campaign.get('service_focus','General')} - Search", "cpc_bid": 3.0}]
+            # Fallback: single ad group with all keywords.
+            # Use max_cpc_cap from launch_bidding_strategy if available, else 3.0.
+            _fallback_bid = ((_launch_bid_strategy.get("max_cpc_cap_usd") or 0.0) if _launch_bid_strategy else 0.0)
+            try:
+                _fallback_bid = float(str(_fallback_bid).replace("$", "").replace(",", "").strip()) if _fallback_bid else 0.0
+            except (ValueError, TypeError):
+                _fallback_bid = 0.0
+            ag_entries = [{"name": f"{campaign.get('service_focus','General')} - Search", "cpc_bid_usd": _fallback_bid or 5.0}]
 
         ad_group_resources = []
         keywords_added     = 0
@@ -687,9 +719,29 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
 
         # Split keywords evenly across ad groups if multiple groups
         # (Simple approach: all groups get all keywords — Google doesn't mind)
+        def _parse_bid(raw) -> float:
+            """Safely parse a CPC bid value that may be a float, int, or string like '$3.50'."""
+            if not raw:
+                return 0.0
+            try:
+                return float(str(raw).replace("$", "").replace(",", "").strip())
+            except (ValueError, TypeError):
+                return 0.0
+
+        # Fallback chain: per-ad-group bid → launch_bidding_strategy cap → 3.0
+        _global_cap = _parse_bid(_launch_bid_strategy.get("max_cpc_cap_usd")) if _launch_bid_strategy else 0.0
+
         for ag_entry in ag_entries:
             ag_name    = ag_entry.get("name") or ag_entry.get("ad_group_name") or "Ad Group 1"
-            cpc_bid    = float(ag_entry.get("cpc_bid") or ag_entry.get("cpc_bid_usd") or 3.0)
+            # Read cpc_bid_usd (wizard schema) or legacy cpc_bid / suggested_cpc_usd fields.
+            # Fall back to the campaign-level max_cpc_cap from launch_bidding_strategy, then $3.00.
+            cpc_bid    = (
+                _parse_bid(ag_entry.get("cpc_bid_usd"))
+                or _parse_bid(ag_entry.get("suggested_cpc_usd"))
+                or _parse_bid(ag_entry.get("cpc_bid"))
+                or _global_cap
+                or 5.0  # $5 default — safer floor for dental keywords than $3
+            )
 
             # Create ad group
             ag_op      = client.get_type("AdGroupOperation")

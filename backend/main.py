@@ -450,8 +450,50 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # SKAG traffic lock — runs nightly at 4:30 AM.
+    # Finds SKAGs created 7+ days ago and adds an EXACT negative to the
+    # source ad group so traffic routes exclusively through the SKAG.
+    # Idempotent: KEYWORD_ALREADY_EXISTS is handled gracefully.
+    def _skag_lock_job():
+        _stamp("skag_lock")
+        try:
+            from skag_signals import lock_skag_traffic
+            n = lock_skag_traffic()
+            logger.info(f"[skag_lock] Locked {n} SKAG(s)")
+        except Exception as e:
+            logger.error(f"SKAG lock job failed: {e}")
+
+    ads_scheduler.add_job(
+        _skag_lock_job,
+        CronTrigger(hour=4, minute=30),
+        id="skag_lock",
+        name="SKAG Traffic Lock (nightly)",
+        replace_existing=True,
+    )
+
+    # SKAG outcomes snapshot — runs nightly at 4:45 AM.
+    # Pulls 30-day impressions/clicks/conversions from GAds for each live SKAG
+    # and writes a timestamped row to skag_outcomes_30d for performance tracking.
+    def _skag_snapshot_job():
+        _stamp("skag_snapshot")
+        try:
+            from skag_signals import snapshot_skag_outcomes, revert_zombie_skags
+            n_snap = snapshot_skag_outcomes()
+            n_revert = revert_zombie_skags()
+            logger.info(f"[skag_snapshot] Snapshots written: {n_snap}  Zombies reverted: {n_revert}")
+        except Exception as e:
+            logger.error(f"SKAG snapshot/revert job failed: {e}")
+
+    ads_scheduler.add_job(
+        _skag_snapshot_job,
+        CronTrigger(hour=4, minute=45),
+        id="skag_snapshot",
+        name="SKAG Outcomes Snapshot + Zombie Revert (nightly)",
+        replace_existing=True,
+    )
+
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
+    logger.info("Scheduled jobs started (15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 4:30AM SKAG lock, 4:45AM SKAG snapshot, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
 
     yield
 
@@ -5345,11 +5387,13 @@ Rules:
         kw_context = f"Keywords: {keywords}" if keywords else "No keywords generated yet."
         groups_context = f"Ad groups from copy: {[g.get('name') for g in ad_copy.get('ad_groups', [])]}" if ad_copy else ""
 
+        _daily_budget = round(budget / 30.4, 2) if budget else 0
+
         prompt = f"""You are a Google Ads account manager. Create the final ad group structure for this campaign.
 
 Campaign: {campaign_name}
 Service Focus: {service_focus}
-Monthly Budget: ${budget}
+Monthly Budget: ${budget} (≈${_daily_budget}/day)
 {kw_context}
 {groups_context}
 Implementation Notes: {impl_notes}{_site_section}
@@ -5362,19 +5406,28 @@ Return a JSON object with this exact structure:
       "theme": "Brief theme description",
       "match_types": ["exact", "phrase"],
       "keywords": ["keyword1", "keyword2", ...],
-      "suggested_cpc_usd": 3.50,
+      "cpc_bid_usd": 3.50,
       "daily_budget_pct": 40,
       "notes": "Why this group and bidding rationale"
     }}
   ],
-  "bidding_strategy": "Recommended bidding strategy and rationale",
+  "launch_bidding_strategy": {{
+    "strategy_type": "MANUAL_CPC",
+    "max_cpc_cap_usd": 4.50,
+    "rationale": "Why this strategy at launch"
+  }},
+  "bidding_strategy": "Human-readable summary of recommended bidding strategy",
   "budget_allocation_notes": "How to split the monthly budget across groups"
 }}
 
 Rules:
 - Create 2-3 ad groups that map to the keyword themes
 - daily_budget_pct values should sum to 100
-- suggested_cpc_usd should be realistic for dental keywords ($2-8 range)
+- cpc_bid_usd should be realistic for dental keywords ($2-8 range)
+- For launch_bidding_strategy.strategy_type use ONLY "MANUAL_CPC" or "MAXIMIZE_CLICKS"
+  (do NOT use MAXIMIZE_CONVERSIONS — new campaigns have no conversion history yet)
+- For new campaigns with budget <$30/day, prefer MANUAL_CPC for full control
+- For MAXIMIZE_CLICKS, set max_cpc_cap_usd to a reasonable ceiling (e.g. 1.5-2x the typical CPC)
 - Return ONLY the JSON object, no explanation."""
 
     elif step == "competitor_analysis":

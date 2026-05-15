@@ -14937,7 +14937,8 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
                       borderColor: selected[rec.action_id] ? 'var(--teal)' : 'var(--border)'}}>
                     <input type="checkbox"
                       checked={!!selected[rec.action_id]}
-                      onChange={(e) => toggle(rec.action_id, e)}
+                      onClick={(e) => toggle(rec.action_id, e)}
+                      readOnly
                       style={{marginTop:3,cursor:'pointer',flexShrink:0}} />
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:3}}>

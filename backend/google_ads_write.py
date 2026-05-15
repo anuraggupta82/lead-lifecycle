@@ -757,3 +757,57 @@ def create_skag_ad_group(
         "ad_resource":       ad_resource,
         "rsa_copied":        rsa_copied,
     }
+
+
+# ── 8. Add a negative keyword to an ad group (SKAG traffic lock) ─────────────
+
+def add_negative_keyword_to_ad_group(
+    ad_group_resource: str,
+    keyword_text: str,
+    match_type: str = "EXACT",
+) -> bool:
+    """
+    Add a negative keyword at the ad-group level.
+
+    Used by the SKAG lock step (PR 5): after a SKAG has been live for 7 days,
+    the source ad group gets an EXACT negative for the isolated keyword so that
+    traffic routes exclusively through the new SKAG ad group.
+
+    match_type: 'EXACT' | 'PHRASE' | 'BROAD'  (default EXACT for SKAGs)
+    Handles KEYWORD_ALREADY_EXISTS gracefully (idempotent).
+    Raises on other API errors.
+    """
+    match_type = (match_type or "EXACT").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise ValueError(f"Invalid match_type '{match_type}' — must be EXACT, PHRASE, or BROAD")
+
+    customer_id = _customer_id_from_resource(ad_group_resource)
+    client = _build_client()
+    service = client.get_service("AdGroupCriterionService")
+    operation = client.get_type("AdGroupCriterionOperation")
+    criterion = operation.create
+    criterion.ad_group = ad_group_resource
+    criterion.negative = True
+    criterion.keyword.text = keyword_text
+    criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+
+    try:
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=[operation],
+        )
+        logger.info(
+            "SKAG lock: negated '%s' [%s] on ad group %s",
+            keyword_text, match_type, ad_group_resource
+        )
+        return True
+    except Exception as e:
+        err_str = str(e)
+        if "KEYWORD_ALREADY_EXISTS" in err_str or "already exists" in err_str.lower():
+            logger.info(
+                "SKAG lock: negative '%s' already exists on %s — idempotent success",
+                keyword_text, ad_group_resource
+            )
+            return True
+        logger.error("add_negative_keyword_to_ad_group failed: %s", e)
+        raise

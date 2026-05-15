@@ -1433,21 +1433,29 @@ def _get_od_production_summary(days: int = 30) -> dict:
     return {"total_attributed": round(total, 2), "by_campaign": by_camp}
 
 
-def _score_tier(impr: int, clicks: int, cost_usd: float, conv: float, avg_ctr: float) -> str:
+def _score_tier(impr: int, clicks: int, cost_usd: float, conv: float, avg_ctr: float,
+                daily_budget_usd: float = 0.0) -> str:
     """
     Shared tier scorer for ads and ad groups.
     Returns: "cold" | "weak" | "average" | "strong"
 
     Thresholds (aligned across both uses):
     - cold:   < 100 impressions — not enough data
-    - weak:   zero conversions after ≥$30 spend (even if CTR looks ok)
+    - weak:   zero conversions after ≥ zero-conv threshold spend
     - strong: CTR ≥ 120% of campaign average
     - average: CTR ≥ 50% of campaign average
     - weak:   CTR < 50% of campaign average
+
+    Zero-conv threshold scales with daily budget to respect Google's learning phase:
+      max($30, daily_budget_usd × 5) — roughly 5 days of spend at budget pace.
+      When daily_budget_usd is 0 (unknown), falls back to $30 (preserves old behavior).
     """
     if impr < 100:
         return "cold"
-    if conv == 0 and cost_usd >= 30:
+    # Scale pause threshold by budget: ~5 days of spend, min $30 (preserves old behavior
+    # when budget is unknown). Prevents premature pausing during Google's learning phase.
+    _zero_conv_threshold = max(30.0, daily_budget_usd * 5) if daily_budget_usd > 0 else 30.0
+    if conv == 0 and cost_usd >= _zero_conv_threshold:
         return "weak"
     ctr = (clicks / impr) if impr > 0 else 0
     if avg_ctr > 0:
@@ -1458,6 +1466,25 @@ def _score_tier(impr: int, clicks: int, cost_usd: float, conv: float, avg_ctr: f
         return "weak"
     # No campaign average yet — treat as average
     return "average"
+
+
+def _bid_confidence_pct(conversions: float) -> float:
+    """
+    Returns bid adjustment multiplier (as a fraction, e.g. 0.10 = 10%) scaled
+    by conversion volume to reflect data confidence:
+      < 5 conversions  → ±5%  (low confidence — limited signal)
+      5–20 conversions → ±10% (medium confidence)
+      20+ conversions  → ±15% (high confidence — well-supported decision)
+
+    Defaults to low confidence (5%) when conversions is 0 or None.
+    Applied symmetrically to both increase_bid and decrease_bid operations.
+    """
+    conv = float(conversions or 0)
+    if conv >= 20:
+        return 0.15
+    if conv >= 5:
+        return 0.10
+    return 0.05
 
 
 def _write_back_competitor_memory(
@@ -2121,7 +2148,7 @@ For replace_ad (A/B ad testing — pause underperformer, create improved version
   "path2": optional display-URL segment ≤15 chars (e.g. "grafton-ma")
   "ad_group_resource": copy from the ad_performance row (required)
   Use replace_ad ONLY when: CTR < 50% of campaign average for 30+ days with ≥200 impressions,
-  OR zero conversions after spending ≥$30, OR impressions < 100 in 30 days when budget allows.
+  OR zero conversions after spending ≥ max($30, 5× daily budget), OR impressions < 100 in 30 days when budget allows.
   Ground new copy in landing_page_intel — use real service names, offers, CTAs from the page.
   Headlines must be specific and locally grounded. Avoid generic phrases like "Quality Care".
   CRITICAL — Google policy rules for ad text (violations cause PROHIBITED rejection):
@@ -2135,7 +2162,7 @@ For pause_ad_group (pause an underperforming ad group — does NOT pause the who
   "ad_group_resource": EXACT ad_group_resource from ad_group_performance data (required — do not invent)
   "ad_group_name": human-readable name from ad_group_performance data
   Use pause_ad_group ONLY when ALL of these are true:
-    - cost_30d_usd ≥ $30 AND conversions_30d = 0 AND lead_count_30d = 0 AND impressions_30d ≥ 100
+    - cost_30d_usd ≥ max($30, 5× daily_budget_usd) AND conversions_30d = 0 AND lead_count_30d = 0 AND impressions_30d ≥ 100
     - performance_tier is "weak" or "cold"
     - The campaign has at least 2 active ad groups (never pause the campaign's ONLY ad group)
   This is a last resort — prefer replace_ad or keyword changes within the group first.
@@ -4099,7 +4126,7 @@ def _execute_create_skag(
          "ad_resource": str, "rsa_copied": bool, "blocked": bool, "reason": str}
     """
     from datetime import datetime, timezone
-    from database import get_db_connection
+    from database import _conn as _get_db_conn
 
     # ── Guard 1: per-run cap ─────────────────────────────────────────────────
     MAX_SKAGS_PER_RUN = 2
@@ -4117,7 +4144,7 @@ def _execute_create_skag(
     # so that concurrent approvals can't both pass the "status != created" check.
     # We atomically claim the row with UPDATE...WHERE status NOT IN ('created','approved')
     # and then verify rowcount to detect a race.
-    with get_db_connection() as conn:
+    with _get_db_conn() as conn:
         rec = conn.execute(
             "SELECT status, new_ad_group_id FROM skag_recommendations "
             "WHERE recommendation_id = ?",
@@ -4159,10 +4186,10 @@ def _execute_create_skag(
 
     # ── Atomic in-flight claim: flip to 'approved' ONLY if still 'pending'/'locked' ─
     # rowcount==0 means another process claimed it between our read and now.
-    with get_db_connection() as conn:
+    with _get_db_conn() as conn:
         cur = conn.execute(
             "UPDATE skag_recommendations SET status = 'approved' "
-            "WHERE recommendation_id = ? AND status NOT IN ('created', 'approved', 'rejected', 'reverted')",
+            "WHERE recommendation_id = ? AND status NOT IN ('created', 'approved', 'locked', 'rejected', 'reverted')",
             (recommendation_id,)
         )
         claimed = cur.rowcount > 0
@@ -4219,7 +4246,7 @@ def _execute_create_skag(
 
     # ── Update DB: mark created ───────────────────────────────────────────────
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with get_db_connection() as conn:
+    with _get_db_conn() as conn:
         conn.execute("""
             UPDATE skag_recommendations
             SET status = 'created',
@@ -4247,8 +4274,8 @@ def _execute_create_skag(
 
 def _update_skag_status(recommendation_id: str, status: str) -> None:
     """Update skag_recommendations.status; no-op if recommendation_id not found."""
-    from database import get_db_connection
-    with get_db_connection() as conn:
+    from database import _conn as _get_db_conn
+    with _get_db_conn() as conn:
         conn.execute(
             "UPDATE skag_recommendations SET status = ? WHERE recommendation_id = ?",
             (status, recommendation_id)
@@ -4257,8 +4284,8 @@ def _update_skag_status(recommendation_id: str, status: str) -> None:
 
 def _mark_skag_failed(recommendation_id: str, error: str) -> None:
     """Mark a SKAG recommendation as failed with an error message."""
-    from database import get_db_connection
-    with get_db_connection() as conn:
+    from database import _conn as _get_db_conn
+    with _get_db_conn() as conn:
         conn.execute(
             "UPDATE skag_recommendations SET status = 'failed', error = ? "
             "WHERE recommendation_id = ?",
@@ -5450,6 +5477,11 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             c: (v["clicks"] / v["impressions"]) if v["impressions"] > 0 else 0
             for c, v in camp_ctr_totals.items()
         }
+        # Build campaign name → daily_budget_usd for _score_tier learning-phase scaling
+        camp_name_to_budget: dict = {
+            (s.get("campaign_name") or "").strip().lower(): float(s.get("daily_budget_usd") or 0)
+            for s in campaign_settings.values()
+        }
         # Score each active RSA
         for ad in raw_ads:
             if ad.get("status") != "ENABLED" or ad.get("ad_type") != "RESPONSIVE_SEARCH_AD":
@@ -5463,8 +5495,9 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             avg_ctr = camp_avg_ctr.get(cname, 0)
             cost_usd = cost_micros / 1_000_000
 
-            # Performance tier — shared logic via _score_tier
-            tier = _score_tier(impr, clicks, cost_usd, conv, avg_ctr)
+            # Performance tier — pass daily_budget_usd so threshold scales with campaign budget
+            tier = _score_tier(impr, clicks, cost_usd, conv, avg_ctr,
+                               daily_budget_usd=camp_name_to_budget.get(cname, 0.0))
 
             # Build assets from assets_json if available
             assets = {}
@@ -5536,6 +5569,22 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             for cid, v in camp_id_ctr_totals.items()
         }
 
+        # Build campaign_id/name → daily_budget_usd for ad group tier scoring
+        camp_id_to_budget: dict = {}
+        for _rn, _cs in campaign_settings.items():
+            _budget = float(_cs.get("daily_budget_usd") or 0)
+            _cname = (_cs.get("campaign_name") or "").strip().lower()
+            if _cname:
+                camp_id_to_budget[_cname] = _budget
+            # Also key by numeric campaign ID extracted from resource name
+            if "/campaigns/" in _rn:
+                try:
+                    _cid = _rn.split("/campaigns/")[-1]
+                    if _cid.isdigit():
+                        camp_id_to_budget[_cid] = _budget
+                except Exception:
+                    pass
+
         for ag in raw_ag:
             cid = ag.get("campaign_id") or ag.get("campaign_name", "")
             impr = ag.get("impressions") or 0
@@ -5543,8 +5592,11 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             cost = float(ag.get("cost") or 0)
             conv = float(ag.get("conversions") or 0)
             avg_ctr = camp_id_avg_ctr.get(cid, 0)
+            _ag_daily_budget = camp_id_to_budget.get(str(cid).strip().lower(), 0.0)
 
-            tier = _score_tier(impr, clicks, cost, conv, avg_ctr)
+            # Performance tier — pass daily_budget_usd so threshold scales with campaign budget
+            tier = _score_tier(impr, clicks, cost, conv, avg_ctr,
+                               daily_budget_usd=_ag_daily_budget)
 
             # Prefer API-derived resource name; fall back to synthesised for new ad groups
             ag_id_str = str(ag.get("ad_group_id") or "")
@@ -5723,9 +5775,23 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         kw["action_id"] = aid
         actions_pending += 1
 
+    # Build resource_name → conversions lookup from keyword_perf for bid confidence scaling.
+    # keyword_perf is in scope from the enclosing optimize_campaign function.
+    _kw_conv_map: dict = {}
+    try:
+        for _kp in keyword_perf:
+            _rn = _kp.get("resource_name") or ""
+            if _rn:
+                _kw_conv_map[_rn] = float(_kp.get("conversions") or 0)
+    except Exception as _kc_err:
+        logger.warning(f"[phase_a] Could not build kw conversion map (non-fatal): {_kc_err}")
+
     for kw in actions["increase_bid"]:
         current_bid = kw.get("current_bid_micros", 0)
-        new_bid = int(current_bid * 1.10) if current_bid > 0 else 0
+        # Scale bid adjustment by conversion confidence: <5 conv=5%, 5-20=10%, 20+=15%
+        _conv = _kw_conv_map.get(kw.get("resource_name", ""), kw.get("conversions", 0))
+        _pct = _bid_confidence_pct(_conv)
+        new_bid = int(current_bid * (1 + _pct)) if current_bid > 0 else 0
         aid = log_pending(
             operation="increase_bid",
             entity_type="keyword",
@@ -5737,8 +5803,9 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 "roas": kw.get("roas", 0),
             },
             after_state={
-                "bid_change": "+10%",
+                "bid_change": f"+{int(_pct * 100)}%",
                 "new_bid_micros": new_bid,
+                "confidence_conversions": _conv,
             },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
@@ -5750,7 +5817,10 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
     for kw in actions["decrease_bid"]:
         current_bid = kw.get("current_bid_micros", 0)
-        new_bid = int(current_bid * 0.90) if current_bid > 0 else 0
+        # Scale bid adjustment by conversion confidence: <5 conv=5%, 5-20=10%, 20+=15%
+        _conv = _kw_conv_map.get(kw.get("resource_name", ""), kw.get("conversions", 0))
+        _pct = _bid_confidence_pct(_conv)
+        new_bid = max(int(current_bid * (1 - _pct)), 10_000) if current_bid > 0 else 0  # floor at $0.01
         aid = log_pending(
             operation="decrease_bid",
             entity_type="keyword",
@@ -5761,8 +5831,9 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 "current_bid_micros": current_bid,
             },
             after_state={
-                "bid_change": "-10%",
+                "bid_change": f"-{int(_pct * 100)}%",
                 "new_bid_micros": new_bid,
+                "confidence_conversions": _conv,
             },
             optimizer_run_id=run_id,
             reason=kw.get("reason", ""),
@@ -6492,6 +6563,11 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 entity_id   = camp_lower.replace(" ", "_")
                 entity_name = camp_name
 
+            # For create_skag: bake recommendation_id into after_state BEFORE logging
+            # so that gads_approve_action can read it back from after_state_json.
+            if op == "create_skag":
+                after["recommendation_id"] = ""  # placeholder — replaced after log_pending gives us aid
+
             aid = log_pending(
                 operation=op,
                 entity_type=entity_type,
@@ -6505,6 +6581,48 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 priority=priority_counter,
                 impact_estimate=rec.get("estimated_monthly_impact", {}),
             )
+
+            # ── create_skag: seed skag_recommendations + patch after_state_json ──
+            if op == "create_skag" and aid:
+                _skag_kw        = rec.get("keyword_text", "")
+                _skag_src_ag    = rec.get("source_ad_group_name", "")
+                _skag_new_ag    = rec.get("new_ad_group_name") or f"SKAG — {_skag_kw}"
+                _skag_camp_id   = (_camp_local_row.get("campaign_id") if _camp_local_row else "") or ""
+                _skag_score     = rec.get("score", 0.0)
+                _skag_breakdown = json.dumps(rec.get("score_breakdown", {}))
+                _skag_snapshot  = json.dumps(rec.get("signal_snapshot", {}))
+                try:
+                    from database import _conn as _skag_ins_conn
+                    with _skag_ins_conn() as _sc:
+                        # Use INSERT OR IGNORE — the unique partial index prevents
+                        # duplicate (keyword, source_ag) pairs that aren't rejected/reverted.
+                        _sc.execute("""
+                            INSERT OR IGNORE INTO skag_recommendations
+                                (recommendation_id, campaign_id, campaign_name,
+                                 source_ad_group_name, keyword_text, match_type,
+                                 new_ad_group_name, score, score_breakdown, signal_snapshot, status)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                        """, (
+                            aid, _skag_camp_id, camp_name,
+                            _skag_src_ag, _skag_kw, "EXACT",
+                            _skag_new_ag, _skag_score, _skag_breakdown, _skag_snapshot,
+                        ))
+                        # Patch after_state_json to include recommendation_id = aid
+                        _after_patched = json.dumps({**after, "recommendation_id": aid})
+                        _sc.execute(
+                            "UPDATE gads_audit_log SET after_state_json=? WHERE action_id=?",
+                            (_after_patched, aid)
+                        )
+                    logger.info(
+                        "  [create_skag] seeded skag_recommendations rec=%s kw='%s' ag='%s'",
+                        aid[:8], _skag_kw, _skag_src_ag
+                    )
+                except Exception as _skag_ins_err:
+                    logger.warning(
+                        "  [create_skag] failed to seed skag_recommendations for %s (non-fatal): %s",
+                        aid[:8], _skag_ins_err
+                    )
+
             # Store google_rec_resource_name if this rec came from a Google recommendation
             google_rec_rn = rec.get("google_rec_resource_name", "")
             if google_rec_rn:
