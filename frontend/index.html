@@ -1908,9 +1908,11 @@ function CampaignTrendChart({ campaignName, dailyStats }) {
 }
 
 // ─── LandingPagesView ──────────────────────────────────────────────────────
-function LandingPagesView({ ga4Data }) {
+function LandingPagesView({ ga4Data, ga4Days = 30, ga4Loading = false, onDaysChange }) {
   const [activeSite, setActiveSite] = React.useState(null); // null = show all sites
   const [subTab, setSubTab]         = React.useState('perpage'); // 'perpage' | 'aggregate'
+  const GA4_DAY_OPTIONS = [7, 30, 90];
+  const tealColor = 'var(--teal)';
 
   if (!ga4Data) {
     return (
@@ -2228,7 +2230,23 @@ function LandingPagesView({ ga4Data }) {
           </div>
         </div>
         <div style={{display:'flex',alignItems:'center',gap:6}}>
-          {fetched && <span style={{fontSize:9,color:muted}}>Updated {fetched}</span>}
+          {/* Date range pills */}
+          {onDaysChange && (
+            <div style={{display:'flex',gap:3,alignItems:'center'}}>
+              {GA4_DAY_OPTIONS.map(d => (
+                <button key={d} onClick={() => onDaysChange(d)} disabled={ga4Loading}
+                  style={{fontSize:10,padding:'3px 10px',borderRadius:12,border:'1px solid',cursor:'pointer',
+                    background: ga4Days===d ? tealColor : '#fff',
+                    color:      ga4Days===d ? '#fff'    : 'var(--text-muted)',
+                    borderColor:ga4Days===d ? tealColor : 'var(--border)',
+                    opacity: ga4Loading ? 0.6 : 1, transition:'all .15s'}}>
+                  {d}d
+                </button>
+              ))}
+              {ga4Loading && <span style={{fontSize:9,color:'var(--text-muted)'}}>Loading…</span>}
+            </div>
+          )}
+          {fetched && !ga4Loading && <span style={{fontSize:9,color:muted}}>Updated {fetched}</span>}
           {/* Site filter pills — only shown on Per Page tab */}
           {subTab==='perpage' && sitesWithData.length > 1 && (
             <div style={{display:'flex',gap:4}}>
@@ -5264,7 +5282,7 @@ function CallAnalysisView() {
   );
 }
 
-function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
+function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading, onGa4DaysChange }) {
   const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'income' | ...
   const [incomeData, setIncomeData] = useState(null);   // {rows, summary} or null
   const [incomeLoading, setIncomeLoading] = useState(false);
@@ -6068,7 +6086,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       )}
 
       {/* ── Landing Pages view ── */}
-      {view==='landingpages' && <LandingPagesView ga4Data={ga4Data} />}
+      {view==='landingpages' && <LandingPagesView ga4Data={ga4Data} ga4Days={ga4Days} ga4Loading={ga4Loading} onDaysChange={onGa4DaysChange} />}
 
       {/* ── Nearby Practices view ── */}
       {view==='nearby' && <NearbyPracticesView />}
@@ -16856,7 +16874,9 @@ function App() {
   const [stats, setStats] = useState(null);
   const [campaignStats, setCampaignStats] = useState([]);
   const [keywordStats, setKeywordStats] = useState([]);
-  const [ga4Data, setGa4Data] = useState(null);
+  const [ga4Data, setGa4Data]   = useState(null);
+  const [ga4Days, setGa4Days]   = useState(30);
+  const [ga4Loading, setGa4Loading] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -16899,13 +16919,21 @@ function App() {
     } catch(_) {}
   }
 
+  async function loadGa4(days) {
+    setGa4Loading(true);
+    try {
+      const g = await api(`/api/admin/ga4?days=${days}`).catch(() => null);
+      if (g) setGa4Data(g);
+    } finally { setGa4Loading(false); }
+  }
+
   async function loadData() {
     try {
       const [p, s, c, g] = await Promise.all([
         api('/api/pipeline/enriched'),
         api('/api/admin/stats'),
         api('/api/admin/campaigns'),
-        api('/api/admin/ga4').catch(() => null),
+        api(`/api/admin/ga4?days=${ga4Days}`).catch(() => null),
       ]);
       setPipeline(p.leads || []);
       setStats(s);
@@ -17089,7 +17117,7 @@ function App() {
                 )}
               </React.Fragment>
             )}
-            {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} />}
+            {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} ga4Days={ga4Days} ga4Loading={ga4Loading} onGa4DaysChange={(d) => { setGa4Days(d); loadGa4(d); }} />}
             {tab === 'workflows' && <WorkflowsSection />}
             {tab === 'calls' && <CallAnalysisView />}
             {tab === 'ai_optimizer' && <AiOptimizerTab onTabSwitch={setTab} />}
