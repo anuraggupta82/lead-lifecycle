@@ -15401,9 +15401,10 @@ function fmtRecChange(json_str, op) {
 }
 
 // A single collapsible section (Account Level or one campaign)
-function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, open, onToggle }) {
+function OptimizerSection({ title, recs, loading, onApprove, onIgnore, onMove, onBulkMove, busy, open, onToggle }) {
   const [selected, setSelected] = React.useState({});
   const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [bulkMoveModal, setBulkMoveModal] = React.useState(false); // open/close bulk-move modal
 
   // Strip stale selections whenever recs change
   React.useEffect(() => {
@@ -15469,6 +15470,23 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
     if (failed.length) alert(`${failed.length} item(s) failed to ignore.`);
   };
 
+  const confirmBulkMove = async ({ target_level, campaign_name, reason }) => {
+    setBulkMoveModal(false);
+    if (!selectedIds.length || !onBulkMove) return;
+    setBulkBusy(true);
+    // Build list of action_ids that actually need moving (skip no-ops)
+    const toMove = selectedIds.filter(id => {
+      const rec = recs.find(r => r.action_id === id);
+      if (!rec) return false;
+      const currentCamp = rec.campaign_name || '';
+      const newCamp = target_level === 'account' ? '' : campaign_name;
+      return currentCamp !== newCamp;
+    });
+    await onBulkMove(toMove, { target_level, campaign_name, reason });
+    setSelected({});
+    setBulkBusy(false);
+  };
+
   const pendingCount = recs.length;
 
   return (
@@ -15505,6 +15523,19 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
 
           {!loading && pendingCount > 0 && (
             <>
+              {/* Bulk move modal */}
+              {bulkMoveModal && (
+                <ReclassifyModal
+                  actionId={null}
+                  entityName={`${selectedIds.length} selected rec${selectedIds.length !== 1 ? 's' : ''}`}
+                  operation="bulk move"
+                  currentCampaign={title === 'Account Level' ? '' : title}
+                  campaignOptions={[...new Set(recs.map(r => r.campaign_name).filter(Boolean))].sort()}
+                  onConfirm={confirmBulkMove}
+                  onCancel={() => setBulkMoveModal(false)}
+                />
+              )}
+
               {/* Bulk action bar */}
               <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8,
                 padding:'6px 10px',background:'#f8fafc',borderRadius:6,border:'1px solid var(--border)'}}>
@@ -15530,6 +15561,13 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
                         background:'#fee2e2',color:'#dc2626',border:'none',fontWeight:600}}>
                       {bulkBusy ? '⏳' : `✕ Ignore ${selectedIds.length}`}
                     </button>
+                    {onBulkMove && (
+                      <button onClick={() => setBulkMoveModal(true)} disabled={bulkBusy}
+                        style={{padding:'3px 12px',fontSize:11,borderRadius:5,cursor:'pointer',
+                          background:'#eff6ff',color:'#2563eb',border:'1px solid #bfdbfe',fontWeight:600}}>
+                        {bulkBusy ? '⏳' : `↔ Move ${selectedIds.length}`}
+                      </button>
+                    )}
                   </>
                 )}
               </div>
@@ -15568,7 +15606,7 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
                         </div>
                       )}
                     </div>
-                    <div style={{display:'flex',gap:4,flexShrink:0}}>
+                    <div style={{display:'flex',gap:4,flexShrink:0,flexWrap:'wrap',justifyContent:'flex-end'}}>
                       <button onClick={() => onApprove(rec.action_id)} disabled={!!isBusy}
                         style={{padding:'3px 10px',fontSize:11,borderRadius:4,cursor:'pointer',
                           background:'var(--teal)',color:'#fff',border:'none',fontWeight:600}}>
@@ -15579,6 +15617,14 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, busy, ope
                           background:'#fee2e2',color:'#dc2626',border:'none',fontWeight:600}}>
                         {isBusy === 'ignore' ? '⏳' : '✕'}
                       </button>
+                      {onMove && (
+                        <button onClick={() => onMove(rec)} disabled={!!isBusy}
+                          title="Move between campaign-level and account-level"
+                          style={{padding:'3px 8px',fontSize:11,borderRadius:4,cursor:'pointer',
+                            background:'#eff6ff',color:'#2563eb',border:'1px solid #bfdbfe',fontWeight:600}}>
+                          {isBusy === 'move' ? '⏳' : '↔'}
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -15620,7 +15666,8 @@ function AiOptimizerTab() {
   const [impactLoading, setImpactLoading] = React.useState(false);
   const [histFilter, setHistFilter] = React.useState('all');
   const [histSelected, setHistSelected] = React.useState({});
-  const [rejectModal, setRejectModal] = React.useState(null); // {actionId, entity_name, operation}
+  const [rejectModal, setRejectModal] = React.useState(null);      // {actionId, entity_name, operation}
+  const [reclassifyModal, setReclassifyModal] = React.useState(null); // {action_id, entity_name, operation, campaign_name}
   // Competitor candidate queue
   const [compQueue, setCompQueue] = React.useState({pending:[], dismissed:[], promoted:[]});
   const [showIgnoredQueue, setShowIgnoredQueue] = React.useState(false);
@@ -15636,13 +15683,15 @@ function AiOptimizerTab() {
     } catch(_) {}
   }, []);
 
-  const loadRecs = React.useCallback(async () => {
-    setLoading(true);
+  const loadRecs = React.useCallback(async (opts = {}) => {
+    // silent=true: skip the loading spinner (used after approve/ignore/move so page doesn't jump)
+    const silent = opts.silent || false;
+    if (!silent) setLoading(true);
     try {
       const d = await api('/api/admin/optimizer/account/recommendations?status=all&limit=500');
       setRecs(d);
     } catch(e) { console.error('Recs load error', e); }
-    finally { setLoading(false); }
+    finally { if (!silent) setLoading(false); }
   }, []);
 
   const loadQueued = React.useCallback(async () => {
@@ -15768,12 +15817,16 @@ function AiOptimizerTab() {
 
   const handleApprove = async (actionId) => {
     setBusy(p => ({...p, [actionId]: 'approve'}));
+    const scrollY = window.scrollY;
     try {
       await api(`/api/admin/gads/approve/${actionId}`, {method:'POST'});
-      await loadRecs();
+      await loadRecs({ silent: true });
       await loadQueued();
     } catch(e) { alert('Approve failed: ' + (e.message || e)); }
-    finally { setBusy(p => { const n={...p}; delete n[actionId]; return n; }); }
+    finally {
+      setBusy(p => { const n={...p}; delete n[actionId]; return n; });
+      requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'instant' }));
+    }
   };
 
   const handleIgnore = (actionId) => {
@@ -15786,11 +15839,58 @@ function AiOptimizerTab() {
   const confirmIgnore = async (actionId, reason) => {
     setRejectModal(null);
     setBusy(p => ({...p, [actionId]: 'ignore'}));
+    const scrollY = window.scrollY;
     try {
       await api(`/api/admin/gads/reject/${actionId}`, {method:'POST', body:JSON.stringify({reason})});
-      await loadRecs();
+      await loadRecs({ silent: true });
     } catch(e) { alert('Ignore failed: ' + (e.message || e)); }
-    finally { setBusy(p => { const n={...p}; delete n[actionId]; return n; }); }
+    finally {
+      setBusy(p => { const n={...p}; delete n[actionId]; return n; });
+      requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'instant' }));
+    }
+  };
+
+  const handleMove = (rec) => {
+    if (rec._bulkDone) { loadRecs({ silent: true }); return; }
+    setReclassifyModal({
+      action_id:     rec.action_id,
+      entity_name:   rec.entity_name,
+      operation:     rec.operation,
+      campaign_name: rec.campaign_name || '',
+    });
+  };
+
+  const confirmMove = async (actionId, { target_level, campaign_name, reason }) => {
+    setReclassifyModal(null);
+    setBusy(p => ({...p, [actionId]: 'move'}));
+    const scrollY = window.scrollY;
+    try {
+      await api(`/api/admin/gads/reclassify/${actionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ target_level, campaign_name, reason }),
+      });
+      await loadRecs({ silent: true });
+    } catch(e) { alert('Move failed: ' + (e.message || e)); }
+    finally {
+      setBusy(p => { const n={...p}; delete n[actionId]; return n; });
+      requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'instant' }));
+    }
+  };
+
+  const handleBulkMove = async (actionIds, { target_level, campaign_name, reason }) => {
+    const scrollY = window.scrollY;
+    const failed = [];
+    for (const id of actionIds) {
+      try {
+        await api(`/api/admin/gads/reclassify/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ target_level, campaign_name, reason }),
+        });
+      } catch(e) { failed.push(id); }
+    }
+    if (failed.length) alert(`${failed.length} item(s) failed to move.`);
+    await loadRecs({ silent: true });
+    requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'instant' }));
   };
 
   const handlePushToGoogle = async () => {
@@ -15821,6 +15921,13 @@ function AiOptimizerTab() {
   const totalPending = pendingRecs.length;
   const totalHistory = historyRecs.length;
 
+  // Build unique campaign list from current recs for reclassify dropdown
+  const _aiOptimizerCampaignOptions = React.useMemo(() => {
+    const allR = recs ? Object.values(recs.recommendations || {}).flat() : [];
+    const names = allR.map(r => r.campaign_name).filter(Boolean);
+    return [...new Set(names)].sort();
+  }, [recs]);
+
   return (
     <>
     {rejectModal && (
@@ -15830,6 +15937,17 @@ function AiOptimizerTab() {
         operation={rejectModal.operation}
         onConfirm={(reason) => confirmIgnore(rejectModal.actionId, reason)}
         onCancel={() => setRejectModal(null)}
+      />
+    )}
+    {reclassifyModal && (
+      <ReclassifyModal
+        actionId={reclassifyModal.action_id}
+        entityName={reclassifyModal.entity_name}
+        operation={reclassifyModal.operation}
+        currentCampaign={reclassifyModal.campaign_name}
+        campaignOptions={_aiOptimizerCampaignOptions}
+        onConfirm={(opts) => confirmMove(reclassifyModal.action_id, opts)}
+        onCancel={() => setReclassifyModal(null)}
       />
     )}
     <div style={{padding:'16px 20px',maxWidth:960,margin:'0 auto'}}>
@@ -16029,6 +16147,8 @@ function AiOptimizerTab() {
                 loading={loading}
                 onApprove={handleApprove}
                 onIgnore={handleIgnore}
+                onMove={handleMove}
+                onBulkMove={handleBulkMove}
                 busy={busy}
                 open={expandedSections['__account__'] || false}
                 onToggle={() => handleToggleSection('__account__')}
@@ -16043,6 +16163,8 @@ function AiOptimizerTab() {
                   loading={loading}
                   onApprove={handleApprove}
                   onIgnore={handleIgnore}
+                  onMove={handleMove}
+                  onBulkMove={handleBulkMove}
                   busy={busy}
                   open={expandedSections[name] || false}
                   onToggle={() => handleToggleSection(name)}

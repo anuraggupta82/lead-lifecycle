@@ -5090,22 +5090,46 @@ def _execute_replace_ad(client, customer_id: str,
     if path2:
         rsa.path2 = path2
 
-    # --- 6. Atomic mutate: partial_failure=False (default) = all-or-nothing --
+    # --- 6. Two-step mutate: PAUSE first, then CREATE -------------------------
+    # Google evaluates the RSA-per-ad-group limit (max 3 enabled) before
+    # applying any operation in a batch. Sending pause+create together fails
+    # with RESOURCE_LIMIT when the ad group already has 3 enabled RSAs, even
+    # though the pause would have freed a slot. Split into sequential calls so
+    # the count is decremented before the new RSA is created.
     service = client.get_service("AdGroupAdService")
+
+    # Step 6a: Pause the old ad
     try:
-        response = service.mutate_ad_group_ads(
+        pause_response = service.mutate_ad_group_ads(
             customer_id=customer_id,
-            operations=[pause_op, create_op],
+            operations=[pause_op],
         )
     except Exception as e:
-        logger.error(f"replace_ad failed for {old_ad_group_ad_resource}: {e}")
+        logger.error(f"replace_ad pause step failed for {old_ad_group_ad_resource}: {e}")
         raise
 
-    # results are ordered same as operations: [pause_result, create_result]
-    paused_rn  = response.results[0].resource_name
-    created_rn = response.results[1].resource_name
+    paused_rn = pause_response.results[0].resource_name
+    logger.info(f"replace_ad: paused {paused_rn}")
+
+    # Step 6b: Create the new ad (slot now free)
+    try:
+        create_response = service.mutate_ad_group_ads(
+            customer_id=customer_id,
+            operations=[create_op],
+        )
+    except Exception as e:
+        # Pause already executed — log prominently so the ad group isn't left
+        # with only the paused ad and no replacement.
+        logger.error(
+            f"replace_ad CREATE step failed after pause — ad group {ad_group_resource} "
+            f"may now have fewer enabled RSAs than expected. "
+            f"Paused ad: {paused_rn}. Error: {e}"
+        )
+        raise
+
+    created_rn = create_response.results[0].resource_name
     logger.info(
-        f"replace_ad: paused {paused_rn}, created {created_rn} "
+        f"replace_ad: created {created_rn} "
         f"(ad_group={ad_group_resource}, {len(h_list)}H/{len(d_list)}D)"
     )
     return {"paused_resource": paused_rn, "created_resource": created_rn}
