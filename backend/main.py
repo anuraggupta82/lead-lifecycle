@@ -7584,8 +7584,16 @@ def admin_calls_campaign_attribution_early(days: int = 30):
     with _conn() as conn:
         rows = conn.execute(
             """SELECT
-                 COALESCE(NULLIF(gcv.campaign_name,''), NULLIF(l.campaign_name,'')) AS campaign_name,
-                 COALESCE(NULLIF(gcv.campaign_id,''),   NULLIF(l.campaign_id,''))   AS campaign_id,
+                 COALESCE(
+                   NULLIF(gcv.campaign_name,''),
+                   NULLIF(l.campaign_name,''),
+                   NULLIF(agcv.campaign_name,'')
+                 ) AS campaign_name,
+                 COALESCE(
+                   NULLIF(gcv.campaign_id,''),
+                   NULLIF(l.campaign_id,''),
+                   NULLIF(agcv.campaign_id,'')
+                 ) AS campaign_id,
                  COUNT(*) AS total_calls,
                  SUM(CASE WHEN mc.booked_outcome='booked' THEN 1 ELSE 0 END) AS booked_calls,
                  SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
@@ -7593,17 +7601,143 @@ def admin_calls_campaign_attribution_early(days: int = 30):
                FROM mango_calls mc
                LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
                LEFT JOIN leads l ON l.id = mc.lead_id
+               LEFT JOIN (
+                 SELECT ad_group_name, campaign_name, campaign_id
+                 FROM gads_call_view
+                 WHERE ad_group_name != ''
+                 GROUP BY ad_group_name
+               ) agcv ON agcv.ad_group_name = mc.attributed_ad_group
+                      AND (mc.gads_call_id IS NULL OR mc.gads_call_id = '')
                WHERE mc.started_at >= ?
                  AND mc.direction = 'inbound'
                  AND (
                    (gcv.campaign_name IS NOT NULL AND gcv.campaign_name != '')
                    OR (l.campaign_name IS NOT NULL AND l.campaign_name != '')
+                   OR (agcv.campaign_name IS NOT NULL AND agcv.campaign_name != '')
                  )
                GROUP BY 1, 2
                ORDER BY total_calls DESC""",
             (cutoff,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/admin/calls/campaign-appts", dependencies=[Depends(_require_admin)])
+def admin_calls_campaign_appts(campaign_name: str, days: int = 30):
+    """
+    Return the individual call+appointment records for a specific campaign.
+    Used by the clickable APPTS modal in the campaign table.
+    Returns calls that have either od_appointment_id set OR booked_outcome='booked'.
+    Patient status filtering (new/existing/all) is done client-side in the frontend.
+    """
+    from database import _conn
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT
+                 mc.uuid,
+                 mc.started_at,
+                 mc.caller_id_name,
+                 mc.duration_sec,
+                 mc.od_appointment_id,
+                 mc.od_patient_name,
+                 mc.od_patient_num,
+                 mc.od_patient_status,
+                 mc.booked_outcome,
+                 mc.attributed_keyword,
+                 mc.attributed_ad_group,
+                 mc.call_summary,
+                 COALESCE(gcv.ad_group_name, mc.attributed_ad_group) AS gads_ad_group,
+                 COALESCE(NULLIF(l.appointment_date,''), NULLIF(l2.appointment_date,''), NULLIF(kpl.appointment_date,'')) AS od_appt_date,
+                 COALESCE(NULLIF(l.appointment_status,''), NULLIF(l2.appointment_status,'')) AS od_appt_status,
+                 COALESCE(NULLIF(mc.od_patient_name,''), NULLIF(TRIM(l.first_name||' '||l.last_name),''), NULLIF(TRIM(l2.first_name||' '||l2.last_name),'')) AS patient_name
+               FROM mango_calls mc
+               LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+               LEFT JOIN leads l ON l.id = mc.lead_id
+               LEFT JOIN leads l2 ON l2.od_patient_num = mc.od_patient_num
+                                  AND mc.od_patient_num != ''
+                                  AND (mc.lead_id IS NULL OR mc.lead_id = '')
+               LEFT JOIN keyword_production_log kpl
+                      ON kpl.od_patient_num = mc.od_patient_num
+                     AND mc.od_patient_num != ''
+               LEFT JOIN (
+                 SELECT ad_group_name, campaign_name
+                 FROM gads_call_view
+                 WHERE ad_group_name != ''
+                 GROUP BY ad_group_name
+               ) agcv ON agcv.ad_group_name = mc.attributed_ad_group
+                      AND (mc.gads_call_id IS NULL OR mc.gads_call_id = '')
+               WHERE mc.started_at >= ?
+                 AND mc.direction = 'inbound'
+                 AND (
+                   (mc.od_appointment_id IS NOT NULL AND mc.od_appointment_id != '')
+                   OR mc.booked_outcome = 'booked'
+                 )
+                 AND (
+                   gcv.campaign_name = ?
+                   OR l.campaign_name = ?
+                   OR agcv.campaign_name = ?
+                 )
+               ORDER BY mc.started_at DESC""",
+            (cutoff, campaign_name, campaign_name, campaign_name),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/admin/reports/income", dependencies=[Depends(_require_admin)])
+def admin_reports_income(days: int = 90):
+    """
+    Return patient-level production records from keyword_production_log,
+    joined to leads for patient name and first/last name fallback.
+    Used by the Income sub-view in the Reports tab.
+    """
+    from database import _conn
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT
+                 kpl.id,
+                 kpl.logged_at,
+                 kpl.lead_id,
+                 kpl.keyword_text,
+                 kpl.match_type,
+                 kpl.campaign_name,
+                 kpl.ad_group_name,
+                 kpl.od_patient_num,
+                 kpl.production_amount,
+                 kpl.procedure_codes,
+                 kpl.match_method,
+                 kpl.appointment_date,
+                 COALESCE(
+                   NULLIF(TRIM(l.first_name||' '||l.last_name),''),
+                   (SELECT mc.od_patient_name FROM mango_calls mc
+                     WHERE mc.od_patient_num = kpl.od_patient_num
+                       AND kpl.od_patient_num != ''
+                       AND IFNULL(mc.od_patient_name,'') != ''
+                     ORDER BY mc.started_at DESC LIMIT 1),
+                   kpl.od_patient_num
+                 ) AS patient_name
+               FROM keyword_production_log kpl
+               LEFT JOIN leads l ON l.id = kpl.lead_id
+               WHERE kpl.logged_at >= ?
+               ORDER BY kpl.logged_at DESC, kpl.id DESC""",
+            (cutoff,),
+        ).fetchall()
+    rows_list = [dict(r) for r in rows]
+    total_production = sum(r.get("production_amount") or 0 for r in rows_list)
+    patient_count = len({r.get("od_patient_num") for r in rows_list if r.get("od_patient_num")})
+    campaign_count = len({r.get("campaign_name") for r in rows_list if r.get("campaign_name")})
+    return {
+        "rows": rows_list,
+        "summary": {
+            "total_production": round(total_production, 2),
+            "patient_count": patient_count,
+            "campaign_count": campaign_count,
+            "days": days,
+        }
+    }
 
 
 @app.get("/api/admin/calls/{uuid}", dependencies=[Depends(_require_admin)])

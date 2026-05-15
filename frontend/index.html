@@ -7,7 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <!-- v20260512-1600 -->
+  <!-- v20260515-1300 -->
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -5265,7 +5265,11 @@ function CallAnalysisView() {
 }
 
 function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
-  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'calls'
+  const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'income' | ...
+  const [incomeData, setIncomeData] = useState(null);   // {rows, summary} or null
+  const [incomeLoading, setIncomeLoading] = useState(false);
+  const [incomeDays, setIncomeDays] = useState(90);
+  const [incomeSearch, setIncomeSearch] = useState('');
   const [dateRange, setDateRange] = useState(() => defaultDateRange(30));
   const [adCreativesDays, setAdCreativesDays] = useState(30);
   const [expanded, setExpanded] = useState(null); // campKey → null | 'analytics' | 'keywords' | 'trend'
@@ -5281,6 +5285,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
   const [acctBudgetDraft, setAcctBudgetDraft] = useState('');
   const [acctBudgetSaving, setAcctBudgetSaving] = useState(false);
   const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts}}
+  const [apptModal, setApptModal] = useState(null); // {campaign_name, rows: [...]} or null
+  const [apptFilter, setApptFilter] = useState('new'); // 'new' | 'existing' | 'all'
   const [aiReviewSaving, setAiReviewSaving] = useState({});
   const [aiMaxSaving, setAiMaxSaving] = useState({});
   const [syncingFromGads, setSyncingFromGads] = useState({});   // {campaign_id: bool}
@@ -5388,6 +5394,22 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     finally { setUnifiedLoading(false); }
   }
   useEffect(() => { loadUnifiedCamps(); }, [unifiedDays, showInactive]);
+
+  async function loadIncomeData() {
+    setIncomeLoading(true);
+    setIncomeData(null);
+    try {
+      const data = await api(`/api/admin/reports/income?days=${incomeDays}`);
+      setIncomeData(data);
+    } catch(e) {
+      console.error('Failed to load income data', e);
+      setIncomeData(null);
+    }
+    finally { setIncomeLoading(false); }
+  }
+  useEffect(() => {
+    if (view === 'income') loadIncomeData();
+  }, [view, incomeDays]);
 
   async function saveAccountBudget() {
     const val = parseFloat(acctBudgetDraft);
@@ -5979,7 +6001,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages'],['nearby','Nearby Practices'],['competitor-intel','Competitor Intel']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages'],['nearby','Nearby Practices'],['competitor-intel','Competitor Intel'],['income','💰 Income']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -6020,6 +6042,146 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
       {/* ── Nearby Practices view ── */}
       {view==='nearby' && <NearbyPracticesView />}
       {view==='competitor-intel' && <CompetitorIntelView />}
+
+      {/* ── Income view ── */}
+      {view==='income' && (
+        <div className="report-section">
+          {/* Header + controls */}
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:14}}>
+            <div className="report-title" style={{marginBottom:0}}>💰 Patient Income Tracking</div>
+            <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
+              <span style={{fontSize:11,color:'var(--text-muted)'}}>Window:</span>
+              {[30,60,90,180].map(d=>(
+                <button key={d}
+                  style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                    background:incomeDays===d?'var(--teal)':'#fff',
+                    color:incomeDays===d?'#fff':'var(--text-muted)'}}
+                  onClick={()=>setIncomeDays(d)}>{d}d</button>
+              ))}
+              <input placeholder="Search patient, campaign, keyword…"
+                value={incomeSearch} onChange={e=>setIncomeSearch(e.target.value)}
+                style={{fontSize:11,padding:'4px 8px',border:'1px solid var(--border)',borderRadius:4,minWidth:220}} />
+              <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={loadIncomeData}>↻ Refresh</button>
+            </div>
+          </div>
+
+          {incomeLoading && (
+            <div style={{textAlign:'center',color:'var(--text-muted)',padding:40,fontSize:13}}>Loading income data…</div>
+          )}
+          {!incomeLoading && incomeData && (()=>{
+            const summary = incomeData.summary || {};
+            const rows = (incomeData.rows || []).filter(r => {
+              if (!incomeSearch.trim()) return true;
+              const q = incomeSearch.toLowerCase();
+              return (r.patient_name||'').toLowerCase().includes(q)
+                || (r.campaign_name||'').toLowerCase().includes(q)
+                || (r.keyword_text||'').toLowerCase().includes(q)
+                || (r.ad_group_name||'').toLowerCase().includes(q);
+            });
+
+            // Summary cards
+            return (
+              <React.Fragment>
+                <div style={{display:'flex',gap:12,marginBottom:16,flexWrap:'wrap'}}>
+                  {[
+                    {label:'Total Production', value:fmtMoney(summary.total_production||0), color:'#059669'},
+                    {label:'Patients', value:summary.patient_count||0, color:'#1d4ed8'},
+                    {label:'Campaigns', value:summary.campaign_count||0, color:'#7c3aed'},
+                  ].map(card=>(
+                    <div key={card.label} style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,
+                      padding:'12px 18px',flex:'1 1 140px',minWidth:120,boxShadow:'0 1px 3px rgba(0,0,0,.06)'}}>
+                      <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:4}}>{card.label}</div>
+                      <div style={{fontSize:20,fontWeight:700,color:card.color}}>{card.value}</div>
+                      <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>last {incomeDays} days</div>
+                    </div>
+                  ))}
+                  {incomeSearch && (
+                    <div style={{display:'flex',alignItems:'center',fontSize:11,color:'var(--text-muted)'}}>
+                      Showing {rows.length} of {(incomeData.rows||[]).length} results
+                    </div>
+                  )}
+                </div>
+
+                {/* Table */}
+                {rows.length === 0 ? (
+                  <div style={{textAlign:'center',color:'var(--text-muted)',padding:40,fontSize:13}}>
+                    {incomeSearch ? 'No results match your search.' : 'No production records yet. Production data populates after the nightly OD sync.'}
+                  </div>
+                ) : (
+                  <div style={{overflowX:'auto'}}>
+                    <table className="report-table">
+                      <thead>
+                        <tr>
+                          <th>Patient</th>
+                          <th>Campaign</th>
+                          <th>Keyword</th>
+                          <th>Ad Group</th>
+                          <th>Appt Date</th>
+                          <th>Procedures</th>
+                          <th>Match</th>
+                          <th className="num">Production</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows.map((r,i)=>{
+                          let procs = [];
+                          try { procs = JSON.parse(r.procedure_codes||'[]'); } catch(_) {}
+                          return (
+                            <tr key={i}>
+                              <td style={{fontWeight:600,maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                                {r.patient_name || <span style={{color:'var(--text-muted)',fontStyle:'italic'}}>Unknown</span>}
+                                {r.od_patient_num && (
+                                  <div style={{fontSize:9,color:'var(--text-muted)',fontFamily:'monospace'}}>#{r.od_patient_num}</div>
+                                )}
+                              </td>
+                              <td style={{fontSize:11,maxWidth:180,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'var(--text-muted)'}}>
+                                {r.campaign_name || '—'}
+                              </td>
+                              <td style={{fontSize:11,maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                                {r.keyword_text
+                                  ? <span style={{color:'var(--teal)',fontWeight:500}}>{r.keyword_text}</span>
+                                  : <span style={{color:'var(--text-muted)'}}>—</span>}
+                              </td>
+                              <td style={{fontSize:11,maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'var(--text-muted)'}}>
+                                {r.ad_group_name || '—'}
+                              </td>
+                              <td style={{fontSize:11,whiteSpace:'nowrap'}}>
+                                {r.appointment_date
+                                  ? <span style={{color:'#059669',fontWeight:600}}>{r.appointment_date}</span>
+                                  : <span style={{color:'var(--text-muted)'}}>—</span>}
+                              </td>
+                              <td style={{fontSize:10,maxWidth:160}}>
+                                {procs.length > 0
+                                  ? <span style={{color:'var(--text-muted)'}}>{procs.join(', ')}</span>
+                                  : <span style={{color:'var(--text-muted)'}}>—</span>}
+                              </td>
+                              <td style={{fontSize:10}}>
+                                <span style={{padding:'1px 5px',borderRadius:3,fontWeight:600,
+                                  background: r.match_method==='email' ? '#eff6ff' : r.match_method==='phone' ? '#f0fdf4' : '#fef9c3',
+                                  color:      r.match_method==='email' ? '#1d4ed8' : r.match_method==='phone' ? '#059669' : '#92400e'}}>
+                                  {r.match_method || 'unknown'}
+                                </span>
+                              </td>
+                              <td className="num" style={{fontWeight:700,color:'#059669'}}>
+                                {fmtMoney(r.production_amount||0)}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </React.Fragment>
+            );
+          })()}
+          {!incomeLoading && !incomeData && (
+            <div style={{textAlign:'center',color:'var(--text-muted)',padding:40,fontSize:13}}>
+              Failed to load income data. <button className="btn btn-ghost btn-sm" onClick={loadIncomeData}>Retry</button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>
@@ -6227,17 +6389,16 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
               <th className="num">Cost</th>
               <th className="num">CPL</th>
               <th className="num">ROI</th>
-              <th style={{textAlign:'center',width:80}}>AI Review</th>
-              <th style={{textAlign:'center',width:76}}>AI Max</th>
+              <th className="num" title="Attributed production value from OD (new patients only)">Income</th>
               <th style={{width:190}}>Actions</th>
             </tr>
           </thead>
           <tbody>
             {unifiedLoading && (
-              <tr><td colSpan={15} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
+              <tr><td colSpan={14} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
             )}
             {!unifiedLoading && unifiedCamps.length === 0 && (
-              <tr><td colSpan={15} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
+              <tr><td colSpan={14} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
                 No campaigns yet — click "+ New Campaign" or "⬇ Import from Google Ads".
               </td></tr>
             )}
@@ -6249,7 +6410,6 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                 SCHEDULED:'#7c3aed', QUEUED:'#0891b2',
               }[c.status] || '#6b7280';
               const isLoading = !!campActionLoading[c.campaign_id];
-              const aiSaving = !!aiReviewSaving[c.campaign_id];
               const rowKey = c.campaign_id || `synthetic_${ci}`;
               const strategyOpen = expandedStrategy === c.campaign_id;
               let parsedStrategy = null;
@@ -6287,6 +6447,16 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           </span>
                         ) : null;
                       })()}
+                      {!c.is_synthetic && c.ai_review_enabled && (
+                        <span title="AI Review active" style={{display:'inline-block',fontSize:9,marginLeft:4,
+                          background:'#f0fdf4',color:'#059669',border:'1px solid #86efac',
+                          borderRadius:8,padding:'0px 5px',fontWeight:600,lineHeight:'16px'}}>🤖</span>
+                      )}
+                      {!c.is_synthetic && c.ai_max_enabled && (
+                        <span title="AI Max enabled" style={{display:'inline-block',fontSize:9,marginLeft:4,
+                          background:'#eff6ff',color:'#1d4ed8',border:'1px solid #bfdbfe',
+                          borderRadius:8,padding:'0px 5px',fontWeight:600,lineHeight:'16px'}}>⚡</span>
+                      )}
                     </td>
 
                     {/* Status */}
@@ -6314,7 +6484,17 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                           </td>
                           <td className="num">
                             {ca.confirmed_appts > 0
-                              ? <span style={{color:'#059669',fontWeight:600}}>{ca.confirmed_appts}</span>
+                              ? <span
+                                  style={{color:'#059669',fontWeight:600,cursor:'pointer',textDecoration:'underline dotted'}}
+                                  title="Click to see appointment details"
+                                  onClick={()=>{
+                                    const campName = c.campaign_name;
+                                    setApptFilter('new');
+                                    api(`/api/admin/calls/campaign-appts?campaign_name=${encodeURIComponent(campName)}&days=30`)
+                                      .then(rows=>setApptModal({campaign_name:campName,rows}))
+                                      .catch(()=>setApptModal({campaign_name:campName,rows:[]}));
+                                  }}
+                                >{ca.confirmed_appts}</span>
                               : ca.booked_calls > 0
                                 ? <span style={{color:'#92400e'}} title="Booked calls, OD match pending">~{ca.booked_calls}</span>
                                 : <span style={{color:'var(--text-muted)'}}>—</span>}
@@ -6329,51 +6509,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                            : m.roi > 0 ? '#059669' : m.roi < 0 ? 'var(--red)' : 'var(--text-muted)'
                     }}>{m.roi != null ? Math.round(m.roi)+'%' : '—'}</td>
 
-                    {/* AI Review toggle */}
-                    <td style={{textAlign:'center'}}>
-                      {c.is_synthetic ? (
-                        <span style={{fontSize:9,color:'var(--text-muted)'}} title="Import this campaign to enable AI Review">—</span>
-                      ) : (
-                        <label style={{display:'inline-flex',alignItems:'center',gap:3,cursor:aiSaving?'wait':'pointer'}}
-                          title={c.ai_review_enabled ? 'AI actively monitoring — click to disable' : 'Click to enable AI monitoring'}>
-                          <input type="checkbox" disabled={aiSaving}
-                            checked={!!c.ai_review_enabled}
-                            onChange={()=>toggleAiReview(c)} />
-                          {c.ai_review_enabled && !aiSaving && (
-                            <span style={{fontSize:9,color:'#059669',fontWeight:600}}>ON</span>
-                          )}
-                          {aiSaving && <span style={{fontSize:9,color:'var(--text-muted)'}}>…</span>}
-                        </label>
-                      )}
+                    {/* Income — attributed_production from OD */}
+                    <td className="num" style={{color: (m.production||0) > 0 ? '#059669' : 'var(--text-muted)'}}>
+                      {(m.production||0) > 0 ? fmtMoney(m.production) : '—'}
                     </td>
-
-                    {/* AI Max toggle */}
-                    {(() => {
-                      const maxSaving = !!aiMaxSaving[c.campaign_id];
-                      const isLinked = c.is_gads_linked && !c.is_synthetic && c.campaign_id;
-                      return (
-                        <td style={{textAlign:'center'}}>
-                          {!isLinked ? (
-                            <span style={{fontSize:9,color:'var(--text-muted)'}}
-                              title="Link to Google Ads to enable AI Max">—</span>
-                          ) : (
-                            <label style={{display:'inline-flex',alignItems:'center',gap:3,
-                              cursor:maxSaving?'wait':'pointer'}}
-                              title={c.ai_max_enabled
-                                ? 'AI Max ON — Google AI expanding keyword reach. Click to disable.'
-                                : 'Enable AI Max — Google AI will expand beyond your keyword list'}>
-                              <input type="checkbox" disabled={maxSaving}
-                                checked={!!c.ai_max_enabled}
-                                onChange={()=>toggleAiMax(c)} />
-                              {c.ai_max_enabled && !maxSaving && (
-                                <span style={{fontSize:9,color:'#4285f4',fontWeight:600}}>ON</span>
-                              )}
-                              {maxSaving && <span style={{fontSize:9,color:'var(--text-muted)'}}>…</span>}
-                            </label>
-                          )}
-                        </td>
-                      );
-                    })()}
 
                     {/* Actions */}
                     <td style={{textAlign:'right'}}>
@@ -6428,7 +6567,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                   {/* Strategy expansion row */}
                   {strategyOpen && parsedStrategy && (
                     <tr>
-                      <td colSpan={15} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
+                      <td colSpan={14} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
                         <div style={{padding:'16px 18px',borderLeft:'3px solid var(--teal)'}}>
                           <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
                             <span style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>🧠 Opus Strategy</span>
@@ -8948,50 +9087,95 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
                                   )}
                                 </div>
 
-                                {/* AI Max Section (retained from previous version) */}
+                                {/* 🤖 AI Controls card */}
                                 {(() => {
                                   const isLinked = !!(camp.gads_campaign_resource || camp.gads_campaign_numeric_id);
+                                  const reviewOn = !!camp.ai_review_enabled;
                                   const maxOn = !!camp.ai_max_enabled;
+                                  const revSav = !!aiReviewSaving[camp.campaign_id];
                                   const maxSav = !!aiMaxSaving[camp.campaign_id];
                                   return (
-                                    <div style={{marginTop:22,borderTop:'1px solid var(--border)',paddingTop:18}}>
-                                      <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🤖 Google AI Max</div>
-                                      {!isLinked ? (
-                                        <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',
-                                          background:'#f9fafb',border:'1px solid var(--border)',borderRadius:7,
-                                          padding:'10px 14px'}}>
-                                          AI Max requires this campaign to be linked to Google Ads.
-                                          Launch to Google Ads first.
-                                        </div>
-                                      ) : (
-                                        <div style={{background: maxOn ? '#eff6ff' : '#f9fafb',
-                                          border:`1px solid ${maxOn ? '#bfdbfe' : 'var(--border)'}`,
-                                          borderRadius:8, padding:'14px 16px'}}>
-                                          <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',userSelect:'none'}}>
-                                            <input type="checkbox" checked={maxOn} disabled={maxSav}
-                                              style={{marginTop:2,flexShrink:0,accentColor:'#4285f4'}}
-                                              onChange={()=>toggleAiMax(camp)}/>
-                                            <div>
-                                              <div style={{fontSize:12,fontWeight:600,
-                                                color: maxOn ? '#1d4ed8' : 'var(--text)'}}>
-                                                {maxOn ? '✓ AI Max enabled' : 'Enable AI Max search term matching'}
-                                                {maxSav && <span style={{fontWeight:400,color:'var(--text-muted)',fontSize:11}}> — saving…</span>}
-                                              </div>
-                                              <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,lineHeight:1.5}}>
-                                                {maxOn
-                                                  ? 'Google\'s AI is expanding your keyword reach. Check the Performance tab for AI Max vs. standard match type breakdown after 7+ days.'
-                                                  : 'Lets Google\'s AI find searchers beyond your keyword list. Recommended after 4+ weeks of baseline data. Start with this OFF, then enable once you have CPL benchmarks.'}
-                                              </div>
-                                              {!maxOn && (
-                                                <div style={{fontSize:10,color:'#92400e',marginTop:6,
-                                                  background:'#fef3c7',padding:'4px 8px',borderRadius:4,display:'inline-block'}}>
-                                                  ⚠ Enabling may increase spend — confirm your daily budget cap first
+                                    <div style={{...cardStyle, marginTop:22}}>
+                                      <div style={cardHeaderStyle}>
+                                        <span style={{fontSize:12,fontWeight:700}}>🤖 AI Controls</span>
+                                        <span style={{fontSize:10,color:'var(--text-muted)'}}>
+                                          {reviewOn ? '🟢 Review active' : '⚫ Review off'}
+                                          {' · '}
+                                          {isLinked ? (maxOn ? '⚡ Max on' : 'Max off') : 'Max: link first'}
+                                        </span>
+                                      </div>
+                                      <div style={cardBodyStyle}>
+                                        {/* AI Review row */}
+                                        <div style={{marginBottom:14}}>
+                                          <div style={{fontSize:11,fontWeight:700,marginBottom:6,color:'var(--text)'}}>AI Review (Optimizer)</div>
+                                          {camp.is_synthetic ? (
+                                            <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic'}}>Import this campaign to enable AI Review.</div>
+                                          ) : (
+                                            <div style={{
+                                              background: reviewOn ? '#f0fdf4' : '#f9fafb',
+                                              border:`1px solid ${reviewOn ? '#86efac' : 'var(--border)'}`,
+                                              borderRadius:8, padding:'12px 14px'
+                                            }}>
+                                              <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:revSav?'wait':'pointer',userSelect:'none'}}>
+                                                <input type="checkbox" checked={reviewOn} disabled={revSav}
+                                                  style={{marginTop:2,flexShrink:0,accentColor:'#059669'}}
+                                                  onChange={()=>toggleAiReview(camp)}/>
+                                                <div>
+                                                  <div style={{fontSize:12,fontWeight:600,color:reviewOn?'#059669':'var(--text)'}}>
+                                                    {reviewOn ? '✓ AI actively monitoring this campaign' : 'Enable AI monitoring'}
+                                                    {revSav && <span style={{fontWeight:400,color:'var(--text-muted)',fontSize:11}}> — saving…</span>}
+                                                  </div>
+                                                  <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,lineHeight:1.5}}>
+                                                    {reviewOn
+                                                      ? 'The AI optimizer will include this campaign in each optimization run — keywords, bids, ad groups, and negatives.'
+                                                      : 'Lets the AI optimizer manage bids, keywords, and ad groups for this campaign during optimization runs.'}
+                                                  </div>
                                                 </div>
-                                              )}
+                                              </label>
                                             </div>
-                                          </label>
+                                          )}
                                         </div>
-                                      )}
+                                        {/* AI Max row */}
+                                        <div>
+                                          <div style={{fontSize:11,fontWeight:700,marginBottom:6,color:'var(--text)'}}>AI Max (Google Search Term Expansion)</div>
+                                          {!isLinked ? (
+                                            <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',
+                                              background:'#f9fafb',border:'1px solid var(--border)',borderRadius:7,
+                                              padding:'10px 14px'}}>
+                                              AI Max requires this campaign to be linked to Google Ads. Launch first.
+                                            </div>
+                                          ) : (
+                                            <div style={{
+                                              background: maxOn ? '#eff6ff' : '#f9fafb',
+                                              border:`1px solid ${maxOn ? '#bfdbfe' : 'var(--border)'}`,
+                                              borderRadius:8, padding:'12px 14px'
+                                            }}>
+                                              <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:maxSav?'wait':'pointer',userSelect:'none'}}>
+                                                <input type="checkbox" checked={maxOn} disabled={maxSav}
+                                                  style={{marginTop:2,flexShrink:0,accentColor:'#4285f4'}}
+                                                  onChange={()=>toggleAiMax(camp)}/>
+                                                <div>
+                                                  <div style={{fontSize:12,fontWeight:600,color:maxOn?'#1d4ed8':'var(--text)'}}>
+                                                    {maxOn ? '✓ AI Max enabled' : 'Enable AI Max search term matching'}
+                                                    {maxSav && <span style={{fontWeight:400,color:'var(--text-muted)',fontSize:11}}> — saving…</span>}
+                                                  </div>
+                                                  <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,lineHeight:1.5}}>
+                                                    {maxOn
+                                                      ? "Google's AI is expanding your keyword reach. Check Performance tab for AI Max vs. standard match type breakdown after 7+ days."
+                                                      : "Lets Google's AI find searchers beyond your keyword list. Recommended after 4+ weeks of baseline data."}
+                                                  </div>
+                                                  {!maxOn && (
+                                                    <div style={{fontSize:10,color:'#92400e',marginTop:6,
+                                                      background:'#fef3c7',padding:'4px 8px',borderRadius:4,display:'inline-block'}}>
+                                                      ⚠ Enabling may increase spend — confirm your daily budget cap first
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              </label>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </div>
                                     </div>
                                   );
                                 })()}
@@ -10658,6 +10842,152 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data }) {
         </div>
       )}
       </div>}
+
+      {/* ── Appointment Details Modal ─────────────────────────────────── */}
+      {apptModal && (()=>{
+        // Client-side filter
+        const allRows = apptModal.rows || [];
+        const filteredRows = apptFilter === 'new'
+          ? allRows.filter(r => r.od_patient_status === 'new_patient')
+          : apptFilter === 'existing'
+            ? allRows.filter(r => r.od_patient_status !== 'new_patient')
+            : allRows;
+        const newCount = allRows.filter(r => r.od_patient_status === 'new_patient').length;
+        const existingCount = allRows.filter(r => r.od_patient_status !== 'new_patient').length;
+        const showApptDate = apptFilter === 'new' || apptFilter === 'all';
+        const pillStyle = (val) => ({
+          padding: '3px 12px', borderRadius: 20, fontSize: 11, fontWeight: 600,
+          cursor: 'pointer', border: '1px solid',
+          background: apptFilter === val ? 'var(--teal)' : 'transparent',
+          color: apptFilter === val ? '#fff' : 'var(--teal)',
+          borderColor: 'var(--teal)',
+        });
+        return (
+          <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.45)',zIndex:9000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
+            onClick={()=>setApptModal(null)}>
+            <div style={{background:'#fff',borderRadius:10,width:'100%',maxWidth:840,maxHeight:'82vh',display:'flex',flexDirection:'column',overflow:'hidden',boxShadow:'0 8px 32px rgba(0,0,0,.25)'}}
+              onClick={e=>e.stopPropagation()}>
+              {/* Header */}
+              <div style={{padding:'12px 18px',borderBottom:'1px solid var(--border)',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                <span style={{fontSize:14,fontWeight:700,color:'var(--teal)'}}>📅 Appointment Details</span>
+                <span style={{fontSize:12,color:'var(--text-muted)',flex:1}}>— {apptModal.campaign_name} (last 30 days)</span>
+                {/* Filter pills */}
+                <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                  <button style={pillStyle('new')} onClick={()=>setApptFilter('new')}>
+                    New ({newCount})
+                  </button>
+                  <button style={pillStyle('existing')} onClick={()=>setApptFilter('existing')}>
+                    Existing / Unknown ({existingCount})
+                  </button>
+                  <button style={pillStyle('all')} onClick={()=>setApptFilter('all')}>
+                    All ({allRows.length})
+                  </button>
+                </div>
+                <button className="btn btn-ghost btn-sm" onClick={()=>setApptModal(null)}>✕ Close</button>
+              </div>
+              {/* Body */}
+              <div style={{overflowY:'auto',flex:1}}>
+                {filteredRows.length === 0 ? (
+                  <div style={{padding:32,textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
+                    No {apptFilter !== 'all' ? apptFilter+' patient ' : ''}appointment records found.
+                  </div>
+                ) : (
+                  <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                    <thead>
+                      <tr style={{background:'var(--gray-light)',position:'sticky',top:0}}>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Call Date &amp; Time</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Caller (Mango)</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>OD Patient</th>
+                        {showApptDate && (
+                          <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Appt Date</th>
+                        )}
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Status</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>OD Apt #</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Keyword</th>
+                        <th style={{padding:'8px 10px',textAlign:'right',fontWeight:600,color:'var(--text-muted)'}}>Duration</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredRows.map((r,i)=>{
+                        const isOdMatch = !!(r.od_appointment_id);
+                        return (
+                          <tr key={i} style={{borderTop:'1px solid var(--border)',background:i%2===0?'#fff':'#fafafa'}}>
+                            {/* Call Date & Time */}
+                            <td style={{padding:'8px 10px',whiteSpace:'nowrap',fontSize:11}}>
+                              {r.started_at ? (()=>{
+                                const d = new Date(r.started_at);
+                                return (
+                                  <React.Fragment>
+                                    <div style={{fontWeight:600}}>{d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div>
+                                    <div style={{fontSize:10,color:'var(--text-muted)'}}>{d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div>
+                                  </React.Fragment>
+                                );
+                              })() : '—'}
+                            </td>
+                            {/* Caller name from Mango */}
+                            <td style={{padding:'8px 10px',fontSize:11}}>
+                              <div style={{fontWeight:600,color:'var(--text)'}}>{r.caller_id_name || '—'}</div>
+                            </td>
+                            {/* OD Patient name + status */}
+                            <td style={{padding:'8px 10px',fontSize:11}}>
+                              {r.od_patient_name
+                                ? <React.Fragment>
+                                    <div style={{fontWeight:600,color:'#059669'}}>{r.od_patient_name}</div>
+                                    {r.od_patient_status && (
+                                      <span style={{fontSize:9,fontWeight:700,padding:'1px 4px',borderRadius:3,
+                                        background: r.od_patient_status==='new_patient' ? '#dbeafe' : '#d1fae5',
+                                        color:      r.od_patient_status==='new_patient' ? '#1d4ed8' : '#065f46'}}>
+                                        {r.od_patient_status.replace(/_/g,' ')}
+                                      </span>
+                                    )}
+                                  </React.Fragment>
+                                : <span style={{color:'var(--text-muted)'}}>—</span>}
+                            </td>
+                            {/* Appt Date — shown for new/all filters */}
+                            {showApptDate && (
+                              <td style={{padding:'8px 10px',fontSize:11,whiteSpace:'nowrap'}}>
+                                {r.od_appt_date
+                                  ? <span style={{color:'#059669',fontWeight:600}}>{r.od_appt_date}</span>
+                                  : <span style={{color:'var(--text-muted)'}}>—</span>}
+                              </td>
+                            )}
+                            {/* OD match status */}
+                            <td style={{padding:'8px 10px'}}>
+                              {isOdMatch
+                                ? <span style={{fontSize:10,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'2px 6px',borderRadius:4}}>✓ OD Match</span>
+                                : <span style={{fontSize:10,fontWeight:700,color:'#92400e',background:'#fef3c7',padding:'2px 6px',borderRadius:4}}>Booked</span>}
+                            </td>
+                            {/* OD Appointment # */}
+                            <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:10,color:'var(--text-muted)'}}>
+                              {r.od_appointment_id || '—'}
+                            </td>
+                            {/* Keyword */}
+                            <td style={{padding:'8px 10px',maxWidth:150,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                              {r.attributed_keyword
+                                ? <span style={{color:'var(--teal)',fontWeight:500,fontSize:11}}>{r.attributed_keyword}</span>
+                                : <span style={{color:'var(--text-muted)'}}>—</span>}
+                            </td>
+                            {/* Duration */}
+                            <td style={{padding:'8px 10px',textAlign:'right',color:'var(--text-muted)',fontSize:11}}>
+                              {r.duration_sec ? Math.floor(r.duration_sec/60)+'m '+((r.duration_sec%60)+'s') : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+              {/* Footer summary — always shows totals across all rows */}
+              <div style={{padding:'10px 18px',borderTop:'1px solid var(--border)',background:'var(--gray-light)',display:'flex',gap:20,fontSize:11,color:'var(--text-muted)',flexWrap:'wrap',alignItems:'center'}}>
+                <span><strong style={{color:'var(--text)'}}>{allRows.filter(r=>r.od_appointment_id).length}</strong> confirmed OD matches</span>
+                <span><strong style={{color:'#059669'}}>{newCount}</strong> new · <strong style={{color:'var(--text)'}}>{existingCount}</strong> existing/unknown</span>
+                <span style={{marginLeft:'auto'}}>Showing <strong style={{color:'var(--text)'}}>{filteredRows.length}</strong> of {allRows.length}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

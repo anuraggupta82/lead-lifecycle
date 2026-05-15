@@ -3494,8 +3494,9 @@ def get_unified_campaigns(days: int = 30) -> list:
         lead_rows = conn.execute("""
             SELECT
                 LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign))) AS k,
-                COUNT(*)               AS lead_count,
-                SUM(attributed_income) AS attributed_income
+                COUNT(*)                   AS lead_count,
+                SUM(attributed_income)     AS attributed_income,
+                SUM(attributed_production) AS attributed_production
             FROM leads
             WHERE created_at >= DATE('now', ?)
               AND (campaign_name != '' OR utm_campaign != '')
@@ -3537,6 +3538,7 @@ def get_unified_campaigns(days: int = 30) -> list:
             cost = (wm.get("cost_micros") or 0) / 1_000_000.0
             leads = lm.get("lead_count") or 0
             revenue = lm.get("attributed_income") or 0
+            production = lm.get("attributed_production") or 0
             cpl = round(cost / leads, 2) if leads > 0 else None
             roi = round((revenue - cost) / cost * 100, 1) if cost > 0 else None
 
@@ -3564,6 +3566,7 @@ def get_unified_campaigns(days: int = 30) -> list:
                     "cost": round(cost, 2),
                     "leads": leads,
                     "revenue": round(revenue, 2),
+                    "production": round(production, 2),
                     "cpl": cpl,
                     "roi": roi,
                 },
@@ -3580,6 +3583,7 @@ def get_unified_campaigns(days: int = 30) -> list:
             cost = (wm.get("cost_micros") or 0) / 1_000_000.0
             leads = lm.get("lead_count") or 0
             revenue = lm.get("attributed_income") or 0
+            production = lm.get("attributed_production") or 0
             cpl = round(cost / leads, 2) if leads > 0 else None
             roi = round((revenue - cost) / cost * 100, 1) if cost > 0 else None
             last = last_activity_by_key.get(k)
@@ -3609,6 +3613,7 @@ def get_unified_campaigns(days: int = 30) -> list:
                     "cost": round(cost, 2),
                     "leads": leads,
                     "revenue": round(revenue, 2),
+                    "production": round(production, 2),
                     "cpl": cpl,
                     "roi": roi,
                 },
