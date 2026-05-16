@@ -179,16 +179,44 @@ LIFECYCLE_RULES = """
 The "lifecycle" field in the campaign data contains: stage, days_since_launch, in_learning_period.
 
 STAGE = new (days_since_launch <= 30) OR stage = unknown:
-  ALLOWED operations: add_negative_keyword, claude_advisory
-  FORBIDDEN: increase_bid, decrease_bid, pause_keyword, add_exact_keyword,
-             replace_ad, change_bid_strategy, pause_ad_group, update_geo_targeting,
-             change_budget, change_match_type, ad_copy_suggestion
+  ALLOWED operations: add_negative_keyword, claude_advisory, increase_bid (with strict conditions below),
+                      change_bid_strategy → MANUAL_CPC (with strict conditions below)
+  FORBIDDEN: decrease_bid, pause_keyword, add_exact_keyword,
+             replace_ad, pause_ad_group, update_geo_targeting,
+             change_budget, change_match_type, ad_copy_suggestion,
+             change_bid_strategy to anything other than MANUAL_CPC
   REASON: Google's algorithm needs 14–30 days of uninterrupted data collection to
-          optimize delivery. Bid or structural changes reset the learning phase and
-          degrade impression quality. During this period, ONLY add clearly-irrelevant
-          negative keywords (zero-risk) and provide observational commentary.
-  ACTION: If data suggests a change you'd normally make, instead emit a claude_advisory
-          describing WHAT you would do and WHEN (e.g. "After day 30, consider...").
+          optimize delivery. Structural changes and budget/strategy changes reset the
+          learning phase. However, if a campaign launched on a smart bidding strategy
+          with a budget too thin to feed it, the smart bidder starves and collects no
+          data — which is worse than switching to Manual CPC temporarily.
+  increase_bid RULE DURING NEW STAGE — two mandatory branches:
+
+  BRANCH A — MUST emit increase_bid (not claude_advisory) when ALL of the following are true:
+    1. search_rank_lost_is > 0.40 (losing >40% of auctions due to low rank, not budget)
+    2. search_budget_lost_is < 0.20 (not budget-constrained — room exists to bid higher)
+    3. The keyword has >= 10 impressions (enough signal that it is entering auctions)
+    4. Set new_bid_micros = round(current_bid_micros * 1.08) — exactly +8%, no more
+    5. Include current_bid_micros, search_rank_lost_is, search_budget_lost_is, impressions fields
+    DO NOT downgrade to claude_advisory when all 4 conditions above are met. EMIT increase_bid.
+
+  BRANCH B — emit claude_advisory ONLY when at least one condition is NOT met:
+    Use reason: "LIFECYCLE_ADVISORY: Bid increase deferred — [state which condition failed].
+    After day 30, consider increasing if rank lost IS remains above 40%."
+
+  change_bid_strategy → MANUAL_CPC RULE DURING NEW STAGE:
+  MUST emit change_bid_strategy (bid_strategy: "MANUAL_CPC") when ALL of the following are true:
+    1. bidding_strategy_type is NOT MANUAL_CPC (i.e. campaign is on Maximize Clicks, Maximize Conversions, Target CPA, etc.)
+    2. search_rank_lost_is > 0.40 (losing >40% of auctions — smart bidding has nothing to optimize)
+    3. daily_budget_usd < 15.0 (budget too thin to feed smart bidding algorithm)
+    REASON: Smart bidding on a sub-$15/day budget starves — Google can't gather enough auction
+    signals to make intelligent decisions. Manual CPC lets us set competitive baseline bids
+    immediately and gather real impression data during the learning window.
+    Required op fields: bid_strategy:"MANUAL_CPC", campaign_resource, search_rank_lost_is (float),
+    daily_budget_usd (float, from campaign_settings). DO NOT include target_cpa_micros or target_roas.
+
+  ACTION: For all other changes you'd normally make, emit a claude_advisory describing
+          WHAT you would do and WHEN (e.g. "After day 30, consider...").
           Prefix that advisory reason with "LIFECYCLE_ADVISORY: ".
 
 STAGE = ramping (31 <= days_since_launch <= 90):
@@ -208,6 +236,56 @@ WHEN REFUSING AN OPERATION due to lifecycle stage, emit a claude_advisory with
 reason starting with "LIFECYCLE_BLOCKED: [operation_name] — " followed by the
 reason you would have given if the campaign were mature.
 === END LIFECYCLE RULES ===
+"""
+
+LEARNING_PHASE_RULES = """
+=== LEARNING PHASE DIAGNOSTIC RULES (campaigns age < 30 days) ===
+
+RULE 1 — DIAGNOSE BEFORE PRESCRIBING:
+Before recommending any change, identify the primary loss reason from campaign_settings:
+- search_rank_lost_is > 0.40 → BID/QUALITY PROBLEM — fix bids or bidding strategy first
+- search_budget_lost_is > 0.30 → BUDGET PROBLEM — raising budget is warranted
+- Both < 0.20 → IMPRESSION QUALITY PROBLEM — review keywords and targeting
+NEVER recommend a budget increase (change_budget) when search_budget_lost_is < 0.20.
+
+RULE 2 — BIDDING STRATEGY BY BUDGET TIER:
+- daily_budget_usd < 15 → MANUAL_CPC required. Smart bidding starves at this scale.
+- daily_budget_usd 15–50 AND conversions_30d < 15 → MANUAL_CPC or MAXIMIZE_CLICKS
+- daily_budget_usd > 50 AND conversions_30d 15–30 → MAXIMIZE_CONVERSIONS eligible
+- daily_budget_usd > 50 AND conversions_30d >= 30 → TARGET_CPA eligible
+
+RULE 3 — ONE RESET PER 7-DAY WINDOW:
+Bid strategy changes, budget swings >20%, and geo target changes all reset Google's
+learning clock. Emit at most ONE reset-class operation per optimizer run during learning.
+If a change_bid_strategy op is already in your recommendations, do NOT also recommend
+change_budget or update_geo_targeting in the same run.
+
+RULE 4 — CONCENTRATE SPEND ON SIGNAL, DON'T EXPLORE:
+For campaigns with daily_budget_usd < 15:
+- Recommend pause_keyword for keywords with impressions >= 50 AND clicks == 0
+- Recommend pause_keyword for keywords with impressions >= 200 AND conversions == 0
+- DO NOT recommend adding new keywords or match type expansion
+- DO NOT pause keywords with impressions < 30 (insufficient signal)
+Concentrate the limited budget on keywords with any positive signal.
+
+RULE 5 — DO NOT TREAT AD COPY AS A BID FIX:
+If search_rank_lost_is > 0.40, the campaign is losing auctions due to low bids, NOT ad
+quality. Ad copy changes (ad_copy_suggestion, replace_ad) will not meaningfully improve
+Ad Rank at this scale. Defer ad copy work until bids are fixed and rank_lost_is < 0.30.
+
+RULE 6 — BUDGET DRIFT IS A RED FLAG:
+If actual monthly spend is severely below planned budget AND search_rank_lost_is > 0.40,
+emit ONE claude_advisory explaining the cause: bids are too low to enter enough auctions
+to spend the budget. Label the reason: "BUDGET_DRIFT_ALERT: [explanation]".
+Do NOT silently accept severe budget under-delivery.
+
+RULE 7 — N=1 CONVERSION IS A HYPOTHESIS, NOT A SIGNAL:
+If a keyword has exactly 1 conversion, treat it as promising but unconfirmed.
+- DO concentrate bids on it (it is the best signal available)
+- DO NOT use it as justification for TARGET_CPA or aggressive budget reallocation
+- DO surface it in the reason field so the human can validate
+
+=== END LEARNING PHASE DIAGNOSTIC RULES ===
 """
 
 # ── Negative keyword signals (module-level so all functions can use them) ─────
@@ -1744,7 +1822,7 @@ def _compute_budget_click_signal(
     }
 
 
-def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float) -> list:
+def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float, campaign_settings: dict = None) -> list:
     """
     Defense-in-depth post-filter: ensure Claude didn't violate lifecycle rules.
     Blocked ops are converted to claude_advisory rows with 'LIFECYCLE_BLOCKED:' prefix
@@ -1766,10 +1844,10 @@ def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float) -> list
     # Operations always safe in any stage (zero-risk)
     _ALWAYS_ALLOWED = {"add_negative_keyword", "claude_advisory"}
 
-    # Operations forbidden in new/unknown
+    # Operations forbidden in new/unknown (increase_bid and change_bid_strategy handled separately below)
     _FORBIDDEN_NEW = {
-        "increase_bid", "decrease_bid", "pause_keyword", "add_exact_keyword",
-        "replace_ad", "change_bid_strategy", "pause_ad_group", "update_geo_targeting",
+        "decrease_bid", "pause_keyword", "add_exact_keyword",
+        "replace_ad", "pause_ad_group", "update_geo_targeting",
         "change_budget", "change_match_type", "ad_copy_suggestion", "add_asset",
     }
 
@@ -1780,7 +1858,226 @@ def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float) -> list
         op_type = op.get("operation", "")
         original_reason = op.get("reason", "")
 
-        # --- new / unknown: only negatives + advisory ---
+        # --- new / unknown: special handling for increase_bid ---
+        # Allow small bid increases (≤8%) during learning ONLY when impression rank loss
+        # is high and the campaign is NOT budget-constrained. This corrects bids that were
+        # set too low at launch without resetting the learning phase.
+        if stage in (STAGE_NEW, STAGE_UNKNOWN) and op_type == "increase_bid":
+            current_micros  = int(op.get("current_bid_micros") or 0)
+            new_micros      = int(op.get("new_bid_micros") or 0)
+            rank_lost       = float(op.get("search_rank_lost_is") or 0)
+            budget_lost     = float(op.get("search_budget_lost_is") or 0)
+            impressions     = int(op.get("impressions") or 0)
+
+            # M1: if current_micros = 0, campaign is on smart bidding — increase_bid not applicable
+            if current_micros == 0:
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"LIFECYCLE_BLOCKED: increase_bid not applicable — campaign is on smart bidding "
+                        f"(current_bid_micros=0). Consider change_bid_strategy→MANUAL_CPC if "
+                        f"search_rank_lost_is>{rank_lost:.0%} and budget<$15/day. "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0, "impact_type": "bid_efficiency",
+                        "confidence": "low",
+                        "benchmark_gap": "increase_bid not applicable on smart bidding — use change_bid_strategy→MANUAL_CPC",
+                    },
+                })
+                logger.info(f"[lifecycle_sieve] Blocked increase_bid during {stage}: smart bidding (current_micros=0)")
+                continue
+
+            pct_increase = (new_micros - current_micros) / current_micros
+
+            allowed = (
+                rank_lost    > 0.40 and   # losing >40% of auctions due to low rank
+                budget_lost  < 0.20 and   # not budget-constrained
+                impressions  >= 10  and   # enough signal that the keyword is entering auctions
+                pct_increase <= 0.08      # max +8% increase
+            )
+
+            if allowed:
+                logger.info(
+                    f"[lifecycle_sieve] Allowing increase_bid during {stage} stage "
+                    f"(rank_lost={rank_lost:.0%}, +{pct_increase:.0%}, impressions={impressions})"
+                )
+                filtered.append(op)
+            else:
+                block_reason = []
+                if rank_lost <= 0.40:   block_reason.append(f"rank_lost_IS={rank_lost:.0%} (need >40%)")
+                if budget_lost >= 0.20: block_reason.append(f"budget_lost_IS={budget_lost:.0%} — budget-constrained, increase budget first")
+                if impressions < 10:    block_reason.append(f"only {impressions} impressions — insufficient signal")
+                if pct_increase > 0.08: block_reason.append(f"requested +{pct_increase:.0%} exceeds 8% learning-phase cap")
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"LIFECYCLE_BLOCKED: increase_bid suppressed during '{stage}' stage — "
+                        f"{'; '.join(block_reason)}. "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0, "impact_type": "bid_efficiency",
+                        "confidence": "low",
+                        "benchmark_gap": f"bid increase deferred: {'; '.join(block_reason)}",
+                    },
+                })
+                logger.info(f"[lifecycle_sieve] Blocked increase_bid during {stage}: {'; '.join(block_reason)}")
+            continue
+
+        # --- new / unknown: change_bid_strategy → MANUAL_CPC allowed when smart bidding + thin budget ---
+        # Smart bidding on <$15/day starves — no auction signals. Manual CPC lets us set
+        # competitive baseline bids immediately.
+        if stage in (STAGE_NEW, STAGE_UNKNOWN) and op_type == "change_bid_strategy":
+            target_strategy = (op.get("bid_strategy") or "").upper()
+            _cs = campaign_settings or {}
+            # M4: read rank_lost from op first, then campaign_settings (lifecycle dict doesn't have it)
+            rank_lost    = float(op.get("search_rank_lost_is") or _cs.get("search_rank_lost_is") or 0)
+            daily_budget = float(op.get("daily_budget_usd") or _cs.get("daily_budget_usd") or 0)
+
+            if target_strategy == "MANUAL_CPC":
+                # C1: require a known positive budget; 0 means missing data — block conservatively
+                if daily_budget <= 0:
+                    filtered.append({
+                        "operation": "claude_advisory",
+                        "reason": (
+                            f"LIFECYCLE_BLOCKED: change_bid_strategy→MANUAL_CPC suppressed — "
+                            f"daily budget unknown (0 or missing); cannot verify thin-budget condition. "
+                            f"Original intent: {original_reason}"
+                        ),
+                        "estimated_monthly_impact": {"savings_usd": 0, "impact_type": "bid_efficiency",
+                                                     "confidence": "low", "benchmark_gap": "budget data missing — bid strategy change deferred"},
+                    })
+                elif rank_lost > 0.40 and 0 < daily_budget < 15.0:
+                    # All conditions met — allow
+                    logger.info(
+                        f"[lifecycle_sieve] Allowing change_bid_strategy→MANUAL_CPC during {stage} "
+                        f"(rank_lost={rank_lost:.0%}, budget=${daily_budget:.2f}/day)"
+                    )
+                    filtered.append(op)
+                else:
+                    # Conditions not met — block with specific reason
+                    block_parts = []
+                    if rank_lost <= 0.40:
+                        block_parts.append(f"rank_lost_IS={rank_lost:.0%} (need >40%)")
+                    if daily_budget >= 15.0:
+                        block_parts.append(f"budget=${daily_budget:.2f}/day (need <$15 — smart bidding viable at this budget)")
+                    filtered.append({
+                        "operation": "claude_advisory",
+                        "reason": (
+                            f"LIFECYCLE_BLOCKED: change_bid_strategy→MANUAL_CPC suppressed — "
+                            f"{'; '.join(block_parts)}. "
+                            f"Original intent: {original_reason}"
+                        ),
+                        "estimated_monthly_impact": {"savings_usd": 0, "impact_type": "bid_efficiency",
+                                                     "confidence": "low", "benchmark_gap": "bid strategy change deferred"},
+                    })
+            else:
+                # Non-MANUAL_CPC strategy switches always blocked during new stage
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"LIFECYCLE_BLOCKED: change_bid_strategy to {target_strategy} suppressed — "
+                        f"campaign in '{stage}' stage. Only MANUAL_CPC is allowed during learning. "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {"savings_usd": 0, "impact_type": "bid_efficiency",
+                                                 "confidence": "low", "benchmark_gap": "bid strategy change deferred until day 31+"},
+                })
+            continue
+
+        # --- Any stage: block change_budget when budget_lost_is < 20% (bid problem, not budget problem) ---
+        if op_type == "change_budget":
+            _cs_budget = campaign_settings or {}
+            budget_lost_is = float(op.get("search_budget_lost_is") or _cs_budget.get("search_budget_lost_is") or 0)
+            if budget_lost_is < 0.20:
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"OPTIMIZER_BLOCKED: change_budget suppressed — search_budget_lost_is={budget_lost_is:.0%} "
+                        f"(threshold: >20%). Current impression loss is rank/bid-side, not budget-side. "
+                        f"Fix bids first; raise budget only after budget_lost_is exceeds 30%. "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0, "impact_type": "waste_reduction",
+                        "confidence": "high",
+                        "benchmark_gap": f"budget increase deferred: budget_lost_is={budget_lost_is:.0%} — not budget-constrained",
+                    },
+                })
+                logger.info(f"[sieve] Blocked change_budget: budget_lost_is={budget_lost_is:.0%} < 20%")
+                continue
+
+        # --- Any stage: pause_keyword requires >= 30 impressions for valid signal ---
+        if op_type == "pause_keyword":
+            kw_impressions = int(op.get("impressions") or 0)
+            if 0 < kw_impressions < 30:
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"OPTIMIZER_BLOCKED: pause_keyword suppressed for '{op.get('keyword_text', '')}' — "
+                        f"only {kw_impressions} impressions (minimum 30 required for valid signal). "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0, "impact_type": "waste_reduction",
+                        "confidence": "low",
+                        "benchmark_gap": f"pause deferred: {kw_impressions} impressions < 30 minimum",
+                    },
+                })
+                logger.info(f"[sieve] Blocked pause_keyword '{op.get('keyword_text','')}': only {kw_impressions} impressions")
+                continue
+
+        # --- new/unknown: only one reset-class op per run ---
+        _RESET_CLASS_OPS = {"change_bid_strategy", "update_geo_targeting"}
+        if stage in (STAGE_NEW, STAGE_UNKNOWN) and op_type in _RESET_CLASS_OPS:
+            already_has_reset = any(
+                f.get("operation") in _RESET_CLASS_OPS
+                for f in filtered
+                if isinstance(f, dict)
+            )
+            if already_has_reset:
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"LIFECYCLE_BLOCKED: {op_type} suppressed — a reset-class operation is already "
+                        f"queued this run. Google's learning clock can only be disrupted once per optimizer run. "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0, "impact_type": "bid_efficiency",
+                        "confidence": "high",
+                        "benchmark_gap": "second reset-class op deferred to next optimizer run",
+                    },
+                })
+                logger.info(f"[sieve] Blocked second reset-class op '{op_type}' during {stage}")
+                continue
+
+        # --- new/unknown: defer ad copy changes when loss is bid-driven not quality-driven ---
+        _AD_COPY_OPS = {"ad_copy_suggestion", "replace_ad"}
+        if stage in (STAGE_NEW, STAGE_UNKNOWN) and op_type in _AD_COPY_OPS:
+            _cs_ad = campaign_settings or {}
+            rank_lost_ad = float(op.get("search_rank_lost_is") or _cs_ad.get("search_rank_lost_is") or 0)
+            if rank_lost_ad > 0.40:
+                filtered.append({
+                    "operation": "claude_advisory",
+                    "reason": (
+                        f"LIFECYCLE_BLOCKED: {op_type} deferred — search_rank_lost_is={rank_lost_ad:.0%} "
+                        f"indicates auction losses are bid-driven, not quality-driven. "
+                        f"Ad copy improvements will not meaningfully improve Ad Rank. "
+                        f"Fix bids first; revisit ad copy after rank_lost_is < 30%. "
+                        f"Original intent: {original_reason}"
+                    ),
+                    "estimated_monthly_impact": {
+                        "savings_usd": 0, "impact_type": "conversion_lift",
+                        "confidence": "low",
+                        "benchmark_gap": "ad copy deferred: rank loss is bid-side",
+                    },
+                })
+                logger.info(f"[sieve] Blocked {op_type} during {stage}: rank_lost_is={rank_lost_ad:.0%} > 40%")
+                continue
+
+        # --- new / unknown: block everything else in _FORBIDDEN_NEW ---
         if stage in (STAGE_NEW, STAGE_UNKNOWN) and op_type in _FORBIDDEN_NEW:
             filtered.append({
                 "operation": "claude_advisory",
@@ -1790,7 +2087,7 @@ def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float) -> list
                 ),
                 "estimated_monthly_impact": {
                     "savings_usd": 0,
-                    "impact_type": "waste_reduction",   # prevents learning-phase disruption, not a conversion lift
+                    "impact_type": "waste_reduction",
                     "confidence": "low",
                     "benchmark_gap": f"lifecycle gate: {op_type} deferred until day 31+",
                 },
@@ -2299,7 +2596,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             _lc_day_str = f"day {_lc_days}" if _lc_days is not None else "age unknown"
             _lc_warning = ""
             if _lc_stage in ("new", "unknown"):
-                _lc_warning = "\n⚠️  LEARNING PERIOD ACTIVE — only add_negative_keyword and claude_advisory are permitted."
+                _lc_warning = "\n⚠️  LEARNING PERIOD ACTIVE — most operations are restricted. See LIFECYCLE_RULES. Exceptions: (1) increase_bid IS allowed for MANUAL_CPC campaigns when search_rank_lost_is > 0.40 AND search_budget_lost_is < 0.20 AND impressions >= 10 (max +8%). (2) change_bid_strategy → MANUAL_CPC IS allowed when current strategy is NOT MANUAL_CPC AND daily_budget_usd < 15.0 AND search_rank_lost_is > 0.40."
             elif _lc_stage == "ramping":
                 _lc_warning = "\n⚠️  RAMPING — no change_bid_strategy unless conversions_30d ≥ 15; no add_exact_keyword."
             lifecycle_note = (
@@ -2337,7 +2634,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
         except Exception as _skag_err:
             logger.warning("SKAG signals failed for %r (non-fatal): %s", campaign, _skag_err)
 
-        prompt = excellence_block + GOOGLE_ADS_RULES + LIFECYCLE_RULES + """
+        prompt = excellence_block + GOOGLE_ADS_RULES + LIFECYCLE_RULES + (LEARNING_PHASE_RULES if lifecycle and lifecycle.get("stage") in ("new", "unknown") else "") + """
 You are a Google Ads specialist optimizing a dental practice's campaigns.
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
 
@@ -2365,6 +2662,31 @@ Use this to:
 - If bidding_strategy_type is MAXIMIZE_CONVERSIONS or TARGET_CPA: do NOT suggest manual bid adjustments (increase_bid / decrease_bid) — the smart bidding algorithm manages bids automatically
 - Always reference the current daily_budget_usd when recommending a change_budget — state the specific dollar increase and the % change
 
+=== PRE-FLIGHT CHECKS — RUN THESE BEFORE GENERATING ANY RECOMMENDATIONS ===
+
+CHECK 1 — SMART BIDDING ON THIN BUDGET (learning phase):
+  IF lifecycle.stage IN ('new', 'unknown')
+  AND campaign_settings.bidding_strategy_type != 'MANUAL_CPC'  (i.e. Maximize Clicks, Maximize Conversions, Target CPA, etc.)
+  AND campaign_settings.search_rank_lost_is > 0.40
+  AND campaign_settings.daily_budget_usd < 15.0
+  THEN → emit ONE change_bid_strategy op with:
+    {"operation": "change_bid_strategy", "bid_strategy": "MANUAL_CPC",
+     "campaign_resource": <from data>, "search_rank_lost_is": <value>, "daily_budget_usd": <value>,
+     "reason": "Campaign is on [strategy] with $X/day budget — smart bidding cannot learn on sub-$15/day. Switching to Manual CPC enables competitive baseline bids during the learning window. search_rank_lost_is=[value] confirms [X]% of auctions are lost due to bid level."}
+  DO NOT emit a claude_advisory instead. DO NOT say "after day 30". EMIT THE OP NOW.
+
+CHECK 2 — MANUAL CPC TOO LOW (learning phase):
+  IF lifecycle.stage IN ('new', 'unknown')
+  AND campaign_settings.bidding_strategy_type == 'MANUAL_CPC'
+  AND campaign_settings.search_rank_lost_is > 0.40
+  AND campaign_settings.search_budget_lost_is < 0.20
+  AND any keyword has impressions >= 10
+  THEN → emit increase_bid ops for qualifying keywords:
+    new_bid_micros = round(current_bid_micros * 1.08), include current_bid_micros, search_rank_lost_is, search_budget_lost_is, impressions
+  DO NOT emit a claude_advisory instead. EMIT THE OPS NOW.
+
+=== END PRE-FLIGHT CHECKS ===
+
 Each recommendation MUST be a JSON object with these fields:
 - "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group | update_geo_targeting | claude_advisory
 - "reason": 1-2 sentence explanation with specific numbers from the data
@@ -2387,7 +2709,11 @@ For enable_keyword:
 
 For increase_bid / decrease_bid:
   "keyword_text": keyword, "resource_name": resource_name,
-  "new_bid_micros": integer (current bid ± 10-20%)
+  "new_bid_micros": integer (current bid ± 10-20%),
+  "current_bid_micros": integer (the keyword's current bid — required for learning-phase sieve),
+  "search_rank_lost_is": float (from campaign_settings — required for learning-phase sieve),
+  "search_budget_lost_is": float (from campaign_settings — required for learning-phase sieve),
+  "impressions": integer (keyword's 30d impressions — required for learning-phase sieve)
 
 For add_exact_keyword:
   "keyword_text": search term, "ad_group_resource": ad_group_resource from data
@@ -2406,10 +2732,12 @@ For change_budget:
   "campaign_resource": the campaign resource name from the data
 
 For change_bid_strategy:
-  "bid_strategy": "MAXIMIZE_CONVERSIONS"|"TARGET_CPA"|"TARGET_ROAS"|"MAXIMIZE_CLICKS",
+  "bid_strategy": "MAXIMIZE_CONVERSIONS"|"TARGET_CPA"|"TARGET_ROAS"|"MAXIMIZE_CLICKS"|"MANUAL_CPC",
   "target_cpa_micros": integer (only for TARGET_CPA),
   "target_roas": float (only for TARGET_ROAS),
-  "campaign_resource": campaign resource name
+  "campaign_resource": campaign resource name,
+  "search_rank_lost_is": float (from campaign_settings — required for learning-phase sieve),
+  "daily_budget_usd": float (from campaign_settings.daily_budget_usd — required for learning-phase sieve)
 
 For change_match_type:
   "keyword_text": keyword text,
@@ -2817,7 +3145,7 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
             logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
             # Lifecycle sieve — defense in depth: convert any violated ops to advisories
             _conv_30d = sum(k.get("conversions", 0) for k in keyword_perf)
-            sieved = _lifecycle_sieve(validated, lifecycle or {}, _conv_30d)
+            sieved = _lifecycle_sieve(validated, lifecycle or {}, _conv_30d, camp_settings or {})
             if len(sieved) != len(validated):
                 logger.info(
                     f"[lifecycle_sieve] {len(validated) - len(sieved)} ops blocked, "
@@ -4522,6 +4850,11 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
     elif strategy == "TARGET_ROAS":
         campaign.target_roas.target_roas = float(target_roas)
         paths = ["target_roas.target_roas"]
+    elif strategy == "MANUAL_CPC":
+        # Switch to Manual CPC by setting manual_cpc sub-message.
+        # enhanced_cpc_enabled = False ensures true manual bidding without eCPC override.
+        campaign.manual_cpc.enhanced_cpc_enabled = False
+        paths = ["manual_cpc.enhanced_cpc_enabled"]
     else:
         raise ValueError(f"Unknown bid strategy: {bid_strategy}")
 
@@ -4534,6 +4867,12 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
             operations=[operation],
         )
         logger.info(f"Changed bid strategy to {bid_strategy} for {campaign_resource}")
+        if strategy == "MANUAL_CPC":
+            logger.warning(
+                "[change_bid_strategy→MANUAL_CPC] Strategy switched. IMPORTANT: keyword bids may have "
+                "defaulted to ad-group level CPC. Verify keyword-level bids are set competitively "
+                "in Google Ads before the next auction cycle to avoid zero traffic."
+            )
         return True
     except Exception as e:
         logger.error(f"Failed to change bid strategy: {e}")
