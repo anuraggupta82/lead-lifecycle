@@ -3094,35 +3094,56 @@ async def gads_push_queued():
 
 
 @app.get("/api/admin/optimizer/account/recommendations", dependencies=[Depends(_require_admin)])
-def account_recommendations(status: str = "all", limit: int = 500):
+def account_recommendations(status: str = "all", limit: int = 100, offset: int = 0, search: str = ""):
     """
-    Return all recommendations across ALL campaigns (account-level view).
+    Return recommendations across ALL campaigns (account-level view).
     status: 'all' | 'pending_approval' | 'queued' | 'success' | 'rejected'
+    limit/offset: pagination (default 100 per page)
+    search: optional substring filter applied server-side on entity_name, operation, campaign_name
     """
     from database import _conn as _db_conn
-    import urllib.parse
     valid_statuses = {"all", "pending_approval", "queued", "success", "rejected", "expired"}
     if status not in valid_statuses:
         raise HTTPException(status_code=422, detail=f"Invalid status '{status}'")
 
+    search_lower = search.strip().lower()
+
     with _db_conn() as conn:
         if status == "all":
             # Always surface pending_approval rows first so they are never crowded
-            # out by the limit when there are many success/history rows in the DB.
+            # out by the limit when there are many history rows in the DB.
             pending_rows = conn.execute(
                 "SELECT * FROM gads_audit_log WHERE execution_result='pending_approval' ORDER BY priority ASC, created_at DESC",
             ).fetchall()
-            remaining = max(0, limit - len(pending_rows))
+            # Total history count for pagination metadata
+            total_history = conn.execute(
+                "SELECT COUNT(*) FROM gads_audit_log WHERE execution_result != 'pending_approval'"
+            ).fetchone()[0]
             history_rows = conn.execute(
-                "SELECT * FROM gads_audit_log WHERE execution_result != 'pending_approval' ORDER BY priority ASC, created_at DESC LIMIT ?",
-                (remaining,)
+                "SELECT * FROM gads_audit_log WHERE execution_result != 'pending_approval' ORDER BY priority ASC, created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset)
             ).fetchall()
             rows = list(pending_rows) + list(history_rows)
+            total_count = len(pending_rows) + total_history
         else:
-            rows = conn.execute(
-                "SELECT * FROM gads_audit_log WHERE execution_result=? ORDER BY priority ASC, created_at DESC LIMIT ?",
-                (status, limit)
-            ).fetchall()
+            # Apply search filter in SQL when possible
+            if search_lower:
+                total_count = conn.execute(
+                    "SELECT COUNT(*) FROM gads_audit_log WHERE execution_result=? AND (LOWER(entity_name) LIKE ? OR LOWER(operation) LIKE ? OR LOWER(campaign_name) LIKE ?)",
+                    (status, f"%{search_lower}%", f"%{search_lower}%", f"%{search_lower}%")
+                ).fetchone()[0]
+                rows = conn.execute(
+                    "SELECT * FROM gads_audit_log WHERE execution_result=? AND (LOWER(entity_name) LIKE ? OR LOWER(operation) LIKE ? OR LOWER(campaign_name) LIKE ?) ORDER BY priority ASC, created_at DESC LIMIT ? OFFSET ?",
+                    (status, f"%{search_lower}%", f"%{search_lower}%", f"%{search_lower}%", limit, offset)
+                ).fetchall()
+            else:
+                total_count = conn.execute(
+                    "SELECT COUNT(*) FROM gads_audit_log WHERE execution_result=?", (status,)
+                ).fetchone()[0]
+                rows = conn.execute(
+                    "SELECT * FROM gads_audit_log WHERE execution_result=? ORDER BY priority ASC, created_at DESC LIMIT ? OFFSET ?",
+                    (status, limit, offset)
+                ).fetchall()
 
     grouped = {}
     total_impact = 0.0
@@ -3147,6 +3168,12 @@ def account_recommendations(status: str = "all", limit: int = 500):
         "status_filter": status,
         "recommendations": grouped,
         "total": len(rows),
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "total_count": total_count,
+            "has_more": (offset + limit) < total_count,
+        },
         "summary": {
             "total_pending": sum(1 for r in rows if r["execution_result"] == "pending_approval"),
             "total_queued": sum(1 for r in rows if r["execution_result"] == "queued"),

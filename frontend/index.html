@@ -15804,6 +15804,10 @@ function AiOptimizerTab() {
   const [impactHistory, setImpactHistory] = React.useState([]);
   const [impactLoading, setImpactLoading] = React.useState(false);
   const [histFilter, setHistFilter] = React.useState('all');
+  const [histSearch, setHistSearch] = React.useState('');
+  const [histOffset, setHistOffset] = React.useState(0);
+  const [histHasMore, setHistHasMore] = React.useState(false);
+  const [histLoadingMore, setHistLoadingMore] = React.useState(false);
   const [histSelected, setHistSelected] = React.useState({});
   const [rejectModal, setRejectModal] = React.useState(null);      // {actionId, entity_name, operation}
   const [reclassifyModal, setReclassifyModal] = React.useState(null); // {action_id, entity_name, operation, campaign_name}
@@ -15827,11 +15831,39 @@ function AiOptimizerTab() {
     const silent = opts.silent || false;
     if (!silent) setLoading(true);
     try {
-      const d = await api('/api/admin/optimizer/account/recommendations?status=all&limit=500');
+      const d = await api('/api/admin/optimizer/account/recommendations?status=all&limit=100&offset=0');
       setRecs(d);
+      setHistOffset(0);
+      setHistHasMore(d.pagination?.has_more || false);
     } catch(e) { console.error('Recs load error', e); }
     finally { if (!silent) setLoading(false); }
   }, []);
+
+  const loadMoreHistory = React.useCallback(async () => {
+    setHistLoadingMore(true);
+    try {
+      const nextOffset = histOffset + 100;
+      const d = await api(`/api/admin/optimizer/account/recommendations?status=all&limit=100&offset=${nextOffset}`);
+      // Merge new history rows into existing recs (pending stays as-is, history appends)
+      setRecs(prev => {
+        if (!prev) return d;
+        const merged = {...prev};
+        const newRecs = d.recommendations || {};
+        Object.entries(newRecs).forEach(([op, items]) => {
+          // Only append non-pending items (history rows)
+          const histItems = items.filter(r => r.execution_result !== 'pending_approval');
+          if (histItems.length) {
+            merged.recommendations = {...merged.recommendations};
+            merged.recommendations[op] = [...(merged.recommendations[op] || []), ...histItems];
+          }
+        });
+        return merged;
+      });
+      setHistOffset(nextOffset);
+      setHistHasMore(d.pagination?.has_more || false);
+    } catch(e) { console.error('Load more error', e); }
+    finally { setHistLoadingMore(false); }
+  }, [histOffset]);
 
   const loadQueued = React.useCallback(async () => {
     try {
@@ -16804,16 +16836,26 @@ function AiOptimizerTab() {
 
       {/* ── HISTORY TAB ── */}
       {innerTab === 'history' && (() => {
+        const searchLower = histSearch.trim().toLowerCase();
 
         const filteredHistory = historyRecs.filter(r => {
-          if (histFilter === 'all') return true;
-          const isSuccess  = r.execution_result === 'success' || r.execution_result === 'advisory_applied';
-          const isRejected = (r.execution_result || '').startsWith('rejected') || r.execution_result === 'ignored';
-          const isError    = r.execution_result === 'error' || r.execution_result === 'failed';
-          if (histFilter === 'applied')  return isSuccess;
-          if (histFilter === 'ignored')  return isRejected;
-          if (histFilter === 'error')    return isError;
-          return true;
+          if (histFilter === 'all') {
+            // no status filter — just check search
+          } else {
+            const isSuccess  = r.execution_result === 'success' || r.execution_result === 'advisory_applied';
+            const isRejected = (r.execution_result || '').startsWith('rejected') || r.execution_result === 'ignored';
+            const isError    = r.execution_result === 'error' || r.execution_result === 'failed';
+            if (histFilter === 'applied'  && !isSuccess)  return false;
+            if (histFilter === 'ignored'  && !isRejected) return false;
+            if (histFilter === 'error'    && !isError)    return false;
+          }
+          if (!searchLower) return true;
+          return (
+            (r.entity_name  || '').toLowerCase().includes(searchLower) ||
+            (r.operation    || '').toLowerCase().includes(searchLower) ||
+            (r.campaign_name|| '').toLowerCase().includes(searchLower) ||
+            (r.reason       || '').toLowerCase().includes(searchLower)
+          );
         });
 
         const selectableIds = filteredHistory.filter(r => r.execution_result === 'error').map(r => r.action_id);
@@ -16844,7 +16886,7 @@ function AiOptimizerTab() {
         };
 
         const filterBtn = (key, label, color) => (
-          <button onClick={() => { setHistFilter(key); setHistSelected({}); }}
+          <button onClick={() => { setHistFilter(key); setHistSelected({}); setHistSearch(''); }}
             style={{padding:'4px 12px',borderRadius:20,fontSize:11,fontWeight:600,cursor:'pointer',
               border: histFilter === key ? `1.5px solid ${color}` : '1.5px solid var(--border)',
               background: histFilter === key ? color+'18' : 'var(--bg-card)',
@@ -16867,12 +16909,21 @@ function AiOptimizerTab() {
 
         return (
           <div>
-            {/* Filter bar */}
+            {/* Filter bar + search */}
             <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:10,flexWrap:'wrap'}}>
               {filterBtn('all',     'All',     '#64748b')}
               {filterBtn('applied', '✓ Applied', '#16a34a')}
               {filterBtn('ignored', '✕ Ignored', '#dc2626')}
               {filterBtn('error',   '⚠ Error',  '#b45309')}
+              <input
+                type="text"
+                placeholder="Search keyword, operation, campaign…"
+                value={histSearch}
+                onChange={e => setHistSearch(e.target.value)}
+                style={{marginLeft:'auto',padding:'4px 10px',fontSize:11,borderRadius:6,
+                  border:'1px solid var(--border)',outline:'none',width:240,
+                  background:'var(--bg-card)',color:'var(--text)'}}
+              />
             </div>
 
             {/* Bulk action bar — shown when errors exist in current filter */}
@@ -16902,7 +16953,7 @@ function AiOptimizerTab() {
             {loading && <div style={{color:'var(--text-muted)',fontSize:12,padding:'16px 0'}}>Loading history...</div>}
             {!loading && filteredHistory.length === 0 && (
               <div style={{textAlign:'center',padding:'32px 0',color:'var(--text-muted)',fontSize:13}}>
-                {histFilter === 'all' ? 'No optimization history yet.' : `No ${histFilter} items.`}
+                {searchLower ? `No results for "${histSearch}".` : histFilter === 'all' ? 'No optimization history yet.' : `No ${histFilter} items.`}
               </div>
             )}
             {!loading && filteredHistory.map(rec => {
@@ -16981,6 +17032,17 @@ function AiOptimizerTab() {
                 </div>
               );
             })}
+
+            {/* Load More */}
+            {!loading && histHasMore && !searchLower && (
+              <div style={{textAlign:'center',padding:'16px 0'}}>
+                <button onClick={loadMoreHistory} disabled={histLoadingMore}
+                  style={{padding:'6px 24px',borderRadius:6,fontSize:12,fontWeight:600,cursor:'pointer',
+                    border:'1px solid var(--border)',background:'var(--bg-card)',color:'var(--text-muted)'}}>
+                  {histLoadingMore ? 'Loading…' : 'Load more history'}
+                </button>
+              </div>
+            )}
           </div>
         );
       })()}

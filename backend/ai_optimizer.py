@@ -3356,6 +3356,29 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
                         item["values"] = values
                     # Mark this (campaign, asset_type) pair as seen for dedup
                     _add_asset_seen.add(_dedup_key)
+
+                # ── Recently-applied suppression ──────────────────────────────────────
+                # Don't re-surface an action that was successfully pushed in the last 14 days.
+                # Google's data takes 24-72h to reflect changes — re-suggesting too soon
+                # just creates noise and can double-apply bids/budgets.
+                # Exempt: claude_advisory (no side effects), add_negative_keyword (handled
+                # separately by _negative_already_handled), add_exact_keyword (adding again
+                # is harmless — Google dedupes), enable_keyword.
+                _exempt_from_recency = {"claude_advisory", "add_negative_keyword",
+                                        "add_exact_keyword", "enable_keyword"}
+                if op not in _exempt_from_recency:
+                    _entity = (
+                        item.get("keyword_text") or item.get("entity_name") or
+                        item.get("ad_group_name") or item.get("location_name") or
+                        item.get("headline") or item.get("insight", "")[:60]
+                    )
+                    _cr = item.get("campaign_resource", "") or campaign_resource
+                    if _was_recently_applied(op, _entity, campaign_resource=_cr, days=14):
+                        logger.info(
+                            f"Suppressing '{op}' for '{_entity}' — already applied within 14 days"
+                        )
+                        continue
+
                 validated.append(item)
             logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
             # Lifecycle sieve — defense in depth: convert any violated ops to advisories
@@ -3578,6 +3601,9 @@ def _call_claude_account_level(
     budget_constrained: bool = False,
     # campaign_name → daily_budget_usd map — used by budget sieve to allow decreases
     budget_by_campaign: dict | None = None,
+    # Campaign lifecycle map: campaign_name → build_lifecycle_block() dict
+    # Used to inject stage/age into camp_perf and enforce lifecycle-aware prompt rules
+    campaign_lifecycle_map: dict | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -3623,6 +3649,7 @@ def _call_claude_account_level(
         cross_camp_terms = {t: list(camps) for t, camps in term_campaigns.items() if len(camps) > 1}
 
         # Build per-campaign budget/performance summary
+        _lc_map = campaign_lifecycle_map or {}
         camp_perf = {}
         for cn, cr in camp_resources.items():
             kws = [k for k in all_keyword_perf if k.get("campaign","") == cn]
@@ -3634,6 +3661,7 @@ def _call_claude_account_level(
             if isinstance(od_production, dict):
                 by_camp = od_production.get("by_campaign", {})
                 prod = float(by_camp.get(cn, 0))
+            _lc = _lc_map.get(cn) or {}
             camp_perf[cn] = {
                 "campaign_resource": cr,
                 "spend_30d": round(spend, 2),
@@ -3642,6 +3670,10 @@ def _call_claude_account_level(
                 "booked_calls": booked,
                 "production": prod,
                 "daily_budget": campaign_spend.get(cn, {}).get("daily_budget_usd") if isinstance(campaign_spend.get(cn), dict) else None,
+                # Lifecycle awareness — used by account-level Claude to respect learning phase
+                "lifecycle_stage": _lc.get("stage", "unknown"),
+                "days_since_launch": _lc.get("days_since_launch"),
+                "in_learning_period": _lc.get("in_learning_period", True),  # conservative default
             }
 
         # Fetch call quality flags for account-level signal
@@ -3651,6 +3683,14 @@ def _call_claude_account_level(
             _call_quality_flags = get_call_flag_summary(days=30)
         except Exception as _cqf_err:
             logger.debug(f"call_flag_summary fetch failed (non-fatal): {_cqf_err}")
+
+        # GI-3: N-gram waste signals
+        _ngram_waste_signals: dict = {}
+        try:
+            from ngram_analysis import compute_ngram_waste
+            _ngram_waste_signals = compute_ngram_waste(days=30)
+        except Exception as _ngram_err:
+            logger.debug(f"ngram_analysis fetch failed (non-fatal): {_ngram_err}")
 
         # Read account budget constraint
         _account_budget = 0.0
@@ -3685,6 +3725,8 @@ def _call_claude_account_level(
             "lqi": _build_lqi_account_summary(lqi or {}),
             # PR 5: account-wide competitor intel
             "competitor_intel_union": competitor_intel_union or {},
+            # GI-3: N-gram waste signals
+            "ngram_waste_signals": _ngram_waste_signals,
         }
 
         # Account-level: use aggregate summary, no specific camp_settings
@@ -3856,12 +3898,47 @@ The "lqi" field in the account data contains pre-computed quality signals across
    - If no_show_median > 14 days, flag the long booking lag as a likely no-show driver.
    - lqi.no_shows.reminders.no_show_no_reminders_pct: if > 0.50, flag as critical — no-shows not receiving reminders.
 
+ACCOUNT-LEVEL LIFECYCLE AWARENESS (MANDATORY):
+Each campaign in "campaign_performance" has three lifecycle fields:
+  - lifecycle_stage: "new" (≤30d) | "ramping" (31–90d) | "mature" (>90d) | "unknown"
+  - days_since_launch: integer days since first launch (null if unknown)
+  - in_learning_period: bool — true when stage is new/unknown OR ramping + thin data
+
+RULES FOR ACCOUNT-LEVEL RECOMMENDATIONS:
+1. NEVER recommend change_bid_strategy, change_budget (increase), or pause_ad_group for a campaign
+   where in_learning_period = true. These reset the learning phase. Downgrade to claude_advisory.
+2. For "new" campaigns (stage = "new" or days_since_launch < 30):
+   - Cross-campaign negative keyword additions ARE allowed (negatives don't reset learning).
+   - Do NOT cite poor CPA or low conversion rate as justification for structural changes —
+     the campaign has not had enough time to collect valid data.
+   - DO flag if a new campaign shows alarming waste signals (high spend, 0 clicks) as advisory.
+3. For "ramping" campaigns (31–90d, in_learning_period = false):
+   - Tactical changes (bid adjustments, negatives) are allowed.
+   - Strategy switches (change_bid_strategy) require conversions_30d >= 15 — check campaign_performance.
+4. For "mature" campaigns (>90d): all cross-campaign account-level operations are allowed.
+5. When blocking an operation due to lifecycle, emit claude_advisory with reason starting:
+   "LIFECYCLE_BLOCKED (account-level): [operation] on [campaign_name] — [reason]"
+
 ACCOUNT-WIDE COMPETITOR INTELLIGENCE (from campaign creation wizard data):
 The "competitor_intel_union" field contains the union of all conquest keywords and differentiators across all managed campaigns.
 - all_conquest_keywords: these are INTENTIONAL competitor brand targets — NEVER recommend them as cross-campaign add_negative_keyword.
 - all_differentiators: the practice's committed positioning themes — use these when writing account-wide advisory framing.
 - by_campaign: per-campaign breakdown for reference.
-If you see a search term that appears in all_conquest_keywords, treat it as intentional targeting, not waste.""" + _build_institutional_memory_note("")
+If you see a search term that appears in all_conquest_keywords, treat it as intentional targeting, not waste.
+
+N-GRAM WASTE ANALYSIS (GI-3):
+The "ngram_waste_signals" field contains statistical patterns across ALL non-converting search terms.
+- "unigrams": single tokens that appear across many non-converting search terms with significant total waste.
+- "bigrams": two-word phrases that appear across many non-converting search terms with significant total waste.
+- Each entry has: token, total_waste (USD), distinct_terms (# unique search terms containing it), example_terms.
+USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
+- A unigram or bigram with distinct_terms ≥ 3 AND total_waste ≥ $15 is a strong candidate for a cross-campaign broad negative.
+- Before recommending, check "all_conquest_keywords" — never negate a conquest keyword.
+- Also check "existing_negative_keywords" — skip if already negated.
+- Prefer bigrams over unigrams when the bigram captures the intent more precisely.
+- Highly service-relevant tokens (implant, invisalign, crown, emergency, etc.) are pre-filtered — do not appear in ngram signals.
+- Generate add_negative_keyword with match_type "broad" for the strongest candidates (top 3–5 by waste).
+- The "reason" field should cite: total_waste, distinct_terms, and a sample of example_terms.""" + _build_institutional_memory_note("")
 
         msg = client.messages.create(
             model="claude-sonnet-4-5",
@@ -3940,6 +4017,22 @@ If you see a search term that appears in all_conquest_keywords, treat it as inte
                 if op == "change_budget" and not item.get("new_daily_budget_usd"):
                     logger.warning("Account-level: dropping change_budget — missing new_daily_budget_usd")
                     continue
+
+                # Recently-applied suppression (account-level)
+                _exempt_acct = {"claude_advisory", "add_negative_keyword",
+                                 "add_exact_keyword", "enable_keyword"}
+                if op not in _exempt_acct:
+                    _entity_acct = (
+                        item.get("keyword_text") or item.get("entity_name") or
+                        item.get("ad_group_name") or item.get("insight", "")[:60]
+                    )
+                    _cr_acct = item.get("campaign_resource", "")
+                    if _was_recently_applied(op, _entity_acct, campaign_resource=_cr_acct, days=14):
+                        logger.info(
+                            f"Account-level: suppressing '{op}' for '{_entity_acct}' — applied within 14 days"
+                        )
+                        continue
+
                 validated.append(item)
             logger.info(f"Account-level Claude returned {len(arr)} recs, {len(validated)} passed validation")
             # Budget constraint sieve — block change_budget increases at account level too
@@ -6492,6 +6585,57 @@ def _negative_already_handled(keyword_text: str, campaign_name: str,
     return False
 
 
+def _was_recently_applied(operation: str, entity_name: str,
+                           campaign_resource: str = "",
+                           days: int = 14) -> bool:
+    """
+    Return True if the same (operation, entity_name) was successfully applied
+    within the last `days` days for the same campaign.
+
+    Prevents Claude from re-recommending actions that were just approved and
+    pushed — e.g. a bid increase that was applied yesterday coming back today
+    because the performance data hasn't fully reflected the change yet.
+
+    entity_name is lowercased for comparison.
+    campaign_resource is optional — if provided, scopes the check to that campaign.
+    """
+    entity_lower = (entity_name or "").strip().lower()
+    if not entity_lower:
+        return False
+    try:
+        from database import _conn
+        with _conn() as conn:
+            if campaign_resource:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM gads_audit_log
+                     WHERE operation = ?
+                       AND LOWER(entity_name) = ?
+                       AND campaign_resource = ?
+                       AND execution_result = 'success'
+                       AND created_at >= datetime('now', ?)
+                     LIMIT 1
+                    """,
+                    (operation, entity_lower, campaign_resource, f"-{days} days"),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM gads_audit_log
+                     WHERE operation = ?
+                       AND LOWER(entity_name) = ?
+                       AND execution_result = 'success'
+                       AND created_at >= datetime('now', ?)
+                     LIMIT 1
+                    """,
+                    (operation, entity_lower, f"-{days} days"),
+                ).fetchone()
+            return row is not None
+    except Exception as e:
+        logger.debug(f"Recently-applied check failed for op={operation} entity='{entity_name}': {e}")
+        return False
+
+
 # ── Main Entry Point ─────────────────────────────────────────────────────────
 
 def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> dict:
@@ -7987,6 +8131,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         competitor_intel_union=_competitor_intel_union,
         budget_constrained=_budget_constrained,
         budget_by_campaign=_acct_budget_by_campaign if _budget_constrained else None,
+        campaign_lifecycle_map=_rule_lifecycle_by_camp,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")
