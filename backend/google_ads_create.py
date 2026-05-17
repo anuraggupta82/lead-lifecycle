@@ -709,7 +709,10 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         # All keywords from build (flat lists)
         exact_kws  = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("exact_match", [])]
         phrase_kws = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("phrase_match", [])]
-        broad_kws  = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("broad_match_modifier", [])]
+        # BMM (+keyword) was deprecated by Google in 2021 — strip leading + from each word
+        # and submit as plain BROAD match. The API hard-rejects any keyword containing +.
+        _raw_broad = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("broad_match_modifier", [])]
+        broad_kws  = [" ".join(w.lstrip("+") for w in kw.split()) for kw in _raw_broad]
         neg_kws_raw = [k if isinstance(k, str) else k.get("keyword","") for k in kw_data.get("negative_keywords", [])]
         # Google Ads rejects negatives with more than 10 words (KEYWORD_HAS_TOO_MANY_WORDS)
         neg_kws = [kw for kw in neg_kws_raw if kw.strip() and len(kw.split()) <= 10]
@@ -789,7 +792,8 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
                 c  = op.create
                 c.ad_group = ag_resource
                 c.status   = client.enums.AdGroupCriterionStatusEnum.ENABLED
-                c.keyword.text       = kw.strip()
+                # Defensive: strip any residual + (BMM deprecated 2021, API rejects it)
+                c.keyword.text       = " ".join(w.lstrip("+") for w in kw.strip().split())
                 c.keyword.match_type = match_enum.BROAD
                 kw_ops.append(op)
 
@@ -1069,6 +1073,74 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
         else:
             log.append("Step 8c: No ad schedule configured — ads run 24/7")
 
+        # ── Step 8d: Attach shared negative keyword lists ─────────────────────
+        log.append("Step 8d: Attaching account shared negative keyword lists")
+        _neg_list_logs = _attach_shared_negative_lists(client, customer_id, camp_resource)
+        log.extend(_neg_list_logs)
+
+        # ── Step 8e: Callouts + Structured Snippets from campaign_build_json ──
+        # If the campaign wizard (or AI optimizer) saved callouts/structured_snippets
+        # into campaign_build_json, we attach them automatically at launch time.
+        # Schema:
+        #   build["callout_texts"]        = ["text1", "text2", ...]  (3–10 strings)
+        #   build["structured_snippets"]  = [{"header": "...", "values": [...]}, ...]
+        _callout_texts = build.get("callout_texts") or []
+        if isinstance(_callout_texts, str):
+            try:
+                _callout_texts = json.loads(_callout_texts)
+            except Exception:
+                _callout_texts = []
+        # Filter to strings only before passing to add_callouts_to_campaign (HIGH-3)
+        _callout_texts = [t for t in _callout_texts if isinstance(t, str) and t.strip()][:10]
+        if len(_callout_texts) >= 3:
+            log.append(f"Step 8e: Adding {len(_callout_texts)} callout(s) from campaign build")
+            try:
+                _cl_result = add_callouts_to_campaign(camp_resource, _callout_texts, customer_id)
+                if _cl_result["ok"]:
+                    log.append(f"  ✓ {_cl_result['count']} callout(s) linked to campaign")
+                else:
+                    log.append(f"  ⚠ Callouts Step 8e failed (non-fatal): {'; '.join(_cl_result.get('errors') or [])}")
+                for _cle in (_cl_result.get("errors") or []):
+                    log.append(f"    • {_cle}")
+            except Exception as _clex:
+                log.append(f"  ⚠ Callouts Step 8e exception (non-fatal): {_clex}")
+                logger.warning(f"create_campaign_in_gads Step 8e callouts failed: {_clex}")
+        else:
+            log.append("Step 8e: No callouts in campaign build — skipping")
+
+        _snippets = build.get("structured_snippets") or []
+        if isinstance(_snippets, str):
+            try:
+                _snippets = json.loads(_snippets)
+            except Exception:
+                _snippets = []
+        if _snippets:
+            from ai_optimizer import VALID_SNIPPET_HEADERS as _VALID_SNIPPET_HEADERS
+            log.append(f"Step 8e: Adding {len(_snippets)} structured snippet(s) from campaign build")
+            for _snip in _snippets:
+                # HIGH-2: guard against non-dict entries (e.g. list of strings)
+                if not isinstance(_snip, dict):
+                    log.append(f"  ⚠ Skipping snippet — not a dict: {_snip!r}")
+                    continue
+                _hdr = (_snip.get("header") or "").strip()
+                _vals = [v for v in (_snip.get("values") or []) if isinstance(v, str) and v.strip()]
+                # HIGH-1: validate header against Google's required list
+                if not _hdr or _hdr not in _VALID_SNIPPET_HEADERS or len(_vals) < 3:
+                    log.append(
+                        f"  ⚠ Skipping snippet — invalid/missing header or <3 values "
+                        f"(header={_hdr!r}, values={len(_vals)})"
+                    )
+                    continue
+                try:
+                    _sn_result = add_structured_snippet_to_campaign(camp_resource, _hdr, _vals, customer_id)
+                    if _sn_result["ok"]:
+                        log.append(f"  ✓ Snippet '{_hdr}' linked to campaign ({len(_vals)} values)")
+                    else:
+                        log.append(f"  ⚠ Snippet '{_hdr}' failed (non-fatal): {'; '.join(_sn_result.get('errors') or [])}")
+                except Exception as _snex:
+                    log.append(f"  ⚠ Snippet '{_hdr}' exception (non-fatal): {_snex}")
+                    logger.warning(f"create_campaign_in_gads Step 8e snippet failed: {_snex}")
+
         # ── Step 9: Enable campaign ───────────────────────────────────────────
         log.append("Step 9: Enabling campaign (PAUSED → ENABLED)")
         enable_result = set_campaign_status(camp_resource, "ENABLED")
@@ -1172,6 +1244,72 @@ def _build_client():
         "login_customer_id":  settings.google_ads_login_customer_id,
         "use_proto_plus":     True,
     })
+
+
+def _attach_shared_negative_lists(client, customer_id: str, camp_resource: str) -> list[str]:
+    """
+    Attach all account-level shared negative keyword lists to a newly created campaign.
+    Returns a list of log strings describing what was done.
+    Non-fatal — any exception is caught and returned as a warning log entry.
+    """
+    logs = []
+    try:
+        ga_service = client.get_service("GoogleAdsService")
+
+        # Fetch all enabled shared negative keyword lists in the account
+        list_query = """
+            SELECT shared_set.resource_name, shared_set.name
+            FROM shared_set
+            WHERE shared_set.type = 'NEGATIVE_KEYWORDS'
+              AND shared_set.status = 'ENABLED'
+        """
+        list_rows = list(ga_service.search(customer_id=customer_id, query=list_query))
+        if not list_rows:
+            logs.append("  ⓘ No shared negative keyword lists found in account — skipping")
+            return logs
+
+        # Check which lists are already linked to this campaign (idempotency)
+        already_linked = set()
+        link_query = f"""
+            SELECT campaign_shared_set.shared_set
+            FROM campaign_shared_set
+            WHERE campaign_shared_set.campaign = '{camp_resource}'
+        """
+        try:
+            link_rows = list(ga_service.search(customer_id=customer_id, query=link_query))
+            already_linked = {row.campaign_shared_set.shared_set for row in link_rows}
+        except Exception:
+            pass  # If check fails, attempt to link anyway (mutate handles duplicates)
+
+        css_service = client.get_service("CampaignSharedSetService")
+        link_ops = []
+        names_to_link = []
+        for row in list_rows:
+            ss_rn = row.shared_set.resource_name
+            ss_name = row.shared_set.name
+            if ss_rn in already_linked:
+                logs.append(f"  ⓘ '{ss_name}' already linked — skipped")
+                continue
+            op = client.get_type("CampaignSharedSetOperation")
+            op.create.campaign = camp_resource
+            op.create.shared_set = ss_rn
+            link_ops.append(op)
+            names_to_link.append(ss_name)
+
+        if link_ops:
+            css_service.mutate_campaign_shared_sets(
+                customer_id=customer_id, operations=link_ops
+            )
+            for name in names_to_link:
+                logs.append(f"  ✓ Attached shared negative list: '{name}'")
+        else:
+            logs.append("  ⓘ All shared negative lists already linked")
+
+    except Exception as e:
+        logs.append(f"  ⚠ Shared negative list attach failed (non-fatal): {e}")
+        logger.warning(f"_attach_shared_negative_lists failed for {camp_resource}: {e}")
+
+    return logs
 
 
 def _remove_existing_campaign_sitelinks(campaign_resource_name: str, client, customer_id: str) -> int:
@@ -1343,6 +1481,200 @@ def add_sitelinks_to_campaign(campaign_resource_name: str, sitelinks: list, cust
 
     except Exception as e:
         logger.error(f"add_sitelinks_to_campaign failed: {e}")
+        return {"ok": False, "count": 0, "errors": [str(e)]}
+
+
+def add_callouts_to_campaign(
+    campaign_resource_name: str,
+    callout_texts: list[str],
+    customer_id: str | None = None,
+) -> dict:
+    """
+    Create CalloutAsset assets and link them to an existing campaign.
+
+    Two-pass: create all assets in one mutate, then link all to the campaign.
+    Kill-switch guarded. Non-fatal — returns {"ok", "count", "errors"}.
+
+    Args:
+        campaign_resource_name: Full resource name e.g. "customers/.../campaigns/..."
+        callout_texts: 3–10 strings, each ≤25 chars (pre-validated by caller)
+        customer_id: Digits-only string. If None, loaded from settings.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        logger.warning(f"add_callouts_to_campaign blocked by kill switch: {e}")
+        return {"ok": False, "count": 0, "errors": [str(e)]}
+
+    settings = get_settings()
+    if not customer_id:
+        customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    if not customer_id:
+        return {"ok": False, "count": 0, "errors": ["google_ads_customer_id not configured"]}
+
+    camp_id_suffix = campaign_resource_name.split("/campaigns/")[-1]
+    errors: list[str] = []
+
+    try:
+        client = _build_client()
+        asset_service = client.get_service("AssetService")
+        camp_asset_service = client.get_service("CampaignAssetService")
+
+        # ── Pass 1: Create all callout assets in one batch ───────────────────────
+        asset_ops = []
+        valid_texts: list[str] = []
+        for text in callout_texts:
+            if not isinstance(text, str):
+                errors.append(f"Callout skipped — non-string item: {text!r}")
+                continue
+            text = text.strip()[:25]
+            if not text:
+                errors.append("Callout skipped — empty text after sanitization")
+                continue
+            asset_op = client.get_type("AssetOperation")
+            asset = asset_op.create
+            asset.name = f"Camp {camp_id_suffix} Callout — {text}"
+            asset.callout_asset.callout_text = text
+            asset_ops.append(asset_op)
+            valid_texts.append(text)
+
+        if not asset_ops:
+            return {"ok": False, "count": 0, "errors": errors or ["No valid callout texts"]}
+
+        # Google allows max 10 callout assets per campaign — cap defensively
+        if len(asset_ops) > 10:
+            logger.warning(f"add_callouts_to_campaign: capping {len(asset_ops)} callouts to 10")
+            asset_ops = asset_ops[:10]
+            valid_texts = valid_texts[:10]
+
+        asset_response = asset_service.mutate_assets(
+            customer_id=customer_id,
+            operations=asset_ops,
+        )
+
+        asset_resources: list[str] = []
+        for i, result in enumerate(asset_response.results):
+            rn = result.resource_name
+            if rn:
+                asset_resources.append(rn)
+            else:
+                label = valid_texts[i] if i < len(valid_texts) else f"index {i}"
+                errors.append(f"Asset create returned empty resource for callout '{label}'")
+
+        if not asset_resources:
+            return {"ok": False, "count": 0, "errors": errors}
+
+        # ── Pass 2: Link all callout assets to the campaign ──────────────────────
+        link_ops = []
+        for asset_rn in asset_resources:
+            link_op = client.get_type("CampaignAssetOperation")
+            link = link_op.create
+            link.campaign = campaign_resource_name
+            link.asset = asset_rn
+            link.field_type = client.enums.AssetFieldTypeEnum.CALLOUT
+            link_ops.append(link_op)
+
+        link_response = camp_asset_service.mutate_campaign_assets(
+            customer_id=customer_id,
+            operations=link_ops,
+        )
+
+        linked_count = sum(1 for r in link_response.results if r.resource_name)
+        logger.info(f"add_callouts_to_campaign: {linked_count} callout(s) linked to {campaign_resource_name}")
+        return {"ok": True, "count": linked_count, "errors": errors}
+
+    except Exception as e:
+        logger.error(f"add_callouts_to_campaign failed: {e}")
+        return {"ok": False, "count": 0, "errors": [str(e)]}
+
+
+def add_structured_snippet_to_campaign(
+    campaign_resource_name: str,
+    header: str,
+    values: list[str],
+    customer_id: str | None = None,
+) -> dict:
+    """
+    Create a single StructuredSnippetAsset and link it to an existing campaign.
+
+    One asset per header (Google allows only one snippet per header per campaign).
+    Kill-switch guarded. Non-fatal — returns {"ok", "count", "errors"}.
+
+    Args:
+        campaign_resource_name: Full resource name e.g. "customers/.../campaigns/..."
+        header: Exact Google-required header string, e.g. "Service catalog", "Types"
+                Must be one of VALID_SNIPPET_HEADERS defined in ai_optimizer.py.
+        values: 3–10 strings, each ≤25 chars (pre-validated by caller)
+        customer_id: Digits-only string. If None, loaded from settings.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        logger.warning(f"add_structured_snippet_to_campaign blocked by kill switch: {e}")
+        return {"ok": False, "count": 0, "errors": [str(e)]}
+
+    settings = get_settings()
+    if not customer_id:
+        customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    if not customer_id:
+        return {"ok": False, "count": 0, "errors": ["google_ads_customer_id not configured"]}
+
+    camp_id_suffix = campaign_resource_name.split("/campaigns/")[-1]
+    errors: list[str] = []
+
+    try:
+        client = _build_client()
+        asset_service = client.get_service("AssetService")
+        camp_asset_service = client.get_service("CampaignAssetService")
+
+        # ── Pass 1: Create the structured snippet asset ───────────────────────────
+        # Google structured snippets: one asset holds the header + all values.
+        clean_values = [v.strip()[:25] for v in values if isinstance(v, str) and v.strip()]
+        if len(clean_values) < 3:
+            return {
+                "ok": False, "count": 0,
+                "errors": [f"Structured snippet needs ≥3 values, got {len(clean_values)}"],
+            }
+        clean_values = clean_values[:10]  # hard cap
+
+        asset_op = client.get_type("AssetOperation")
+        asset = asset_op.create
+        asset.name = f"Camp {camp_id_suffix} Snippet — {header}"
+        asset.structured_snippet_asset.header = header
+        asset.structured_snippet_asset.values.extend(clean_values)
+
+        asset_response = asset_service.mutate_assets(
+            customer_id=customer_id,
+            operations=[asset_op],
+        )
+
+        asset_rn = asset_response.results[0].resource_name if asset_response.results else ""
+        if not asset_rn:
+            return {"ok": False, "count": 0, "errors": ["Asset create returned empty resource"]}
+
+        # ── Pass 2: Link the asset to the campaign ───────────────────────────────
+        link_op = client.get_type("CampaignAssetOperation")
+        link = link_op.create
+        link.campaign = campaign_resource_name
+        link.asset = asset_rn
+        link.field_type = client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET
+
+        link_response = camp_asset_service.mutate_campaign_assets(
+            customer_id=customer_id,
+            operations=[link_op],
+        )
+
+        linked_count = sum(1 for r in link_response.results if r.resource_name)
+        logger.info(
+            f"add_structured_snippet_to_campaign: '{header}' snippet linked to {campaign_resource_name} "
+            f"({len(clean_values)} values)"
+        )
+        return {"ok": True, "count": linked_count, "errors": errors}
+
+    except Exception as e:
+        logger.error(f"add_structured_snippet_to_campaign failed: {e}")
         return {"ok": False, "count": 0, "errors": [str(e)]}
 
 

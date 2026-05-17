@@ -520,7 +520,7 @@ def remove_negative_keyword_from_campaign(
 
     # Step 1: find the criterion resource_name
     # Escape single quotes for GAQL by doubling them
-    _kw_escaped = keyword_text.replace("'", "''")
+    _kw_escaped = keyword_text.replace("'", "\\'")
     # Note: campaign_criterion.type is an enum — must NOT be quoted in GAQL.
     # Filter by match_type to avoid removing the wrong criterion when the same
     # text exists as both PHRASE and EXACT negatives.
@@ -549,7 +549,7 @@ def remove_negative_keyword_from_campaign(
             f"remove_negative_keyword_from_campaign: '{keyword_text}' not found on "
             f"{campaign_resource} — idempotent success"
         )
-        return True  # already absent — idempotent
+        return 0  # already absent — idempotent
 
     # Step 2: remove the criterion
     service = client.get_service("CampaignCriterionService")
@@ -564,9 +564,76 @@ def remove_negative_keyword_from_campaign(
         logger.info(
             f"Removed negative '{keyword_text}' [{match_type}] from {campaign_resource}"
         )
-        return True
+        return 1  # count: 1 criterion removed
     except Exception as e:
         logger.error(f"remove_negative_keyword_from_campaign mutate failed: {e}")
+        raise
+
+
+def remove_positive_keyword_from_campaign(
+    campaign_resource: str,
+    keyword_text: str,
+    match_type: str,
+) -> int:
+    """
+    Remove all ad-group-level positive keyword criteria matching keyword_text + match_type
+    across every ad group in the campaign. Returns the count of criteria removed.
+
+    Positive keywords live on ad groups (AdGroupCriterion), not the campaign itself,
+    so we query across all ad groups and batch-remove every match.
+    """
+    match_type = (match_type or "EXACT").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise ValueError(f"Invalid match_type '{match_type}'")
+
+    customer_id = _customer_id_from_resource(campaign_resource)
+    client = _build_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    _kw_escaped = keyword_text.replace("'", "\\'")
+    query = f"""
+        SELECT ad_group_criterion.resource_name
+        FROM ad_group_criterion
+        WHERE campaign.resource_name = '{campaign_resource}'
+          AND ad_group_criterion.negative = FALSE
+          AND ad_group_criterion.keyword.text = '{_kw_escaped}'
+          AND ad_group_criterion.keyword.match_type = {match_type}
+          AND ad_group_criterion.type = KEYWORD
+          AND ad_group_criterion.status != 'REMOVED'
+    """
+    try:
+        response = ga_service.search(customer_id=customer_id, query=query)
+        resource_names = [row.ad_group_criterion.resource_name for row in response]
+    except Exception as e:
+        logger.error(f"remove_positive_keyword_from_campaign GAQL failed: {e}")
+        raise
+
+    if not resource_names:
+        logger.info(
+            f"remove_positive_keyword_from_campaign: '{keyword_text}' [{match_type}] "
+            f"not found in {campaign_resource} — idempotent success"
+        )
+        return 0
+
+    agc_service = client.get_service("AdGroupCriterionService")
+    operations = []
+    for rn in resource_names:
+        op = client.get_type("AdGroupCriterionOperation")
+        op.remove = rn
+        operations.append(op)
+
+    try:
+        agc_service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=operations,
+        )
+        logger.info(
+            f"Removed {len(operations)} positive criterion(s) for '{keyword_text}' "
+            f"[{match_type}] from {campaign_resource}"
+        )
+        return len(operations)
+    except Exception as e:
+        logger.error(f"remove_positive_keyword_from_campaign mutate failed: {e}")
         raise
 
 

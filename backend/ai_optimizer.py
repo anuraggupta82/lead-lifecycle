@@ -179,7 +179,8 @@ LIFECYCLE_RULES = """
 The "lifecycle" field in the campaign data contains: stage, days_since_launch, in_learning_period.
 
 STAGE = new (days_since_launch <= 30) OR stage = unknown:
-  ALLOWED operations: add_negative_keyword, claude_advisory, increase_bid (with strict conditions below),
+  ALLOWED operations: add_negative_keyword, claude_advisory, add_asset,
+                      increase_bid (with strict conditions below),
                       change_bid_strategy → MANUAL_CPC (with strict conditions below)
   FORBIDDEN: decrease_bid, pause_keyword, add_exact_keyword,
              replace_ad, pause_ad_group, update_geo_targeting,
@@ -190,6 +191,10 @@ STAGE = new (days_since_launch <= 30) OR stage = unknown:
           learning phase. However, if a campaign launched on a smart bidding strategy
           with a budget too thin to feed it, the smart bidder starves and collects no
           data — which is worse than switching to Manual CPC temporarily.
+  add_asset NOTE: Callouts and structured snippets (add_asset) are ALWAYS allowed at
+          any lifecycle stage — they are zero-cost, do NOT reset the learning phase,
+          and improve ad real estate and CTR. ALWAYS recommend add_asset if callouts
+          or snippets are missing, regardless of stage.
   increase_bid RULE DURING NEW STAGE — two mandatory branches:
 
   BRANCH A — MUST emit increase_bid (not claude_advisory) when ALL of the following are true:
@@ -262,10 +267,11 @@ change_budget or update_geo_targeting in the same run.
 
 RULE 4 — CONCENTRATE SPEND ON SIGNAL, DON'T EXPLORE:
 For campaigns with daily_budget_usd < 15:
-- Recommend pause_keyword for keywords with impressions >= 50 AND clicks == 0
-- Recommend pause_keyword for keywords with impressions >= 200 AND conversions == 0
+- Emit claude_advisory recommending pause of keywords with impressions >= 50 AND clicks == 0
+  (reason: "CONCENTRATION: keyword has X impressions but 0 clicks — recommend pausing after day 30")
+- Emit claude_advisory recommending pause of keywords with impressions >= 200 AND conversions == 0
 - DO NOT recommend adding new keywords or match type expansion
-- DO NOT pause keywords with impressions < 30 (insufficient signal)
+- DO NOT flag keywords with impressions < 30 (insufficient signal to judge)
 Concentrate the limited budget on keywords with any positive signal.
 
 RULE 5 — DO NOT TREAT AD COPY AS A BID FIX:
@@ -287,6 +293,20 @@ If a keyword has exactly 1 conversion, treat it as promising but unconfirmed.
 
 === END LEARNING PHASE DIAGNOSTIC RULES ===
 """
+
+# ── Valid structured snippet headers (Google's fixed approved list) ───────────
+# These are the EXACT strings Google Ads accepts for structured_snippet_asset.header
+# (case-sensitive). Submitting any other string → STRUCTURED_SNIPPET_INVALID_HEADER error.
+VALID_SNIPPET_HEADERS = {
+    "Amenities", "Brands", "Courses", "Degree programs", "Destinations",
+    "Featured hotels", "Insurance coverage", "Models", "Neighborhoods",
+    "Service catalog", "Shows", "Styles", "Types",
+}
+# For dental practices the most useful are:
+#   "Service catalog" — list treatments offered
+#   "Insurance coverage" — list accepted insurances
+#   "Types" — sub-types of a service (e.g. implant types)
+
 
 # ── Negative keyword signals (module-level so all functions can use them) ─────
 
@@ -888,6 +908,9 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
     end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=days)
 
+    # Quality score enum mapping (Google Ads API enum value → string)
+    _qs_map = {0: None, 1: "UNKNOWN", 2: "BELOW_AVERAGE", 3: "AVERAGE", 4: "ABOVE_AVERAGE"}
+
     query = f"""
         SELECT
             ad_group_criterion.keyword.text,
@@ -896,6 +919,10 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
             ad_group_criterion.resource_name,
             ad_group_criterion.effective_cpc_bid_micros,
             ad_group_criterion.cpc_bid_micros,
+            ad_group_criterion.quality_info.quality_score,
+            ad_group_criterion.quality_info.creative_quality_score,
+            ad_group_criterion.quality_info.post_click_quality_score,
+            ad_group_criterion.quality_info.search_predicted_ctr,
             ad_group.name,
             ad_group.resource_name,
             campaign.name,
@@ -913,31 +940,56 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
     """
 
     results = []
+    # Aggregate per keyword (same keyword appears multiple times with date segmentation)
+    agg: dict = {}
     try:
         response = service.search(customer_id=customer_id, query=query)
         for row in response:
+            kw_text = row.ad_group_criterion.keyword.text
+            if not kw_text:
+                continue
             cost = (row.metrics.cost_micros or 0) / 1_000_000.0
             clicks = row.metrics.clicks or 0
             # Use cpc_bid_micros (manual CPC) if set; fall back to effective_cpc
             current_bid = (row.ad_group_criterion.cpc_bid_micros or
                            row.ad_group_criterion.effective_cpc_bid_micros or 0)
-            results.append({
-                "keyword": row.ad_group_criterion.keyword.text,
-                "match_type": str(row.ad_group_criterion.keyword.match_type),
-                "status": str(row.ad_group_criterion.status),
-                "resource_name": row.ad_group_criterion.resource_name,
-                "current_bid_micros": current_bid,
-                "ad_group": row.ad_group.name,
-                "ad_group_resource": row.ad_group.resource_name,
-                "campaign": row.campaign.name,
-                "campaign_resource": row.campaign.resource_name,
-                "impressions": row.metrics.impressions or 0,
-                "clicks": clicks,
-                "cost": cost,
-                "cpc": cost / clicks if clicks > 0 else 0,
-                "conversions": row.metrics.conversions or 0,
-                "conversion_value": row.metrics.conversions_value or 0,
-            })
+            # Dedup key: criterion resource_name is globally unique per kw+match_type+ad_group.
+            # Using it (rather than kw_text+ad_group) handles the case where the same keyword
+            # text exists with multiple match types in the same ad group.
+            key = row.ad_group_criterion.resource_name
+            if key not in agg:
+                qi = row.ad_group_criterion.quality_info
+                agg[key] = {
+                    "keyword": kw_text,
+                    "match_type": str(row.ad_group_criterion.keyword.match_type),
+                    "status": str(row.ad_group_criterion.status),
+                    "resource_name": row.ad_group_criterion.resource_name,
+                    "current_bid_micros": current_bid,
+                    "ad_group": row.ad_group.name,
+                    "ad_group_resource": row.ad_group.resource_name,
+                    "campaign": row.campaign.name,
+                    "campaign_resource": row.campaign.resource_name,
+                    "impressions": 0,
+                    "clicks": 0,
+                    "cost": 0.0,
+                    "conversions": 0.0,
+                    "conversion_value": 0.0,
+                    # Quality Score fields — not day-segmentable; take first non-None value
+                    "quality_score": qi.quality_score or None,
+                    "ad_relevance": _qs_map.get(int(qi.creative_quality_score) if qi.creative_quality_score else 0),
+                    "landing_page_experience": _qs_map.get(int(qi.post_click_quality_score) if qi.post_click_quality_score else 0),
+                    "expected_ctr_qs": _qs_map.get(int(qi.search_predicted_ctr) if qi.search_predicted_ctr else 0),
+                }
+            agg[key]["impressions"] += row.metrics.impressions or 0
+            agg[key]["clicks"] += clicks
+            agg[key]["cost"] += cost
+            agg[key]["conversions"] += row.metrics.conversions or 0
+            agg[key]["conversion_value"] += row.metrics.conversions_value or 0
+
+        for kw_data in agg.values():
+            c = kw_data["clicks"] or 1
+            kw_data["cpc"] = round(kw_data["cost"] / c, 4) if kw_data["cost"] > 0 else 0.0
+            results.append(kw_data)
     except Exception as e:
         logger.error(f"Failed to get keyword performance: {e}")
 
@@ -1842,13 +1894,15 @@ def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float, campaig
     stage = lifecycle.get("stage")
 
     # Operations always safe in any stage (zero-risk)
-    _ALWAYS_ALLOWED = {"add_negative_keyword", "claude_advisory"}
+    # add_asset (callouts/snippets) is always allowed — zero cost, improves ad real estate
+    # and Quality Score without disrupting the learning phase
+    _ALWAYS_ALLOWED = {"add_negative_keyword", "claude_advisory", "add_asset"}
 
     # Operations forbidden in new/unknown (increase_bid and change_bid_strategy handled separately below)
     _FORBIDDEN_NEW = {
         "decrease_bid", "pause_keyword", "add_exact_keyword",
         "replace_ad", "pause_ad_group", "update_geo_targeting",
-        "change_budget", "change_match_type", "ad_copy_suggestion", "add_asset",
+        "change_budget", "change_match_type", "ad_copy_suggestion",
     }
 
     filtered = []
@@ -2029,6 +2083,10 @@ def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float, campaig
                 continue
 
         # --- new/unknown: only one reset-class op per run ---
+        # NOTE: change_bid_strategy ops always hit `continue` in the earlier dedicated block,
+        # so they never reach this guard. In practice this guard prevents a second
+        # update_geo_targeting op, or an update_geo_targeting after a change_bid_strategy
+        # already passed through. A second change_bid_strategy is blocked by the earlier block.
         _RESET_CLASS_OPS = {"change_bid_strategy", "update_geo_targeting"}
         if stage in (STAGE_NEW, STAGE_UNKNOWN) and op_type in _RESET_CLASS_OPS:
             already_has_reset = any(
@@ -2282,7 +2340,9 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              # Lifecycle: age + stage classification block
                              lifecycle: dict | None = None,
                              # Budget constraint: True = no budget increases allowed
-                             budget_constrained: bool = False) -> list:
+                             budget_constrained: bool = False,
+                             # Existing campaign assets: callouts, snippets, sitelinks already live
+                             existing_campaign_assets: dict | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -2622,6 +2682,38 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                 "=== END BUDGET CONSTRAINED MODE ===\n"
             )
 
+        # ── Existing campaign assets note ─────────────────────────────────────
+        # Always emit this block — Claude needs to know what's present AND what's missing
+        # so it can proactively recommend callouts/snippets for campaigns that have none.
+        _ea = existing_campaign_assets or {}
+        _ea_callouts = _ea.get("callouts") or []
+        _ea_snippets = _ea.get("structured_snippets") or []
+        _ea_sitelinks = _ea.get("sitelinks") or []
+
+        assets_note = "\n\nCAMPAIGN ASSET STATUS:\n"
+        if _ea_callouts:
+            assets_note += f"- Callouts already set ({len(_ea_callouts)}): {_ea_callouts}\n"
+        else:
+            assets_note += "- Callouts: NONE — recommend add_asset CALLOUT with 3-8 practice-specific callout_texts\n"
+        if _ea_snippets:
+            for snip in _ea_snippets:
+                assets_note += f"- Structured snippet [{snip['header']}]: {snip['values']}\n"
+        else:
+            assets_note += (
+                "- Structured snippets: NONE — recommend add_asset STRUCTURED_SNIPPET "
+                "using header \"Service catalog\" with services specific to this campaign type\n"
+            )
+        if _ea_sitelinks:
+            assets_note += f"- Sitelinks already set ({len(_ea_sitelinks)}): {_ea_sitelinks}\n"
+        else:
+            assets_note += "- Sitelinks: NONE (managed by wizard — do not recommend via add_asset)\n"
+        assets_note += (
+            "Rules: Do NOT recommend a CALLOUT with text already listed above. "
+            "Do NOT recommend a STRUCTURED_SNIPPET with a header already listed above. "
+            "ALWAYS recommend add_asset CALLOUT if callouts are NONE. "
+            "ALWAYS recommend add_asset STRUCTURED_SNIPPET if no snippet exists for this campaign type."
+        )
+
         # ── SKAG attribution opportunity note ─────────────────────────────────
         # Collected per campaign — returns empty string if no candidates qualify.
         # Only present when there is genuine signal (call convs or OD appts).
@@ -2635,7 +2727,14 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             logger.warning("SKAG signals failed for %r (non-fatal): %s", campaign, _skag_err)
 
         prompt = excellence_block + GOOGLE_ADS_RULES + LIFECYCLE_RULES + (LEARNING_PHASE_RULES if lifecycle and lifecycle.get("stage") in ("new", "unknown") else "") + """
-You are a Google Ads specialist optimizing a dental practice's campaigns.
+You are the Chief Marketing Officer (CMO) for Grafton Dental Care, a private dental practice in Grafton, MA. You think at two levels simultaneously:
+
+STRATEGIC level — Is this campaign serving the right patients? Are we allocating budget toward services with the highest patient lifetime value (implants, Invisalign, crowns > cleanings > emergency)? Is a campaign in a learning phase that needs patience rather than intervention? Should budget shift from a low-converting campaign to a proven one? Are we missing an entire patient segment worth targeting?
+
+TACTICAL level — Given the strategic picture, what specific, executable Google Ads operations will move the needle this week?
+
+Always lead with strategic insight in your claude_advisory slots, then follow with tactical ops. If a campaign is new (learning phase), say so explicitly and be conservative with changes. If a campaign is underperforming due to poor service-keyword fit, say so — don't just recommend bid decreases.
+
 Analyze the data and return up to 7 SPECIFIC, EXECUTABLE recommendations.
 
 CRITICAL — SPEND AND CPA DATA SCOPING:
@@ -2684,6 +2783,34 @@ CHECK 2 — MANUAL CPC TOO LOW (learning phase):
   THEN → emit increase_bid ops for qualifying keywords:
     new_bid_micros = round(current_bid_micros * 1.08), include current_bid_micros, search_rank_lost_is, search_budget_lost_is, impressions
   DO NOT emit a claude_advisory instead. EMIT THE OPS NOW.
+
+CHECK 3 — QUALITY SCORE DIAGNOSTICS (run for every keyword in keyword_performance with impressions >= 20):
+  The fields "ad_relevance", "landing_page_experience", and "expected_ctr_qs" on each keyword contain
+  Google's Quality Score component ratings: "ABOVE_AVERAGE", "AVERAGE", "BELOW_AVERAGE", or null (not rated yet).
+
+  RULE A — Landing Page Experience is BELOW_AVERAGE:
+    IF a keyword has landing_page_experience == "BELOW_AVERAGE"
+    AND (search_rank_lost_is > 0.25 OR the keyword has cost > $5 with 0 conversions)
+    THEN → emit a claude_advisory (NOT increase_bid). State specifically:
+      - Which keyword(s) have BELOW_AVERAGE landing page experience
+      - That raising bids will NOT fix this — Google is penalizing the landing page itself
+      - What to check: page load speed, content relevance to the keyword, mobile usability
+      - Use "insight" field for the advisory text
+
+  RULE B — Ad Relevance is BELOW_AVERAGE:
+    IF a keyword has ad_relevance == "BELOW_AVERAGE" AND impressions >= 50
+    THEN → emit an ad_copy_suggestion (NOT increase_bid). The ad copy needs to match the keyword
+      more closely. Include the keyword text in your suggestion.
+
+  RULE C — Expected CTR is BELOW_AVERAGE (and ad relevance is OK):
+    IF a keyword has expected_ctr_qs == "BELOW_AVERAGE" AND ad_relevance != "BELOW_AVERAGE"
+    AND impressions >= 100
+    THEN → the keyword intent may not match searcher expectations. Emit a claude_advisory suggesting
+      either a match type change (e.g., BROAD → PHRASE) or pausing the keyword.
+
+  IMPORTANT: Do NOT emit increase_bid for any keyword where landing_page_experience or ad_relevance
+  is BELOW_AVERAGE. A bid increase cannot fix a Quality Score penalty — it only raises your cost
+  for the same poor position. Fix the underlying issue first.
 
 === END PRE-FLIGHT CHECKS ===
 
@@ -2745,9 +2872,38 @@ For change_match_type:
   "new_match_type": "EXACT"|"PHRASE"|"BROAD"
 
 For add_asset:
-  "asset_type": "SITELINK"|"CALLOUT"|"CALL",
-  "campaign_resource": campaign resource name,
-  "description": what to add (advisory — no API call)
+  "asset_type": "CALLOUT"|"STRUCTURED_SNIPPET"
+    (Note: CALL is managed by the campaign wizard — do NOT recommend CALL via add_asset.
+     SITELINK is managed by the wizard — do NOT recommend SITELINK via add_asset.)
+  "campaign_resource": campaign resource name (required)
+  "reason": 1-2 sentences explaining why this asset is needed
+
+  If asset_type == "CALLOUT":
+    "callout_texts": array of 3-10 unique strings, each STRICTLY ≤25 chars,
+                     no phone numbers, no URLs, no trailing punctuation,
+                     Title Case preferred, must not duplicate existing callouts.
+    Example: ["Free Consultations", "Saturday Hours", "Same-Day Emergency"]
+
+  If asset_type == "STRUCTURED_SNIPPET":
+    "snippet_header": MUST be one of exactly (case-sensitive):
+                      "Service catalog" | "Insurance coverage" | "Types" |
+                      "Amenities" | "Brands" | "Styles" | "Neighborhoods"
+      For dental: use "Service catalog" for treatments, "Insurance coverage" for insurers.
+    "values": array of EXACTLY 3-10 unique strings, each STRICTLY ≤25 chars,
+              no phone numbers, no URLs, no punctuation at end.
+              Pick values from services_offered in the campaign data.
+    Example: {"snippet_header": "Service catalog", "values": ["Dental Implants", "Veneers", "Emergency Care"]}
+
+  RULES for add_asset:
+    - ALWAYS recommend CALLOUT if CAMPAIGN ASSET STATUS shows "Callouts: NONE"
+    - ALWAYS recommend STRUCTURED_SNIPPET if CAMPAIGN ASSET STATUS shows "Structured snippets: NONE"
+    - Do NOT recommend if the callout_text already exists in CAMPAIGN ASSET STATUS callouts list
+    - Do NOT recommend a STRUCTURED_SNIPPET if that header already exists in CAMPAIGN ASSET STATUS
+    - Minimum 3 values/callout_texts required — fewer will be rejected by the API
+    - Maximum 1 add_asset op per (campaign, asset_type) per run
+    - Ground callout_texts and values in actual services/features from campaign_build_json and landing_page_intel
+    - For CALLOUT: include practice differentiators like hours, financing, insurance, emergency access
+    - For STRUCTURED_SNIPPET: use "Service catalog" for treatment lists specific to this campaign type
 
 For replace_ad (A/B ad testing — pause underperformer, create improved version):
   "old_ad_group_ad_resource": EXACT ad_group_ad_resource from ad_performance or rsa_resources data (required)
@@ -2827,7 +2983,9 @@ When endorsing a Google recommendation, use these operation mappings:
 - MARGINAL_ROI_CAMPAIGN_BUDGET / CAMPAIGN_BUDGET → "change_budget" operation
 - MAXIMIZE_CONVERSIONS_OPT_IN → "change_bid_strategy" operation
 - TARGET_CPA_OPT_IN → "change_bid_strategy" operation
-- SITELINK_EXTENSION / CALLOUT_EXTENSION / CALL_EXTENSION → "add_asset" operation (advisory)
+- CALLOUT_EXTENSION → "add_asset" operation with asset_type="CALLOUT" and callout_texts array
+- STRUCTURED_SNIPPET_EXTENSION → "add_asset" operation with asset_type="STRUCTURED_SNIPPET", snippet_header and values
+- SITELINK_EXTENSION / CALL_EXTENSION → advisory only (managed by wizard — do not generate add_asset for these)
 - RESPONSIVE_SEARCH_AD → "ad_copy_suggestion" operation
 
 Always include "google_rec_resource_name" field in any rec that came from Google.
@@ -2929,7 +3087,7 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
-ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + _build_institutional_memory_note(campaign) + feedback_block
+ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + _build_institutional_memory_note(campaign) + feedback_block
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -2961,6 +3119,7 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
             valid_camp_resources = {kw.get("campaign_resource","")  for kw in keyword_perf if kw.get("campaign_resource")}
 
             validated = []
+            _add_asset_seen: set[tuple] = set()  # (campaign_resource, asset_type) — max 1 per run
             for item in arr:
                 if not isinstance(item, dict) or not item.get("operation"):
                     continue
@@ -3141,6 +3300,62 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
                     # Require geo_rationale
                     if not item.get("geo_rationale"):
                         item["geo_rationale"] = item.get("reason", "Geo optimization based on performance data")
+                elif op == "add_asset":
+                    # ── Validate add_asset ops (callouts + structured snippets) ──────────────
+                    asset_type = item.get("asset_type", "")
+                    if asset_type not in ("CALLOUT", "STRUCTURED_SNIPPET"):
+                        logger.warning(f"Dropping add_asset — unsupported asset_type '{asset_type}'")
+                        continue
+                    # Enforce max 1 add_asset per (campaign_resource, asset_type) per optimizer run
+                    _cr_for_dedup = item.get("campaign_resource") or campaign_resource
+                    if not _cr_for_dedup:
+                        logger.warning("Dropping add_asset — missing campaign_resource")
+                        continue
+                    _dedup_key = (_cr_for_dedup, asset_type)
+                    if _dedup_key in _add_asset_seen:
+                        logger.warning(
+                            f"Dropping add_asset — duplicate {asset_type} for same campaign in this run"
+                        )
+                        continue
+                    if asset_type == "CALLOUT":
+                        texts = item.get("callout_texts") or []
+                        if not isinstance(texts, list) or len(texts) < 3:
+                            logger.warning(
+                                f"Dropping add_asset CALLOUT — need ≥3 callout_texts, got {len(texts) if isinstance(texts, list) else texts!r}"
+                            )
+                            continue
+                        # Clip to 25 chars and filter blanks
+                        texts = [t[:25].strip() for t in texts if isinstance(t, str) and t.strip()]
+                        if len(texts) < 3:
+                            logger.warning("Dropping add_asset CALLOUT — fewer than 3 non-empty texts after cleaning")
+                            continue
+                        if len(texts) > 10:
+                            texts = texts[:10]
+                        item["callout_texts"] = texts
+                    elif asset_type == "STRUCTURED_SNIPPET":
+                        header = item.get("snippet_header", "")
+                        if header not in VALID_SNIPPET_HEADERS:
+                            logger.warning(
+                                f"Dropping add_asset STRUCTURED_SNIPPET — invalid header '{header}'. "
+                                f"Must be one of: {sorted(VALID_SNIPPET_HEADERS)}"
+                            )
+                            continue
+                        values = item.get("values") or []
+                        if not isinstance(values, list) or len(values) < 3:
+                            logger.warning(
+                                f"Dropping add_asset STRUCTURED_SNIPPET — need ≥3 values, got {len(values) if isinstance(values, list) else values!r}"
+                            )
+                            continue
+                        # Clip to 25 chars and filter blanks
+                        values = [v[:25].strip() for v in values if isinstance(v, str) and v.strip()]
+                        if len(values) < 3:
+                            logger.warning("Dropping add_asset STRUCTURED_SNIPPET — fewer than 3 non-empty values after cleaning")
+                            continue
+                        if len(values) > 10:
+                            values = values[:10]
+                        item["values"] = values
+                    # Mark this (campaign, asset_type) pair as seen for dedup
+                    _add_asset_seen.add(_dedup_key)
                 validated.append(item)
             logger.info(f"Claude returned {len(arr)} recs, {len(validated)} passed validation")
             # Lifecycle sieve — defense in depth: convert any violated ops to advisories
@@ -3493,7 +3708,14 @@ The practice has enabled Budget Constrained mode. This means:
 """
 
         prompt = acct_excellence_block + GOOGLE_ADS_RULES + _acct_budget_constrained_note + """
-You are a Google Ads specialist performing an ACCOUNT-LEVEL review for a dental practice (Grafton Dental Care, Grafton MA).
+You are the Chief Marketing Officer (CMO) for Grafton Dental Care, a private dental practice in Grafton, MA, performing an ACCOUNT-LEVEL portfolio review.
+
+Think like a CMO: you are not optimizing individual campaigns in isolation — you are managing a portfolio of bets. Ask yourself:
+- Is the overall budget allocated toward the services that drive the most patient lifetime value (implants, Invisalign, crowns > routine > emergency)?
+- Are any campaigns cannibalizing each other's traffic or budget?
+- Is there a campaign in learning phase that the team is over-touching? Should we leave it alone for 2–3 more weeks?
+- Is there a gap in coverage — a high-value service (e.g. dental implants, Invisalign) with no campaign at all?
+- Is the overall account burn rate on track vs the monthly budget, and is the mix right?
 
 You have already reviewed individual campaigns. Now identify issues and opportunities that span the whole account or cannot be attributed to one campaign.
 
@@ -4809,7 +5031,7 @@ def _execute_change_bid_strategy(client, customer_id: str, campaign_resource: st
                                    target_roas: float = 0.0) -> bool:
     """
     Change a campaign's bid strategy.
-    Supports: MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS, MAXIMIZE_CLICKS
+    Supports: MANUAL_CPC, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS, MAXIMIZE_CLICKS
     """
     campaign_service = client.get_service("CampaignService")
     operation = client.get_type("CampaignOperation")
@@ -6050,6 +6272,64 @@ def _get_active_rsa_resources(client, customer_id: str, campaign_resource: str) 
     return results
 
 
+# ── Campaign asset fetch (callouts, structured snippets, sitelinks) ───────────
+
+def _fetch_campaign_assets(client, customer_id: str, campaign_resource: str) -> dict:
+    """
+    Fetch all active callout, structured snippet, and sitelink assets linked
+    to a campaign.  Returns a dict suitable for injection into Claude's context:
+
+    {
+      "callouts": ["Free Consultations", "Saturday Hours", ...],
+      "structured_snippets": [
+          {"header": "Service catalog", "values": ["Implants", "Veneers", ...]},
+          ...
+      ],
+      "sitelinks": ["About Us", "Book Online", ...]
+    }
+
+    Non-fatal — returns empty structure on any error.
+    """
+    result = {"callouts": [], "structured_snippets": [], "sitelinks": []}
+    try:
+        service = client.get_service("GoogleAdsService")
+        query = f"""
+            SELECT
+                campaign_asset.field_type,
+                campaign_asset.status,
+                asset.type,
+                asset.callout_asset.callout_text,
+                asset.structured_snippet_asset.header,
+                asset.structured_snippet_asset.values,
+                asset.sitelink_asset.link_text
+            FROM campaign_asset
+            WHERE campaign.resource_name = '{campaign_resource}'
+              AND campaign.status != 'REMOVED'
+              AND campaign_asset.status != 'REMOVED'
+              AND campaign_asset.field_type IN ('CALLOUT', 'STRUCTURED_SNIPPET', 'SITELINK')
+        """
+        rows = list(service.search(customer_id=customer_id, query=query))
+        for row in rows:
+            ft = row.campaign_asset.field_type.name  # e.g. "CALLOUT"
+            a = row.asset
+            if ft == "CALLOUT":
+                text = a.callout_asset.callout_text
+                if text:
+                    result["callouts"].append(text)
+            elif ft == "STRUCTURED_SNIPPET":
+                header = a.structured_snippet_asset.header
+                values = list(a.structured_snippet_asset.values)
+                if header:
+                    result["structured_snippets"].append({"header": header, "values": values})
+            elif ft == "SITELINK":
+                link_text = a.sitelink_asset.link_text
+                if link_text:
+                    result["sitelinks"].append(link_text)
+    except Exception as e:
+        logger.warning(f"_fetch_campaign_assets failed for {campaign_resource} (non-fatal): {e}")
+    return result
+
+
 # ── Google Ads live negative keyword fetch ────────────────────────────────────
 
 def _fetch_existing_negatives(client, customer_id: str) -> tuple:
@@ -7163,6 +7443,19 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             except Exception as _rsa_e:
                 logger.warning(f"  [{camp_name}] RSA pre-fetch failed (non-fatal): {_rsa_e}")
 
+        # Pre-fetch existing campaign assets (callouts, snippets, sitelinks)
+        camp_existing_assets: dict = {"callouts": [], "structured_snippets": [], "sitelinks": []}
+        if camp_resource:
+            try:
+                camp_existing_assets = _fetch_campaign_assets(client, customer_id, camp_resource)
+                n_assets = (len(camp_existing_assets["callouts"])
+                            + len(camp_existing_assets["structured_snippets"])
+                            + len(camp_existing_assets["sitelinks"]))
+                if n_assets:
+                    logger.info(f"  [{camp_name}] {n_assets} existing asset(s) fetched for Claude context")
+            except Exception as _ae:
+                logger.warning(f"  [{camp_name}] Asset pre-fetch failed (non-fatal): {_ae}")
+
         # Filter ad performance to this campaign
         camp_ad_perf = [
             a for a in all_ads_with_metrics
@@ -7352,6 +7645,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             lifecycle=_camp_lifecycle,
             # Budget constraint
             budget_constrained=_budget_constrained,
+            # Existing campaign assets (callouts, snippets, sitelinks)
+            existing_campaign_assets=camp_existing_assets,
         )
         if not structured:
             continue

@@ -7466,10 +7466,40 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                     onClick={()=>setRefinedPreview(null)}>✕ Discard</button>
                                 </div>
                               </div>
-                              <pre style={{fontSize:10,lineHeight:1.4,color:'#374151',whiteSpace:'pre-wrap',
-                                maxHeight:200,overflowY:'auto',margin:0}}>
-                                {JSON.stringify(refinedPreview.data, null, 2)}
-                              </pre>
+                              {step === 'keywords' && refinedPreview.data && typeof refinedPreview.data === 'object' && !Array.isArray(refinedPreview.data) ? (
+                                // Keywords: show chips with new items highlighted in purple
+                                <div style={{maxHeight:220,overflowY:'auto'}}>
+                                  {[
+                                    {key:'exact_match',          label:'Exact Match',   color:'#0c4a6e', bg:'#e0f2fe'},
+                                    {key:'phrase_match',         label:'Phrase Match',  color:'#065f46', bg:'#d1fae5'},
+                                    {key:'broad_match_modifier', label:'Broad Match',   color:'#713f12', bg:'#fef3c7'},
+                                    {key:'negative_keywords',    label:'Negatives',     color:'#7f1d1d', bg:'#fee2e2'},
+                                  ].map(({key,label,color,bg})=>{
+                                    const prev = new Set(build.keywords?.[key]||[]);
+                                    const items = refinedPreview.data[key]||[];
+                                    if (!items.length) return null;
+                                    const added = items.filter(k=>!prev.has(k));
+                                    if (!added.length) return null; // only show sections with new items
+                                    return (
+                                      <div key={key} style={{marginBottom:10}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:4}}>
+                                          {label} — {added.length} new
+                                        </div>
+                                        <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                                          {added.map((kw,i)=>(
+                                            <span key={i} style={{background:'#ede9fe',color:'#5b21b6',fontSize:11,padding:'2px 8px',borderRadius:4,border:'1px solid #a78bfa',fontWeight:600}}>+ {kw}</span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <pre style={{fontSize:10,lineHeight:1.4,color:'#374151',whiteSpace:'pre-wrap',
+                                  maxHeight:200,overflowY:'auto',margin:0}}>
+                                  {JSON.stringify(refinedPreview.data, null, 2)}
+                                </pre>
+                              )}
                             </div>
                           )}
                         </div>
@@ -7938,7 +7968,60 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                           </div>
                                           <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
                                             {(build.keywords[key]||[]).map((kw,i)=>(
-                                              <span key={i} style={{background:bg,color,fontSize:11,padding:'3px 9px',borderRadius:4,border:`1px solid ${color}30`}}>{kw}</span>
+                                              <span key={i} style={{display:'inline-flex',alignItems:'center',background:bg,color,fontSize:11,padding:'3px 6px 3px 9px',borderRadius:4,border:`1px solid ${color}30`,gap:4}}>
+                                                {kw}
+                                                <button
+                                                  title="Remove keyword"
+                                                  onClick={async()=>{
+                                                    // Snapshot pre-delete state for revert (avoids stale-closure bug on rapid clicks)
+                                                    const prevKeywords = build.keywords;
+                                                    const updated = {...prevKeywords};
+                                                    updated[key] = (updated[key]||[]).filter((_,idx)=>idx!==i);
+                                                    // Negatives are pushed to GAds as BROAD match by google_ads_create.py
+                                                    const matchTypeMap = {
+                                                      exact_match: 'EXACT',
+                                                      phrase_match: 'PHRASE',
+                                                      broad_match_modifier: 'BROAD',
+                                                      negative_keywords: 'BROAD',
+                                                    };
+                                                    const isNegative = key === 'negative_keywords';
+                                                    // Optimistic update — no scroll reset
+                                                    setCampDetail(prev => prev ? {
+                                                      ...prev,
+                                                      build: { ...(prev.build||{}), keywords: updated }
+                                                    } : prev);
+                                                    try {
+                                                      // For live campaigns: remove from GAds FIRST so local DB
+                                                      // stays consistent with what GAds actually has
+                                                      if (camp.gads_campaign_resource) {
+                                                        await api(`/api/admin/campaigns/${camp.campaign_id}/keyword-remove`,{
+                                                          method:'POST',
+                                                          body:JSON.stringify({
+                                                            keyword_text: kw,
+                                                            match_type: matchTypeMap[key] || 'EXACT',
+                                                            is_negative: isNegative,
+                                                          }),
+                                                        });
+                                                      }
+                                                      // Then persist to local DB
+                                                      await api(`/api/admin/campaigns/${camp.campaign_id}/build-step-save`,{
+                                                        method:'POST',
+                                                        body:JSON.stringify({step:'keywords',data:updated}),
+                                                      });
+                                                    } catch(e){
+                                                      // Revert using snapshot, not stale closure
+                                                      setCampDetail(prev => prev ? {
+                                                        ...prev,
+                                                        build: { ...(prev.build||{}), keywords: prevKeywords }
+                                                      } : prev);
+                                                      alert('Could not remove keyword: '+e.message);
+                                                    }
+                                                  }}
+                                                  style={{background:'none',border:'none',cursor:'pointer',color,opacity:0.6,padding:'0 2px',lineHeight:1,fontSize:12,fontWeight:700,display:'inline-flex',alignItems:'center'}}
+                                                  onMouseEnter={e=>e.currentTarget.style.opacity=1}
+                                                  onMouseLeave={e=>e.currentTarget.style.opacity=0.6}
+                                                >×</button>
+                                              </span>
                                             ))}
                                           </div>
                                         </div>
@@ -9057,6 +9140,69 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                   );
                                 })()}
 
+                                {/* Card 5c — Callouts & Structured Snippets */}
+                                {(() => {
+                                  const calloutTexts = build.callout_texts || [];
+                                  const snippets = build.structured_snippets || [];
+                                  const hasCallouts = calloutTexts.length > 0;
+                                  const hasSnippets = snippets.length > 0;
+                                  if (!hasCallouts && !hasSnippets) return (
+                                    <div style={cardStyle}>
+                                      <div style={cardHeaderStyle}>
+                                        <span style={{fontSize:12,fontWeight:700}}>📢 Callouts &amp; Snippets</span>
+                                        <span style={{fontSize:10,color:'#9ca3af'}}>Auto-generated at launch</span>
+                                      </div>
+                                      <div style={{...cardBodyStyle,color:'#9ca3af',fontStyle:'italic',fontSize:12}}>
+                                        Claude will automatically generate callout extensions and structured snippets when you launch this campaign.
+                                      </div>
+                                    </div>
+                                  );
+                                  return (
+                                    <div style={cardStyle}>
+                                      <div style={cardHeaderStyle}>
+                                        <span style={{fontSize:12,fontWeight:700}}>📢 Callouts &amp; Snippets</span>
+                                        <span style={{fontSize:10,color:'#059669',fontWeight:600}}>
+                                          {hasCallouts ? `${calloutTexts.length} callouts` : ''}
+                                          {hasCallouts && hasSnippets ? ' · ' : ''}
+                                          {hasSnippets ? `${snippets.length} snippet group${snippets.length>1?'s':''}` : ''}
+                                        </span>
+                                      </div>
+                                      <div style={cardBodyStyle}>
+                                        {hasCallouts && (
+                                          <div style={{marginBottom: hasSnippets ? 14 : 0}}>
+                                            <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:6}}>
+                                              Callout Extensions
+                                            </div>
+                                            <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                                              {calloutTexts.map((ct,i)=>(
+                                                <span key={i} style={{background:'#eff6ff',color:'#1d4ed8',fontSize:11,
+                                                  padding:'3px 9px',borderRadius:4,border:'1px solid #bfdbfe'}}>
+                                                  {ct}
+                                                </span>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        )}
+                                        {hasSnippets && snippets.map((sn, si) => (
+                                          <div key={si} style={{marginBottom: si < snippets.length-1 ? 10 : 0}}>
+                                            <div style={{fontSize:10,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:5}}>
+                                              {sn.header}
+                                            </div>
+                                            <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                                              {(sn.values||[]).map((v,vi)=>(
+                                                <span key={vi} style={{background:'#f0fdf4',color:'#065f46',fontSize:11,
+                                                  padding:'3px 9px',borderRadius:4,border:'1px solid #bbf7d0'}}>
+                                                  {v}
+                                                </span>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+
                                 {/* Card 6 — Custom Values (collapsed accordion) */}
                                 <div style={cardStyle}>
                                   <div style={{...cardHeaderStyle, cursor:'pointer'}}
@@ -9070,7 +9216,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                     <div style={cardBodyStyle}>
                                       {[
                                         {label:'Bidding Strategy', val: adGroups.bidding_strategy || camp.bidding_strategy || ''},
-                                        {label:'Callouts',         val: camp.callouts || ''},
+                                        {label:'Callouts',         val: (build.callout_texts||[]).length > 0 ? `${(build.callout_texts||[]).length} callout(s) — auto-generated at launch` : ''},
                                         {label:'Ad Schedule',      val: camp.ad_schedule || ''},
                                         {label:'UTM Parameters',   val: camp.utm_params || ''},
                                       ].map(({label, val}) => (
@@ -9188,50 +9334,25 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                 {/* 🤖 AI Controls card */}
                                 {(() => {
                                   const isLinked = !!(camp.gads_campaign_resource || camp.gads_campaign_numeric_id);
-                                  const reviewOn = !!camp.ai_review_enabled;
                                   const maxOn = !!camp.ai_max_enabled;
-                                  const revSav = !!aiReviewSaving[camp.campaign_id];
                                   const maxSav = !!aiMaxSaving[camp.campaign_id];
                                   return (
                                     <div style={{...cardStyle, marginTop:22}}>
                                       <div style={cardHeaderStyle}>
                                         <span style={{fontSize:12,fontWeight:700}}>🤖 AI Controls</span>
                                         <span style={{fontSize:10,color:'var(--text-muted)'}}>
-                                          {reviewOn ? '🟢 Review active' : '⚫ Review off'}
-                                          {' · '}
+                                          🟢 AI optimizer active &nbsp;·&nbsp;
                                           {isLinked ? (maxOn ? '⚡ Max on' : 'Max off') : 'Max: link first'}
                                         </span>
                                       </div>
                                       <div style={cardBodyStyle}>
-                                        {/* AI Review row */}
-                                        <div style={{marginBottom:14}}>
-                                          <div style={{fontSize:11,fontWeight:700,marginBottom:6,color:'var(--text)'}}>AI Review (Optimizer)</div>
-                                          {camp.is_synthetic ? (
-                                            <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic'}}>Import this campaign to enable AI Review.</div>
-                                          ) : (
-                                            <div style={{
-                                              background: reviewOn ? '#f0fdf4' : '#f9fafb',
-                                              border:`1px solid ${reviewOn ? '#86efac' : 'var(--border)'}`,
-                                              borderRadius:8, padding:'12px 14px'
-                                            }}>
-                                              <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:revSav?'wait':'pointer',userSelect:'none'}}>
-                                                <input type="checkbox" checked={reviewOn} disabled={revSav}
-                                                  style={{marginTop:2,flexShrink:0,accentColor:'#059669'}}
-                                                  onChange={()=>toggleAiReview(camp)}/>
-                                                <div>
-                                                  <div style={{fontSize:12,fontWeight:600,color:reviewOn?'#059669':'var(--text)'}}>
-                                                    {reviewOn ? '✓ AI actively monitoring this campaign' : 'Enable AI monitoring'}
-                                                    {revSav && <span style={{fontWeight:400,color:'var(--text-muted)',fontSize:11}}> — saving…</span>}
-                                                  </div>
-                                                  <div style={{fontSize:11,color:'var(--text-muted)',marginTop:4,lineHeight:1.5}}>
-                                                    {reviewOn
-                                                      ? 'The AI optimizer will include this campaign in each optimization run — keywords, bids, ad groups, and negatives.'
-                                                      : 'Lets the AI optimizer manage bids, keywords, and ad groups for this campaign during optimization runs.'}
-                                                  </div>
-                                                </div>
-                                              </label>
-                                            </div>
-                                          )}
+                                        {/* AI Optimizer status — always on, no toggle needed */}
+                                        <div style={{
+                                          background:'#f0fdf4',border:'1px solid #86efac',
+                                          borderRadius:8,padding:'10px 14px',marginBottom:14,
+                                          fontSize:11,color:'#166534'
+                                        }}>
+                                          ✓ <strong>AI Optimizer is always active</strong> — all campaigns with impressions are automatically included in every optimization run.
                                         </div>
                                         {/* AI Max row */}
                                         <div>

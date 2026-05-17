@@ -1513,9 +1513,67 @@ async def gads_approve_action(action_id: str, request: Request):
             logger.info(f"Approved + executed change_match_type: '{kw_text}' → {new_mt} ({action_id[:8]})")
 
         elif operation == "add_asset":
-            # Advisory — user adds manually or via ApplyRecommendation
+            from google_ads_create import add_callouts_to_campaign, add_structured_snippet_to_campaign
             after = json.loads(row["after_state_json"] or "{}")
-            logger.info(f"Asset recommendation acknowledged: {after.get('asset_type')} for {after.get('campaign_resource')} ({action_id[:8]})")
+            asset_type = after.get("asset_type", "")
+            camp_rn = after.get("campaign_resource") or row.get("entity_id", "")
+            if not camp_rn:
+                raise HTTPException(
+                    status_code=422,
+                    detail="add_asset after_state_json missing campaign_resource"
+                )
+            if asset_type == "CALLOUT":
+                callout_texts = after.get("callout_texts") or []
+                if len(callout_texts) < 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"add_asset CALLOUT needs ≥3 callout_texts, got {len(callout_texts)}"
+                    )
+                result = add_callouts_to_campaign(
+                    campaign_resource_name=camp_rn,
+                    callout_texts=callout_texts,
+                    customer_id=customer_id,
+                )
+                if not result["ok"]:
+                    errs = "; ".join(result.get("errors") or ["unknown error"])
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result="failed", error_detail=errs[:500])
+                    raise HTTPException(status_code=502, detail=f"add_callouts_to_campaign failed: {errs}")
+                logger.info(
+                    f"add_asset CALLOUT approved: {result['count']} callout(s) linked to {camp_rn} ({action_id[:8]})"
+                )
+            elif asset_type == "STRUCTURED_SNIPPET":
+                header = after.get("snippet_header", "")
+                values = after.get("values") or []
+                if not header:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="add_asset STRUCTURED_SNIPPET missing snippet_header"
+                    )
+                if len(values) < 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"add_asset STRUCTURED_SNIPPET needs ≥3 values, got {len(values)}"
+                    )
+                result = add_structured_snippet_to_campaign(
+                    campaign_resource_name=camp_rn,
+                    header=header,
+                    values=values,
+                    customer_id=customer_id,
+                )
+                if not result["ok"]:
+                    errs = "; ".join(result.get("errors") or ["unknown error"])
+                    update_gads_action_result(action_id, executed=False,
+                        execution_result="failed", error_detail=errs[:500])
+                    raise HTTPException(status_code=502, detail=f"add_structured_snippet_to_campaign failed: {errs}")
+                logger.info(
+                    f"add_asset STRUCTURED_SNIPPET approved: header='{header}' linked to {camp_rn} ({action_id[:8]})"
+                )
+            else:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"add_asset unsupported asset_type '{asset_type}'"
+                )
             update_gads_action_result(action_id, executed=True, execution_result="success")
             set_audit_approval(action_id, approver="admin")
 
@@ -2101,10 +2159,21 @@ async def gads_reclassify_action(action_id: str, request: Request):
         )
 
     now = datetime.now(timezone.utc).isoformat()
+
+    # When moving to account level, flip add_negative_keyword → add_to_shared_negative_list
+    # so the approval handler routes to the shared list execution path, not campaign-level.
+    # When moving back to campaign level, flip it back.
+    current_operation = (row.get("operation") or "").strip()
+    new_operation = current_operation  # default: no change
+    if target_level == "account" and current_operation == "add_negative_keyword":
+        new_operation = "add_to_shared_negative_list"
+    elif target_level == "campaign" and current_operation == "add_to_shared_negative_list":
+        new_operation = "add_negative_keyword"
+
     with _db_conn() as conn:
         cur = conn.execute(
-            "UPDATE gads_audit_log SET campaign_name=?, updated_at=? WHERE action_id=?",
-            (new_campaign_name, now, action_id)
+            "UPDATE gads_audit_log SET campaign_name=?, operation=?, updated_at=? WHERE action_id=?",
+            (new_campaign_name, new_operation, now, action_id)
         )
         # H2: verify the row was actually updated
         if cur.rowcount == 0:
@@ -2585,12 +2654,27 @@ async def campaign_apply_bulk(campaign_name: str, request: Request):
                     _execute_change_match_type(client, customer_id, resource_name_kw, new_mt, keyword_text=kw_text)
 
             elif operation == "add_asset":
-                # Advisory — check for google_rec_resource_name for direct apply
-                google_rec_rn = row.get("google_rec_resource_name", "")
-                if google_rec_rn:
+                from google_ads_create import add_callouts_to_campaign, add_structured_snippet_to_campaign
+                after = json.loads(row["after_state_json"] or "{}")
+                _a_type = after.get("asset_type", "")
+                _a_camp = after.get("campaign_resource") or row.get("entity_id", "")
+                if _a_type == "CALLOUT" and _a_camp:
                     client = _build_client()
-                    _apply_google_recommendation(client, customer_id, google_rec_rn)
-                # else: acknowledged only
+                    add_callouts_to_campaign(_a_camp, after.get("callout_texts") or [], customer_id=customer_id)
+                elif _a_type == "STRUCTURED_SNIPPET" and _a_camp:
+                    client = _build_client()
+                    add_structured_snippet_to_campaign(
+                        _a_camp,
+                        after.get("snippet_header", ""),
+                        after.get("values") or [],
+                        customer_id=customer_id,
+                    )
+                else:
+                    # Fallback: try google_rec_resource_name for direct apply
+                    google_rec_rn = row.get("google_rec_resource_name", "")
+                    if google_rec_rn:
+                        client = _build_client()
+                        _apply_google_recommendation(client, customer_id, google_rec_rn)
 
             elif operation == "replace_ad":
                 after = json.loads(row["after_state_json"] or "{}")
@@ -2810,6 +2894,12 @@ async def gads_push_queued():
                     match_type=after.get("match_type", "BROAD"))
                 api_hit = True
 
+            elif operation == "add_to_shared_negative_list":
+                _execute_add_to_shared_negative_list(client, customer_id,
+                    keyword_text=after.get("keyword_text") or row["entity_name"],
+                    match_type=after.get("match_type", "BROAD"))
+                api_hit = True
+
             elif operation == "tighten_match_type":
                 _execute_add_keyword(client, customer_id,
                     ad_group_resource=after.get("ad_group_resource", ""),
@@ -2869,18 +2959,38 @@ async def gads_push_queued():
                     api_hit = True
 
             elif operation == "add_asset":
-                # Check if came from Google — try ApplyRecommendation for direct apply
-                google_rec_rn = row.get("google_rec_resource_name", "")
-                if google_rec_rn:
-                    try:
-                        _apply_google_recommendation(client, customer_id, google_rec_rn)
+                from google_ads_create import add_callouts_to_campaign, add_structured_snippet_to_campaign
+                from ai_optimizer import VALID_SNIPPET_HEADERS as _VALID_HDRS_PUSH
+                _a2_type = after.get("asset_type", "")
+                _a2_camp = after.get("campaign_resource") or row.get("entity_id", "")
+                if _a2_type == "CALLOUT" and _a2_camp:
+                    _cres = add_callouts_to_campaign(
+                        _a2_camp, after.get("callout_texts") or [], customer_id=customer_id
+                    )
+                    if _cres.get("ok"):
                         api_hit = True
-                    except Exception as _are:
-                        logger.error(f"ApplyRecommendation failed for add_asset: {_are}")
-                        # fall through — api_hit stays False (acknowledged)
+                elif _a2_type == "STRUCTURED_SNIPPET" and _a2_camp:
+                    _push_hdr = after.get("snippet_header", "")
+                    if _push_hdr not in _VALID_HDRS_PUSH:
+                        logger.warning(f"Skipping push add_asset — invalid snippet_header '{_push_hdr}'")
+                    else:
+                        _sres = add_structured_snippet_to_campaign(
+                            _a2_camp,
+                            _push_hdr,
+                            after.get("values") or [],
+                            customer_id=customer_id,
+                        )
+                        if _sres.get("ok"):
+                            api_hit = True
                 else:
-                    logger.info(f"Asset recommendation acknowledged: {after.get('asset_type')} for {after.get('campaign_resource')}")
-                    # api_hit stays False
+                    # Fallback: try ApplyRecommendation for Google-sourced recs
+                    google_rec_rn = row.get("google_rec_resource_name", "")
+                    if google_rec_rn:
+                        try:
+                            _apply_google_recommendation(client, customer_id, google_rec_rn)
+                            api_hit = True
+                        except Exception as _are:
+                            logger.error(f"ApplyRecommendation failed for add_asset: {_are}")
 
             elif operation == "replace_ad":
                 old_rn = after.get("old_ad_group_ad_resource", "")
@@ -4092,6 +4202,210 @@ def admin_campaign_update_fields(campaign_id: str, body: CampaignUpdateFieldsReq
     }
 
 
+# ─── Auto-generate callouts + structured snippets at launch ──────────────────
+
+def _generate_callouts_and_snippets(campaign_id: str, camp: dict, build: dict) -> dict:
+    """
+    Call Claude Haiku to generate callout_texts and structured_snippets from
+    the campaign build data (strategy, keywords, ad copy, ad groups).
+
+    Returns the (possibly enriched) build dict. On any failure, returns build
+    unchanged — non-fatal, campaign launch continues regardless.
+
+    Idempotent: skips generation per-field if that field is already populated.
+    """
+    from ai_optimizer import VALID_SNIPPET_HEADERS
+    from database import get_campaign_build, _conn
+
+    # ── Determine what's missing ──────────────────────────────────────────────
+    existing_callouts = [t for t in (build.get("callout_texts") or []) if isinstance(t, str) and t.strip()]
+    existing_snippets = [s for s in (build.get("structured_snippets") or []) if isinstance(s, dict)]
+    need_callouts = len(existing_callouts) < 3
+    need_snippets = len(existing_snippets) < 1
+    if not need_callouts and not need_snippets:
+        logger.info(f"_generate_callouts_and_snippets: already populated for {campaign_id} — skipping")
+        return build
+
+    try:
+        client = _get_anthropic_client()
+    except Exception as e:
+        logger.warning(f"_generate_callouts_and_snippets: no AI client ({e}) — skipping")
+        return build
+
+    # ── Build context from wizard steps ──────────────────────────────────────
+    campaign_name   = camp.get("campaign_name", "")
+    campaign_type   = camp.get("campaign_type", "general")
+    practice        = _build_practice_context()
+    practice_name   = practice.get("name") or "Grafton Dental Care"
+    practice_loc    = practice.get("address") or "Grafton, MA"
+
+    strategy_block = ""
+    strategy = build.get("strategy") or {}
+    if isinstance(strategy, dict):
+        goal      = strategy.get("primary_goal", "")
+        audience  = strategy.get("target_audience", "")
+        usp       = strategy.get("unique_selling_points", "")
+        strategy_block = f"Goal: {goal}\nAudience: {audience}\nUSP: {usp}"
+    elif isinstance(strategy, str):
+        strategy_block = strategy[:500]
+
+    keywords_block = ""
+    kw_data = build.get("keywords") or {}
+    if isinstance(kw_data, dict):
+        kws = kw_data.get("keywords") or kw_data.get("keyword_list") or []
+        if isinstance(kws, list):
+            keywords_block = ", ".join(str(k.get("keyword", k) if isinstance(k, dict) else k) for k in kws[:20])
+    elif isinstance(kw_data, str):
+        keywords_block = kw_data[:300]
+
+    headlines_block = ""
+    ad_copy = build.get("ad_copy") or {}
+    if isinstance(ad_copy, dict):
+        ads = ad_copy.get("ads") or ad_copy.get("ad_groups") or []
+        if isinstance(ads, list) and ads:
+            first_ad = ads[0]
+            if isinstance(first_ad, dict):
+                hls = first_ad.get("headlines") or []
+                descs = first_ad.get("descriptions") or []
+                if hls:
+                    headlines_block = "Headlines: " + " | ".join(str(h) for h in hls[:5])
+                if descs:
+                    headlines_block += "\nDescriptions: " + " | ".join(str(d) for d in descs[:3])
+
+    ad_groups_block = ""
+    ag_data = build.get("ad_groups") or {}
+    if isinstance(ag_data, dict):
+        ags = ag_data.get("ad_groups") or []
+        if isinstance(ags, list):
+            ad_groups_block = ", ".join(str(ag.get("name", ag) if isinstance(ag, dict) else ag) for ag in ags[:8])
+
+    # Dental-relevant snippet headers only (L1: narrow from full set)
+    _DENTAL_SNIPPET_HEADERS = {"Service catalog", "Insurance coverage", "Types", "Amenities", "Brands", "Styles"}
+    valid_dental_headers = sorted(_DENTAL_SNIPPET_HEADERS & VALID_SNIPPET_HEADERS)
+
+    prompt = f"""You are a Google Ads expert writing extensions for a dental practice.
+
+Practice: {practice_name}, {practice_loc}
+Campaign: {campaign_name} (type: {campaign_type})
+
+=== Strategy ===
+{strategy_block or "(not available)"}
+
+=== Top Keywords ===
+{keywords_block or "(not available)"}
+
+=== Ad Headlines / Descriptions ===
+{headlines_block or "(not available)"}
+
+=== Ad Groups ===
+{ad_groups_block or "(not available)"}
+
+Generate callout extensions and structured snippet extensions for this campaign.
+
+Rules for callouts:
+- 6 to 8 callout strings
+- Each string ≤25 characters (STRICT — count carefully)
+- Short punchy phrases: e.g. "Same-Day Appointments", "Insurance Accepted"
+- Specific to this campaign type and dental specialty
+- No punctuation at end, no quotes
+
+Rules for structured snippets:
+- 1 to 2 snippets
+- header MUST be exactly one of: {', '.join(valid_dental_headers)}
+- For dental practices, prefer "Service catalog" or "Insurance coverage" or "Types"
+- 3 to 6 values per snippet, each ≤25 characters (STRICT)
+
+Return ONLY valid JSON, no prose, no markdown fences:
+{{
+  "callout_texts": ["text1", "text2", ...],
+  "structured_snippets": [
+    {{"header": "Service catalog", "values": ["value1", "value2", ...]}}
+  ]
+}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+
+        # Strip markdown fences if Claude added them (case-insensitive tag, M4)
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+
+        parsed = json.loads(raw)
+
+        # ── Validate + clean callout_texts (only if needed) ───────────────────
+        new_callouts = existing_callouts  # default: keep what we had
+        if need_callouts:
+            raw_callouts = parsed.get("callout_texts") or []
+            # M5: re-filter empties after truncate+strip
+            cleaned = [s for s in (t[:25].strip() for t in raw_callouts if isinstance(t, str) and t.strip()) if s]
+            if len(cleaned) >= 3:
+                new_callouts = cleaned
+            else:
+                logger.warning(f"_generate_callouts_and_snippets: only {len(cleaned)} callouts after cleaning — keeping existing")
+
+        # ── Validate + clean structured_snippets (only if needed) ─────────────
+        new_snippets = existing_snippets  # default: keep what we had
+        if need_snippets:
+            raw_snippets = parsed.get("structured_snippets") or []
+            built_snippets = []
+            for snip in raw_snippets:
+                if not isinstance(snip, dict):
+                    continue
+                header = snip.get("header", "")
+                if header not in VALID_SNIPPET_HEADERS:
+                    logger.warning(f"_generate_callouts_and_snippets: invalid header '{header}' — dropping snippet")
+                    continue
+                # M5: re-filter empties after truncate+strip
+                values = [s for s in (v[:25].strip() for v in (snip.get("values") or []) if isinstance(v, str) and v.strip()) if s]
+                if len(values) < 3:
+                    logger.warning(f"_generate_callouts_and_snippets: snippet '{header}' has <3 values — dropping")
+                    continue
+                built_snippets.append({"header": header, "values": values[:10]})
+            if built_snippets:
+                new_snippets = built_snippets
+            else:
+                logger.warning("_generate_callouts_and_snippets: no valid snippets generated — keeping existing")
+
+        # M1: skip DB write if nothing actually changed
+        if not new_callouts and not new_snippets:
+            logger.warning(f"_generate_callouts_and_snippets: nothing generated for {campaign_id} — skipping DB write")
+            return build
+
+        # ── Merge into build dict ─────────────────────────────────────────────
+        build["callout_texts"] = new_callouts
+        build["structured_snippets"] = new_snippets
+
+        # ── Persist to DB (read-modify-write inside single connection) ─────────
+        _build_full = get_campaign_build(campaign_id)
+        _build_full["callout_texts"] = new_callouts
+        _build_full["structured_snippets"] = new_snippets
+        with _conn() as _c:
+            cur = _c.execute(
+                "UPDATE campaigns SET campaign_build_json=?, updated_at=? WHERE campaign_id=?",
+                (json.dumps(_build_full), datetime.now(timezone.utc).isoformat(), campaign_id)
+            )
+            if cur.rowcount == 0:
+                logger.warning(f"_generate_callouts_and_snippets: UPDATE matched 0 rows for {campaign_id}")
+
+        logger.info(
+            f"_generate_callouts_and_snippets: {campaign_id} → "
+            f"{len(new_callouts)} callouts, {len(new_snippets)} snippet(s)"
+        )
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"_generate_callouts_and_snippets: JSON parse failed ({e}) — skipping")
+    except Exception as e:
+        logger.warning(f"_generate_callouts_and_snippets: unexpected error ({e}) — skipping")
+
+    return build
+
+
 # ─── Campaign Launch (now / schedule / queue) ────────────────────────────────
 
 class LaunchCampaignRequest(BaseModel):
@@ -4155,6 +4469,8 @@ def admin_campaign_launch(campaign_id: str, body: LaunchCampaignRequest):
             from database import update_campaign_fields
 
             logger.info(f"Launching new campaign {campaign_id} to Google Ads")
+            # Auto-generate callouts + structured snippets if not already in build
+            build = _generate_callouts_and_snippets(campaign_id, camp, build)
             result = create_campaign_in_gads(camp, build)
 
             if not result["ok"]:
@@ -4323,6 +4639,8 @@ async def admin_campaign_build_step_refine(campaign_id: str, body: CampaignBuild
     _api_key = get_setting("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
     ai_client = _anthropic.Anthropic(api_key=_api_key)
 
+    _kw_delta_mode = False  # set True only for keywords step; controls delta-merge logic below
+
     if body.step == "strategy":
         prompt = f"""You are a Google Ads specialist refining a campaign strategy.
 
@@ -4347,6 +4665,53 @@ Return the COMPLETE updated strategy as a JSON object with EXACTLY these keys (n
 
 Apply only the changes the user requested. Keep everything else identical to the current strategy.
 Return ONLY the JSON object, no explanation."""
+    elif body.step == "keywords":
+        # Summarise existing lists so the prompt stays small regardless of list size.
+        # Claude only generates the *delta* (additions/removals); we merge in Python.
+        _kw_summary_lines = []
+        for _mk in ["exact_match", "phrase_match", "broad_match_modifier", "negative_keywords"]:
+            _items = current.get(_mk) or []
+            if _items:
+                _kw_summary_lines.append(f"  {_mk}: {len(_items)} keywords (e.g. {', '.join(_items[:5])}{'…' if len(_items)>5 else ''})")
+        _kw_summary = "\n".join(_kw_summary_lines) or "  (empty)"
+
+        prompt = f"""You are a Google Ads specialist refining a keyword list for a dental practice campaign.
+
+Campaign: {camp.get("campaign_name", "")}
+Service Focus: {camp.get("service_focus", "")}
+Objective: {strategy.get("objective", "")}
+{_competitor_section}
+
+Current keyword counts (do NOT repeat these — only generate the delta):
+{_kw_summary}
+
+User instruction: {body.instruction}
+
+Your job: generate ONLY the keywords to ADD or REMOVE, not the full list.
+Return a JSON object with EXACTLY these four keys — each containing only the NEW items to add (or empty list if nothing to add for that type):
+{{
+  "add": {{
+    "exact_match": [],
+    "phrase_match": [],
+    "broad_match_modifier": [],
+    "negative_keywords": []
+  }},
+  "remove": {{
+    "exact_match": [],
+    "phrase_match": [],
+    "broad_match_modifier": [],
+    "negative_keywords": []
+  }}
+}}
+
+Rules:
+- Only include keywords the user explicitly asked to add or remove
+- If the user asks to add competitor names as negatives, use the brand stems from "Local competitor brand stems" in the Competitor Intelligence section above
+- NEVER add conquest keywords as negatives
+- Return ONLY the JSON object, no explanation"""
+
+        # After getting delta from Claude, merge into current list in Python
+        _kw_delta_mode = True
     else:
         prompt = f"""You are a Google Ads specialist helping refine a campaign build step.
 
@@ -4372,16 +4737,39 @@ Rules:
 - If user asks to "negate all competitors", add all brand stems from the Competitor Intelligence section that are not already present
 - Return ONLY the JSON object, no explanation."""
 
+    # Keywords uses delta mode — small prompt regardless of list size; 2k tokens is plenty.
+    # Other steps (ad_copy, strategy) can be larger — 4k.
+    _max_tok = 2000 if body.step == "keywords" else 4000
+
     try:
         response = ai_client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=2000,
+            max_tokens=_max_tok,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        # BE-G12 fix: use shared helper to handle ```json fences + bare JSON
-        _refined_text = _extract_json_from_ai_response(raw, allow_array=True)
+        if not raw:
+            raise ValueError("Claude returned an empty response")
+        # For keywords step, always expect an object (never allow bare array — that picks up inner arrays)
+        _allow_arr = body.step not in {"keywords", "strategy"}
+        _refined_text = _extract_json_from_ai_response(raw, allow_array=_allow_arr)
         refined = _json.loads(_refined_text)
+
+        # Keywords delta mode: merge add/remove delta into the full current list
+        if _kw_delta_mode:
+            _merged = {k: list(current.get(k) or []) for k in ["exact_match","phrase_match","broad_match_modifier","negative_keywords"]}
+            _add = refined.get("add") or {}
+            _rem = refined.get("remove") or {}
+            for _mk in _merged:
+                # Add new items (dedup)
+                for _kw in (_add.get(_mk) or []):
+                    if _kw not in _merged[_mk]:
+                        _merged[_mk].append(_kw)
+                # Remove requested items (case-insensitive)
+                _rem_lower = {r.lower() for r in (_rem.get(_mk) or [])}
+                _merged[_mk] = [k for k in _merged[_mk] if k.lower() not in _rem_lower]
+            refined = _merged
+
     except Exception as e:
         logger.error(f"build-step-refine AI call failed ({body.step}): {e}")
         raise HTTPException(status_code=500, detail=f"AI refinement failed: {e}")
@@ -5240,11 +5628,31 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
                         (_source_camp_name,)
                     ).fetchall()
                     if _neg_rows:
-                        _neg_list = ", ".join(f'"{r["keyword_text"]}"' for r in _neg_rows)
-                        _source_neg_block = (
-                            f"\n\nSource campaign negatives (MUST include ALL of these in negative_keywords — "
-                            f"they were validated as wasted spend on '{_source_camp_name}'):\n{_neg_list}"
-                        )
+                        # Filter out dental service terms — these are valid for general campaigns
+                        # and should never be inherited as negatives regardless of source campaign
+                        _dental_service_terms = {
+                            "implant", "implants", "dental implant", "dental implants",
+                            "veneer", "veneers", "porcelain veneer", "porcelain veneers",
+                            "crown", "crowns", "dental crown", "dental crowns",
+                            "denture", "dentures", "partial denture", "full denture",
+                            "whitening", "teeth whitening", "tooth whitening",
+                            "cosmetic", "cosmetic dentistry", "smile makeover",
+                            "invisalign", "clear aligner", "clear aligners", "braces", "orthodontic",
+                            "root canal", "root canals", "endodontist",
+                            "extraction", "extractions", "tooth extraction", "wisdom tooth",
+                            "wisdom teeth", "oral surgery", "sedation", "sleep dentistry",
+                            "periodontal", "gum disease", "gum treatment",
+                        }
+                        _filtered_negs = [
+                            r for r in _neg_rows
+                            if r["keyword_text"].lower().strip() not in _dental_service_terms
+                        ]
+                        if _filtered_negs:
+                            _neg_list = ", ".join(f'"{r["keyword_text"]}"' for r in _filtered_negs)
+                            _source_neg_block = (
+                                f"\n\nSource campaign negatives (include these in negative_keywords — "
+                                f"validated wasted spend on '{_source_camp_name}'):\n{_neg_list}"
+                            )
                     _kw_rows = _c.execute(
                         "SELECT keyword_text, match_type, conversions, clicks FROM gads_keywords_cache "
                         "WHERE LOWER(campaign_name) = LOWER(?) AND days = 30 "
@@ -6994,6 +7402,73 @@ def admin_add_negative_keyword(campaign_id: str, body: NegativeKeywordRequest):
             "keyword_text": keyword_text,
             "match_type": match_type,
         }
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+class KeywordRemoveRequest(BaseModel):
+    keyword_text: str
+    match_type: str          # EXACT | PHRASE | BROAD
+    is_negative: bool = False  # True → campaign-level negative; False → ad-group positive
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/keyword-remove", dependencies=[Depends(_require_admin)])
+def admin_remove_keyword(campaign_id: str, body: KeywordRemoveRequest):
+    """
+    Remove a keyword from the live Google Ads campaign.
+    - is_negative=True  → removes a campaign-level negative criterion
+    - is_negative=False → removes the matching ad-group positive criterion(s)
+    Only operates when the campaign has a gads_campaign_resource (is live).
+    Safe to call on DRAFT campaigns — returns ok=True with gads_removed=0.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from google_ads_write import remove_negative_keyword_from_campaign, remove_positive_keyword_from_campaign
+
+    keyword_text = (body.keyword_text or "").strip()
+    if not keyword_text:
+        raise HTTPException(status_code=422, detail="keyword_text is required")
+    match_type = (body.match_type or "EXACT").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise HTTPException(status_code=422, detail="match_type must be EXACT, PHRASE, or BROAD")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        # DRAFT campaign — local save already done by build-step-save; nothing to do in GAds
+        return {"ok": True, "gads_removed": 0, "draft": True}
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    operation = "remove_negative_keyword" if body.is_negative else "remove_positive_keyword"
+    action_id = log_admin_manual_action(
+        operation=operation,
+        entity_type="campaign",
+        entity_id=gads_resource,
+        entity_name=camp.get("campaign_name", ""),
+        before={"keyword_text": keyword_text, "match_type": match_type},
+        after={},
+        reason="manual_keyword_chip_delete",
+    )
+
+    try:
+        if body.is_negative:
+            removed = remove_negative_keyword_from_campaign(gads_resource, keyword_text, match_type)
+        else:
+            removed = remove_positive_keyword_from_campaign(gads_resource, keyword_text, match_type)
+
+        result_str = "success" if removed > 0 else "noop"
+        update_gads_action_result(action_id, executed=True, execution_result=result_str)
+        set_audit_approval(action_id, "admin")
+        return {"ok": True, "gads_removed": removed, "draft": False}
     except Exception as e:
         update_gads_action_result(action_id, executed=True,
                                   execution_result="error", error_detail=str(e))
@@ -9202,26 +9677,35 @@ def _extract_json_from_ai_response(raw_text: str, allow_array: bool = False) -> 
       - Bare JSON (most common)
       - Wrapped in ```json ... ``` or ``` ... ``` fences
       - JSON preceded by explanation text
+
+    Uses json.JSONDecoder.raw_decode to find the first valid JSON value and
+    stop exactly there — avoids greedy regex "Extra data" issues.
     """
+    import json as _j
     json_text = raw_text.strip()
-    # 1. Code-fenced JSON object
-    match = re.search(r"```(?:json)?\s*(\{[\s\S]+\})\s*```", json_text)
-    if match:
-        return match.group(1)
-    if allow_array:
-        # 2. Code-fenced JSON array
-        match = re.search(r"```(?:json)?\s*(\[[\s\S]+\])\s*```", json_text)
-        if match:
-            return match.group(1)
-    # 3. Bare JSON object not at start of string
-    if not json_text.startswith("{"):
-        brace_match = re.search(r"\{[\s\S]+\}", json_text)
-        if brace_match:
-            return brace_match.group(0)
-    if allow_array and not json_text.startswith("["):
-        arr_match = re.search(r"\[[\s\S]+\]", json_text)
-        if arr_match:
-            return arr_match.group(0)
+
+    # 1. Strip code fences first
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", json_text)
+    if fence_match:
+        json_text = fence_match.group(1).strip()
+
+    # 2. Try to find the first valid JSON object or array using raw_decode
+    decoder = _j.JSONDecoder()
+    # Scan forward to find first { or [
+    for start_char, wanted in [("{", "object"), ("[", "array")]:
+        if not allow_array and start_char == "[":
+            continue
+        idx = json_text.find(start_char)
+        if idx == -1:
+            continue
+        try:
+            obj, end = decoder.raw_decode(json_text, idx)
+            # raw_decode found valid JSON ending at `end` — return just that slice
+            return json_text[idx:end]
+        except _j.JSONDecodeError:
+            continue
+
+    # 3. Fallback — return as-is and let the caller handle the error
     return json_text
 
 
