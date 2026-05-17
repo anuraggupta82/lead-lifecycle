@@ -3864,7 +3864,7 @@ The "competitor_intel_union" field contains the union of all conquest keywords a
 If you see a search term that appears in all_conquest_keywords, treat it as intentional targeting, not waste.""" + _build_institutional_memory_note("")
 
         msg = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-sonnet-4-5",
             max_tokens=1500,
             messages=[{
                 "role": "user",
@@ -3875,7 +3875,7 @@ If you see a search term that appears in all_conquest_keywords, treat it as inte
             from ai_costs import log_claude
             log_claude(
                 purpose="ad_optimization",
-                model="claude-opus-4-5",
+                model="claude-sonnet-4-5",
                 input_tokens=msg.usage.input_tokens,
                 output_tokens=msg.usage.output_tokens,
                 optimizer_run_id=optimizer_run_id,
@@ -3992,7 +3992,7 @@ User feedback: {feedback}
 Return a SINGLE revised recommendation as a JSON object with the same operation type and all required fields updated per the feedback. Return ONLY the JSON object, no markdown."""
 
         msg = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-sonnet-4-5",
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )

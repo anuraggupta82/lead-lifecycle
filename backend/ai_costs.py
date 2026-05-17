@@ -25,9 +25,17 @@ WHISPER_COST_PER_MIN: float = 0.006
 GEMINI_IN_PER_M_TOKENS: float = 0.075
 GEMINI_OUT_PER_M_TOKENS: float = 0.300
 
-# Anthropic Claude Sonnet 4.x  ($3 / 1 M input tokens, $15 / 1 M output tokens)
-CLAUDE_IN_PER_M_TOKENS: float = 3.00
-CLAUDE_OUT_PER_M_TOKENS: float = 15.00
+# Anthropic Claude — per-model pricing (USD per 1 M tokens)
+# Rates as of May 2026. Update here when Anthropic changes pricing.
+_CLAUDE_PRICING: dict[str, tuple[float, float]] = {
+    # model-name-substring → (input_per_M, output_per_M)
+    "opus":   (15.00, 75.00),   # claude-opus-4-x
+    "sonnet": ( 3.00, 15.00),   # claude-sonnet-4-x
+    "haiku":  ( 0.80,  4.00),   # claude-haiku-4-x
+}
+# Fallback if model string doesn't match any key above (default to Sonnet rates)
+_CLAUDE_DEFAULT_IN:  float = 3.00
+_CLAUDE_DEFAULT_OUT: float = 15.00
 
 # ── Cost calculators ──────────────────────────────────────────────────────────
 
@@ -44,10 +52,21 @@ def gemini_cost(input_tokens: int, output_tokens: int) -> float:
     return round(cost, 6)
 
 
-def claude_cost(input_tokens: int, output_tokens: int) -> float:
-    """Return USD cost for a Claude API call."""
-    cost = (input_tokens / 1_000_000) * CLAUDE_IN_PER_M_TOKENS
-    cost += (output_tokens / 1_000_000) * CLAUDE_OUT_PER_M_TOKENS
+def claude_cost(input_tokens: int, output_tokens: int, model: str = "") -> float:
+    """Return USD cost for a Claude API call.
+
+    Uses per-model pricing — Opus is 5x more expensive than Sonnet.
+    Pass the full model string (e.g. 'claude-opus-4-5') for accurate cost.
+    Falls back to Sonnet rates if model is unrecognised.
+    """
+    model_lower = model.lower()
+    in_rate, out_rate = _CLAUDE_DEFAULT_IN, _CLAUDE_DEFAULT_OUT
+    for key, (i, o) in _CLAUDE_PRICING.items():
+        if key in model_lower:
+            in_rate, out_rate = i, o
+            break
+    cost = (input_tokens / 1_000_000) * in_rate
+    cost += (output_tokens / 1_000_000) * out_rate
     return round(cost, 6)
 
 
@@ -180,7 +199,7 @@ def log_claude(
     request_ms: int = 0,
 ) -> float:
     """Log a Claude API call and return the cost."""
-    cost = claude_cost(input_tokens, output_tokens)
+    cost = claude_cost(input_tokens, output_tokens, model=model)
     log_ai_usage(
         api="claude",
         model=model,
