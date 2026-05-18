@@ -5282,6 +5282,615 @@ function CallAnalysisView() {
   );
 }
 
+// ── CampaignNegativeInlineForm ────────────────────────────────────────────────
+// Hoisted as a proper component so hooks (useState) are valid.
+// Previously this was an IIFE inside a render expression which caused
+// React error #310 (hooks called outside a component).
+function CampaignNegativeInlineForm({ campaignId }) {
+  const [perfNegText, setPerfNegText]     = React.useState('');
+  const [perfNegMatch, setPerfNegMatch]   = React.useState('EXACT');
+  const [perfNegAdding, setPerfNegAdding] = React.useState(false);
+  const [perfNegFlash, setPerfNegFlash]   = React.useState('');
+
+  async function submitPerfNeg() {
+    const text = perfNegText.trim();
+    if (!text) return;
+    setPerfNegAdding(true);
+    setPerfNegFlash('');
+    try {
+      await api(`/api/admin/campaigns/${campaignId}/negative-keywords`, {
+        method: 'POST',
+        body: JSON.stringify({ keyword_text: text, match_type: perfNegMatch }),
+      });
+      setPerfNegFlash('Added ✓');
+      setPerfNegText('');
+    } catch(e) {
+      setPerfNegFlash('Error: ' + (e.detail || e.message || 'unknown'));
+    } finally {
+      setPerfNegAdding(false);
+      setTimeout(() => setPerfNegFlash(''), 4000);
+    }
+  }
+
+  const flashIsError = perfNegFlash.startsWith('Error');
+  return React.createElement('div', {
+    style: { background:'#fff', border:'1px solid #e0e0e0', borderRadius:6, padding:'10px 14px', marginBottom:14 }
+  },
+    React.createElement('div', { style:{ fontSize:11, fontWeight:700, color:'#7f1d1d', marginBottom:8 } },
+      '🚫 Add Campaign Negative Keyword'
+    ),
+    React.createElement('div', { style:{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' } },
+      React.createElement('input', {
+        style: { flex:1, minWidth:160, padding:'5px 8px', border:'1px solid #ddd', borderRadius:4, fontSize:13, boxSizing:'border-box' },
+        placeholder: 'e.g. grafton dental care',
+        value: perfNegText,
+        onChange: e => setPerfNegText(e.target.value),
+        onKeyDown: e => { if (e.key === 'Enter') submitPerfNeg(); },
+      }),
+      React.createElement('select', {
+        style: { padding:'5px 8px', border:'1px solid #ddd', borderRadius:4, fontSize:13, cursor:'pointer', width:90 },
+        value: perfNegMatch,
+        onChange: e => setPerfNegMatch(e.target.value),
+      },
+        React.createElement('option', { value:'EXACT' }, 'Exact'),
+        React.createElement('option', { value:'PHRASE' }, 'Phrase'),
+        React.createElement('option', { value:'BROAD' }, 'Broad'),
+      ),
+      React.createElement('button', {
+        disabled: perfNegAdding || !perfNegText.trim(),
+        onClick: submitPerfNeg,
+        style: {
+          fontSize:12, padding:'5px 14px', background:'#7f1d1d', color:'#fff',
+          border:'none', borderRadius:4,
+          cursor: (perfNegAdding || !perfNegText.trim()) ? 'not-allowed' : 'pointer',
+          opacity: (perfNegAdding || !perfNegText.trim()) ? 0.6 : 1,
+        },
+      }, perfNegAdding ? '⏳ Adding…' : 'Add'),
+      perfNegFlash && React.createElement('span', {
+        style: { fontSize:12, color: flashIsError ? '#dc2626' : '#16a34a', fontWeight:600 }
+      }, perfNegFlash),
+    )
+  );
+}
+
+// Hoisted outside AbTestsTab so React preserves identity across re-renders.
+// If defined inside, every AbTestsTab render creates a new component type,
+// causing React to unmount/remount and discard inner state.
+function AbTestMetricRow({ label, base, trial, format, higherIsBetter = true }) {
+  const b = parseFloat(base) || 0, t = parseFloat(trial) || 0;
+  const baseWins = higherIsBetter ? b >= t : b <= t;
+  const fmt = (v) => format === 'pct' ? (v * 100).toFixed(2) + '%'
+    : format === 'usd' ? '$' + v.toFixed(2)
+    : format === 'int' ? v.toLocaleString()
+    : v.toFixed(2);
+  return React.createElement('tr', null,
+    React.createElement('td', { style: { padding: '4px 8px', color: '#888', fontSize: 13 } }, label),
+    React.createElement('td', { style: { padding: '4px 8px', fontWeight: baseWins ? 700 : 400, color: baseWins ? '#28a745' : '#333', textAlign: 'right' } }, fmt(b)),
+    React.createElement('td', { style: { padding: '4px 8px', fontWeight: !baseWins ? 700 : 400, color: !baseWins ? '#28a745' : '#333', textAlign: 'right' } }, fmt(t)),
+  );
+}
+
+function AbTestExperimentDetail({ id, metricsData, metricsLoading }) {
+  if (metricsLoading[id]) return React.createElement('div', { style: { padding: 16, color: '#888' } }, 'Loading metrics...');
+  const m = metricsData[id];
+  if (!m) return null;
+  const { gads_metrics: gm, lead_metrics: lm, winner_signal: ws } = m;
+  const bg = gm?.base || {}; const tg = gm?.trial || {};
+  const bl = lm?.base || {}; const tl = lm?.trial || {};
+  const signalColor = { high: '#28a745', medium: '#ffc107', low: '#6c757d' }[ws?.confidence] || '#6c757d';
+
+  return React.createElement('div', { style: { padding: '12px 16px', background: '#f8f9fa', borderTop: '1px solid #e0e0e0' } },
+    ws && React.createElement('div', {
+      style: { marginBottom: 12, padding: '8px 12px', background: '#fff', border: `1px solid ${signalColor}`, borderRadius: 6 }
+    },
+      React.createElement('strong', { style: { color: signalColor } },
+        ws.ready ? (ws.winner === 'inconclusive' ? 'Inconclusive' : ws.winner === 'trial' ? 'Trial wins' : 'Base wins') : 'Collecting data'
+      ),
+      React.createElement('span', { style: { marginLeft: 8, color: '#555', fontSize: 13 } }, ws.summary)
+    ),
+    React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 13 } },
+      React.createElement('thead', null,
+        React.createElement('tr', null,
+          React.createElement('th', { style: { textAlign: 'left', padding: '4px 8px', color: '#666', fontWeight: 600 } }, 'Metric'),
+          React.createElement('th', { style: { textAlign: 'right', padding: '4px 8px', color: '#666', fontWeight: 600 } }, 'Base (Control)'),
+          React.createElement('th', { style: { textAlign: 'right', padding: '4px 8px', color: '#666', fontWeight: 600 } }, 'Trial (Variant)'),
+        )
+      ),
+      React.createElement('tbody', null,
+        React.createElement(AbTestMetricRow, { label: 'Clicks', base: bg.clicks, trial: tg.clicks, format: 'int' }),
+        React.createElement(AbTestMetricRow, { label: 'Impressions', base: bg.impressions, trial: tg.impressions, format: 'int' }),
+        React.createElement(AbTestMetricRow, { label: 'CTR', base: bg.ctr, trial: tg.ctr, format: 'pct' }),
+        React.createElement(AbTestMetricRow, { label: 'GAds Conversions', base: bg.conversions, trial: tg.conversions, format: 'float' }),
+        React.createElement(AbTestMetricRow, { label: 'GAds Cost', base: bg.cost_usd, trial: tg.cost_usd, format: 'usd', higherIsBetter: false }),
+        React.createElement(AbTestMetricRow, { label: 'Local Leads', base: bl.total_leads, trial: tl.total_leads, format: 'int' }),
+        React.createElement(AbTestMetricRow, { label: 'Booked Appts', base: bl.booked, trial: tl.booked, format: 'int' }),
+        React.createElement(AbTestMetricRow, { label: 'Revenue (OD)', base: bl.revenue, trial: tl.revenue, format: 'usd' }),
+      )
+    )
+  );
+}
+
+function AbTestsTab({ campaigns }) {
+  const [experiments, setExperiments] = React.useState([]);
+  const [loading, setLoading] = React.useState(false);
+  const [showForm, setShowForm] = React.useState(false);
+  const [expandedId, setExpandedId] = React.useState(null);
+  const [metrics, setMetrics] = React.useState({});
+  const [metricsLoading, setMetricsLoading] = React.useState({});
+  const [form, setForm] = React.useState({
+    experiment_name: '', experiment_resource: '',
+    base_campaign_resource: '', base_campaign_name: '',
+    trial_campaign_resource: '', trial_campaign_name: '',
+    experiment_type: 'landing_page', control_url: '', variant_url: '',
+    traffic_split_percent: 50, status: 'SETUP',
+    start_date: '', end_date: '', notes: ''
+  });
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState('');
+  const pw = window._adminPw || '';
+
+  const load = () => {
+    setLoading(true);
+    fetch('/api/admin/experiments', { headers: { 'x-admin-password': pw } })
+      .then(r => r.json())
+      .then(d => { setExperiments(d.experiments || []); setLoading(false); })
+      .catch(() => setLoading(false));
+  };
+
+  React.useEffect(() => { load(); }, []);
+
+  const loadMetrics = (id) => {
+    setMetricsLoading(m => ({ ...m, [id]: true }));
+    fetch(`/api/admin/experiments/${id}/metrics`, { headers: { 'x-admin-password': pw } })
+      .then(r => r.json())
+      .then(d => {
+        setMetrics(m => ({ ...m, [id]: d }));
+        setMetricsLoading(ml => ({ ...ml, [id]: false }));
+      })
+      .catch(() => setMetricsLoading(ml => ({ ...ml, [id]: false })));
+  };
+
+  const toggleExpand = (id) => {
+    if (expandedId === id) { setExpandedId(null); return; }
+    setExpandedId(id);
+    if (!metrics[id]) loadMetrics(id);
+  };
+
+  const handleSave = async () => {
+    if (!form.experiment_name || !form.base_campaign_resource) {
+      setError('Experiment name and base campaign are required.'); return;
+    }
+    setSaving(true); setError('');
+    try {
+      const r = await fetch('/api/admin/experiments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-password': pw },
+        body: JSON.stringify(form)
+      });
+      const d = await r.json();
+      if (!r.ok) { setError(d.detail || 'Save failed'); setSaving(false); return; }
+      setShowForm(false);
+      setForm({ experiment_name: '', experiment_resource: '',
+        base_campaign_resource: '', base_campaign_name: '',
+        trial_campaign_resource: '', trial_campaign_name: '',
+        experiment_type: 'landing_page', control_url: '', variant_url: '',
+        traffic_split_percent: 50, status: 'SETUP',
+        start_date: '', end_date: '', notes: '' });
+      load();
+    } catch(e) { setError('Network error'); }
+    setSaving(false);
+  };
+
+  const updateStatus = async (id, status, winner) => {
+    await fetch(`/api/admin/experiments/${id}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-admin-password': pw },
+      body: JSON.stringify({ status, winner: winner || '' })
+    });
+    load();
+    if (metrics[id]) loadMetrics(id);
+  };
+
+  const statusColor = (s) => ({
+    SETUP: '#6c757d', RUNNING: '#28a745', HALTED: '#dc3545',
+    PROMOTED: '#007bff', GRADUATED: '#6f42c1'
+  }[s] || '#6c757d');
+
+  const winnerBadge = (w) => {
+    if (!w) return null;
+    const colors = { base: '#007bff', trial: '#28a745', inconclusive: '#ffc107', insufficient_data: '#6c757d' };
+    const labels = { base: 'Base wins', trial: 'Trial wins', inconclusive: 'Inconclusive', insufficient_data: 'Insufficient data' };
+    return React.createElement('span', {
+      style: { background: colors[w] || '#6c757d', color: '#fff', borderRadius: 4, padding: '2px 8px', fontSize: 11, marginLeft: 6 }
+    }, labels[w] || w);
+  };
+
+
+  const fieldStyle = { width: '100%', padding: '6px 8px', border: '1px solid #ddd', borderRadius: 4, fontSize: 13, boxSizing: 'border-box' };
+  const labelStyle = { display: 'block', fontSize: 12, color: '#666', marginBottom: 3 };
+
+  return React.createElement('div', { style: { padding: 16 } },
+    React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 } },
+      React.createElement('h3', { style: { margin: 0, fontSize: 16 } }, 'A/B Experiments'),
+      React.createElement('button', {
+        onClick: () => setShowForm(f => !f),
+        style: { background: '#007bff', color: '#fff', border: 'none', borderRadius: 4, padding: '6px 14px', cursor: 'pointer', fontSize: 13 }
+      }, showForm ? 'Cancel' : '+ New Experiment')
+    ),
+
+    showForm && React.createElement('div', { style: { background: '#fff', border: '1px solid #ddd', borderRadius: 6, padding: 16, marginBottom: 16 } },
+      React.createElement('h4', { style: { margin: '0 0 12px', fontSize: 14 } }, 'New Experiment'),
+      error && React.createElement('div', { style: { color: '#dc3545', marginBottom: 8, fontSize: 13 } }, error),
+      React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Experiment Name *'),
+          React.createElement('input', { style: fieldStyle, value: form.experiment_name, onChange: e => setForm(f => ({...f, experiment_name: e.target.value})), placeholder: 'e.g. Dentures LP Test May 2026' })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Type'),
+          React.createElement('select', { style: fieldStyle, value: form.experiment_type, onChange: e => setForm(f => ({...f, experiment_type: e.target.value})) },
+            React.createElement('option', { value: 'landing_page' }, 'Landing Page'),
+            React.createElement('option', { value: 'ad_copy' }, 'Ad Copy'),
+          )
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Base Campaign *'),
+          React.createElement('select', { style: fieldStyle, value: form.base_campaign_resource,
+            onChange: e => {
+              const camp = (campaigns || []).find(c => c.resource_name === e.target.value);
+              setForm(f => ({...f, base_campaign_resource: e.target.value, base_campaign_name: camp?.name || ''}));
+            }
+          },
+            React.createElement('option', { value: '' }, '-- select campaign --'),
+            (campaigns || []).map(c => React.createElement('option', { key: c.resource_name, value: c.resource_name }, c.name))
+          )
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Trial Campaign Resource Name'),
+          React.createElement('input', { style: fieldStyle, value: form.trial_campaign_resource, onChange: e => setForm(f => ({...f, trial_campaign_resource: e.target.value})), placeholder: 'customers/123/campaigns/456' })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Trial Campaign Name'),
+          React.createElement('input', { style: fieldStyle, value: form.trial_campaign_name, onChange: e => setForm(f => ({...f, trial_campaign_name: e.target.value})), placeholder: 'Name as it appears in Google Ads' })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Google Experiment Resource'),
+          React.createElement('input', { style: fieldStyle, value: form.experiment_resource, onChange: e => setForm(f => ({...f, experiment_resource: e.target.value})), placeholder: 'customers/123/experiments/456 (optional)' })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Control URL (Base)'),
+          React.createElement('input', { style: fieldStyle, value: form.control_url, onChange: e => setForm(f => ({...f, control_url: e.target.value})), placeholder: 'https://graftondentalcare.com/dentures-grafton-ma' })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Variant URL (Trial)'),
+          React.createElement('input', { style: fieldStyle, value: form.variant_url, onChange: e => setForm(f => ({...f, variant_url: e.target.value})), placeholder: 'https://graftondentalcare.com/dentures-v2' })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Traffic Split % (to trial)'),
+          React.createElement('input', { style: fieldStyle, type: 'number', min: 1, max: 99, value: form.traffic_split_percent, onChange: e => setForm(f => ({...f, traffic_split_percent: parseInt(e.target.value) || 50})) })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'Start Date'),
+          React.createElement('input', { style: fieldStyle, type: 'date', value: form.start_date, onChange: e => setForm(f => ({...f, start_date: e.target.value})) })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: labelStyle }, 'End Date'),
+          React.createElement('input', { style: fieldStyle, type: 'date', value: form.end_date, onChange: e => setForm(f => ({...f, end_date: e.target.value})) })
+        ),
+        React.createElement('div', { style: { gridColumn: '1 / -1' } },
+          React.createElement('label', { style: labelStyle }, 'Notes'),
+          React.createElement('textarea', { style: {...fieldStyle, height: 60, resize: 'vertical'}, value: form.notes, onChange: e => setForm(f => ({...f, notes: e.target.value})), placeholder: 'What are you testing and why?' })
+        ),
+      ),
+      React.createElement('div', { style: { marginTop: 12, display: 'flex', gap: 8 } },
+        React.createElement('button', {
+          onClick: handleSave, disabled: saving,
+          style: { background: '#28a745', color: '#fff', border: 'none', borderRadius: 4, padding: '7px 18px', cursor: saving ? 'not-allowed' : 'pointer', fontSize: 13 }
+        }, saving ? 'Saving...' : 'Create Experiment'),
+        React.createElement('button', {
+          onClick: () => { setShowForm(false); setError(''); },
+          style: { background: '#6c757d', color: '#fff', border: 'none', borderRadius: 4, padding: '7px 14px', cursor: 'pointer', fontSize: 13 }
+        }, 'Cancel')
+      )
+    ),
+
+    loading
+      ? React.createElement('div', { style: { color: '#888', padding: 16 } }, 'Loading experiments...')
+      : experiments.length === 0
+        ? React.createElement('div', { style: { color: '#888', padding: 16, textAlign: 'center' } },
+            'No experiments yet. Create one when you have an A/B test running in Google Ads.')
+        : React.createElement('div', null,
+            experiments.map(exp => {
+              const m = metrics[exp.id];
+              const ws = m?.winner_signal;
+              const isExpanded = expandedId === exp.id;
+              const daysRunning = m?.days_running ?? '';
+
+              return React.createElement('div', {
+                key: exp.id,
+                style: { border: '1px solid #e0e0e0', borderRadius: 6, marginBottom: 10, overflow: 'hidden', background: '#fff' }
+              },
+                React.createElement('div', {
+                  style: { padding: '10px 14px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+                  onClick: () => toggleExpand(exp.id)
+                },
+                  React.createElement('div', null,
+                    React.createElement('strong', { style: { fontSize: 14 } }, exp.experiment_name),
+                    React.createElement('span', {
+                      style: { marginLeft: 8, background: statusColor(exp.status), color: '#fff', borderRadius: 4, padding: '2px 7px', fontSize: 11 }
+                    }, exp.status),
+                    React.createElement('span', { style: { marginLeft: 8, fontSize: 12, color: '#888' } },
+                      exp.experiment_type === 'landing_page' ? 'Landing Page' : 'Ad Copy'
+                    ),
+                    ws && winnerBadge(ws.winner),
+                  ),
+                  React.createElement('div', { style: { fontSize: 12, color: '#888', textAlign: 'right' } },
+                    exp.base_campaign_name && React.createElement('div', null, exp.base_campaign_name),
+                    exp.start_date && React.createElement('div', null, 'Started: ', exp.start_date),
+                    daysRunning !== '' && React.createElement('div', null, daysRunning, ' days running'),
+                    React.createElement('span', { style: { color: '#007bff' } }, isExpanded ? 'collapse' : 'expand')
+                  )
+                ),
+
+                isExpanded && React.createElement('div', null,
+                  React.createElement(AbTestExperimentDetail, { id: exp.id, metricsData: metrics, metricsLoading }),
+                  React.createElement('div', { style: { padding: '8px 16px 12px', display: 'flex', gap: 8, borderTop: '1px solid #e0e0e0' } },
+                    exp.status === 'SETUP' && React.createElement('button', {
+                      onClick: () => updateStatus(exp.id, 'RUNNING'),
+                      style: { background: '#28a745', color: '#fff', border: 'none', borderRadius: 4, padding: '5px 12px', cursor: 'pointer', fontSize: 12 }
+                    }, 'Mark Running'),
+                    exp.status === 'RUNNING' && React.createElement('button', {
+                      onClick: () => updateStatus(exp.id, 'HALTED'),
+                      style: { background: '#dc3545', color: '#fff', border: 'none', borderRadius: 4, padding: '5px 12px', cursor: 'pointer', fontSize: 12 }
+                    }, 'Halt'),
+                    exp.status === 'RUNNING' && React.createElement('button', {
+                      onClick: () => updateStatus(exp.id, 'PROMOTED', ws?.winner || ''),
+                      style: { background: '#007bff', color: '#fff', border: 'none', borderRadius: 4, padding: '5px 12px', cursor: 'pointer', fontSize: 12 }
+                    }, 'Mark Promoted'),
+                    exp.status === 'RUNNING' && React.createElement('button', {
+                      onClick: () => updateStatus(exp.id, 'GRADUATED', ws?.winner || ''),
+                      style: { background: '#6f42c1', color: '#fff', border: 'none', borderRadius: 4, padding: '5px 12px', cursor: 'pointer', fontSize: 12 }
+                    }, 'Mark Graduated'),
+                    React.createElement('button', {
+                      onClick: () => loadMetrics(exp.id),
+                      style: { background: '#6c757d', color: '#fff', border: 'none', borderRadius: 4, padding: '5px 12px', cursor: 'pointer', fontSize: 12 }
+                    }, 'Refresh Metrics'),
+                  )
+                )
+              );
+            })
+          )
+  );
+}
+
+// ─── NegativesTab ─────────────────────────────────────────────────────────────
+// Hoisted outside ReportsTab so React preserves component identity across
+// re-renders. Manages both account-level and campaign-level negative keywords.
+function NegativesTab({ campaigns, pw }) {
+  // Account-level state
+  const [acctNegatives, setAcctNegatives]       = React.useState([]);
+  const [acctLoading, setAcctLoading]           = React.useState(false);
+  const [acctAddText, setAcctAddText]           = React.useState('');
+  const [acctAddMatch, setAcctAddMatch]         = React.useState('BROAD');
+  const [acctAdding, setAcctAdding]             = React.useState(false);
+  const [acctFlash, setAcctFlash]               = React.useState('');   // success/error msg
+  const [acctJustAdded, setAcctJustAdded]       = React.useState(new Set()); // texts added this session
+  // Campaign-level state
+  const [campId, setCampId]                     = React.useState('');
+  const [campNegatives, setCampNegatives]       = React.useState([]);
+  const [campNegLoading, setCampNegLoading]     = React.useState(false);
+  const [campAddText, setCampAddText]           = React.useState('');
+  const [campAddMatch, setCampAddMatch]         = React.useState('EXACT');
+  const [campAdding, setCampAdding]             = React.useState(false);
+  const [campFlash, setCampFlash]               = React.useState('');
+
+  const matchBadgeColor = { BROAD: '#6c757d', PHRASE: '#007bff', EXACT: '#28a745' };
+  const fieldStyle = { padding: '5px 8px', border: '1px solid #ddd', borderRadius: 4, fontSize: 13, boxSizing: 'border-box' };
+  const selectStyle = { ...fieldStyle, cursor: 'pointer' };
+
+  // Load account-level negatives on mount
+  React.useEffect(() => {
+    setAcctLoading(true);
+    api('/api/admin/gads/negatives/account')
+      .then(d => { setAcctNegatives(d.negatives || []); setAcctLoading(false); })
+      .catch(() => setAcctLoading(false));
+  }, []);
+
+  // Load campaign-level negatives when campaign changes
+  React.useEffect(() => {
+    if (!campId) { setCampNegatives([]); return; }
+    setCampNegLoading(true);
+    api(`/api/admin/gads/negatives/campaign/${campId}`)
+      .then(d => { setCampNegatives(d.negatives || []); setCampNegLoading(false); })
+      .catch(() => setCampNegLoading(false));
+  }, [campId]);
+
+  async function addAcctNegative() {
+    const text = acctAddText.trim();
+    if (!text) return;
+    setAcctAdding(true);
+    setAcctFlash('');
+    try {
+      const r = await api('/api/admin/gads/negatives/account', {
+        method: 'POST',
+        body: JSON.stringify({ keyword_text: text, match_type: acctAddMatch }),
+      });
+      if (r.duplicate) {
+        setAcctFlash('Already exists');
+      } else {
+        setAcctFlash('Added ✓');
+        setAcctJustAdded(s => new Set([...s, text]));
+        setAcctAddText('');
+        // Reload list
+        api('/api/admin/gads/negatives/account')
+          .then(d => setAcctNegatives(d.negatives || []))
+          .catch(() => {});
+      }
+    } catch(e) {
+      setAcctFlash('Error: ' + (e.detail || e.message || 'unknown'));
+    } finally {
+      setAcctAdding(false);
+      setTimeout(() => setAcctFlash(''), 4000);
+    }
+  }
+
+  async function addCampNegative() {
+    const text = campAddText.trim();
+    if (!text || !campId) return;
+    setCampAdding(true);
+    setCampFlash('');
+    try {
+      await api(`/api/admin/campaigns/${campId}/negative-keywords`, {
+        method: 'POST',
+        body: JSON.stringify({ keyword_text: text, match_type: campAddMatch }),
+      });
+      setCampFlash('Added ✓');
+      setCampAddText('');
+      // Reload campaign negatives
+      api(`/api/admin/gads/negatives/campaign/${campId}`)
+        .then(d => setCampNegatives(d.negatives || []))
+        .catch(() => {});
+    } catch(e) {
+      setCampFlash('Error: ' + (e.detail || e.message || 'unknown'));
+    } finally {
+      setCampAdding(false);
+      setTimeout(() => setCampFlash(''), 4000);
+    }
+  }
+
+  const acctFlashIsError = acctFlash.startsWith('Error');
+  const campFlashIsError = campFlash.startsWith('Error');
+
+  return React.createElement('div', { style: { padding: 16 } },
+
+    // ── Account-Level Section ──
+    React.createElement('div', { style: { background: '#fff', border: '1px solid #e0e0e0', borderRadius: 6, padding: 16, marginBottom: 20 } },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 4 } },
+        React.createElement('h3', { style: { margin: 0, fontSize: 15 } }, 'Account-Level Negatives'),
+        React.createElement('span', { style: { fontSize: 11, color: '#dc2626', fontWeight: 600 } }, 'Blocks keyword across ALL campaigns')
+      ),
+
+      // Add form
+      React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' } },
+        React.createElement('input', {
+          style: { ...fieldStyle, flex: 1, minWidth: 180 },
+          placeholder: 'e.g. grafton dental care',
+          value: acctAddText,
+          onChange: e => setAcctAddText(e.target.value),
+          onKeyDown: e => { if (e.key === 'Enter') addAcctNegative(); },
+        }),
+        React.createElement('select', {
+          style: { ...selectStyle, width: 100 },
+          value: acctAddMatch,
+          onChange: e => setAcctAddMatch(e.target.value),
+        },
+          React.createElement('option', { value: 'BROAD' }, 'Broad'),
+          React.createElement('option', { value: 'PHRASE' }, 'Phrase'),
+          React.createElement('option', { value: 'EXACT' }, 'Exact'),
+        ),
+        React.createElement('button', {
+          disabled: acctAdding || !acctAddText.trim(),
+          onClick: addAcctNegative,
+          style: { fontSize: 12, padding: '5px 14px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 4, cursor: acctAdding || !acctAddText.trim() ? 'not-allowed' : 'pointer', opacity: acctAdding || !acctAddText.trim() ? 0.6 : 1 },
+        }, acctAdding ? 'Adding…' : 'Add Account Negative'),
+        acctFlash && React.createElement('span', {
+          style: { fontSize: 12, color: acctFlashIsError ? '#dc2626' : '#16a34a', fontWeight: 600 }
+        }, acctFlash),
+      ),
+
+      // List
+      acctLoading
+        ? React.createElement('div', { style: { color: '#888', fontSize: 13 } }, 'Loading…')
+        : acctNegatives.length === 0
+          ? React.createElement('div', { style: { color: '#aaa', fontSize: 13, fontStyle: 'italic' } }, 'No account-level negatives found.')
+          : React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+              acctNegatives.map((n, i) => React.createElement('span', {
+                key: i,
+                style: {
+                  display: 'inline-flex', alignItems: 'center', gap: 5,
+                  background: acctJustAdded.has(n.text) ? '#fef9c3' : '#fff5f5',
+                  border: '1px solid #fca5a5', borderRadius: 4, padding: '3px 9px', fontSize: 12,
+                }
+              },
+                React.createElement('span', { style: { fontWeight: 600, color: '#991b1b' } }, '−' + n.text),
+                React.createElement('span', {
+                  style: { fontSize: 10, padding: '1px 5px', borderRadius: 3, background: matchBadgeColor[n.match_type] || '#6c757d', color: '#fff' }
+                }, n.match_type),
+                acctJustAdded.has(n.text) && React.createElement('span', { style: { fontSize: 10, color: '#16a34a', fontWeight: 600 } }, '✓ Added'),
+              ))
+            )
+    ),
+
+    // ── Campaign-Level Section ──
+    React.createElement('div', { style: { background: '#fff', border: '1px solid #e0e0e0', borderRadius: 6, padding: 16 } },
+      React.createElement('h3', { style: { margin: '0 0 12px', fontSize: 15 } }, 'Campaign-Level Negatives'),
+
+      // Campaign selector
+      React.createElement('div', { style: { marginBottom: 12 } },
+        React.createElement('label', { style: { fontSize: 12, color: '#666', display: 'block', marginBottom: 4 } }, 'Select Campaign'),
+        React.createElement('select', {
+          style: { ...selectStyle, width: '100%', maxWidth: 420 },
+          value: campId,
+          onChange: e => setCampId(e.target.value),
+        },
+          React.createElement('option', { value: '' }, '-- choose a campaign --'),
+          (campaigns || []).map(c => React.createElement('option', {
+            key: c.resource_name || c.campaign_id,
+            value: c.campaign_id || c.resource_name,
+          }, c.name || c.campaign_name || c.resource_name))
+        )
+      ),
+
+      campId && React.createElement('div', null,
+        // Add form
+        React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' } },
+          React.createElement('input', {
+            style: { ...fieldStyle, flex: 1, minWidth: 180 },
+            placeholder: 'e.g. free dental',
+            value: campAddText,
+            onChange: e => setCampAddText(e.target.value),
+            onKeyDown: e => { if (e.key === 'Enter') addCampNegative(); },
+          }),
+          React.createElement('select', {
+            style: { ...selectStyle, width: 100 },
+            value: campAddMatch,
+            onChange: e => setCampAddMatch(e.target.value),
+          },
+            React.createElement('option', { value: 'EXACT' }, 'Exact'),
+            React.createElement('option', { value: 'PHRASE' }, 'Phrase'),
+            React.createElement('option', { value: 'BROAD' }, 'Broad'),
+          ),
+          React.createElement('button', {
+            disabled: campAdding || !campAddText.trim(),
+            onClick: addCampNegative,
+            style: { fontSize: 12, padding: '5px 14px', background: '#7f1d1d', color: '#fff', border: 'none', borderRadius: 4, cursor: campAdding || !campAddText.trim() ? 'not-allowed' : 'pointer', opacity: campAdding || !campAddText.trim() ? 0.6 : 1 },
+          }, campAdding ? 'Adding…' : 'Add Negative'),
+          campFlash && React.createElement('span', {
+            style: { fontSize: 12, color: campFlashIsError ? '#dc2626' : '#16a34a', fontWeight: 600 }
+          }, campFlash),
+        ),
+
+        // List
+        campNegLoading
+          ? React.createElement('div', { style: { color: '#888', fontSize: 13 } }, 'Loading…')
+          : campNegatives.length === 0
+            ? React.createElement('div', { style: { color: '#aaa', fontSize: 13, fontStyle: 'italic' } }, 'No campaign-level negatives found.')
+            : React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+                campNegatives.map((n, i) => React.createElement('span', {
+                  key: i,
+                  style: { display: 'inline-flex', alignItems: 'center', gap: 5, background: '#fff5f5', border: '1px solid #fca5a5', borderRadius: 4, padding: '3px 9px', fontSize: 12 }
+                },
+                  React.createElement('span', { style: { fontWeight: 600, color: '#991b1b' } }, '−' + n.text),
+                  React.createElement('span', { style: { fontSize: 10, padding: '1px 5px', borderRadius: 3, background: matchBadgeColor[n.match_type] || '#6c757d', color: '#fff' } }, n.match_type),
+                ))
+              )
+      ),
+
+      !campId && React.createElement('div', { style: { color: '#aaa', fontSize: 13, fontStyle: 'italic' } }, 'Select a campaign above to view and add campaign-level negatives.')
+    )
+  );
+}
+
 function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading, onGa4DaysChange }) {
   const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'income' | ...
   const [incomeData, setIncomeData] = useState(null);   // {rows, summary} or null
@@ -5296,6 +5905,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [unifiedCamps, setUnifiedCamps] = useState([]);
   const [unifiedLoading, setUnifiedLoading] = useState(false);
   const [showInactive, setShowInactive] = useState(false);
+  const [campStatusFilter, setCampStatusFilter] = useState('active'); // 'active' | 'paused' | 'all'
+  const [syncAllLoading, setSyncAllLoading] = useState(false);
+  const [syncAllResult, setSyncAllResult] = useState(null);
   const [unifiedDays, setUnifiedDays] = useState(30);
   // Budget summary
   const [budgetSummary, setBudgetSummary] = useState(null);
@@ -5367,6 +5979,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [negatePopover, setNegatePopover]     = useState(null);  // {term, matchType}
   const [negateLoading, setNegateLoading]     = useState(false);
   const [negatedTerms, setNegatedTerms]       = useState(new Set()); // locally-negated search terms
+  const [hideNegated, setHideNegated]         = useState(true);  // hide negated terms by default
   // Bulk negate state
   const [stSelectedTerms, setStSelectedTerms] = useState(new Set()); // selected search term strings
   const [stBulkMatchType, setStBulkMatchType] = useState('EXACT');
@@ -5398,8 +6011,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   async function loadUnifiedCamps() {
     setUnifiedLoading(true);
     try {
+      const includeInactive = campStatusFilter !== 'active';
       const [d, callRows] = await Promise.all([
-        api(`/api/admin/campaigns/unified?days=${unifiedDays}&include_inactive=${showInactive}`),
+        api(`/api/admin/campaigns/unified?days=${unifiedDays}&include_inactive=${includeInactive}`),
         api(`/api/admin/calls/campaign-attribution?days=${unifiedDays}`).catch(()=>[]),
       ]);
       setUnifiedCamps(d.campaigns || []);
@@ -5419,7 +6033,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
     } catch(e) { console.error('Failed to load unified campaigns', e); }
     finally { setUnifiedLoading(false); }
   }
-  useEffect(() => { loadUnifiedCamps(); }, [unifiedDays, showInactive]);
+  useEffect(() => { loadUnifiedCamps(); }, [unifiedDays, campStatusFilter]);
 
   async function loadIncomeData() {
     setIncomeLoading(true);
@@ -6050,7 +6664,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
-        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages'],['nearby','Nearby Practices'],['competitor-intel','Competitor Intel'],['income','💰 Income']].map(([k,l])=>(
+        {[['campaigns','Campaigns'],['adgroups','Ad Groups'],['searchterms','Search Terms'],['adcreatives','Ad Creatives'],['landingpages','Landing Pages'],['nearby','Nearby Practices'],['competitor-intel','Competitor Intel'],['income','💰 Income'],['abtests','A/B Tests'],['negatives','🚫 Negatives']].map(([k,l])=>(
           <button key={k} className={'reports-view-btn'+(view===k?' active':'')} onClick={()=>setView(k)}>{l}</button>
         ))}
       </div>
@@ -6232,6 +6846,27 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
         </div>
       )}
 
+      {/* ── A/B Tests view ── */}
+      {view==='abtests' && (
+        <div className="report-section">
+          <AbTestsTab campaigns={(unifiedCamps||[]).filter(c=>c.gads_campaign_resource).map(c=>({resource_name:c.gads_campaign_resource,name:c.campaign_name||''}))} />
+        </div>
+      )}
+
+      {/* ── Negatives view ── */}
+      {view==='negatives' && (
+        <div className="report-section">
+          <NegativesTab
+            campaigns={(unifiedCamps||[]).map(c=>({
+              campaign_id: c.campaign_id,
+              resource_name: c.gads_campaign_resource||'',
+              name: c.campaign_name||'',
+            }))}
+            pw={window._adminPw||''}
+          />
+        </div>
+      )}
+
       {/* ── Campaigns view ── */}
       {view==='campaigns' && <div>
       <div className="report-section">
@@ -6244,10 +6879,15 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
               onClick={openGadsImport}>⬇ Import from Google Ads</button>
           </div>
           <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
-            <label style={{fontSize:10,color:'var(--text-muted)',display:'flex',alignItems:'center',gap:4,cursor:'pointer',userSelect:'none'}}>
-              <input type="checkbox" checked={showInactive} onChange={e=>setShowInactive(e.target.checked)} />
-              Show inactive (90d+)
-            </label>
+            {/* Status filter pills */}
+            {[{id:'active',label:'Active'},{id:'paused',label:'Paused'},{id:'all',label:'All'}].map(f=>(
+              <button key={f.id}
+                style={{padding:'3px 10px',fontSize:10,border:'1px solid var(--border)',borderRadius:12,cursor:'pointer',
+                  background:campStatusFilter===f.id?'var(--teal)':'#fff',
+                  color:campStatusFilter===f.id?'#fff':'var(--text-muted)',fontWeight:campStatusFilter===f.id?600:400}}
+                onClick={()=>setCampStatusFilter(f.id)}>{f.label}</button>
+            ))}
+            <div style={{width:1,height:16,background:'var(--border)',margin:'0 2px'}}/>
             {presets.map(p=>(
               <button key={p.label}
                 style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
@@ -6256,6 +6896,26 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                 onClick={()=>setUnifiedDays(p.days)}>{p.label}</button>
             ))}
             <button className="btn btn-ghost btn-sm" onClick={loadUnifiedCamps} style={{fontSize:10}}>↻ Refresh</button>
+            <button
+              style={{padding:'3px 10px',fontSize:10,border:'1px solid #4285f4',borderRadius:4,cursor:'pointer',
+                background:syncAllLoading?'#e8f0fe':'#fff',color:'#4285f4',fontWeight:500}}
+              disabled={syncAllLoading}
+              onClick={async()=>{
+                setSyncAllLoading(true); setSyncAllResult(null);
+                try {
+                  const r = await api('/api/admin/campaigns/sync-all-active',{method:'POST'});
+                  setSyncAllResult(r);
+                  loadUnifiedCamps();
+                } catch(e){ setSyncAllResult({error: e.message||'Sync failed'}); }
+                finally { setSyncAllLoading(false); }
+              }}>
+              {syncAllLoading ? '⟳ Syncing…' : '⟳ Sync Google Ads'}
+            </button>
+            {syncAllResult && !syncAllLoading && (
+              <span style={{fontSize:10,color:syncAllResult.error?'#dc2626':'#16a34a'}}>
+                {syncAllResult.error ? `❌ ${syncAllResult.error}` : syncAllResult.errors_total > 0 ? `⚠ ${syncAllResult.synced||0} synced, ${syncAllResult.errors_total} errors` : `✓ ${syncAllResult.synced||0} campaigns synced`}
+              </span>
+            )}
           </div>
         </div>
 
@@ -6470,7 +7130,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                 No campaigns yet — click "+ New Campaign" or "⬇ Import from Google Ads".
               </td></tr>
             )}
-            {!unifiedLoading && unifiedCamps.map((c,ci) => {
+            {!unifiedLoading && unifiedCamps.filter(c => {
+              if (campStatusFilter === 'all') return true;
+              const s = (c.status || '').toUpperCase();
+              if (campStatusFilter === 'active') return s === 'ACTIVE';
+              if (campStatusFilter === 'paused') return ['PAUSED','DRAFT','COMPLETED','ARCHIVED','SCHEDULED','QUEUED','UNMANAGED'].includes(s);
+              return true;
+            }).map((c,ci) => {
               const m = c.metrics || {};
               const statusColor = {
                 ACTIVE:'#059669', DRAFT:'#6b7280', PAUSED:'#d97706',
@@ -9889,7 +10555,12 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                               {/* Search Terms */}
                               {cd.search_terms && cd.search_terms.length > 0 && (() => {
                                 const campId = cd.campaign.campaign_id;
-                                const visibleTerms = cd.search_terms.slice(0,100);
+                                const allTerms = cd.search_terms;
+                                const filteredTerms = hideNegated
+                                  ? allTerms.filter(st => !negatedTerms.has(st.search_term) && st.status !== 'EXCLUDED' && st.status !== 'ADDED')
+                                  : allTerms;
+                                const visibleTerms = filteredTerms.slice(0,100);
+                                const negatedCount = allTerms.filter(st => negatedTerms.has(st.search_term) || st.status === 'EXCLUDED' || st.status === 'ADDED').length;
                                 const negateableTerms = visibleTerms.filter(st =>
                                   !negatedTerms.has(st.search_term) && st.status !== 'EXCLUDED'
                                 );
@@ -9913,13 +10584,23 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
 
                                 return (
                                 <div style={{marginBottom:20}}>
-                                  <div style={{fontSize:12,fontWeight:700,marginBottom:8,display:'flex',alignItems:'center',gap:8}}>
-                                    🔍 Search Terms ({cd.search_terms.length})
+                                  <div style={{fontSize:12,fontWeight:700,marginBottom:8,display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                                    🔍 Search Terms ({hideNegated ? `${filteredTerms.length} unreviewed` : `${allTerms.length} total`})
                                     {stSelectedTerms.size > 0 && (
                                       <span style={{fontSize:10,fontWeight:500,color:'#dc2626',
                                         background:'#fee2e2',padding:'1px 7px',borderRadius:10}}>
                                         {stSelectedTerms.size} selected
                                       </span>
+                                    )}
+                                    {negatedCount > 0 && (
+                                      <button
+                                        onClick={() => setHideNegated(h => !h)}
+                                        style={{fontSize:10,padding:'2px 8px',borderRadius:10,border:'1px solid #e5e7eb',
+                                          background: hideNegated ? '#f3f4f6' : '#fee2e2',
+                                          color: hideNegated ? '#6b7280' : '#991b1b',
+                                          cursor:'pointer',fontWeight:500,marginLeft:'auto'}}>
+                                        {hideNegated ? `Show ${negatedCount} negated` : `Hide ${negatedCount} negated`}
+                                      </button>
                                     )}
                                   </div>
 
@@ -10095,6 +10776,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                 </div>
                                 );
                               })()}
+
+                              {/* ── Add Campaign Negative (Performance tab inline form) ── */}
+                              {cd.campaign.gads_campaign_resource && React.createElement(CampaignNegativeInlineForm, { campaignId: cd.campaign.campaign_id })}
 
                               {cd.has_gads_data && cd.ad_groups.length===0 && cd.ads.length===0 && (
                                 <div style={{fontSize:12,color:'var(--text-muted)',fontStyle:'italic',textAlign:'center',padding:'24px 0'}}>

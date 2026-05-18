@@ -9,7 +9,25 @@ Keeping both in sync ensures the wizard and the optimizer speak the same
 vocabulary when classifying search terms and recommending keywords/negatives.
 """
 
-# High-intent keyword pattern examples by campaign type.
+# ── Emergency urgency tokens ──────────────────────────────────────────────────
+# A valid emergency keyword MUST contain at least one of these tokens.
+# Used by: keyword wizard (main.py), search term classifier, CAMPAIGN_INTENT_RULES.
+EMERGENCY_URGENCY_TOKENS: list[str] = [
+    "emergency", "urgent", "urgently", "same day", "same-day",
+    "toothache", "tooth ache", "tooth pain", "dental pain",
+    "broken tooth", "cracked tooth", "chipped tooth", "chip",
+    "knocked out", "knocked-out", "avulsed",
+    "abscessed", "abscess", "swollen", "swelling",
+    "lost filling", "lost crown", "broken crown", "broken bridge",
+    "open now", "open today", "open late", "after hours",
+    "24 hour", "24-hour", "weekend dentist", "weekend dental",
+    "dentist tonight", "dentist today", "dentist asap",
+    "pain relief", "tooth infection",
+    "bleeding", "bleeding gum", "bleeding tooth",
+    "asap", "tonight", "today",  # standalone urgency signals
+]
+
+# ── High-intent keyword pattern examples by campaign type ─────────────────────
 # These are representative search queries that signal genuine buying intent.
 INTENT_SIGNALS_BY_TYPE: dict[str, list[str]] = {
     "emergency":  [
@@ -43,7 +61,31 @@ INTENT_SIGNALS_BY_TYPE: dict[str, list[str]] = {
 # Low-intent negative-keyword patterns by campaign type.
 # Search terms containing these tokens are unlikely to convert for the given service.
 NEG_INTENT_BY_TYPE: dict[str, list[str]] = {
-    "emergency":  ["jobs", "salary", "school", "training", "course", "free", "home remedy", "DIY"],
+    # Emergency: anything without urgency signal is wrong-intent.
+    # Navigational/general searches belong in the General Dentistry campaign.
+    "emergency":  [
+        # Career / informational (always wrong)
+        "jobs", "salary", "school", "training", "course", "free", "home remedy", "DIY",
+        # Navigational — patient shopping for a regular dentist, not in acute pain
+        "dentist near me", "dentists near me", "dentist in", "dentists in",
+        "family dentist", "family dentistry", "new patient", "new patients",
+        "dental cleaning", "teeth cleaning", "routine cleaning", "checkup",
+        "dental checkup", "dental exam", "annual exam", "preventive",
+        "affordable dentist", "best dentist", "top dentist", "local dentist",
+        "accepting new patients", "establish care", "primary dentist",
+        # Bare city-dentist patterns (e.g. "dentist worcester", "dentist grafton")
+        # These are navigational; someone in acute pain searches "emergency dentist worcester"
+        "dentist worcester", "dentist grafton", "dentist shrewsbury",
+        "dentist westborough", "dentist northborough", "dentist millbury",
+        "dentist auburn", "dentist milford", "dentist framingham",
+        "dentist marlborough", "dentist hopkinton",
+        # Service-specific that belong in other campaigns
+        # NOTE: "dental implant emergency" / "broken implant" ARE valid emergencies —
+        # these patterns are excluded from the fast-path block; Haiku handles them.
+        "invisalign", "clear aligner", "braces", "orthodont",
+        "veneer", "veneers", "whitening", "cosmetic",
+        "cleaning near me", "hygienist",
+    ],
     "implants":   [
         "jobs", "salary", "free", "insurance only", "medicaid", "snap-on smile",
         "flipper", "partial denture", "school", "course",
@@ -83,4 +125,6 @@ def get_intent_signals(campaign_type: str) -> dict:
         "campaign_type": ctype,
         "high_intent_examples": INTENT_SIGNALS_BY_TYPE.get(ctype, INTENT_SIGNALS_BY_TYPE["general"]),
         "low_intent_negatives": NEG_INTENT_BY_TYPE.get(ctype, NEG_INTENT_BY_TYPE["general"]),
+        # For emergency campaigns only: keywords must contain one of these tokens
+        "urgency_tokens_required": EMERGENCY_URGENCY_TOKENS if ctype == "emergency" else [],
     }

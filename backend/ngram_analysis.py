@@ -119,7 +119,10 @@ def compute_ngram_waste(days: int = MIN_DAYS) -> dict:
         logger.info("ngram_analysis: no non-converting search terms found")
         return _empty_result(days)
 
-    total_waste = sum(r[1] for r in rows)
+    total_waste = sum(float(r[1] or 0) for r in rows)  # defensive against NULL cost
+
+    # M1 fix: build search_term → cost map so example_terms can be sorted by actual spend
+    _term_cost: dict[str, float] = {r[0]: float(r[1] or 0) for r in rows}
 
     # Aggregate waste/clicks per token
     uni_waste:   defaultdict[str, float] = defaultdict(float)
@@ -163,14 +166,19 @@ def compute_ngram_waste(days: int = MIN_DAYS) -> dict:
             "total_waste":  round(waste, 2),
             "distinct_terms": distinct,
             "total_clicks": uni_clicks[tok],
-            "example_terms": sorted(uni_terms[tok], key=lambda t: -uni_waste.get(t, 0))[:3],
+            # M1 fix: sort by search_term cost (not token waste)
+            "example_terms": sorted(uni_terms[tok], key=lambda t: -_term_cost.get(t, 0))[:3],
         })
 
     bigrams = []
     for bg, waste in sorted(bi_waste.items(), key=lambda x: -x[1]):
-        # Skip bigrams whose both tokens are stopwords
         parts = bg.split()
+        # Skip bigrams where both tokens are stopwords
         if all(p in _STOPWORDS for p in parts):
+            continue
+        # M2 fix: skip bigrams containing any never-negative token (e.g. "grafton", "implant")
+        # Negating these as broad match would kill local intent or high-value service terms
+        if any(p in _NEVER_NEGATIVE_UNIGRAMS for p in parts):
             continue
         distinct = len(bi_terms[bg])
         if distinct < MIN_TERMS or waste < MIN_WASTE:
@@ -180,7 +188,8 @@ def compute_ngram_waste(days: int = MIN_DAYS) -> dict:
             "total_waste":  round(waste, 2),
             "distinct_terms": distinct,
             "total_clicks": bi_clicks[bg],
-            "example_terms": sorted(bi_terms[bg], key=lambda t: -bi_waste.get(t, 0))[:3],
+            # M1 fix: sort by search_term cost (not bigram waste)
+            "example_terms": sorted(bi_terms[bg], key=lambda t: -_term_cost.get(t, 0))[:3],
         })
 
     from datetime import datetime, timezone

@@ -877,6 +877,32 @@ CREATE TABLE IF NOT EXISTS skag_outcomes_30d (
 
 CREATE INDEX IF NOT EXISTS idx_skag_outcomes_rec
     ON skag_outcomes_30d(skag_recommendation_id, snapshot_date DESC);
+
+-- ── A/B Experiments ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ab_experiments (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_name         TEXT NOT NULL,
+    experiment_resource     TEXT DEFAULT '',   -- customers/{cid}/experiments/{id} from GAds UI
+    base_campaign_resource  TEXT NOT NULL,     -- resource name of base/control campaign
+    base_campaign_name      TEXT DEFAULT '',
+    trial_campaign_resource TEXT DEFAULT '',   -- resource name of trial campaign (after experiment starts)
+    trial_campaign_name     TEXT DEFAULT '',
+    experiment_type         TEXT DEFAULT 'landing_page',  -- 'landing_page' | 'ad_copy'
+    control_url             TEXT DEFAULT '',   -- base landing page URL
+    variant_url             TEXT DEFAULT '',   -- trial landing page URL
+    traffic_split_percent   INTEGER DEFAULT 50,  -- % going to trial arm
+    status                  TEXT DEFAULT 'SETUP',  -- SETUP | RUNNING | HALTED | PROMOTED | GRADUATED
+    start_date              TEXT DEFAULT '',   -- YYYY-MM-DD
+    end_date                TEXT DEFAULT '',   -- YYYY-MM-DD
+    winner                  TEXT DEFAULT '',   -- 'base' | 'trial' | 'inconclusive' | ''
+    winner_signal_json      TEXT DEFAULT '{}', -- snapshot of metrics that triggered recommendation
+    notes                   TEXT DEFAULT '',
+    created_by              TEXT DEFAULT 'admin',  -- 'admin' | 'ai_optimizer'
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ab_experiments_status ON ab_experiments(status);
+CREATE INDEX IF NOT EXISTS idx_ab_experiments_base   ON ab_experiments(base_campaign_resource);
 """
 
 LIFECYCLE_STAGES = [
@@ -2471,6 +2497,33 @@ GROUP BY a.campaign_id, c.campaign_name;
             CREATE INDEX IF NOT EXISTS idx_skag_outcomes_rec
             ON skag_outcomes_30d(skag_recommendation_id, snapshot_date DESC)
         """)
+
+    # ab_experiments table
+    if "ab_experiments" not in _existing_tables:
+        conn.execute("""CREATE TABLE IF NOT EXISTS ab_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_name TEXT NOT NULL,
+            experiment_resource TEXT DEFAULT '',
+            base_campaign_resource TEXT NOT NULL,
+            base_campaign_name TEXT DEFAULT '',
+            trial_campaign_resource TEXT DEFAULT '',
+            trial_campaign_name TEXT DEFAULT '',
+            experiment_type TEXT DEFAULT 'landing_page',
+            control_url TEXT DEFAULT '',
+            variant_url TEXT DEFAULT '',
+            traffic_split_percent INTEGER DEFAULT 50,
+            status TEXT DEFAULT 'SETUP',
+            start_date TEXT DEFAULT '',
+            end_date TEXT DEFAULT '',
+            winner TEXT DEFAULT '',
+            winner_signal_json TEXT DEFAULT '{}',
+            notes TEXT DEFAULT '',
+            created_by TEXT DEFAULT 'admin',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ab_experiments_status ON ab_experiments(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ab_experiments_base ON ab_experiments(base_campaign_resource)")
 
 
 def _seed_call_grading_criteria(conn):
@@ -8545,3 +8598,160 @@ def get_intel_scan_stats() -> dict:
         "last_run_id": last_run["run_id"] if last_run and last_run["run_id"] else "",
         "last_detected_at": last_run["last_at"] if last_run else "",
     }
+
+
+# ── A/B Experiments ────────────────────────────────────────────────────────────
+
+def create_ab_experiment(data: dict) -> int:
+    """Insert a new experiment. Returns the new row id."""
+    now = _now()
+    with _conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO ab_experiments
+                (experiment_name, experiment_resource, base_campaign_resource, base_campaign_name,
+                 trial_campaign_resource, trial_campaign_name, experiment_type,
+                 control_url, variant_url, traffic_split_percent,
+                 status, start_date, end_date, notes, created_by, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            data.get("experiment_name", ""),
+            data.get("experiment_resource", ""),
+            data.get("base_campaign_resource", ""),
+            data.get("base_campaign_name", ""),
+            data.get("trial_campaign_resource", ""),
+            data.get("trial_campaign_name", ""),
+            data.get("experiment_type", "landing_page"),
+            data.get("control_url", ""),
+            data.get("variant_url", ""),
+            int(data.get("traffic_split_percent", 50)),
+            data.get("status", "SETUP"),
+            data.get("start_date", ""),
+            data.get("end_date", ""),
+            data.get("notes", ""),
+            data.get("created_by", "admin"),
+            now, now,
+        ))
+        return cur.lastrowid
+
+
+def get_ab_experiment(experiment_id: int) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM ab_experiments WHERE id=?", (experiment_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_ab_experiments(status: str = "") -> list:
+    with _conn() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM ab_experiments WHERE status=? ORDER BY created_at DESC", (status,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM ab_experiments ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_ab_experiment(experiment_id: int, updates: dict) -> bool:
+    """Update any subset of fields on an experiment."""
+    if not updates:
+        return False
+    allowed = {
+        "experiment_resource", "trial_campaign_resource", "trial_campaign_name",
+        "status", "start_date", "end_date", "winner", "winner_signal_json",
+        "notes", "traffic_split_percent", "control_url", "variant_url",
+        "experiment_name", "base_campaign_name",
+    }
+    fields = {k: v for k, v in updates.items() if k in allowed}
+    if not fields:
+        return False
+    fields["updated_at"] = _now()
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    with _conn() as conn:
+        conn.execute(
+            f"UPDATE ab_experiments SET {set_clause} WHERE id=?",
+            (*fields.values(), experiment_id)
+        )
+    return True
+
+
+def get_ab_experiment_lead_metrics(
+    base_campaign_name: str,
+    trial_campaign_name: str,
+    control_url: str,
+    variant_url: str,
+    start_date: str = "",
+) -> dict:
+    """
+    Query local leads table for per-arm lead/revenue metrics.
+    Matches leads by campaign_name (base vs trial) AND by landing_url (control vs variant).
+    Returns metrics for both arms.
+    """
+    with _conn() as conn:
+        _ZERO_ARM = {
+            "total_leads": 0, "engaged_leads": 0, "booked": 0,
+            "showed": 0, "tx_accepted": 0, "revenue": 0.0, "pipeline_value": 0.0,
+        }
+
+        def _arm_metrics(campaign_name: str, landing_url: str) -> dict:
+            # Guard: if neither discriminator is set, return zeros rather than
+            # matching the entire leads table (would corrupt winner signals).
+            _cname = (campaign_name or "").strip()
+            _lurl  = (landing_url or "").strip().rstrip("/")
+            if not _cname and not _lurl:
+                return dict(_ZERO_ARM)
+
+            where_parts = []
+            params = []
+
+            # Match by campaign name if provided
+            if _cname:
+                where_parts.append("LOWER(campaign_name) = LOWER(?)")
+                params.append(_cname)
+
+            # Match by landing URL — use exact match OR path-prefix to avoid
+            # substring false positives (e.g. "/dentures" matching "/dentures-v2").
+            # Minimum length guard prevents degenerate patterns like "%/%" matching all rows.
+            if _lurl and len(_lurl) > 8:
+                where_parts.append("(landing_url = ? OR landing_url LIKE ?)")
+                params.extend([_lurl, _lurl + "/%"])
+
+            # Date filter
+            if start_date:
+                where_parts.append("created_at >= ?")
+                params.append(start_date)
+
+            where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+            row = conn.execute(f"""
+                SELECT
+                    COUNT(*)                                           AS total_leads,
+                    SUM(CASE WHEN stage NOT IN ('new','cold') THEN 1 ELSE 0 END) AS engaged_leads,
+                    SUM(CASE WHEN scheduled_at != '' THEN 1 ELSE 0 END)          AS booked,
+                    SUM(CASE WHEN showed_at != '' THEN 1 ELSE 0 END)             AS showed,
+                    SUM(CASE WHEN tx_accepted_at != '' THEN 1 ELSE 0 END)        AS tx_accepted,
+                    COALESCE(SUM(attributed_production), 0)                      AS revenue,
+                    COALESCE(SUM(treatment_plan_value), 0)                       AS pipeline_value
+                FROM leads {where_clause}
+            """, params).fetchone()
+
+            return {
+                "total_leads":    row[0] or 0,
+                "engaged_leads":  row[1] or 0,
+                "booked":         row[2] or 0,
+                "showed":         row[3] or 0,
+                "tx_accepted":    row[4] or 0,
+                "revenue":        round(float(row[5] or 0), 2),
+                "pipeline_value": round(float(row[6] or 0), 2),
+            }
+
+        base_metrics  = _arm_metrics(base_campaign_name, control_url)
+        trial_metrics = _arm_metrics(trial_campaign_name, variant_url)
+
+        return {
+            "base":  base_metrics,
+            "trial": trial_metrics,
+        }

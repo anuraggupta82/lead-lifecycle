@@ -172,6 +172,99 @@ OPERATIONS REFERENCE (for replace_ad / ad_copy_suggestion):
 === END GOOGLE ADS HARD RULES ===
 """
 
+# ── Campaign intent boundaries — injected into every per-campaign Claude prompt ──
+# Each campaign type has a defined patient intent it is supposed to capture.
+# The AI must enforce these boundaries when evaluating search terms and keywords.
+CAMPAIGN_INTENT_RULES = """
+=== CAMPAIGN INTENT BOUNDARIES (MANDATORY) ===
+
+Every campaign at GDC targets a specific patient intent. A search term that does not match
+the campaign's intent is OFF-INTENT and must be negated — even if it generated a lead,
+even if another campaign is not running, even if the term is broadly dental-related.
+
+This prevents budget dilution and ensures each campaign reaches the right patient.
+
+CAMPAIGN TYPE DEFINITIONS AND INTENT BOUNDARIES:
+
+EMERGENCY campaigns (name contains: emergency, urgent, same day, toothache, broken tooth):
+  PERMITTED INTENTS: acute pain, urgent dental need, same-day appointment, broken/cracked tooth,
+                     lost filling, abscess, swollen face, tooth knocked out, dental trauma
+  PERMITTED SIGNALS: "emergency", "urgent", "same day", "same-day", "toothache", "tooth pain",
+                     "dental pain", "pain", "broken tooth", "cracked tooth", "chipped tooth",
+                     "chip", "abscessed", "abscess", "swollen", "knocked out", "after hours",
+                     "open now", "open today", "open late", "weekend dentist", "24 hour dentist",
+                     "bleeding", "bleeding gum", "tooth infection", "lost filling", "broken crown",
+                     "dentist tonight", "dentist today", "dentist asap", "asap", "tonight", "today"
+  OFF-INTENT (negate): generic dentist searches ("dentists near me", "dentist in [city]",
+                        "dentist worcester", "dentist grafton", "[city] dentist", "[city] dental",
+                        "family dentist", "dental cleaning", "teeth cleaning", "new patient",
+                        "dental checkup", "affordable dentist", "best dentist", "local dentist",
+                        "accepting new patients", "establish care") — these patients are shopping
+                        for a regular dentist, not seeking emergency care.
+  RULE: A patient searching "dentist worcester" or "dentists near me" has general/navigational
+        intent. They belong in the General Dentistry campaign. Spending emergency budget on
+        them is waste — they will not book a same-day emergency appointment.
+        CONVERSION = patient scheduled a same-day/next-day appointment. A click that did not
+        produce a booking is evidence of intent mismatch, not just a performance issue.
+
+GENERAL DENTISTRY campaigns (name contains: general dentistry, new patients, general dental):
+  PERMITTED INTENTS: finding a new dentist, routine care, checkups, cleanings, family dentistry,
+                     new patient specials, affordable dental care, preventive care
+  PERMITTED SIGNALS: "dentist near me", "dentist in [city]", "family dentist", "new patient",
+                     "dental cleaning", "teeth cleaning", "affordable dentist", "accept new patients"
+  OFF-INTENT (negate): emergency/urgent terms, specialty-specific terms (implants, veneers,
+                        orthodontics) — those have dedicated campaigns.
+
+IMPLANTS/DENTURES campaigns (name contains: implant, denture, all-on-4):
+  PERMITTED INTENTS: tooth replacement research, implant cost, implant procedure, denture fitting,
+                     all-on-4, snap-on dentures, full arch restoration
+  PERMITTED SIGNALS: "dental implant", "implant cost", "tooth implant", "denture", "all on 4",
+                     "missing teeth", "tooth replacement", "implant dentist"
+  OFF-INTENT (negate): generic dentist searches, emergency searches, insurance searches
+
+COSMETIC/INVISALIGN campaigns (name contains: cosmetic, veneer, invisalign, whitening, smile):
+  PERMITTED INTENTS: smile improvement, teeth straightening, cosmetic enhancement
+  PERMITTED SIGNALS: "invisalign", "clear aligners", "veneers", "teeth whitening",
+                     "smile makeover", "cosmetic dentist", "teeth straightening"
+  OFF-INTENT (negate): emergency terms, insurance terms, generic "dentist near me"
+
+BRAND campaigns (name contains: grafton dental, brand, branded):
+  PERMITTED INTENTS: name-based navigation only — patients who already know Grafton Dental Care
+  PERMITTED SIGNALS: "grafton dental care", "dr anurag gupta", "dr gupta grafton",
+                     "graftondentalcare.com", "gdc dental"
+  OFF-INTENT (negate): everything that is not a variation of the practice name or doctor name.
+                        Generic dental searches, service searches, competitor searches — all off-intent.
+
+ENFORCEMENT RULE:
+When reviewing search_terms for a campaign, check EACH term against the campaign's PERMITTED SIGNALS.
+
+For EMERGENCY campaigns — DEFAULT-DENY posture:
+  If the term does NOT contain at least one urgency signal:
+    emergency, urgent, same day, same-day, toothache, tooth pain, dental pain, pain,
+    broken tooth, cracked tooth, chipped tooth, chip, abscess, abscessed, swollen,
+    knocked out, open now, open today, open late, after hours, 24 hour, weekend dentist,
+    bleeding, tooth infection, lost filling, broken crown, asap, tonight, today
+  → it is OFF-INTENT. Recommend add_negative_keyword regardless of cost or clicks.
+  Even ONE impression of a navigational term wastes emergency budget on a patient who
+  does not need same-day care. Also negate bare city-dentist patterns:
+  "dentist [city]", "[city] dentist", "[city] dental", "dental [city]".
+
+For ALL other campaign types:
+  If a term does not match the campaign's PERMITTED SIGNALS and has ≥ 1 click:
+  → Recommend add_negative_keyword (PHRASE match unless it is a very specific term, then EXACT)
+
+In all cases:
+  → Reason must explicitly state: "Off-intent for [campaign_type] campaign: '[term]' signals
+    [inferred intent] which belongs in [correct campaign type] campaign."
+  → Do NOT wait for zero-conversion data to recommend an intent negative. Intent is determined by
+    the SEARCH QUERY MEANING, not by whether it happened to convert.
+  → Conversion = patient scheduled an appointment. A click that did not produce a booking is
+    evidence of intent mismatch, not just a performance issue.
+
+=== END CAMPAIGN INTENT BOUNDARIES ===
+"""
+
+
 # ── Campaign lifecycle rules — injected into every per-campaign Claude prompt ──
 LIFECYCLE_RULES = """
 === CAMPAIGN LIFECYCLE RULES (MANDATORY — DO NOT VIOLATE) ===
@@ -2726,7 +2819,7 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
         except Exception as _skag_err:
             logger.warning("SKAG signals failed for %r (non-fatal): %s", campaign, _skag_err)
 
-        prompt = excellence_block + GOOGLE_ADS_RULES + LIFECYCLE_RULES + (LEARNING_PHASE_RULES if lifecycle and lifecycle.get("stage") in ("new", "unknown") else "") + """
+        prompt = excellence_block + GOOGLE_ADS_RULES + CAMPAIGN_INTENT_RULES + LIFECYCLE_RULES + (LEARNING_PHASE_RULES if lifecycle and lifecycle.get("stage") in ("new", "unknown") else "") + """
 You are the Chief Marketing Officer (CMO) for Grafton Dental Care, a private dental practice in Grafton, MA. You think at two levels simultaneously:
 
 STRATEGIC level — Is this campaign serving the right patients? Are we allocating budget toward services with the highest patient lifetime value (implants, Invisalign, crowns > cleanings > emergency)? Is a campaign in a learning phase that needs patience rather than intervention? Should budget shift from a low-converting campaign to a proven one? Are we missing an entire patient segment worth targeting?
@@ -3392,6 +3485,20 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
             # Budget constraint sieve — convert change_budget increases to advisories
             if budget_constrained:
                 sieved = _budget_constraint_sieve(sieved, camp_settings or {})
+            # Experiment sieve — block structural changes mid-test
+            try:
+                from database import list_ab_experiments as _lab
+                _running = _lab(status="RUNNING")
+                _exp_camps = set()
+                for _re in _running:
+                    if _re.get("base_campaign_name"):
+                        _exp_camps.add(_re["base_campaign_name"].strip().lower())
+                    if _re.get("trial_campaign_name"):
+                        _exp_camps.add(_re["trial_campaign_name"].strip().lower())
+                if _exp_camps:
+                    sieved = _experiment_sieve(sieved, _exp_camps, current_campaign=campaign)
+            except Exception as _es_err:
+                logger.debug(f"experiment_sieve failed (non-fatal): {_es_err}")
             return sieved
     except Exception as e:
         logger.warning(f"Claude advisory call failed (non-fatal): {e}")
@@ -3532,6 +3639,52 @@ def _budget_constraint_sieve(
     return filtered
 
 
+def _experiment_sieve(
+    ops: list,
+    active_experiment_campaigns: set,
+    current_campaign: str = "",
+) -> list:
+    """
+    Block structural changes to campaigns that are mid-experiment.
+    Negatives and advisories are still allowed — only ops that change
+    bids/budgets/strategy/pauses are blocked to preserve test integrity.
+
+    current_campaign: the campaign name being optimized in per-campaign mode.
+    Per-campaign Claude ops often omit campaign_name from each op (it's
+    implicit context), so we fall back to current_campaign when the field is
+    absent so the sieve correctly guards structural changes.
+    """
+    _BLOCKED_MID_EXPERIMENT = {
+        "increase_bid", "decrease_bid", "change_budget",
+        "change_bid_strategy", "pause_keyword", "pause_ad_group",
+        "replace_ad", "change_match_type",
+    }
+    if not active_experiment_campaigns:
+        return ops
+
+    _current = (current_campaign or "").strip().lower()
+
+    filtered = []
+    for op in ops:
+        op_type = op.get("operation", "")
+        # Use op's own campaign_name if present; fall back to the ambient campaign
+        camp = (op.get("campaign_name") or _current or "").strip().lower()
+        if op_type in _BLOCKED_MID_EXPERIMENT and camp in active_experiment_campaigns:
+            filtered.append({
+                "operation": "claude_advisory",
+                "campaign_name": op.get("campaign_name", ""),
+                "insight": (
+                    f"EXPERIMENT_BLOCKED: {op_type} suppressed — campaign '{op.get('campaign_name','')}' "
+                    f"is mid-experiment. Structural changes during an A/B test invalidate the comparison. "
+                    f"Wait until the experiment concludes before making this change."
+                ),
+                "reason": op.get("reason", ""),
+            })
+        else:
+            filtered.append(op)
+    return filtered
+
+
 def _build_lqi_account_summary(lqi: dict) -> dict:
     """
     Build the account-level LQI summary injected into _call_claude_account_level.
@@ -3582,6 +3735,134 @@ def _build_lqi_account_summary(lqi: dict) -> dict:
     }
 
 
+# ── Budget reallocation thresholds ────────────────────────────────────────────
+_REALLOC_RECEIVER_BUDGET_LOST_MIN: float = 0.30  # must be losing ≥30% to budget to qualify as receiver
+_REALLOC_DONOR_ROAS_MIN: float           = 1.0   # donor must have ROAS ≥ 1 (not losing money)
+_REALLOC_DONOR_BUDGET_LOST_MAX: float    = 0.15  # donor should NOT be budget-constrained itself
+_REALLOC_MIN_FLOOR_USD: float            = 15.0  # never reduce a campaign below $15/day
+_REALLOC_MAX_SINGLE_TRANSFER_USD: float  = 20.0  # cap single transfer per run
+_REALLOC_MIN_SPEND_FOR_SIGNAL: float     = 5.0   # campaign must have spent ≥$5 to generate signal
+
+
+def _build_budget_reallocation_signals(
+    camp_perf: dict,
+    budget_constrained: bool = False,
+) -> dict:
+    """
+    Pre-compute budget reallocation donor/receiver candidates from camp_perf.
+
+    Returns:
+    {
+        "reallocation_allowed": bool,   # False when budget_constrained=True
+        "total_daily_budget_usd": float,
+        "receivers": [                  # budget-constrained, high-signal campaigns
+            {
+                "campaign_name": str,
+                "daily_budget_usd": float,
+                "search_budget_lost_is": float,
+                "roas_30d": float | None,
+                "production_30d": float,
+                "lifecycle_stage": str,
+            }
+        ],
+        "donors": [                     # under-spending, lower-priority campaigns
+            {
+                "campaign_name": str,
+                "daily_budget_usd": float,
+                "search_budget_lost_is": float,
+                "roas_30d": float | None,
+                "headroom_usd": float,  # max transferable = daily_budget - floor
+            }
+        ],
+        "note": str,   # human-readable summary of why reallocation is or isn't recommended
+    }
+    """
+    if budget_constrained:
+        return {
+            "reallocation_allowed": False,
+            "total_daily_budget_usd": 0.0,
+            "receivers": [],
+            "donors": [],
+            "note": "Budget constrained mode is active — no budget increases allowed.",
+        }
+
+    total_daily = 0.0
+    receivers = []
+    donors = []
+
+    for cn, cp in camp_perf.items():
+        daily = float(cp.get("daily_budget_usd") or 0)
+        total_daily += daily
+
+        # Skip new/unknown campaigns — not enough data for reallocation judgment
+        if cp.get("lifecycle_stage") in ("new", "unknown"):
+            continue
+        if cp.get("in_learning_period"):
+            continue
+
+        spend = float(cp.get("spend_30d") or 0)
+        if spend < _REALLOC_MIN_SPEND_FOR_SIGNAL:
+            continue
+
+        budget_lost = float(cp.get("search_budget_lost_is") or 0)
+        roas = cp.get("roas_30d")  # may be None
+        prod = float(cp.get("production_30d") or 0)
+
+        # Receiver: budget-constrained campaign that is generating value
+        if budget_lost >= _REALLOC_RECEIVER_BUDGET_LOST_MIN and daily > 0:
+            receivers.append({
+                "campaign_name":         cn,
+                "daily_budget_usd":      round(daily, 2),
+                "search_budget_lost_is": round(budget_lost, 3),
+                "roas_30d":              roas,
+                "production_30d":        round(prod, 2),
+                "lifecycle_stage":       cp.get("lifecycle_stage", "unknown"),
+            })
+
+        # Donor: not budget-constrained, ROAS ≥ floor (not actively losing money),
+        # and has headroom above the $15/day minimum floor
+        headroom = max(daily - _REALLOC_MIN_FLOOR_USD, 0.0)
+        if (
+            budget_lost <= _REALLOC_DONOR_BUDGET_LOST_MAX
+            and (roas is None or roas >= _REALLOC_DONOR_ROAS_MIN)
+            and headroom > 0
+            and daily > 0
+        ):
+            donors.append({
+                "campaign_name":         cn,
+                "daily_budget_usd":      round(daily, 2),
+                "search_budget_lost_is": round(budget_lost, 3),
+                "roas_30d":              roas,
+                "headroom_usd":          round(min(headroom, _REALLOC_MAX_SINGLE_TRANSFER_USD), 2),
+            })
+
+    # Sort: receivers by budget_lost descending, donors by headroom descending
+    receivers.sort(key=lambda x: -x["search_budget_lost_is"])
+    donors.sort(key=lambda x: -x["headroom_usd"])
+
+    if receivers and donors:
+        note = (
+            f"{len(receivers)} receiver(s) losing budget IS, "
+            f"{len(donors)} donor(s) with headroom. "
+            f"Max single transfer: ${_REALLOC_MAX_SINGLE_TRANSFER_USD:.0f}/day. "
+            f"Net account budget must stay at ${total_daily:.2f}/day."
+        )
+    elif receivers and not donors:
+        note = f"{len(receivers)} receiver(s) need budget but no eligible donors found (all at floor or also budget-constrained)."
+    elif donors and not receivers:
+        note = "No campaigns are budget-constrained. No reallocation needed."
+    else:
+        note = "Insufficient data for reallocation analysis."
+
+    return {
+        "reallocation_allowed": True,
+        "total_daily_budget_usd": round(total_daily, 2),
+        "receivers": receivers,
+        "donors": donors,
+        "note": note,
+    }
+
+
 def _call_claude_account_level(
     all_keyword_perf: list,
     all_search_terms: list,
@@ -3604,6 +3885,9 @@ def _call_claude_account_level(
     # Campaign lifecycle map: campaign_name → build_lifecycle_block() dict
     # Used to inject stage/age into camp_perf and enforce lifecycle-aware prompt rules
     campaign_lifecycle_map: dict | None = None,
+    # Raw campaign_settings dict (resource_name-keyed) from _get_campaign_settings()
+    # Used to enrich camp_perf with search_budget_lost_is, roas, bidding_strategy_type
+    campaign_settings_raw: dict | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -3648,6 +3932,73 @@ def _call_claude_account_level(
                 term_campaigns[t].add(c)
         cross_camp_terms = {t: list(camps) for t, camps in term_campaigns.items() if len(camps) > 1}
 
+        # ── Cannibalization signal ────────────────────────────────────────────
+        # For each search term appearing in multiple ACTIVE campaigns, compute
+        # which campaign converts it and which doesn't.  Only flag pairs where
+        # BOTH campaigns are currently active so we never recommend a negative
+        # that would leave a term uncovered if the "winner" campaign is later paused.
+        _active_campaign_names: set = set()
+        try:
+            from database import get_all_campaigns as _get_all_camps
+            for _c in (_get_all_camps() or []):
+                if (_c.get("status") or "").upper() == "ACTIVE":
+                    _active_campaign_names.add((_c.get("campaign_name") or "").strip())
+        except Exception as _can_err:
+            logger.debug(f"cannibalization: campaign status fetch failed: {_can_err}")
+
+        # Build per-term conversion map from search terms data
+        _term_conv: dict = {}   # term -> {campaign_name: {clicks, conversions, cost}}
+        for _st in all_search_terms:
+            _t = (_st.get("search_term") or "").strip().lower()
+            _c = (_st.get("campaign") or "").strip()
+            if not _t or not _c:
+                continue
+            if _t not in _term_conv:
+                _term_conv[_t] = {}
+            if _c not in _term_conv[_t]:
+                _term_conv[_t][_c] = {"clicks": 0, "conversions": 0.0, "cost": 0.0}
+            _term_conv[_t][_c]["clicks"]      += int(_st.get("clicks", 0) or 0)
+            _term_conv[_t][_c]["conversions"] += float(_st.get("conversions", 0) or 0)
+            _term_conv[_t][_c]["cost"]        += float(_st.get("cost", 0) or 0)
+
+        cannibalization_signals: list = []
+        for _term, _camp_data in _term_conv.items():
+            _active_camps_for_term = {c: d for c, d in _camp_data.items() if c in _active_campaign_names}
+            if len(_active_camps_for_term) < 2:
+                continue   # only flag when 2+ active campaigns compete for same term
+            # Find winner (most conversions) and losers (zero conversions + spend > 0)
+            _winner = max(_active_camps_for_term, key=lambda c: _active_camps_for_term[c]["conversions"])
+            _winner_conv = _active_camps_for_term[_winner]["conversions"]
+            for _loser, _ld in _active_camps_for_term.items():
+                if _loser == _winner:
+                    continue
+                if _ld["cost"] > 0 and _ld["conversions"] == 0 and _winner_conv > 0:
+                    cannibalization_signals.append({
+                        "search_term":    _term,
+                        "loser_campaign": _loser,
+                        "loser_clicks":   _ld["clicks"],
+                        "loser_cost":     round(_ld["cost"], 2),
+                        "winner_campaign": _winner,
+                        "winner_conversions": _winner_conv,
+                        "both_active":    True,  # guaranteed by filter above
+                        "note": (
+                            f"Both campaigns ACTIVE. Safe to add negative to '{_loser}'. "
+                            f"If '{_winner}' is later paused, remove this negative or '{_loser}' "
+                            f"will go dark for this query."
+                        ),
+                    })
+        # Cap to 20 highest-cost signals
+        cannibalization_signals.sort(key=lambda x: -x["loser_cost"])
+        cannibalization_signals = cannibalization_signals[:20]
+
+        # Build name-keyed settings lookup from raw resource-keyed campaign_settings
+        _cs_raw = campaign_settings_raw or {}
+        _name_to_settings: dict = {}
+        for _rn, _cs in _cs_raw.items():
+            _cn = (_cs.get("campaign_name") or "").strip()
+            if _cn:
+                _name_to_settings[_cn] = _cs
+
         # Build per-campaign budget/performance summary
         _lc_map = campaign_lifecycle_map or {}
         camp_perf = {}
@@ -3662,19 +4013,37 @@ def _call_claude_account_level(
                 by_camp = od_production.get("by_campaign", {})
                 prod = float(by_camp.get(cn, 0))
             _lc = _lc_map.get(cn) or {}
+            _cs_entry = _name_to_settings.get(cn) or {}
+            _daily_bud = (
+                _cs_entry.get("daily_budget_usd")
+                or (campaign_spend.get(cn, {}).get("daily_budget_usd") if isinstance(campaign_spend.get(cn), dict) else None)
+            )
+            _roas_30d = round(prod / spend, 2) if spend > 0 else None
             camp_perf[cn] = {
                 "campaign_resource": cr,
                 "spend_30d": round(spend, 2),
                 "clicks": clicks,
                 "calls": calls,
                 "booked_calls": booked,
-                "production": prod,
-                "daily_budget": campaign_spend.get(cn, {}).get("daily_budget_usd") if isinstance(campaign_spend.get(cn), dict) else None,
+                "production_30d": round(prod, 2),
+                "roas_30d": _roas_30d,          # production / spend; None if no spend
+                "daily_budget_usd": _daily_bud,
+                "search_budget_lost_is": _cs_entry.get("search_budget_lost_is"),
+                "search_rank_lost_is": _cs_entry.get("search_rank_lost_is"),
+                "bidding_strategy_type": _cs_entry.get("bidding_strategy_type"),
                 # Lifecycle awareness — used by account-level Claude to respect learning phase
                 "lifecycle_stage": _lc.get("stage", "unknown"),
                 "days_since_launch": _lc.get("days_since_launch"),
                 "in_learning_period": _lc.get("in_learning_period", True),  # conservative default
             }
+
+        # ── GI-3: Budget reallocation signal ─────────────────────────────────
+        # Pre-compute donor/receiver candidates so Claude has a structured signal
+        # rather than having to reason over raw campaign_performance fields.
+        _realloc_signals: dict = _build_budget_reallocation_signals(
+            camp_perf=camp_perf,
+            budget_constrained=budget_constrained,
+        )
 
         # Fetch call quality flags for account-level signal
         _call_quality_flags: dict = {}
@@ -3699,6 +4068,48 @@ def _call_claude_account_level(
             _account_budget = float(_acct_budget_raw)
         except Exception:
             pass
+
+        # A/B experiment signals — feed active experiments into account-level Claude
+        _active_experiments: list = []
+        try:
+            from database import list_ab_experiments, get_ab_experiment_lead_metrics
+            from experiment_metrics import get_gads_experiment_metrics, compute_winner_signal
+            from datetime import date as _exp_date
+            _running_exps = list_ab_experiments(status="RUNNING")
+            for _exp in _running_exps[:5]:  # cap at 5 to avoid token bloat
+                _exp_start = _exp.get("start_date") or ""
+                _days = 0
+                if _exp_start:
+                    try:
+                        _days = (_exp_date.today() - _exp_date.fromisoformat(_exp_start)).days
+                    except Exception:
+                        pass
+                _gads_m = get_gads_experiment_metrics(
+                    base_campaign_resource=_exp["base_campaign_resource"],
+                    trial_campaign_resource=_exp.get("trial_campaign_resource", ""),
+                    start_date=_exp_start,
+                )
+                _lead_m = get_ab_experiment_lead_metrics(
+                    base_campaign_name=_exp.get("base_campaign_name", ""),
+                    trial_campaign_name=_exp.get("trial_campaign_name", ""),
+                    control_url=_exp.get("control_url", ""),
+                    variant_url=_exp.get("variant_url", ""),
+                    start_date=_exp_start,
+                )
+                _signal = compute_winner_signal(_gads_m, _lead_m, days_running=_days)
+                _active_experiments.append({
+                    "id":              _exp["id"],
+                    "name":            _exp["experiment_name"],
+                    "type":            _exp["experiment_type"],
+                    "days_running":    _days,
+                    "base_campaign":   _exp.get("base_campaign_name", ""),
+                    "trial_campaign":  _exp.get("trial_campaign_name", ""),
+                    "control_url":     _exp.get("control_url", ""),
+                    "variant_url":     _exp.get("variant_url", ""),
+                    "winner_signal":   _signal,
+                })
+        except Exception as _exp_err:
+            logger.debug(f"experiment signals fetch failed (non-fatal): {_exp_err}")
 
         context = {
             "account_summary": summary,
@@ -3727,6 +4138,14 @@ def _call_claude_account_level(
             "competitor_intel_union": competitor_intel_union or {},
             # GI-3: N-gram waste signals
             "ngram_waste_signals": _ngram_waste_signals,
+            # GI-3: Budget reallocation candidates (pre-computed)
+            "budget_reallocation_signals": _realloc_signals,
+            # A/B experiment signals
+            "active_ab_experiments": _active_experiments,
+            # Cannibalization: terms where 2+ active campaigns compete and one converts, other doesn't
+            "cannibalization_signals": cannibalization_signals,
+            # Which campaigns are currently ACTIVE (used to validate cross-campaign negative safety)
+            "active_campaign_names": sorted(_active_campaign_names),
         }
 
         # Account-level: use aggregate summary, no specific camp_settings
@@ -3749,7 +4168,7 @@ The practice has enabled Budget Constrained mode. This means:
 === END BUDGET CONSTRAINED MODE ===
 """
 
-        prompt = acct_excellence_block + GOOGLE_ADS_RULES + _acct_budget_constrained_note + """
+        prompt = acct_excellence_block + GOOGLE_ADS_RULES + CAMPAIGN_INTENT_RULES + _acct_budget_constrained_note + """
 You are the Chief Marketing Officer (CMO) for Grafton Dental Care, a private dental practice in Grafton, MA, performing an ACCOUNT-LEVEL portfolio review.
 
 Think like a CMO: you are not optimizing individual campaigns in isolation — you are managing a portfolio of bets. Ask yourself:
@@ -3793,7 +4212,20 @@ Focus areas for account-level recs:
 2. BUDGET REBALANCING — if one campaign has 0 conversions/calls but high spend vs another with conversions → change_budget
 3. BID STRATEGY — if a campaign has enough conversion data to switch strategies → change_bid_strategy
 4. MISSING ASSETS — sitelinks/callouts that should exist on all campaigns but don't → add_asset
-5. CROSS-CAMPAIGN WASTE — identical wasteful terms appearing in multiple campaigns
+5. CROSS-CAMPAIGN CANNIBALIZATION — use the "cannibalization_signals" field:
+   Each entry has: search_term, loser_campaign (spending with 0 conversions), loser_cost,
+   winner_campaign (converting), winner_conversions, both_active (always true here).
+
+   RULE: Only recommend add_negative_keyword for cannibalized terms when both_active=true.
+   The negative goes on the loser_campaign (use campaign_resources[loser_campaign] for campaign_resource).
+
+   CRITICAL — always pair each cannibalization negative with a claude_advisory that says:
+   "This negative was added because [winner_campaign] is currently active and converting this term.
+   If [winner_campaign] is paused or stopped, remove this negative from [loser_campaign] so it can
+   recapture that traffic." This ensures the team knows the negative is conditional on both campaigns running.
+
+   Do NOT add cannibalization negatives if either campaign is in learning phase (check lifecycle_stage).
+   Do NOT flag terms where loser_cost < $1.00 (not worth the friction).
 6. ACCOUNT HEALTH — any account-wide pattern not captured by individual campaign reviews
 7. CALL EXPERIENCE: The field "call_quality_flags" in the data shows missed/short Google Ads calls
    flagged for follow-up. If missed_call_rate_pct > 15% OR any campaign has 3+ missed new-patient
@@ -3926,6 +4358,52 @@ The "competitor_intel_union" field contains the union of all conquest keywords a
 - by_campaign: per-campaign breakdown for reference.
 If you see a search term that appears in all_conquest_keywords, treat it as intentional targeting, not waste.
 
+DYNAMIC BUDGET REALLOCATION (GI-3):
+The "budget_reallocation_signals" field contains pre-computed donor/receiver candidates.
+- "reallocation_allowed": false when Budget Constrained mode is on — do NOT recommend any budget changes.
+- "total_daily_budget_usd": the current total daily spend across all campaigns — MUST be preserved exactly.
+- "receivers": campaigns that are losing >=""" + f"{_REALLOC_RECEIVER_BUDGET_LOST_MIN:.0%}" + """% of impression share to budget and are generating value (production > 0 or strong ROAS).
+- "donors": campaigns with headroom above the $""" + f"{_REALLOC_MIN_FLOOR_USD:.0f}" + """/day floor that are not themselves budget-constrained.
+- Each donor has "headroom_usd" — the maximum you may transfer from that campaign in a single run.
+
+REALLOCATION RULES (MANDATORY):
+1. ONLY recommend reallocation if reallocation_allowed = true AND receivers list is non-empty AND donors list is non-empty.
+2. Each reallocation requires EXACTLY TWO paired change_budget operations:
+   - One DECREASE on the donor: new_daily_budget_usd = donor.daily_budget_usd - transfer_amount
+   - One INCREASE on the receiver: new_daily_budget_usd = receiver.daily_budget_usd + transfer_amount
+   - The transfer_amount must equal the same value in both operations (net-zero constraint).
+3. transfer_amount must not exceed donor.headroom_usd AND must not exceed $""" + f"{_REALLOC_MAX_SINGLE_TRANSFER_USD:.0f}" + """/day per transfer.
+4. Never reduce a donor below $""" + f"{_REALLOC_MIN_FLOOR_USD:.0f}" + """/day (headroom already enforces this — trust the pre-computed value).
+5. Never recommend reallocation for campaigns where in_learning_period = true.
+6. Prefer receivers with the highest search_budget_lost_is and highest roas_30d (most value being left on the table).
+7. Prefer donors with the lowest search_budget_lost_is (most clearly not budget-constrained).
+8. In the "reason" field for BOTH change_budget operations, cite:
+   - donor campaign name, receiver campaign name, transfer amount
+   - receiver's search_budget_lost_is and roas_30d
+   - The note: "NET-ZERO: account total stays at $X/day"
+9. Emit at most ONE reallocation pair per optimizer run (one donor decrease + one receiver increase).
+10. If no clean pair exists (e.g., receivers have no production yet, or all donors are at floor), emit claude_advisory explaining what data is needed before reallocation is warranted.
+
+A/B EXPERIMENT MONITORING:
+The "active_ab_experiments" field lists currently running Google Ads A/B experiments.
+Each entry has: name, type (landing_page|ad_copy), days_running, base_campaign, trial_campaign,
+control_url, variant_url, and winner_signal (ready, winner, confidence, summary, base_stats, trial_stats).
+
+RULES:
+1. If winner_signal.ready = true AND winner_signal.winner != 'inconclusive':
+   - Emit an experiment_advisory (use operation="experiment_advisory") with:
+     - insight: which arm won, the primary metric, relative lift, and the summary
+     - reason: "Recommend promoting [winner] arm. Review metrics and promote manually in Google Ads UI."
+     - Include base_stats and trial_stats in the insight for reference.
+2. If winner_signal.ready = false:
+   - Emit experiment_advisory only if days_running > 30 AND still insufficient_data,
+     to flag that the experiment may be underpowered.
+3. Do NOT emit change_budget, change_bid_strategy, increase_bid, or pause_keyword for
+   campaigns that are part of an active experiment (base_campaign or trial_campaign names).
+   These campaigns are mid-test — structural changes invalidate the comparison.
+4. experiment_advisory uses operation="experiment_advisory", not "claude_advisory".
+   This allows the frontend to display it in the A/B Tests tab rather than the main rec queue.
+
 N-GRAM WASTE ANALYSIS (GI-3):
 The "ngram_waste_signals" field contains statistical patterns across ALL non-converting search terms.
 - "unigrams": single tokens that appear across many non-converting search terms with significant total waste.
@@ -3965,7 +4443,7 @@ USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
             arr = json.loads(m.group(0))
             valid_camp_resources = set(camp_resources.values())
             # Operations valid at account level — anything else is a campaign-level op that leaked
-            _ACCOUNT_LEVEL_OPS = {"add_negative_keyword", "change_bid_strategy", "change_budget", "add_asset", "claude_advisory"}
+            _ACCOUNT_LEVEL_OPS = {"add_negative_keyword", "change_bid_strategy", "change_budget", "add_asset", "claude_advisory", "experiment_advisory"}
             # PR 5: build conquest keyword protection set for account-level
             _acct_conquest: set = {
                 k.strip().lower()
@@ -3976,6 +4454,10 @@ USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
             for item in arr:
                 if not isinstance(item, dict) or not item.get("operation"):
                     continue
+                # Stash original campaign_name before clobbering — needed by
+                # budget_constraint_sieve which looks up budget_by_campaign[campaign_name].
+                # (C1 fix: preserve for sieve, then zero out for storage.)
+                item["_original_campaign_name"] = item.get("campaign_name", "")
                 # Force campaign_name to empty — these are account-level
                 item["campaign_name"] = ""
                 op = item["operation"]
@@ -4019,8 +4501,10 @@ USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
                     continue
 
                 # Recently-applied suppression (account-level)
+                # change_budget is exempt: budget situations change week-to-week;
+                # suppressing paired reallocation ops would leave an inconsistent state.
                 _exempt_acct = {"claude_advisory", "add_negative_keyword",
-                                 "add_exact_keyword", "enable_keyword"}
+                                 "add_exact_keyword", "enable_keyword", "change_budget"}
                 if op not in _exempt_acct:
                     _entity_acct = (
                         item.get("keyword_text") or item.get("entity_name") or
@@ -4035,8 +4519,13 @@ USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
 
                 validated.append(item)
             logger.info(f"Account-level Claude returned {len(arr)} recs, {len(validated)} passed validation")
-            # Budget constraint sieve — block change_budget increases at account level too
+            # Budget constraint sieve — block change_budget increases at account level too.
+            # C1 fix: temporarily restore _original_campaign_name so the sieve can look up
+            # budget_by_campaign[campaign_name] correctly, then strip the helper field.
             if budget_constrained:
+                for _v in validated:
+                    if _v.get("_original_campaign_name"):
+                        _v["campaign_name"] = _v["_original_campaign_name"]
                 pre_len = len(validated)
                 validated = _budget_constraint_sieve(
                     validated,
@@ -4048,6 +4537,53 @@ USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
                         f"[budget_constraint_sieve][account] {pre_len - len(validated)} "
                         f"change_budget increases/strategy changes converted to advisories"
                     )
+                # Re-zero campaign_name after sieve (account-level recs must be campaign-agnostic)
+                for _v in validated:
+                    _v["campaign_name"] = ""
+            # Strip the helper field from all recs regardless of budget_constrained mode
+            for _v in validated:
+                _v.pop("_original_campaign_name", None)
+
+            # M4 fix: Net-zero verification for change_budget pairs.
+            # Claude is instructed to emit exactly one paired decrease+increase with equal amounts.
+            # Enforce this programmatically: find all change_budget ops, compute net delta.
+            # If delta != 0 (mismatched pair or one-sided op), drop all change_budget ops
+            # and emit a single advisory explaining what happened.
+            _budget_ops = [v for v in validated if v.get("operation") == "change_budget"]
+            if _budget_ops and not budget_constrained:
+                _net_delta = 0.0
+                _parse_ok = True
+                for _bop in _budget_ops:
+                    _orig_cn = _bop.get("_original_campaign_name", "")
+                    _curr_bud = (_acct_budget_by_campaign or {}).get(_orig_cn, 0.0) if _orig_cn else 0.0
+                    _new_bud = float(_bop.get("new_daily_budget_usd") or 0)
+                    if _curr_bud <= 0:
+                        _parse_ok = False
+                        break
+                    _net_delta += _new_bud - _curr_bud
+                if _parse_ok and abs(_net_delta) > 0.50:  # allow $0.50 rounding tolerance
+                    logger.warning(
+                        f"[net-zero] Account-level budget reallocation rejected: "
+                        f"net delta=${_net_delta:+.2f} (expected 0). "
+                        f"Ops: {[(v.get('_original_campaign_name','?'), v.get('new_daily_budget_usd')) for v in _budget_ops]}"
+                    )
+                    validated = [v for v in validated if v.get("operation") != "change_budget"]
+                    validated.append({
+                        "operation": "claude_advisory",
+                        "campaign_name": "",
+                        "insight": (
+                            f"BUDGET_REALLOCATION_REJECTED: Claude proposed {len(_budget_ops)} change_budget op(s) "
+                            f"with a net delta of ${_net_delta:+.2f}/day — violates net-zero constraint. "
+                            f"No budget changes were made. Review reallocation signals and retry."
+                        ),
+                        "reason": f"net_delta=${_net_delta:+.2f} exceeds $0.50 tolerance",
+                    })
+                elif _budget_ops:
+                    logger.info(
+                        f"[net-zero] Account-level budget reallocation approved: "
+                        f"{len(_budget_ops)} change_budget op(s), net delta=${_net_delta:+.2f}"
+                    )
+
             return validated
     except Exception as e:
         logger.warning(f"Account-level Claude call failed (non-fatal): {e}")
@@ -8132,6 +8668,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         budget_constrained=_budget_constrained,
         budget_by_campaign=_acct_budget_by_campaign if _budget_constrained else None,
         campaign_lifecycle_map=_rule_lifecycle_by_camp,
+        campaign_settings_raw=campaign_settings,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")

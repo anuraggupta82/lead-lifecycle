@@ -5301,6 +5301,51 @@ def admin_campaign_build_step_save(campaign_id: str, body: CampaignBuildStepSave
                     data_to_save["competitor_negatives"] = sorted(set(_current_negs))
             except Exception as _cp_err:
                 logger.warning(f"build-step-save: apply_competitor_policy failed (non-fatal): {_cp_err}")
+        # ── Live-push new negatives when campaign is already in Google Ads ──
+        # If this is the keywords step and the campaign has a gads_campaign_resource,
+        # diff the incoming negative_keywords against what's already saved and push
+        # any new ones immediately so the wizard and live GAds stay in sync.
+        if body.step == "keywords":
+            gads_resource = camp.get("gads_campaign_resource") or ""
+            if gads_resource and isinstance(data_to_save, dict):
+                from database import get_campaign_build
+                from google_ads_write import add_negative_keyword_to_campaign
+                from campaign_safety import check_writes_enabled, WriteBlockedError
+                from database import log_admin_manual_action, update_gads_action_result, set_audit_approval
+                try:
+                    check_writes_enabled()
+                    # Get existing saved negatives before this save
+                    old_build = get_campaign_build(campaign_id) or {}
+                    old_kw = old_build.get("keywords") or {}
+                    old_negs = {n.strip().lower() for n in (old_kw.get("negative_keywords") or []) if n.strip()}
+                    new_negs = data_to_save.get("negative_keywords") or []
+                    added_negs = [n for n in new_negs if n.strip().lower() not in old_negs]
+                    for neg_text in added_negs:
+                        neg_text = neg_text.strip()
+                        if not neg_text:
+                            continue
+                        try:
+                            action_id = log_admin_manual_action(
+                                operation="add_negative_keyword",
+                                entity_type="campaign",
+                                entity_id=gads_resource,
+                                entity_name=camp.get("campaign_name", ""),
+                                before={},
+                                after={"keyword_text": neg_text, "match_type": "BROAD",
+                                       "campaign_resource": gads_resource},
+                                reason="wizard_keywords_step_save",
+                            )
+                            add_negative_keyword_to_campaign(gads_resource, neg_text, "BROAD")
+                            update_gads_action_result(action_id, executed=True, execution_result="success")
+                            set_audit_approval(action_id, "admin")
+                            logger.info(f"build-step-save: live-pushed negative '{neg_text}' to {gads_resource}")
+                        except Exception as _neg_push_err:
+                            logger.warning(f"build-step-save: failed to push negative '{neg_text}': {_neg_push_err}")
+                except WriteBlockedError:
+                    logger.info("build-step-save: keyword step save — writes blocked, skipping live negative push")
+                except Exception as _live_err:
+                    logger.warning(f"build-step-save: live negative push failed (non-fatal): {_live_err}")
+
         save_campaign_build_step(campaign_id, body.step, data_to_save)
     return {"ok": True, "step": body.step}
 
@@ -5852,7 +5897,49 @@ async def admin_campaign_build_step(campaign_id: str, body: CampaignBuildStepReq
             logger.warning(f"build-step keywords: brand negatives load failed (non-fatal): {_bne}")
 
         from ai_optimizer import GOOGLE_ADS_RULES as _GAR
-        prompt = _GAR + f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
+
+        # Build campaign-type-specific keyword generation rules
+        _urgency_tokens_list = _intent_pack.get("urgency_tokens_required") or []
+        if _kw_camp_type == "emergency" and _urgency_tokens_list:
+            _sample_urgency = ", ".join(f'"{t}"' for t in _urgency_tokens_list[:8])
+            _type_specific_rules = f"""
+
+=== EMERGENCY CAMPAIGN KEYWORD RULES (MANDATORY) ===
+This is an EMERGENCY dental campaign. It must ONLY capture patients in acute pain who need
+same-day or next-day care. Every keyword you generate must follow these rules:
+
+RULE 1 — URGENCY TOKEN REQUIRED: Every exact_match and phrase_match keyword MUST contain
+at least one urgency signal: {_sample_urgency}, "cracked tooth", "knocked out", "tooth infection",
+"weekend dentist", "dentist today", "dentist asap". If a keyword lacks ALL of these, DO NOT include it.
+
+RULE 2 — NAVIGATIONAL TERMS BANNED: Do NOT include any of these in exact_match or phrase_match:
+"dentist near me", "dentists near me", "dentist in [city]", "[city] dentist", "family dentist",
+"new patient dentist", "dental cleaning", "teeth cleaning", "affordable dentist", "best dentist",
+"dentist accepting new patients". These patients are shopping for a regular dentist, NOT seeking
+emergency care. They belong in the General Dentistry campaign.
+
+RULE 3 — INTENT CHECK: Before adding any keyword, ask: "Would a patient in acute dental pain
+right now search this?" If the answer is "maybe, but they might just be looking for a regular
+dentist too", the keyword is too broad — exclude it.
+
+NEGATIVE KEYWORDS: The navigational terms above (dentist near me, family dentist, etc.) MUST
+appear in negative_keywords to prevent the emergency campaign from capturing wrong-intent traffic.
+=== END EMERGENCY CAMPAIGN KEYWORD RULES ===
+"""
+            _type_specific_exact_rule = (
+                "- exact_match: 8-12 high-urgency keywords — EVERY keyword must contain an urgency signal "
+                "(emergency/urgent/same day/toothache/pain/broken tooth/open now/after hours/24 hour). "
+                "NO generic dentist searches. Examples: 'emergency dentist near me', 'toothache relief same day', "
+                "'dentist open now grafton ma', 'broken tooth emergency'"
+            )
+        else:
+            _type_specific_rules = ""
+            _type_specific_exact_rule = (
+                f"- exact_match: 8-12 high-intent keywords — must include \"near me\", \"same day\", "
+                f"\"[service] cost\", and \"[town] [service]\" variants using the intent patterns above"
+            )
+
+        prompt = _GAR + _type_specific_rules + f"""You are a Google Ads specialist. Generate a comprehensive keyword list for this dental campaign.
 
 Campaign: {campaign_name}
 Service Focus: {service_focus}
@@ -5872,7 +5959,7 @@ Return a JSON object with this exact structure:
 }}
 
 Rules:
-- exact_match: 8-12 high-intent keywords — must include "near me", "same day", "[service] cost", and "[town] [service]" variants using the intent patterns above
+{_type_specific_exact_rule}
 - phrase_match: 10-15 moderate-intent phrases covering service variations and location modifiers
 - broad_match_modifier: 5-8 broader terms to capture volume (service category + location area)
 - negative_keywords: Include ALL source campaign negatives above PLUS optimizer memory negatives PLUS {_neg_intent_note}{_brand_neg_rule}
@@ -7368,6 +7455,52 @@ def admin_campaign_sync_perf(campaign_id: str):
     }
 
 
+# ─── Bulk sync all active campaigns ─────────────────────────────────────────
+
+@app.post("/api/admin/campaigns/sync-all-active", dependencies=[Depends(_require_admin)])
+def admin_sync_all_active_campaigns():
+    """
+    Sync search terms + daily stats from Google Ads for every ACTIVE campaign.
+    Calls the per-campaign sync-perf logic for each, returns a summary.
+    """
+    from database import get_all_campaigns
+    all_camps = get_all_campaigns() or []
+    active = [c for c in all_camps if (c.get("status") or "").upper() == "ACTIVE"
+              and c.get("gads_campaign_resource") and c.get("gads_campaign_numeric_id")]
+
+    results = []
+    errors_total = 0
+    for camp in active:
+        try:
+            result = admin_campaign_sync_perf(camp["campaign_id"])
+            results.append({
+                "campaign_id":   camp["campaign_id"],
+                "campaign_name": camp.get("campaign_name", ""),
+                "search_terms_updated": result.get("search_terms_updated", 0),
+                "daily_stats_updated":  result.get("daily_stats_updated", 0),
+                "ok": result.get("ok", False),
+                "errors": result.get("errors", []),
+            })
+            if not result.get("ok"):
+                errors_total += 1
+        except Exception as e:
+            errors_total += 1
+            results.append({
+                "campaign_id":   camp["campaign_id"],
+                "campaign_name": camp.get("campaign_name", ""),
+                "ok": False,
+                "errors": [str(e)],
+            })
+
+    return {
+        "ok": errors_total == 0,
+        "synced": len(active),
+        "errors_total": errors_total,
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+        "results": results,
+    }
+
+
 # ─── Campaign write-back endpoints (PR 1) ────────────────────────────────────
 
 class NegativeKeywordRequest(BaseModel):
@@ -7432,6 +7565,164 @@ def admin_add_negative_keyword(campaign_id: str, body: NegativeKeywordRequest):
     except Exception as e:
         update_gads_action_result(action_id, executed=True,
                                   execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+@app.get("/api/admin/gads/negatives/campaign/{campaign_id}",
+         dependencies=[Depends(_require_admin)])
+def admin_list_campaign_negatives(campaign_id: str):
+    """
+    Return the current campaign-level negative keywords from Google Ads.
+    """
+    from database import get_campaign_by_id
+    from ai_optimizer import _build_client
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        return {"negatives": []}
+
+    try:
+        client = _build_client()
+        ga_service = client.get_service("GoogleAdsService")
+        query = (
+            "SELECT campaign_criterion.keyword.text, "
+            "campaign_criterion.keyword.match_type, "
+            "campaign_criterion.negative, "
+            "campaign_criterion.resource_name "
+            "FROM campaign_criterion "
+            "WHERE campaign_criterion.negative = TRUE "
+            f"AND campaign.resource_name = '{gads_resource}'"
+        )
+        customer_id = gads_resource.split("/")[1] if "/" in gads_resource else ""
+        response = ga_service.search(customer_id=customer_id, query=query)
+        negatives = []
+        for row in response:
+            cc = row.campaign_criterion
+            if cc.keyword.text:
+                mt = client.enums.KeywordMatchTypeEnum(cc.keyword.match_type).name
+                negatives.append({
+                    "text": cc.keyword.text,
+                    "match_type": mt,
+                    "resource_name": cc.resource_name,
+                })
+        return {"negatives": negatives}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+class AccountNegativeKeywordRequest(BaseModel):
+    keyword_text: str
+    match_type: str = "BROAD"
+
+
+@app.post("/api/admin/gads/negatives/account",
+          dependencies=[Depends(_require_admin)])
+def admin_add_account_negative(body: AccountNegativeKeywordRequest):
+    """
+    Add a keyword as an account-level (CustomerNegativeCriterion) negative
+    that blocks it across ALL campaigns.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import log_admin_manual_action
+    from ai_optimizer import _build_client
+    from config import get_settings
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    keyword_text = (body.keyword_text or "").strip()
+    if not keyword_text:
+        raise HTTPException(status_code=422, detail="keyword_text is required")
+
+    match_type = (body.match_type or "BROAD").upper()
+    if match_type not in ("EXACT", "PHRASE", "BROAD"):
+        raise HTTPException(status_code=422, detail="match_type must be EXACT, PHRASE, or BROAD")
+
+    settings = get_settings()
+    customer_id = "".join(c for c in (settings.google_ads_customer_id or "") if c.isdigit())
+    if not customer_id:
+        raise HTTPException(status_code=500, detail="google_ads_customer_id not configured")
+
+    log_admin_manual_action(
+        operation="add_account_negative_keyword",
+        entity_type="account",
+        entity_id=customer_id,
+        entity_name="account-level negative",
+        before={},
+        after={"keyword_text": keyword_text, "match_type": match_type},
+        reason="manual_account_negative",
+    )
+
+    client = _build_client()
+    service = client.get_service("CustomerNegativeCriterionService")
+    operation = client.get_type("CustomerNegativeCriterionOperation")
+    criterion = operation.create
+    criterion.keyword.text = keyword_text
+    criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+    try:
+        response = service.mutate_customer_negative_criteria(
+            customer_id=customer_id, operations=[operation]
+        )
+        resource = response.results[0].resource_name
+    except Exception as e:
+        err = str(e)
+        if "DUPLICATE_CRITERION" in err or "already exists" in err.lower() or "ALREADY_EXISTS" in err:
+            return {"ok": True, "duplicate": True, "keyword_text": keyword_text}
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "ok": True,
+        "keyword_text": keyword_text,
+        "match_type": match_type,
+        "resource_name": resource,
+    }
+
+
+@app.get("/api/admin/gads/negatives/account",
+         dependencies=[Depends(_require_admin)])
+def admin_list_account_negatives():
+    """
+    Return all account-level (CustomerNegativeCriterion) negative keywords.
+    """
+    from ai_optimizer import _build_client
+    from config import get_settings
+
+    settings = get_settings()
+    customer_id = "".join(c for c in (settings.google_ads_customer_id or "") if c.isdigit())
+    if not customer_id:
+        raise HTTPException(status_code=500, detail="google_ads_customer_id not configured")
+
+    try:
+        client = _build_client()
+        ga_service = client.get_service("GoogleAdsService")
+        query = (
+            "SELECT customer_negative_criterion.keyword.text, "
+            "customer_negative_criterion.keyword.match_type, "
+            "customer_negative_criterion.resource_name, "
+            "customer_negative_criterion.type "
+            "FROM customer_negative_criterion "
+            "WHERE customer_negative_criterion.type = 'KEYWORD' "
+            "ORDER BY customer_negative_criterion.keyword.text"
+        )
+        response = ga_service.search(customer_id=customer_id, query=query)
+        negatives = []
+        for row in response:
+            cnc = row.customer_negative_criterion
+            if cnc.keyword.text:
+                mt = client.enums.KeywordMatchTypeEnum(cnc.keyword.match_type).name
+                negatives.append({
+                    "text": cnc.keyword.text,
+                    "match_type": mt,
+                    "resource_name": cnc.resource_name,
+                })
+        return {"negatives": negatives}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
 
 
@@ -8067,6 +8358,209 @@ def admin_gads_search_terms(days: int = 30, campaign: str = ""):
         t["verdict_reason"] = clf["reason"] if clf else None
         t["classified_at"] = clf["classified_at"] if clf else None
     return {"search_terms": terms}
+
+
+# ─── A/B Experiment endpoints ──────────────────────────────────────────────────
+
+class AbExperimentCreate(BaseModel):
+    experiment_name: str
+    experiment_resource: str = ""
+    base_campaign_resource: str
+    base_campaign_name: str = ""
+    trial_campaign_resource: str = ""
+    trial_campaign_name: str = ""
+    experiment_type: str = "landing_page"
+    control_url: str = ""
+    variant_url: str = ""
+    traffic_split_percent: int = 50
+    status: str = "SETUP"
+    start_date: str = ""
+    end_date: str = ""
+    notes: str = ""
+
+    @validator("experiment_type")
+    def _valid_type(cls, v):
+        if v not in ("landing_page", "ad_copy"):
+            raise ValueError("experiment_type must be 'landing_page' or 'ad_copy'")
+        return v
+
+    @validator("traffic_split_percent")
+    def _valid_split(cls, v):
+        if not (1 <= v <= 99):
+            raise ValueError("traffic_split_percent must be 1-99")
+        return v
+
+
+class AbExperimentUpdate(BaseModel):
+    experiment_resource: str | None = None
+    trial_campaign_resource: str | None = None
+    trial_campaign_name: str | None = None
+    status: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    winner: str | None = None
+    notes: str | None = None
+    control_url: str | None = None
+    variant_url: str | None = None
+
+
+@app.post("/api/admin/experiments", dependencies=[Depends(_require_admin)])
+def admin_create_experiment(body: AbExperimentCreate):
+    """Create a new A/B experiment record (manually set up in Google Ads UI)."""
+    from database import create_ab_experiment, list_ab_experiments
+    # Guard: only one RUNNING experiment per base campaign
+    existing = list_ab_experiments()
+    for ex in existing:
+        if (ex["base_campaign_resource"] == body.base_campaign_resource
+                and ex["status"] == "RUNNING"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A RUNNING experiment already exists for this campaign: '{ex['experiment_name']}'"
+            )
+    exp_id = create_ab_experiment(body.dict())
+    return {"ok": True, "id": exp_id}
+
+
+@app.get("/api/admin/experiments", dependencies=[Depends(_require_admin)])
+def admin_list_experiments(status: str = ""):
+    """List all A/B experiments, optionally filtered by status."""
+    from database import list_ab_experiments
+    return {"experiments": list_ab_experiments(status=status)}
+
+
+@app.get("/api/admin/experiments/{experiment_id}", dependencies=[Depends(_require_admin)])
+def admin_get_experiment(experiment_id: int):
+    """Get a single experiment by ID."""
+    from database import get_ab_experiment
+    exp = get_ab_experiment(experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    return exp
+
+
+@app.put("/api/admin/experiments/{experiment_id}", dependencies=[Depends(_require_admin)])
+def admin_update_experiment(experiment_id: int, body: AbExperimentUpdate):
+    """Update experiment fields (e.g. add trial_campaign_resource after setting up in Google Ads)."""
+    from database import get_ab_experiment, update_ab_experiment
+    exp = get_ab_experiment(experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    updates = {k: v for k, v in body.dict().items() if v is not None}
+    update_ab_experiment(experiment_id, updates)
+    return {"ok": True}
+
+
+@app.get("/api/admin/experiments/{experiment_id}/metrics", dependencies=[Depends(_require_admin)])
+def admin_experiment_metrics(
+    experiment_id: int,
+    start_date: str = "",
+    end_date: str = "",
+):
+    """
+    Fetch combined metrics for both arms:
+    - Google Ads API: clicks, impressions, CTR, conversions, cost
+    - Local DB: leads, booked, showed, revenue
+    - Winner signal computation
+    """
+    from database import get_ab_experiment, get_ab_experiment_lead_metrics
+    from experiment_metrics import get_gads_experiment_metrics, compute_winner_signal
+
+    exp = get_ab_experiment(experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+
+    # Use experiment dates as default range
+    _start = start_date or exp.get("start_date") or ""
+    _end   = end_date   or exp.get("end_date")   or ""
+
+    # Compute days running
+    days_running = 0
+    if exp.get("start_date"):
+        try:
+            from datetime import date as _date
+            _sd = _date.fromisoformat(exp["start_date"])
+            _ed = _date.fromisoformat(_end) if _end else _date.today()
+            days_running = max((_ed - _sd).days, 0)
+        except Exception:
+            pass
+
+    # Fetch GAds metrics
+    gads = get_gads_experiment_metrics(
+        base_campaign_resource=exp["base_campaign_resource"],
+        trial_campaign_resource=exp.get("trial_campaign_resource", ""),
+        start_date=_start,
+        end_date=_end,
+    )
+
+    # Fetch local lead metrics
+    leads = get_ab_experiment_lead_metrics(
+        base_campaign_name=exp.get("base_campaign_name", ""),
+        trial_campaign_name=exp.get("trial_campaign_name", ""),
+        control_url=exp.get("control_url", ""),
+        variant_url=exp.get("variant_url", ""),
+        start_date=_start,
+    )
+
+    # Compute winner signal
+    signal = compute_winner_signal(gads, leads, days_running=days_running)
+
+    return {
+        "experiment":    exp,
+        "gads_metrics":  gads,
+        "lead_metrics":  leads,
+        "winner_signal": signal,
+        "days_running":  days_running,
+    }
+
+
+@app.post("/api/admin/experiments/{experiment_id}/status", dependencies=[Depends(_require_admin)])
+def admin_update_experiment_status(experiment_id: int, body: dict = Body(...)):
+    """
+    Update experiment status. Valid transitions:
+    SETUP -> RUNNING, RUNNING -> HALTED | PROMOTED | GRADUATED
+    """
+    from database import get_ab_experiment, update_ab_experiment
+    exp = get_ab_experiment(experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+
+    new_status = body.get("status", "").upper()
+    valid = {"SETUP", "RUNNING", "HALTED", "PROMOTED", "GRADUATED"}
+    if new_status not in valid:
+        raise HTTPException(status_code=422, detail=f"status must be one of {valid}")
+
+    updates: dict = {"status": new_status}
+    if body.get("winner"):
+        updates["winner"] = body["winner"]
+    if body.get("notes"):
+        updates["notes"] = body["notes"]
+
+    # On terminal transitions, snapshot the current winner signal so the
+    # decision rationale is preserved even after the experiment data ages out.
+    if new_status in {"PROMOTED", "GRADUATED"}:
+        try:
+            import json as _json
+            from experiment_metrics import get_gads_experiment_metrics, compute_winner_signal
+            from database import get_ab_experiment_lead_metrics as _lead_m
+            _gads = get_gads_experiment_metrics(
+                base_campaign_resource=exp.get("base_campaign_resource", ""),
+                trial_campaign_resource=exp.get("trial_campaign_resource", ""),
+            )
+            _leads = _lead_m(
+                base_campaign_name=exp.get("base_campaign_name", ""),
+                trial_campaign_name=exp.get("trial_campaign_name", ""),
+                control_url=exp.get("control_url", ""),
+                variant_url=exp.get("variant_url", ""),
+            )
+            _signal = compute_winner_signal(_gads, _leads, days_running=None)
+            updates["winner_signal_json"] = _json.dumps(_signal)
+        except Exception as _snap_err:
+            # Non-fatal — snapshot failure must not block the status transition
+            import logging as _log
+            _log.getLogger(__name__).warning(f"winner_signal snapshot failed: {_snap_err}")
+
+    update_ab_experiment(experiment_id, updates)
+    return {"ok": True, "status": new_status}
 
 
 @app.post("/api/admin/gads/classify-search-terms", dependencies=[Depends(_require_admin)])

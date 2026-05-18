@@ -146,9 +146,16 @@ KEY RULES:
    "attleboro falls dentistry", "atwill dental", "[any name] dental/dentistry/orthodontics")
    = "negative" — that person is looking for a DIFFERENT practice, not us.
 2. Generic service searches ("gum recession treatment", "dental implants near me") = "keep"
+   EXCEPTION — EMERGENCY CAMPAIGNS: generic dental searches WITHOUT an urgency signal
+   ("dentist near me", "family dentist", "dentist worcester", "dental cleaning", "new patient dentist")
+   = "negative". Emergency campaigns must only show for patients in acute pain who need same-day care.
+   A patient searching "dentist near me" wants a regular dentist, not emergency care.
+   URGENCY SIGNALS that make a term valid for emergency: emergency, urgent, same day, toothache,
+   broken tooth, pain, abscess, swollen, knocked out, open now, after hours, 24 hour, today.
+   If the term lacks ALL of these signals, mark it "negative" for emergency campaigns.
 3. Searches about our own practice or doctor = "keep"
 4. Research/informational only ("what causes gum recession", "dental implant cost comparison") = "negative"
-   UNLESS the campaign is general/emergency where broad awareness has value.
+   UNLESS the campaign is general where broad awareness has value.
 5. Conquest brands (listed above) = "conquest" — keep them unless campaign type has no conquest list.
 6. Geographic: searches for "[town] dental" where the town is NOT Grafton = "negative"
    UNLESS we explicitly target that town (we target: Grafton, Shrewsbury, Westborough,
@@ -322,12 +329,46 @@ def classify_new_terms_for_campaign(
         return {"classified": 0, "negatives": [], "conquests": [], "skipped": 0}
 
     # Pre-filter conquest terms locally (fast path — no Haiku call needed)
+    # Also pre-filter emergency off-intent terms: any term lacking an urgency token
+    # is automatically negative for emergency campaigns — no Haiku call needed.
     pre_classified = []
     to_classify = []
+
+    _urgency_tokens: list[str] = []
+    _off_intent_tokens: list[str] = []
+    if campaign_type == "emergency":
+        try:
+            from intent_signals import EMERGENCY_URGENCY_TOKENS, NEG_INTENT_BY_TYPE
+            _urgency_tokens = [t.lower() for t in EMERGENCY_URGENCY_TOKENS]
+            _off_intent_tokens = [t.lower() for t in NEG_INTENT_BY_TYPE.get("emergency", [])]
+        except Exception as _ie:
+            logger.warning(f"[st_classifier] intent_signals load failed: {_ie}")
+
+    def _has_urgency(term: str) -> bool:
+        """Return True if the term contains at least one emergency urgency signal."""
+        tl = term.lower()
+        return any(tok in tl for tok in _urgency_tokens)
+
+    def _is_off_intent_for_emergency(term: str) -> bool:
+        """Return True if the term matches a known navigational/general pattern."""
+        import re as _re
+        tl = term.lower().strip()
+        if any(tok in tl for tok in _off_intent_tokens):
+            return True
+        # Catch bare "dentist [city]" / "[city] dentist" patterns not in the token list
+        # e.g. "dentist worcester", "dentist holden", "holden dentist"
+        if _re.search(r'^dentist\s+\w+$', tl) or _re.search(r'^\w+\s+dentist$', tl):
+            return True
+        # Catch "[city] dental" patterns
+        if _re.search(r'^\w+\s+dental$', tl) or _re.search(r'^dental\s+\w+$', tl):
+            return True
+        return False
+
     for t in unclassified:
-        if _is_conquest(t["search_term"], campaign_type):
+        st = t["search_term"]
+        if _is_conquest(st, campaign_type):
             pre_classified.append({
-                "search_term": t["search_term"],
+                "search_term": st,
                 "campaign_name": campaign_name,
                 "verdict": "conquest",
                 "reason": f"Known conquest brand for {campaign_type} campaigns",
@@ -336,6 +377,29 @@ def classify_new_terms_for_campaign(
                 "impressions": int(t.get("impressions") or 0),
                 "clicks": int(t.get("clicks") or 0),
             })
+        elif campaign_type == "emergency" and _urgency_tokens:
+            # Default-deny for emergency: require an urgency token
+            if _has_urgency(st):
+                # Has urgency signal — still send to Haiku to verify it's genuine
+                to_classify.append(t)
+            elif _is_off_intent_for_emergency(st):
+                # Known navigational pattern — fast-path negative
+                pre_classified.append({
+                    "search_term": st,
+                    "campaign_name": campaign_name,
+                    "verdict": "negative",
+                    "reason": (
+                        "Off-intent for EMERGENCY campaign: navigational/general search "
+                        "with no urgency signal. Belongs in General Dentistry campaign."
+                    ),
+                    "classifier": "rule",
+                    "cost": round(float(t.get("cost") or 0), 2),
+                    "impressions": int(t.get("impressions") or 0),
+                    "clicks": int(t.get("clicks") or 0),
+                })
+            else:
+                # Unknown term, no urgency — send to Haiku with extra context
+                to_classify.append(t)
         else:
             to_classify.append(t)
 
