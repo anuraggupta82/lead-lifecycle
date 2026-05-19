@@ -7055,10 +7055,10 @@ def backfill_call_keyword_attribution() -> int:
     now = datetime.now(timezone.utc).isoformat()
     updated = 0
     with _conn() as conn:
-        # Fetch all matched calls EXCEPT those already at the best quality method.
-        # This lets us upgrade campaign_only / ad_group_best_keyword (and any
-        # other non-call_search_term method) to call_search_term when search term
-        # data is now available.
+        # Fetch all matched calls — including those already at call_search_term quality.
+        # We re-evaluate call_search_term rows so that if a higher-conversion term is
+        # now available (e.g. after a fresh sync), we can upgrade to the better term.
+        # Only skips rows where attributed_keyword_method is NULL (no GAds match yet).
         rows = conn.execute("""
             SELECT mc.uuid, mc.gads_call_id,
                    gcv.campaign_id, gcv.campaign_name, gcv.ad_group_id, gcv.ad_group_name,
@@ -7067,8 +7067,6 @@ def backfill_call_keyword_attribution() -> int:
             JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
             WHERE mc.gads_call_id IS NOT NULL
               AND mc.gads_call_id != ''
-              AND (mc.attributed_keyword_method IS NULL
-                   OR mc.attributed_keyword_method != 'call_search_term')
         """).fetchall()
 
         for row in rows:
@@ -7084,8 +7082,39 @@ def backfill_call_keyword_attribution() -> int:
             keyword = ""
             method = "campaign_only"
 
+            # Priority 0: SKAG direct match — one keyword per ad group = 100% certain attribution.
+            # Check skag_recommendations first by ad_group_id, then fall back to name parse.
+            if ad_group_name and "SKAG —" in ad_group_name:
+                skag_row = None
+                if ad_group_id:
+                    skag_row = conn.execute("""
+                        SELECT keyword_text FROM skag_recommendations
+                        WHERE new_ad_group_id = ?
+                          AND status IN ('created', 'locked')
+                          AND keyword_text != ''
+                        LIMIT 1
+                    """, (ad_group_id,)).fetchone()
+                if not skag_row:
+                    # Fallback: match by name (handles cases where ad_group_id is unset)
+                    skag_row = conn.execute("""
+                        SELECT keyword_text FROM skag_recommendations
+                        WHERE new_ad_group_name = ?
+                          AND status IN ('created', 'locked')
+                          AND keyword_text != ''
+                        LIMIT 1
+                    """, (ad_group_name,)).fetchone()
+                if skag_row and skag_row[0]:
+                    keyword = skag_row[0]
+                    method = "skag_direct"
+                else:
+                    # Name-parse fallback: extract keyword from "SKAG — Keyword Text"
+                    parsed = ad_group_name.split("—", 1)[-1].strip().lower()
+                    if parsed:
+                        keyword = parsed
+                        method = "skag_direct"
+
             # Priority 1: actual search term that drove AD_CALL conversions in this ad group
-            if ad_group_name and campaign_id:
+            if not keyword and ad_group_name and campaign_id:
                 st_row = conn.execute("""
                     SELECT search_term FROM gads_call_search_terms
                     WHERE campaign_id = ? AND ad_group_name = ?
@@ -7147,7 +7176,8 @@ def backfill_call_keyword_attribution() -> int:
             # ad_group_best_keyword with a weaker campaign_only result) and from
             # bumping updated_at on no-op rewrites.
             quality_rank = {
-                "call_search_term": 3,
+                "skag_direct": 4,       # one keyword per ad group — certain
+                "call_search_term": 3,  # top converting search term for ad group
                 "ad_group_best_keyword": 2,
                 "campaign_only": 1,
             }

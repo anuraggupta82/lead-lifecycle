@@ -4714,11 +4714,14 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                       {call.attributed_keyword}
                       {call.attributed_keyword_method && (() => {
                         const m = call.attributed_keyword_method;
-                        const label = m === 'call_search_term' ? 'ad group avg'
+                        const label = m === 'skag_direct'         ? 'exact keyword'
+                                    : m === 'call_search_term'    ? 'top search term'
                                     : m === 'ad_group_best_keyword' ? 'ad group kw'
                                     : 'estimated';
-                        const bg = m === 'call_search_term' ? '#fef9c3' : '#f0fdf4';
-                        const col = m === 'call_search_term' ? '#92400e' : '#166534';
+                        const bg = m === 'skag_direct'      ? '#dcfce7'
+                                 : m === 'call_search_term' ? '#fef9c3' : '#f0fdf4';
+                        const col = m === 'skag_direct'      ? '#14532d'
+                                  : m === 'call_search_term' ? '#92400e' : '#166534';
                         return <span style={{marginLeft:6,fontSize:10,background:bg,color:col,padding:'1px 5px',borderRadius:3}}>{label}</span>;
                       })()}
                     </div>

@@ -53,6 +53,8 @@ OPTIMIZER_STEPS = [
     ("Classifying Terms",   "Running Haiku semantic classifier on search terms..."),
     ("Competitor Memory",   "Matching search terms against known competitor brands..."),
     ("Brand Negatives",     "Checking nearby practice brand stems against campaign negatives..."),
+    ("Own-Brand Check",     "Ensuring GDC brand terms are negated on all acquisition campaigns..."),
+    ("Brand Camp Check",    "Ensuring generic terms are negated on brand campaign..."),
     ("Rule-Based Engine",   "Applying rule-based optimization (pauses, bids, harvesting)..."),
     ("AI Per-Campaign",     "Calling Claude Opus for per-campaign recommendations..."),
     ("AI Account-Level",    "Calling Claude Opus for cross-campaign recommendations..."),
@@ -7575,7 +7577,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     if outcome_history:
         logger.info(f"Outcome history loaded: {len(outcome_history)} entity-operation pairs from last 90d")
 
-    _set_progress(7)  # Rule-Based Engine
+    _set_progress(9)  # Rule-Based Engine
     # Analyze
     logger.info("Analyzing and generating recommendations...")
     # Build per-campaign lifecycle map for the rule engine guard
@@ -8048,9 +8050,207 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _bnc_err:
         logger.warning(f"Brand-negative cross-check failed (non-fatal): {_bnc_err}")
 
+    # ── Own-brand negatives on acquisition campaigns ───────────────────────────
+    # For every acquisition (non-brand) campaign, ensure GDC's own brand stems
+    # are present as PHRASE negatives on EACH campaign individually.
+    # This stops existing patients from burning acquisition budget when they
+    # search "grafton dental" or "dr gupta".
+    #
+    # Opus bug fixes applied:
+    #   C1: use get_pending_approvals (not get_pending_actions) + after_state_json key
+    #   C2: live_negatives_by_campaign keyed by campaign name, not resource_name
+    #   M1: dedup per (stem, campaign_res) tuple — never skip a campaign because
+    #       another campaign already has the stem staged
+    _set_progress(7)  # Own-Brand Check
+    try:
+        import json as _bp_json
+        from brand_policy import get_own_brand_negatives, is_brand_campaign as _is_brand_camp
+        from database import get_pending_approvals as _get_pending_approvals
+        _own_brand_stems = get_own_brand_negatives()
+
+        # Build per-campaign pending set: {(campaign_resource, keyword_text)} already queued
+        _ob_pending_pairs: set[tuple] = set()
+        for _pa in (_get_pending_approvals() or []):
+            if _pa.get("operation") == "add_negative_keyword":
+                _after_raw = _pa.get("after_state_json") or "{}"
+                try:
+                    _after = _bp_json.loads(_after_raw) if isinstance(_after_raw, str) else _after_raw
+                except Exception:
+                    _after = {}
+                _kt = (_after.get("keyword_text") or "").lower().strip()
+                _cr = (_after.get("campaign_resource") or "").strip()
+                if _kt and _cr:
+                    _ob_pending_pairs.add((_cr, _kt))
+
+        _ob_camp_name_to_res: dict[str, str] = {
+            s["campaign_name"].lower(): rn
+            for rn, s in campaign_settings.items()
+            if s.get("campaign_name")
+        }
+        # Reverse map for display names (resource_name → display campaign name)
+        _ob_res_to_display: dict[str, str] = {
+            rn: s["campaign_name"]
+            for rn, s in campaign_settings.items()
+            if s.get("campaign_name")
+        }
+
+        _ob_staged = 0
+        for _stem in _own_brand_stems:
+            _stem_lower = _stem.lower().strip()
+            if not _stem_lower:
+                continue
+            for _camp_name_lower, _camp_res in _ob_camp_name_to_res.items():
+                # Skip brand campaigns — they WANT brand traffic
+                if _is_brand_camp(_camp_name_lower):
+                    continue
+                # C1+M1 fix: check per-campaign pending pairs (not flat account set)
+                if (_camp_res, _stem_lower) in _ob_pending_pairs:
+                    continue
+                # C2 fix: look up by campaign name (how live_negatives_by_campaign is keyed)
+                # The dict is keyed by raw campaign name (mixed case from GAds), so try
+                # both lowercased lookup and a scan for case-insensitive match.
+                _raw_camp_name = _ob_res_to_display.get(_camp_res, _camp_name_lower)
+                _camp_live_negs = (
+                    live_negatives_by_campaign.get(_raw_camp_name)
+                    or live_negatives_by_campaign.get(_raw_camp_name.lower())
+                    or set()
+                )
+                _camp_negs_lower = set(n.lower().strip() for n in _camp_live_negs)
+                if _stem_lower in _camp_negs_lower:
+                    continue
+                # Skip if a broader PHRASE negative already covers this stem
+                # (e.g. "grafton dental" covers "grafton dental care" under PHRASE match)
+                _already_covered = any(
+                    _stem_lower.startswith(existing) or existing in _stem_lower
+                    for existing in _camp_negs_lower if existing
+                )
+                if _already_covered:
+                    continue
+                _display_name = _ob_res_to_display.get(_camp_res, _raw_camp_name)
+                log_pending(
+                    operation="add_negative_keyword",
+                    entity_type="keyword",
+                    entity_id=_camp_res,
+                    entity_name=_stem_lower,
+                    before_state={"source": "brand_policy_own_brand"},
+                    after_state={
+                        "keyword_text": _stem_lower,
+                        "match_type": "PHRASE",
+                        "campaign_resource": _camp_res,
+                    },
+                    optimizer_run_id=run_id,
+                    reason=(
+                        f"Own-brand negative: '{_stem_lower}' missing from acquisition campaign — "
+                        f"existing patients searching your practice name should not burn acquisition budget. "
+                        f"Route these searches to the Brand campaign instead."
+                    ),
+                    campaign_name=_display_name,
+                    priority=8,
+                    impact_estimate={"savings_30d_usd": 0, "impact_type": "budget_efficiency"},
+                )
+                _ob_pending_pairs.add((_camp_res, _stem_lower))  # prevent re-staging this run
+                _ob_staged += 1
+
+        if _ob_staged:
+            logger.info(f"[own_brand_check] Staged {_ob_staged} own-brand negative(s) on acquisition campaigns")
+    except Exception as _ob_err:
+        logger.warning(f"Own-brand negative cross-check failed (non-fatal): {_ob_err}")
+
+    # ── Generic dental negatives on brand campaign ────────────────────────────
+    # For every brand campaign, ensure generic dental/service terms are present
+    # as PHRASE negatives. This stops shopping-intent searchers from burning brand
+    # budget (those searches belong in acquisition campaigns).
+    _set_progress(8)  # Brand Camp Check
+    try:
+        import json as _bp_json2
+        from brand_policy import get_generic_dental_negatives, is_brand_campaign as _is_brand_camp2
+        from database import get_pending_approvals as _get_pending_approvals2
+        _generic_stems = get_generic_dental_negatives()
+
+        # Build per-campaign pending set for brand check
+        _gc_pending_pairs: set[tuple] = set()
+        for _pa in (_get_pending_approvals2() or []):
+            if _pa.get("operation") == "add_negative_keyword":
+                _after_raw = _pa.get("after_state_json") or "{}"
+                try:
+                    _after = _bp_json2.loads(_after_raw) if isinstance(_after_raw, str) else _after_raw
+                except Exception:
+                    _after = {}
+                _kt = (_after.get("keyword_text") or "").lower().strip()
+                _cr = (_after.get("campaign_resource") or "").strip()
+                if _kt and _cr:
+                    _gc_pending_pairs.add((_cr, _kt))
+
+        _gc_camp_name_to_res: dict[str, str] = {
+            s["campaign_name"].lower(): rn
+            for rn, s in campaign_settings.items()
+            if s.get("campaign_name")
+        }
+        _gc_res_to_display: dict[str, str] = {
+            rn: s["campaign_name"]
+            for rn, s in campaign_settings.items()
+            if s.get("campaign_name")
+        }
+
+        _gc_staged = 0
+        for _stem in _generic_stems:
+            _stem_lower = _stem.lower().strip()
+            if not _stem_lower:
+                continue
+            for _camp_name_lower, _camp_res in _gc_camp_name_to_res.items():
+                # Only apply to brand campaigns
+                if not _is_brand_camp2(_camp_name_lower):
+                    continue
+                if (_camp_res, _stem_lower) in _gc_pending_pairs:
+                    continue
+                _raw_camp_name = _gc_res_to_display.get(_camp_res, _camp_name_lower)
+                _camp_live_negs = (
+                    live_negatives_by_campaign.get(_raw_camp_name)
+                    or live_negatives_by_campaign.get(_raw_camp_name.lower())
+                    or set()
+                )
+                _camp_negs_lower = set(n.lower().strip() for n in _camp_live_negs)
+                if _stem_lower in _camp_negs_lower:
+                    continue
+                _already_covered = any(
+                    _stem_lower.startswith(existing) or existing in _stem_lower
+                    for existing in _camp_negs_lower if existing
+                )
+                if _already_covered:
+                    continue
+                _display_name = _gc_res_to_display.get(_camp_res, _raw_camp_name)
+                log_pending(
+                    operation="add_negative_keyword",
+                    entity_type="keyword",
+                    entity_id=_camp_res,
+                    entity_name=_stem_lower,
+                    before_state={"source": "brand_policy_generic_dental"},
+                    after_state={
+                        "keyword_text": _stem_lower,
+                        "match_type": "PHRASE",
+                        "campaign_resource": _camp_res,
+                    },
+                    optimizer_run_id=run_id,
+                    reason=(
+                        f"Brand campaign negative: '{_stem_lower}' missing — generic dental searches "
+                        f"indicate shopping/acquisition intent and should be served by acquisition campaigns, "
+                        f"not the brand budget."
+                    ),
+                    campaign_name=_display_name,
+                    priority=8,
+                    impact_estimate={"savings_30d_usd": 0, "impact_type": "budget_efficiency"},
+                )
+                _gc_pending_pairs.add((_camp_res, _stem_lower))
+                _gc_staged += 1
+
+        if _gc_staged:
+            logger.info(f"[brand_camp_check] Staged {_gc_staged} generic negative(s) on brand campaign(s)")
+    except Exception as _gc_err:
+        logger.warning(f"Brand-campaign generic-negative cross-check failed (non-fatal): {_gc_err}")
+
     # Claude structured recommendations — run once per active campaign.
     # Returns dicts with operation + exact API parameters, not plain text.
-    _set_progress(8)  # AI Per-Campaign
+    _set_progress(10)  # AI Per-Campaign
     logger.info("Calling Claude (Opus) for structured recommendations...")
     # Use ALL campaigns with keyword data — not just campaign_spend keys
     # (campaign_spend only covers the allow-listed set in legacy mode; now we use all)
@@ -8097,7 +8297,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     _per_camp_competitor_blocks: dict = {}  # camp_name -> competitor_intel dict
 
     for _camp_idx, camp_name in enumerate(all_campaign_names):
-        _set_progress(8, campaign_context=f"{camp_name} ({_camp_idx + 1}/{_total_camps})")
+        _set_progress(10, campaign_context=f"{camp_name} ({_camp_idx + 1}/{_total_camps})")
         camp_lower = camp_name.strip().lower()
 
         camp_kw   = [k for k in keyword_perf  if k.get("campaign","").strip().lower() == camp_lower]
@@ -8598,7 +8798,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             [f"[claude:{camp_name}] {rec.get('reason','')}" for rec in structured]
         )
 
-    _set_progress(9)  # AI Account-Level
+    _set_progress(11)  # AI Account-Level
     # ── Account-level pass (cross-campaign patterns) ─────────────────────────
     logger.info("Calling Claude (Opus) for account-level recommendations...")
     # Build campaign_spend dict with resource info for the account-level function
@@ -8926,7 +9126,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     except Exception as _mem_err:
         logger.warning(f"Failed to save optimizer memory (non-fatal): {_mem_err}")
 
-    _set_progress(10)  # Finalizing
+    _set_progress(12)  # Finalizing
     # ── Save batch impact history ─────────────────────────────────────────────
     try:
         from database import _conn as _ih_conn
