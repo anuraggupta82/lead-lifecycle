@@ -26,6 +26,8 @@ Manual trigger: POST /api/admin/optimize
 
 import logging
 import json
+import sys
+import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -33,6 +35,26 @@ from typing import Optional
 from google.ads.googleads.client import GoogleAdsClient
 from google.protobuf import field_mask_pb2
 from config import get_settings
+
+# ── MCP decisions injection ───────────────────────────────────────────────────
+# Load prior Claude session decisions so the optimizer reasons with the benefit
+# of strategic decisions made in Cowork sessions.
+_MCP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "../../marketing-mcp")
+if os.path.isdir(_MCP_PATH) and _MCP_PATH not in sys.path:
+    sys.path.insert(0, _MCP_PATH)
+
+try:
+    from tools.decisions import get_decisions_for_campaign, get_global_decisions
+    _DECISIONS_AVAILABLE = True
+    logger_init = logging.getLogger(__name__)
+    logger_init.info("MCP decisions module loaded — prior session decisions will be injected into prompts")
+except ImportError:
+    _DECISIONS_AVAILABLE = False
+    def get_decisions_for_campaign(*args, **kwargs) -> str:  # type: ignore
+        return ""
+    def get_global_decisions(*args, **kwargs) -> str:  # type: ignore
+        return ""
 from database import get_all_leads
 
 logger = logging.getLogger(__name__)
@@ -793,6 +815,48 @@ def _build_institutional_memory_note(campaign: str = "") -> str:
     return "\n".join(lines)
 
 
+def _build_mcp_decisions_note(campaign: str | None = None) -> str:
+    """
+    Load prior Claude session decisions from the MCP decisions system and format
+    as a context block for injection into every optimizer Claude prompt.
+
+    campaign: campaign name to scope decisions. Pass None for account-level prompt.
+
+    This function is non-fatal — if the MCP module is unavailable or the DB
+    has no decisions, it returns an empty string and the optimizer continues normally.
+    """
+    if not _DECISIONS_AVAILABLE:
+        return ""
+
+    try:
+        parts = []
+
+        # Per-campaign decisions
+        if campaign:
+            camp_decisions = get_decisions_for_campaign(
+                campaign_name=campaign,
+                days=90,
+                limit=10,
+            )
+            if camp_decisions:
+                parts.append(camp_decisions)
+
+        # Global / account-level decisions always included
+        global_decisions = get_global_decisions(days=30, limit=10)
+        if global_decisions:
+            parts.append(global_decisions)
+
+        if not parts:
+            return ""
+
+        return "\n\n" + "\n\n".join(parts)
+
+    except Exception as _e:
+        import logging as _log
+        _log.getLogger(__name__).warning(f"[mcp_decisions] load failed (non-fatal): {_e}")
+        return ""
+
+
 def _build_excellence_block(campaign_name: str, summary: dict, camp_settings: dict,
                              campaign_stats: dict | None = None,
                              planned_targets: dict | None = None) -> str:
@@ -1141,6 +1205,7 @@ def _get_campaign_settings(client, customer_id: str, days: int = 30) -> dict:
 
             campaign_settings[rn] = {
                 "campaign_name": row.campaign.name,
+                "campaign_status": str(row.campaign.status).replace("CampaignStatus.", ""),
                 "bidding_strategy_type": strategy_type,
                 "target_cpa_usd": round(target_cpa / 1_000_000, 2) if target_cpa else None,
                 "target_roas": round(target_roas, 3) if target_roas else None,
@@ -3182,7 +3247,7 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
-ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + _build_institutional_memory_note(campaign) + feedback_block
+ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + _build_institutional_memory_note(campaign) + feedback_block + _build_mcp_decisions_note(campaign)
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -4418,7 +4483,7 @@ USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
 - Prefer bigrams over unigrams when the bigram captures the intent more precisely.
 - Highly service-relevant tokens (implant, invisalign, crown, emergency, etc.) are pre-filtered — do not appear in ngram signals.
 - Generate add_negative_keyword with match_type "broad" for the strongest candidates (top 3–5 by waste).
-- The "reason" field should cite: total_waste, distinct_terms, and a sample of example_terms.""" + _build_institutional_memory_note("")
+- The "reason" field should cite: total_waste, distinct_terms, and a sample of example_terms.""" + _build_institutional_memory_note("") + _build_mcp_decisions_note(None)
 
         msg = client.messages.create(
             model="claude-sonnet-4-5",
@@ -7549,16 +7614,24 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     total_clicks_all_campaigns = sum(k.get("clicks", 0) for k in keyword_perf)
 
     # ── Determine which campaigns to analyze ──────────────────────────────────
-    # Analyze ALL campaigns that have at least some keyword data/spend.
-    # The old ai_review_enabled allow-list is ignored — every active campaign
-    # with impressions gets Claude analysis so recommendations appear per-campaign.
-    # Paused campaigns are included if they have recent spend data (last 30d).
+    # Only generate per-campaign AI recommendations for ENABLED (active) campaigns.
+    # Paused campaigns are excluded from the recommendation loop but their keyword
+    # performance data and decision history still flow into the account-level Claude
+    # pass for learning (keyword_perf is not filtered — it retains all campaigns).
+    _enabled_camp_names: set[str] = {
+        s["campaign_name"].strip()
+        for s in campaign_settings.values()
+        if s.get("campaign_status", "").upper() == "ENABLED" and s.get("campaign_name", "").strip()
+    }
     active_campaigns_with_data = {
         k.get("campaign", "").strip()
         for k in keyword_perf
-        if k.get("campaign", "").strip()
+        if k.get("campaign", "").strip() and k.get("campaign", "").strip() in _enabled_camp_names
     }
-    logger.info(f"Campaigns with keyword data: {active_campaigns_with_data}")
+    logger.info(
+        f"Campaigns with keyword data (ENABLED only): {active_campaigns_with_data}  "
+        f"(paused campaigns excluded from per-campaign AI recs; data still used for account-level learning)"
+    )
 
     # Determine the primary campaign name for memory scoping
     campaign_spend: dict = {}
@@ -7600,8 +7673,19 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             logger.debug(f"[lifecycle] rule engine camp lookup failed for '{_rc}': {_rule_lc_err}")
             _rule_lifecycle_by_camp[_rc] = {}
 
+    # Filter keyword_perf to ENABLED campaigns only for rule-based and AI per-campaign analysis.
+    # Full keyword_perf (including paused campaigns) is retained for account-level learning.
+    keyword_perf_active = [
+        k for k in keyword_perf
+        if k.get("campaign", "").strip() in _enabled_camp_names
+    ]
+    logger.info(
+        f"Rule engine: {len(keyword_perf_active)} kw rows from ENABLED campaigns "
+        f"(filtered from {len(keyword_perf)} total rows including paused)"
+    )
+
     actions = _analyze_keywords(
-        keyword_perf, attribution, search_terms,
+        keyword_perf_active, attribution, search_terms,
         call_attribution=call_attribution,
         keyword_call_attribution=keyword_call_attribution,
         campaign=primary_campaign,
@@ -8002,9 +8086,10 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
             # C2 fix: build all_campaign_names_for_brand_check from campaign_settings
             # (campaign_settings is keyed by resource_name and already available in scope).
-            # We do NOT use the all_campaign_names variable which is defined 40 lines later.
+            # Only include ENABLED campaigns — don't stage negatives on paused campaigns.
             _all_camp_for_brand = sorted(
-                {s["campaign_name"] for s in campaign_settings.values() if s.get("campaign_name")}
+                {s["campaign_name"] for s in campaign_settings.values()
+                 if s.get("campaign_name") and s.get("campaign_status", "").upper() == "ENABLED"}
             ) or ([primary_campaign] if primary_campaign else [])
 
             # C4 fix: build a name→resource_name lookup from campaign_settings dict
@@ -8103,6 +8188,10 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 # Skip brand campaigns — they WANT brand traffic
                 if _is_brand_camp(_camp_name_lower):
                     continue
+                # Skip PAUSED campaigns — only stage negatives on ENABLED campaigns
+                _ob_camp_status = campaign_settings.get(_camp_res, {}).get("campaign_status", "").upper()
+                if _ob_camp_status and _ob_camp_status != "ENABLED":
+                    continue
                 # C1+M1 fix: check per-campaign pending pairs (not flat account set)
                 if (_camp_res, _stem_lower) in _ob_pending_pairs:
                     continue
@@ -8200,6 +8289,10 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             for _camp_name_lower, _camp_res in _gc_camp_name_to_res.items():
                 # Only apply to brand campaigns
                 if not _is_brand_camp2(_camp_name_lower):
+                    continue
+                # Skip PAUSED campaigns — only stage negatives on ENABLED campaigns
+                _gc_camp_status = campaign_settings.get(_camp_res, {}).get("campaign_status", "").upper()
+                if _gc_camp_status and _gc_camp_status != "ENABLED":
                     continue
                 if (_camp_res, _stem_lower) in _gc_pending_pairs:
                     continue

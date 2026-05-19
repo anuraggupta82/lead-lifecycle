@@ -3163,11 +3163,26 @@ def account_recommendations(status: str = "all", limit: int = 100, offset: int =
             row_dict["impact_estimate"] = {}
         grouped[op].append(row_dict)
 
+    # Build a set of paused campaign names so the frontend can filter the default view
+    paused_campaign_names: list[str] = []
+    try:
+        with _db_conn() as _sc:
+            _status_rows = _sc.execute(
+                "SELECT campaign_name, gads_status FROM campaigns WHERE gads_status IS NOT NULL"
+            ).fetchall()
+            paused_campaign_names = [
+                r["campaign_name"] for r in _status_rows
+                if (r["gads_status"] or "").upper() not in ("ENABLED", "ACTIVE")
+            ]
+    except Exception:
+        pass  # non-fatal — frontend falls back to showing all
+
     return {
         "campaign_name": "__all__",
         "status_filter": status,
         "recommendations": grouped,
         "total": len(rows),
+        "paused_campaign_names": paused_campaign_names,
         "pagination": {
             "limit": limit,
             "offset": offset,

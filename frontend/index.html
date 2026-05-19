@@ -4307,23 +4307,8 @@ function CallsSubView() {
                   <td style={{padding:'8px 10px',fontWeight:600}}>{call.answered_by||'—'}</td>
                   <td style={{padding:'8px 10px'}}>{_fmtDur(call.duration_sec)}</td>
                   <td style={{padding:'8px 10px'}}>{_statusBadge(call.status)}</td>
-                  <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}>
-                    <span style={{display:'flex',alignItems:'center',gap:4,flexWrap:'wrap'}}>
-                      {_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}
-                      {/* Override button — shown when status is wrong (e.g. city CNAM matched existing) */}
-                      {call.od_patient_status && call.od_patient_status !== 'new_patient' && (
-                        patOverrideState[call.uuid] === 'saving'
-                          ? <span style={{fontSize:9,color:'#6b7280'}}>saving…</span>
-                          : <button
-                              title="Mark as new patient (override OD match)"
-                              onClick={()=>handlePatientOverride(call.uuid,'new_patient')}
-                              style={{fontSize:9,padding:'1px 5px',border:'1px solid #15803d',borderRadius:3,
-                                cursor:'pointer',color:'#15803d',background:'#f0fdf4',whiteSpace:'nowrap'}}>
-                              ✱ New
-                            </button>
-                      )}
-                      {call.od_patient_status === 'new_patient' && call.od_patient_num === '' && false && null}
-                    </span>
+                  <td style={{padding:'8px 10px'}}>
+                    {_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}
                   </td>
                   <td style={{padding:'8px 10px'}}>{_attrBadge(call)}</td>
                   <td style={{padding:'8px 10px'}}>{_transcriptBadge(call.transcription_status)}</td>
@@ -16536,6 +16521,8 @@ function AiOptimizerTab() {
   const [histSelected, setHistSelected] = React.useState({});
   const [rejectModal, setRejectModal] = React.useState(null);      // {actionId, entity_name, operation}
   const [reclassifyModal, setReclassifyModal] = React.useState(null); // {action_id, entity_name, operation, campaign_name}
+  // Default view: hide paused campaign sections
+  const [showPausedCamps, setShowPausedCamps] = React.useState(false);
   // Competitor candidate queue
   const [compQueue, setCompQueue] = React.useState({pending:[], dismissed:[], promoted:[]});
   const [showIgnoredQueue, setShowIgnoredQueue] = React.useState(false);
@@ -16808,7 +16795,10 @@ function AiOptimizerTab() {
 
   const accountPending = pendingRecs.filter(r => !r.campaign_name);
   // Use ALL recs (not just pending) to determine campaign sections — so sections don't vanish after ignoring
-  const campaignNames = [...new Set(allRecs.filter(r => r.campaign_name).map(r => r.campaign_name))].sort();
+  const _pausedCampNames = new Set((recs?.paused_campaign_names || []).map(n => n.toLowerCase()));
+  const campaignNames = [...new Set(allRecs.filter(r => r.campaign_name).map(r => r.campaign_name))]
+    .filter(n => showPausedCamps || !_pausedCampNames.has(n.toLowerCase()))
+    .sort();
 
   const handleToggleSection = React.useCallback((key) => {
     setExpandedSections(p => ({...p, [key]: !p[key]}));
@@ -17050,7 +17040,7 @@ function AiOptimizerTab() {
                 onToggle={() => handleToggleSection('__account__')}
               />
 
-              {/* Per-campaign sections */}
+              {/* Per-campaign sections — active only by default */}
               {campaignNames.map(name => (
                 <OptimizerSection
                   key={name}
@@ -17066,6 +17056,21 @@ function AiOptimizerTab() {
                   onToggle={() => handleToggleSection(name)}
                 />
               ))}
+
+              {/* Paused campaign toggle */}
+              {_pausedCampNames.size > 0 && (
+                <div style={{textAlign:'center',marginTop:6,marginBottom:2}}>
+                  <button
+                    onClick={() => setShowPausedCamps(p => !p)}
+                    style={{fontSize:10,padding:'3px 12px',border:'1px solid var(--border)',
+                      borderRadius:12,cursor:'pointer',color:'var(--text-muted)',
+                      background:showPausedCamps?'#f1f5f9':'#fff',fontWeight:500}}>
+                    {showPausedCamps
+                      ? `⏸ Hide paused campaigns (${_pausedCampNames.size})`
+                      : `⏸ Show paused campaigns (${_pausedCampNames.size})`}
+                  </button>
+                </div>
+              )}
             </>
           );
           })()}
