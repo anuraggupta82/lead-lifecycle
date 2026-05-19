@@ -3534,6 +3534,27 @@ function CallsSubView() {
   // Per-call grade-only state: { uuid: 'idle'|'working'|'done'|'error' }
   const [gradeOnlyState, setGradeOnlyState] = useState({});
   const [gradeOnlyError, setGradeOnlyError] = useState({});
+  // Per-call patient override state: { uuid: 'idle'|'saving'|'done'|'error' }
+  const [patOverrideState, setPatOverrideState] = useState({});
+  async function handlePatientOverride(uuid, newStatus) {
+    setPatOverrideState(s => ({...s, [uuid]: 'saving'}));
+    try {
+      const r = await fetch(`/api/admin/mango-calls/${uuid}/patient-override`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json','X-Admin-Password': ADMIN_PW},
+        body: JSON.stringify({od_patient_status: newStatus})
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setCalls(cs => cs.map(c => c.uuid === uuid
+        ? {...c, od_patient_status: newStatus, od_patient_num: '', od_patient_name: ''}
+        : c
+      ));
+      setPatOverrideState(s => ({...s, [uuid]: 'done'}));
+    } catch(e) {
+      console.error('patient override failed', e);
+      setPatOverrideState(s => ({...s, [uuid]: 'error'}));
+    }
+  }
   // GAds unmatched row — match + transcribe state: { call_id: 'idle'|'matching'|'no_record'|'error' }
   const [matchState, setMatchState] = useState({});
   const [matchError, setMatchError] = useState({});
@@ -4075,7 +4096,7 @@ function CallsSubView() {
                     const matched = !!c.mango_uuid;
                     // Build a call-shaped object for rows that came from a matched Mango record
                     // For unmatched rows we still render the row but greyed out / no actions
-                    const isConv = !!(c.od_appointment_id);
+                    const isConv = !!(c.od_appointment_id) && c.od_patient_status === 'new_patient';
                     const callObj = matched ? {
                       ...c,
                       uuid: c.mango_uuid,
@@ -4164,7 +4185,7 @@ function CallsSubView() {
                 </tbody>
               </table>
               <div style={{padding:'6px 14px',fontSize:10,color:'var(--text-muted)',borderTop:'1px solid var(--border)'}}>
-                🟢 Matched = full Mango record (click to open) · 🟡 Unmatched = GAds call not yet linked to PBX · CONV badge = ≥60s
+                🟢 Matched = full Mango record (click to open) · 🟡 Unmatched = GAds call not yet linked to PBX · CONV badge = new patient with confirmed OD appointment
               </div>
             </div>
         )}
@@ -4266,7 +4287,7 @@ function CallsSubView() {
                     background:drawerCall&&drawerCall.uuid===call.uuid?'#dbeafe':call.status==='missed'?'#fef2f2':'#fff'}}>
                   <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
                     {_fmtTime(call.started_at)}
-                    {!!(call.od_appointment_id) && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
+                    {!!(call.od_appointment_id) && call.od_patient_status === 'new_patient' && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
                     {call.gads_call_id && (() => {
                       const conf = call.match_confidence || 0;
                       const [bg, col] = conf >= 0.75 ? ['#dbeafe','#1d4ed8'] : conf >= 0.60 ? ['#fef3c7','#92400e'] : ['#fee2e2','#991b1b'];
@@ -4286,7 +4307,24 @@ function CallsSubView() {
                   <td style={{padding:'8px 10px',fontWeight:600}}>{call.answered_by||'—'}</td>
                   <td style={{padding:'8px 10px'}}>{_fmtDur(call.duration_sec)}</td>
                   <td style={{padding:'8px 10px'}}>{_statusBadge(call.status)}</td>
-                  <td style={{padding:'8px 10px'}}>{_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}</td>
+                  <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}>
+                    <span style={{display:'flex',alignItems:'center',gap:4,flexWrap:'wrap'}}>
+                      {_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}
+                      {/* Override button — shown when status is wrong (e.g. city CNAM matched existing) */}
+                      {call.od_patient_status && call.od_patient_status !== 'new_patient' && (
+                        patOverrideState[call.uuid] === 'saving'
+                          ? <span style={{fontSize:9,color:'#6b7280'}}>saving…</span>
+                          : <button
+                              title="Mark as new patient (override OD match)"
+                              onClick={()=>handlePatientOverride(call.uuid,'new_patient')}
+                              style={{fontSize:9,padding:'1px 5px',border:'1px solid #15803d',borderRadius:3,
+                                cursor:'pointer',color:'#15803d',background:'#f0fdf4',whiteSpace:'nowrap'}}>
+                              ✱ New
+                            </button>
+                      )}
+                      {call.od_patient_status === 'new_patient' && call.od_patient_num === '' && false && null}
+                    </span>
+                  </td>
                   <td style={{padding:'8px 10px'}}>{_attrBadge(call)}</td>
                   <td style={{padding:'8px 10px'}}>{_transcriptBadge(call.transcription_status)}</td>
                   <td style={{padding:'8px 10px'}}>{_gradeBadge(call.grade_overall_score)}</td>

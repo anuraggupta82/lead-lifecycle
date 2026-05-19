@@ -306,9 +306,9 @@ async def lifespan(app: FastAPI):
             )
             ads_scheduler.add_job(
                 _mango_gads_call_view_job,
-                CronTrigger(hour=6, minute=5),
+                CronTrigger(minute="5,35"),  # every 30 min — keeps call_view fresh for same-day attribution
                 id="mango_call_view", name="GAds Call View Sync",
-                replace_existing=True,
+                max_instances=1, coalesce=True, replace_existing=True,
             )
 
             # Pipeline tick — runs every N minutes (offset from sync to avoid contention)
@@ -8902,6 +8902,38 @@ def admin_mango_match_patients(limit: int = 500):
         from od_matcher import match_mango_calls_to_od_patients
         result = match_mango_calls_to_od_patients(limit=limit)
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/mango-calls/{uuid}/patient-override", dependencies=[Depends(_require_admin)])
+def admin_mango_patient_override(uuid: str, body: dict):
+    """
+    Manually override the od_patient_status for a single Mango call.
+    Clears od_patient_num and od_patient_name when overriding to new_patient.
+    Resets od_matched_at so the auto-matcher won't re-overwrite until next sync.
+    """
+    allowed = {"new_patient", "existing_active", "existing_inactive", "unknown"}
+    new_status = (body or {}).get("od_patient_status", "")
+    if new_status not in allowed:
+        raise HTTPException(status_code=400, detail=f"od_patient_status must be one of: {allowed}")
+    try:
+        from database import _conn
+        with _conn() as conn:
+            if new_status == "new_patient":
+                conn.execute(
+                    """UPDATE mango_calls
+                       SET od_patient_status=?, od_patient_num='', od_patient_name='',
+                           od_matched_at=datetime('now')
+                       WHERE uuid=?""",
+                    (new_status, uuid),
+                )
+            else:
+                conn.execute(
+                    "UPDATE mango_calls SET od_patient_status=?, od_matched_at=datetime('now') WHERE uuid=?",
+                    (new_status, uuid),
+                )
+        return {"ok": True, "uuid": uuid, "od_patient_status": new_status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

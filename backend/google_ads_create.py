@@ -1422,7 +1422,7 @@ def add_sitelinks_to_campaign(campaign_resource_name: str, sitelinks: list, cust
 
             asset_op = client.get_type("AssetOperation")
             asset    = asset_op.create
-            asset.name = f"Camp {camp_id_suffix} Sitelink — {title}"
+            asset.name = f"Camp {camp_id_suffix} Sitelink - {title}"
             asset.sitelink_asset.link_text = title
             asset.final_urls.append(url)  # final_urls is on Asset, not SitelinkAsset
 
@@ -1522,6 +1522,10 @@ def add_callouts_to_campaign(
         camp_asset_service = client.get_service("CampaignAssetService")
 
         # ── Pass 1: Create all callout assets in one batch ───────────────────────
+        import time as _time
+        # Short epoch suffix ensures unique asset names — Google returns INVALID_ARGUMENT
+        # if you try to create an asset whose name already exists in the account.
+        _epoch_suffix = str(int(_time.time()))[-6:]
         asset_ops = []
         valid_texts: list[str] = []
         for text in callout_texts:
@@ -1534,7 +1538,7 @@ def add_callouts_to_campaign(
                 continue
             asset_op = client.get_type("AssetOperation")
             asset = asset_op.create
-            asset.name = f"Camp {camp_id_suffix} Callout — {text}"
+            asset.name = f"Camp {camp_id_suffix} Callout {_epoch_suffix} - {text}"
             asset.callout_asset.callout_text = text
             asset_ops.append(asset_op)
             valid_texts.append(text)
@@ -1641,7 +1645,7 @@ def add_structured_snippet_to_campaign(
 
         asset_op = client.get_type("AssetOperation")
         asset = asset_op.create
-        asset.name = f"Camp {camp_id_suffix} Snippet — {header}"
+        asset.name = f"Camp {camp_id_suffix} Snippet - {header}"
         asset.structured_snippet_asset.header = header
         asset.structured_snippet_asset.values.extend(clean_values)
 

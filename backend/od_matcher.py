@@ -1147,29 +1147,125 @@ def _get_od_patient_info_by_phone(conn, phone_10: str) -> dict | None:
             )
             row = cur.fetchone()
             if row:
+                pat_num = row[0]
+                # Fetch the earliest appointment entry timestamp for this patient.
+                # SecDateTEntry is set when staff books the appointment — this is the
+                # reliable signal for when the patient was actually entered into OD,
+                # since SecDateEntry on the patient table can reflect system defaults.
+                earliest_apt_entry = None
+                try:
+                    cur.execute(
+                        "SELECT MIN(SecDateTEntry) FROM appointment WHERE PatNum = %s",
+                        (pat_num,),
+                    )
+                    apt_row = cur.fetchone()
+                    if apt_row and apt_row[0]:
+                        earliest_apt_entry = apt_row[0]  # datetime or string
+                except Exception as apt_err:
+                    logger.warning(f"OD earliest-apt lookup failed for PatNum {pat_num}: {apt_err}")
                 return {
-                    "pat_num":    str(row[0]),
-                    "first_name": (row[1] or "").strip(),
-                    "last_name":  (row[2] or "").strip(),
-                    "pat_status": int(row[3]),
+                    "pat_num":             str(pat_num),
+                    "first_name":          (row[1] or "").strip(),
+                    "last_name":           (row[2] or "").strip(),
+                    "pat_status":          int(row[3]),
+                    "earliest_apt_entry":  earliest_apt_entry,
                 }
     except Exception as e:
         logger.warning(f"OD patient info lookup failed for phone {phone_10}: {e}")
     return None
 
 
-def _classify_od_status(pat_info: dict | None, check_recent_visit: bool = False,
-                         od_conn=None) -> str:
+_CNAM_NON_PERSON_PATTERNS = (
+    # US state abbreviations that appear in "CITY ST" CNAM values
+    " MA", " RI", " NH", " CT", " VT", " ME", " NY", " NJ",
+    # Generic carrier / location strings
+    "WIRELESS CALLER", "UNKNOWN", "UNAVAILABLE", "TOLL FREE", "TOLLFREE",
+    "NUMBER", "CALLER",
+)
+
+
+def _cnam_is_person(cnam: str) -> bool:
+    """Return False if CNAM looks like a city/carrier string rather than a person name."""
+    if not cnam:
+        return False
+    upper = cnam.upper()
+    for pat in _CNAM_NON_PERSON_PATTERNS:
+        if pat in upper:
+            return False
+    # If every token is Title-case or ALL-CAPS and contains no lowercase → likely a name or city.
+    # Heuristic: a person name has at least 2 tokens, none of which are a bare state abbrev.
+    tokens = upper.split()
+    if len(tokens) < 2:
+        return False  # single-token CNAM (e.g. just "BARNSTABLE") — not a usable person name
+    return True
+
+
+def _names_match(caller_id_name: str, od_first: str, od_last: str) -> bool:
+    """
+    Return True if the caller's CNAM looks like it could be the same person as the OD record.
+    Strategy:
+      1. If CNAM doesn't look like a real person name (city, carrier, etc.) → can't compare,
+         return True (don't override — caller is unverifiable, leave for manual review).
+      2. Tokenise both sides, check if any token from the OD name appears in the caller name
+         (case-insensitive, min 3 chars to avoid false positives on initials).
+      3. Returns True (assume match) when either name is blank.
+    """
+    if not caller_id_name or not od_last:
+        return True  # can't compare → don't override
+    if not _cnam_is_person(caller_id_name):
+        return True  # city/carrier CNAM — can't confirm mismatch, leave as-is
+    caller_tokens = set(t.lower() for t in caller_id_name.split() if len(t) >= 3)
+    od_tokens = set(t.lower() for t in (od_last + " " + od_first).split() if len(t) >= 3)
+    return bool(caller_tokens & od_tokens)
+
+
+def _classify_od_status(pat_info: dict | None, call_time=None,
+                         check_recent_visit: bool = False, od_conn=None) -> str:
     """
     Classify caller as: new_patient | existing_active | existing_inactive | unknown
-    PatStatus=0 → existing_active
-    PatStatus=2 (Inactive) or 3 (Archived) → existing_inactive
-    No match → new_patient
+
+    Core rule: if the patient's earliest appointment entry in OD is AFTER the call
+    time, the record was created in response to this call → new_patient, regardless
+    of PatStatus. SecDateEntry on the patient table is unreliable (can reflect system
+    defaults); SecDateTEntry on the appointment table is the authoritative timestamp.
+
+    PatStatus=0 with earliest_apt_entry <= call_time → existing_active
+    PatStatus=0 with earliest_apt_entry > call_time  → new_patient
+    PatStatus=0 with no appointments at all          → new_patient (never been seen)
+    PatStatus=2 (Inactive) or 3 (Archived)           → existing_inactive
+    No OD match                                      → new_patient
     """
     if pat_info is None:
         return "new_patient"
     ps = pat_info.get("pat_status", -1)
     if ps == 0:
+        earliest = pat_info.get("earliest_apt_entry")
+        if not earliest:
+            # In OD but no appointments at all → new patient
+            logger.debug(f"[classify_od] PatNum={pat_info.get('pat_num')} PatStatus=0, no appointments → new_patient")
+            return "new_patient"
+        if call_time:
+            # Normalise both to naive datetimes for comparison
+            from datetime import datetime
+            def _to_dt(v):
+                if isinstance(v, datetime):
+                    return v.replace(tzinfo=None)
+                if isinstance(v, str):
+                    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            return datetime.strptime(v[:19], fmt)
+                        except ValueError:
+                            continue
+                return None
+            earliest_dt = _to_dt(earliest)
+            call_dt     = _to_dt(call_time)
+            if earliest_dt and call_dt:
+                if earliest_dt > call_dt:
+                    logger.info(
+                        f"[classify_od] PatNum={pat_info.get('pat_num')} earliest_apt={earliest_dt} "
+                        f"> call_time={call_dt} → new_patient (record created after call)"
+                    )
+                    return "new_patient"
         return "existing_active"
     elif ps in (2, 3):
         return "existing_inactive"
@@ -1217,7 +1313,22 @@ def match_mango_calls_to_od_patients(limit: int = 500) -> dict:
                     continue
 
                 pat_info = _get_od_patient_info_by_phone(od_conn, phone_10)
-                status = _classify_od_status(pat_info)
+                caller_name = call.get("caller_id_name") or ""
+                # Name-mismatch guard: if OD found a record but the caller's CNAM shares no
+                # name token with the OD patient, treat as new_patient (phone reuse / family
+                # member / recycled number).
+                if pat_info and not _names_match(
+                    caller_name,
+                    pat_info.get("first_name", ""),
+                    pat_info.get("last_name", ""),
+                ):
+                    logger.info(
+                        f"[mango_od_match] uuid={call['uuid']} phone={phone_10} "
+                        f"OD name='{pat_info.get('first_name','')} {pat_info.get('last_name','')}' "
+                        f"caller='{caller_name}' → name mismatch, treating as new_patient"
+                    )
+                    pat_info = None  # force new_patient classification
+                status = _classify_od_status(pat_info, call_time=call.get("started_at"))
                 pat_num = pat_info["pat_num"] if pat_info else ""
                 pat_name = ""
                 if pat_info:
