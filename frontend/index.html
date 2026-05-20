@@ -3562,6 +3562,8 @@ function CallsSubView() {
   const [bulkJob, setBulkJob] = useState(null); // {id, status, total, done, errors, current_label}
   const [bulkStarting, setBulkStarting] = useState(false);
   const [bulkMsg, setBulkMsg] = useState('');
+  const [odMatchRunning, setOdMatchRunning] = useState(false);
+  const [odMatchMsg, setOdMatchMsg]       = useState('');
   const bulkPollInFlight = React.useRef(false);
   const activePolls = React.useRef({}); // uuid → intervalId, for cleanup on unmount
   // Call flags panel
@@ -3678,8 +3680,9 @@ function CallsSubView() {
   async function handleAnalyze(uuid) {
     setAnalyzeState(s => ({...s, [uuid]: 'processing'}));
     setAnalyzeError(e => ({...e, [uuid]: null}));
-    // Optimistic: mark row as pending immediately
+    // Optimistic: mark row + drawer as pending immediately
     setCalls(cs => cs.map(c => c.uuid === uuid ? {...c, transcription_status: 'pending'} : c));
+    setDrawerCall(prev => prev && prev.uuid === uuid ? {...prev, transcription_status: 'pending'} : prev);
     try {
       await api(`/api/admin/calls/${uuid}/process`, { method: 'POST' });
       setAnalyzeState(s => ({...s, [uuid]: 'polling'}));
@@ -3692,6 +3695,7 @@ function CallsSubView() {
           const updated = await api(`/api/admin/calls/${uuid}`);
           const st = updated.transcription_status;
           setCalls(cs => cs.map(c => c.uuid === uuid ? {...c, ...updated} : c));
+          setDrawerCall(prev => prev && prev.uuid === uuid ? {...prev, ...updated} : prev);
           if (st === 'done' || st === 'failed' || attempts >= MAX) {
             clearInterval(poll);
             delete activePolls.current[uuid];
@@ -3762,14 +3766,13 @@ function CallsSubView() {
 
     return (
       <span style={{display:'flex',gap:3,alignItems:'center',flexWrap:'wrap'}}>
-        {/* Transcribe button — show if no transcript yet. Backend fetches recording from Mango on demand,
-            so we don't require call.recording_url to be present. */}
-        {!hasTranscript && (
+        {/* Transcribe/Analyze button — show if no transcript yet, OR transcript exists but no summary */}
+        {(!hasTranscript || (hasTranscript && !call.summarized_at)) && (
           <button onClick={e=>{e.stopPropagation();handleAnalyze(call.uuid);}}
-            title="Transcribe this call with Whisper"
+            title={hasTranscript ? 'Re-analyze this call (run Gemini summary)' : 'Transcribe this call with Whisper'}
             style={{fontSize:9,padding:'2px 6px',border:'1px solid #0369a1',borderRadius:3,cursor:'pointer',
               color:'#0369a1',background:'#e0f2fe',whiteSpace:'nowrap'}}>
-            🎙 Transcribe
+            {hasTranscript ? '🔍 Analyze' : '🎙 Transcribe'}
           </button>
         )}
         {/* Grade button — only available once transcript exists */}
@@ -3824,6 +3827,16 @@ function CallsSubView() {
       loadCalls(); // refresh list to show updated analysis columns
     }
   }, [bulkJob?.status]);
+
+  async function handleOdMatch() {
+    setOdMatchRunning(true); setOdMatchMsg('');
+    try {
+      const d = await api('/api/admin/calls/match-od-appointments', { method: 'POST' });
+      setOdMatchMsg(`✓ OD match: ${d.matched||0} matched, ${d.skipped||0} skipped`);
+      await loadCalls();
+    } catch(e) { setOdMatchMsg('✗ ' + (e.message||'error')); }
+    finally { setOdMatchRunning(false); }
+  }
 
   async function handleBulkProcess() {
     setBulkStarting(true); setBulkMsg('');
@@ -4096,7 +4109,11 @@ function CallsSubView() {
                     const matched = !!c.mango_uuid;
                     // Build a call-shaped object for rows that came from a matched Mango record
                     // For unmatched rows we still render the row but greyed out / no actions
-                    const isConv = !!(c.od_appointment_id) && c.od_patient_status === 'new_patient';
+                    // CONV = new patient with confirmed booking via OD appointment OR Gemini + GAds attribution
+                    const isConv = c.od_patient_status === 'new_patient' && (
+                      !!(c.od_appointment_id) ||
+                      (c.booked_outcome === 'booked' && !!(c.gads_call_id) && c.ai_appointment_scheduled === 1)
+                    );
                     const callObj = matched ? {
                       ...c,
                       uuid: c.mango_uuid,
@@ -4185,7 +4202,7 @@ function CallsSubView() {
                 </tbody>
               </table>
               <div style={{padding:'6px 14px',fontSize:10,color:'var(--text-muted)',borderTop:'1px solid var(--border)'}}>
-                🟢 Matched = full Mango record (click to open) · 🟡 Unmatched = GAds call not yet linked to PBX · CONV badge = new patient with confirmed OD appointment
+                🟢 Matched = full Mango record (click to open) · 🟡 Unmatched = GAds call not yet linked to PBX · CONV badge = new patient with confirmed booking (OD or Gemini)
               </div>
             </div>
         )}
@@ -4253,6 +4270,13 @@ function CallsSubView() {
             color:(bulkStarting||bulkActive)?'var(--text-muted)':'#fff'}}>
           {bulkStarting?'Starting…':bulkActive?'Processing…':'⚡ Bulk Analyze'}
         </button>
+        <button onClick={handleOdMatch} disabled={odMatchRunning}
+          title="Match booked calls to OpenDental appointments (requires office network)"
+          style={{padding:'4px 12px',fontSize:11,border:'1px solid #0891b2',borderRadius:4,cursor:'pointer',
+            background:odMatchRunning?'var(--bg-card)':'#0891b2',
+            color:odMatchRunning?'var(--text-muted)':'#fff'}}>
+          {odMatchRunning ? '⟳ Matching…' : '🦷 Match OD'}
+        </button>
         <button onClick={loadCalls} disabled={loading}
           style={{padding:'4px 10px',fontSize:11,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
             background:'#fff',color:'var(--text-muted)'}}>
@@ -4260,6 +4284,7 @@ function CallsSubView() {
         </button>
         {syncMsg && <span style={{fontSize:11,color:syncMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{syncMsg}</span>}
         {bulkMsg && <span style={{fontSize:11,color:bulkMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{bulkMsg}</span>}
+        {odMatchMsg && <span style={{fontSize:11,color:odMatchMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{odMatchMsg}</span>}
         {loading && <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>}
         {!loading && lastRefreshed && <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>↻ {lastRefreshed.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true})}</span>}
       </div>
@@ -4280,14 +4305,19 @@ function CallsSubView() {
                 No calls found. Click "Sync Now" to pull latest data.
               </td></tr>
             )}
-            {calls.map(call=>(
+            {calls.map(call=>{
+              const isConv = call.od_patient_status === 'new_patient' && (
+                !!(call.od_appointment_id) ||
+                (call.booked_outcome === 'booked' && !!(call.gads_call_id) && call.ai_appointment_scheduled === 1)
+              );
+              return (
               <React.Fragment key={call.uuid}>
                 <tr onClick={()=>openDrawer(call)}
                   style={{borderBottom:'1px solid var(--border)',cursor:'pointer',
                     background:drawerCall&&drawerCall.uuid===call.uuid?'#dbeafe':call.status==='missed'?'#fef2f2':'#fff'}}>
                   <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
                     {_fmtTime(call.started_at)}
-                    {!!(call.od_appointment_id) && call.od_patient_status === 'new_patient' && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
+                    {isConv && <span style={{marginLeft:5,fontSize:9,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'1px 4px',borderRadius:3}}>CONV</span>}
                     {call.gads_call_id && (() => {
                       const conf = call.match_confidence || 0;
                       const [bg, col] = conf >= 0.75 ? ['#dbeafe','#1d4ed8'] : conf >= 0.60 ? ['#fef3c7','#92400e'] : ['#fee2e2','#991b1b'];
@@ -4317,7 +4347,8 @@ function CallsSubView() {
                   <td style={{padding:'8px 10px'}} onClick={e=>e.stopPropagation()}><PlayButton uuid={call.uuid} call={call} /></td>
                 </tr>
               </React.Fragment>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -4333,6 +4364,7 @@ function CallsSubView() {
           onGrade={handleGrade}
           onAnalyze={handleAnalyze}
           updateCallInState={updateCallInState}
+          analyzeState={analyzeState}
         />
       )}
     </div>
@@ -4341,7 +4373,7 @@ function CallsSubView() {
 
 // ── CallDetailDrawer — slide-in right panel with 4 tabs ───────────────────────
 
-function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState }) {
+function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState, analyzeState }) {
   const [drawerTab, setDrawerTab] = useState('overview'); // 'overview'|'transcript'|'grade'|'attribution'
   const [grading, setGrading]     = useState(false);
   const [gradeMsg, setGradeMsg]   = useState('');
@@ -4532,7 +4564,46 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                   {call.summarized_at && <div style={{fontSize:10,color:'var(--text-muted)',marginTop:6}}>Summarized {_fmtTime(call.summarized_at)}</div>}
                 </div>
               ) : (
-                <div style={{color:'var(--text-muted)',fontSize:12,fontStyle:'italic'}}>No summary yet — analyze this call to generate one.</div>
+                <div style={{display:'flex',alignItems:'center',gap:10}}>
+                  <div style={{color:'var(--text-muted)',fontSize:12,fontStyle:'italic'}}>No summary yet.</div>
+                  {(analyzeState||{})[call.uuid] === 'processing' || (analyzeState||{})[call.uuid] === 'polling' || call.transcription_status === 'in_progress' ? (
+                    <span style={{fontSize:11,color:'#d97706',fontWeight:600}}>⚙ Analyzing…</span>
+                  ) : (
+                    <button onClick={()=>onAnalyze(call.uuid)}
+                      style={{fontSize:11,padding:'3px 10px',border:'1px solid #0369a1',borderRadius:5,cursor:'pointer',
+                        color:'#0369a1',background:'#e0f2fe',fontWeight:600}}>
+                      🔍 Analyze
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Patient Intelligence — always shown once transcript exists */}
+              {call.transcription_status === 'done' && (
+                <div style={{marginTop:12,background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,padding:'12px 14px',fontSize:12}}>
+                  <div style={{fontSize:10,fontWeight:600,color:'#15803d',marginBottom:8,textTransform:'uppercase',letterSpacing:'0.05em'}}>Patient Intelligence</div>
+                  <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'6px 14px',alignItems:'center'}}>
+                    <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Patient Name</span>
+                    <span style={{fontWeight:600,color:call.ai_patient_name?'var(--text)':'var(--text-muted)',fontStyle:call.ai_patient_name?'normal':'italic'}}>
+                      {call.ai_patient_name || '—'}
+                    </span>
+                    <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Appt Scheduled</span>
+                    <span style={{fontWeight:600,
+                      color:call.ai_appointment_scheduled===1?'#16a34a':call.ai_appointment_scheduled===0?'#dc2626':'var(--text-muted)'}}>
+                      {call.ai_appointment_scheduled===1 ? '✓ Yes' : call.ai_appointment_scheduled===0 ? '✗ No' : '—'}
+                    </span>
+                    <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Appt Type</span>
+                    <span style={{color:(call.od_appointment_type||call.ai_appointment_type)?'var(--text-secondary)':'var(--text-muted)',
+                      fontStyle:(call.od_appointment_type||call.ai_appointment_type)?'normal':'italic'}}>
+                      {call.od_appointment_type || call.ai_appointment_type || '—'}
+                      {call.od_appointment_type
+                        ? <span style={{marginLeft:5,fontSize:9,background:'#dbeafe',color:'#1d4ed8',padding:'1px 4px',borderRadius:3}}>OD</span>
+                        : call.ai_appointment_type
+                          ? <span style={{marginLeft:5,fontSize:9,background:'#f3f4f6',color:'#6b7280',padding:'1px 4px',borderRadius:3}}>Gemini</span>
+                          : null}
+                    </span>
+                  </div>
+                </div>
               )}
 
               {/* Pipeline error */}
@@ -4740,36 +4811,6 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                     <div style={{color:'#92400e'}}>⏳ Graded booked — OD match pending</div>
                   </React.Fragment>
                 ) : null}
-
-                {/* ── Gemini Patient Intelligence ── */}
-                {(call.ai_patient_name || call.ai_appointment_type || call.ai_appointment_scheduled === 1 || call.ai_appointment_scheduled === 0) && (<React.Fragment>
-                  <div style={{color:'var(--text-muted)',fontWeight:500,paddingTop:4,borderTop:'1px solid var(--border)',fontSize:11,letterSpacing:'0.05em',textTransform:'uppercase'}}>Gemini Analysis</div>
-                  <div/>
-                </React.Fragment>)}
-
-                {call.ai_patient_name && (<React.Fragment>
-                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Patient Name</div>
-                  <div style={{fontWeight:600}}>
-                    {call.ai_patient_name}
-                    {call.caller_id_name && call.ai_patient_name.toLowerCase() !== (call.caller_id_name||'').toLowerCase().split(' ')[0] && (
-                      <span style={{marginLeft:6,fontSize:10,background:'#fef3c7',color:'#92400e',padding:'1px 5px',borderRadius:3}}>
-                        caller: {call.caller_id_name}
-                      </span>
-                    )}
-                  </div>
-                </React.Fragment>)}
-
-                {(call.ai_appointment_scheduled === 1 || call.ai_appointment_scheduled === 0) && (<React.Fragment>
-                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Appt Scheduled</div>
-                  <div style={{fontWeight:600,color:call.ai_appointment_scheduled===1?'#16a34a':'#dc2626'}}>
-                    {call.ai_appointment_scheduled===1 ? '✓ Yes' : '✗ No'}
-                  </div>
-                </React.Fragment>)}
-
-                {call.ai_appointment_type && (<React.Fragment>
-                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Appt Type</div>
-                  <div style={{color:'var(--text-secondary)'}}>{call.ai_appointment_type}</div>
-                </React.Fragment>)}
 
                 {call.od_patient_num && (<React.Fragment>
                   <div style={{color:'var(--text-muted)',fontWeight:500}}>OD Patient #</div>

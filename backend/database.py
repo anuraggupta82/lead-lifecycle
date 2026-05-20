@@ -1533,11 +1533,14 @@ def _migrate(conn):
     _mango_summary_cols = [
         ("ai_appointment_scheduled", "INTEGER DEFAULT NULL"),  # 1=yes, 0=no, NULL=unknown
         ("ai_appointment_type",      "TEXT DEFAULT ''"),       # e.g. "new patient exam", "cleaning", "emergency"
-        ("ai_patient_name",          "TEXT DEFAULT ''"),       # first name only (PHI-safe)
+        ("ai_patient_name",          "TEXT DEFAULT ''"),       # patient full name from Gemini transcript extraction
         # Tracks last time the OD appointment matcher ran for this call.
         # Prevents infinite re-querying for calls that are booked via Gemini signal
         # but whose caller phone doesn't resolve to an OD patient (family-member callers).
         ("od_match_attempted_at",    "TEXT DEFAULT ''"),       # ISO timestamp; '' = never tried
+        # OD-sourced appointment type: AppointmentTypeName or ProcDescript fallback.
+        # More reliable than Gemini's ai_appointment_type for bid optimization.
+        ("od_appointment_type",      "TEXT DEFAULT ''"),
     ]
     for col_name, col_type in _mango_summary_cols:
         if col_name not in mango_cols:
@@ -6626,7 +6629,7 @@ def get_mango_calls(
                        mc.destination_number, mc.extension_number, mc.answered_by,
                        mc.duration_sec, mc.status, mc.recording_url, mc.recording_local_path,
                        mc.lead_id, mc.gads_call_id, mc.match_confidence, mc.match_method,
-                       mc.call_transcript, mc.call_summary, mc.lead_quality, mc.handling_grade,
+                       mc.call_transcript, mc.call_summary AS summary, mc.lead_quality, mc.handling_grade,
                        mc.booked_outcome, mc.call_category, mc.transcription_status,
                        mc.transcript_model, mc.transcribed_at, mc.od_appointment_id,
                        mc.grade_overridden_by, mc.grade_overridden_at, mc.grade_override_reason,
@@ -6636,7 +6639,7 @@ def get_mango_calls(
                        -- OD patient enrichment
                        mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
                        -- Gemini structured summary fields
-                       mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name,
+                       mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name, mc.od_appointment_type,
                        -- Keyword attribution
                        mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
                        mc.attributed_keyword_method, mc.attributed_keyword_confidence,
@@ -6680,7 +6683,7 @@ def get_mango_call(uuid: str) -> dict | None:
                       mc.destination_number, mc.extension_number, mc.answered_by,
                       mc.duration_sec, mc.status, mc.recording_url, mc.recording_local_path,
                       mc.lead_id, mc.gads_call_id, mc.match_confidence, mc.match_method,
-                      mc.call_transcript, mc.call_summary, mc.lead_quality, mc.handling_grade,
+                      mc.call_transcript, mc.call_summary AS summary, mc.lead_quality, mc.handling_grade,
                       mc.booked_outcome, mc.call_category, mc.transcription_status,
                       mc.transcript_model, mc.transcribed_at, mc.od_appointment_id,
                       mc.grade_overridden_by, mc.grade_overridden_at, mc.grade_override_reason,
@@ -6690,7 +6693,7 @@ def get_mango_call(uuid: str) -> dict | None:
                       -- OD patient enrichment
                       mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
                       -- Gemini structured summary fields
-                      mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name,
+                      mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name, mc.od_appointment_type,
                       -- Keyword attribution
                       mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
                       mc.attributed_keyword_method, mc.attributed_keyword_confidence,
@@ -6824,7 +6827,13 @@ def get_missed_mango_calls_since(since_iso: str) -> list:
 
 
 def get_mango_calls_needing_od_match(limit: int = 500) -> list:
-    """Return inbound calls that haven't been matched against OpenDental yet."""
+    """Return inbound calls from Google Ads that haven't been matched against OpenDental yet.
+
+    Restricted to calls with a gads_call_id (GAds call extension) OR a lead_id
+    (click/form lead that was linked to this call). We only phone-match patients
+    who came through ads — matching every Mango call would pull in existing patients
+    and inflate new-patient metrics.
+    """
     with _conn() as conn:
         rows = conn.execute(
             """SELECT uuid, from_number, caller_id_name, started_at
@@ -6832,6 +6841,10 @@ def get_mango_calls_needing_od_match(limit: int = 500) -> list:
                WHERE direction='inbound'
                  AND (od_matched_at IS NULL OR od_matched_at = '')
                  AND from_number IS NOT NULL AND from_number != ''
+                 AND (
+                     (gads_call_id IS NOT NULL AND gads_call_id != '')
+                     OR lead_id IS NOT NULL
+                 )
                ORDER BY started_at DESC
                LIMIT ?""",
             (limit,),
@@ -7512,7 +7525,7 @@ def update_mango_call_analysis(uuid: str, **kwargs) -> None:
         "booked_outcome", "lead_quality", "handling_grade", "call_category",
         # Structured summary fields (Gemini JSON response — May 2026)
         "ai_appointment_scheduled", "ai_appointment_type", "ai_patient_name",
-        "od_match_attempted_at",
+        "od_match_attempted_at", "od_appointment_type",
         # Phase 3: AI next-action columns
         "call_next_action", "call_next_action_type", "call_next_action_due",
         "call_next_action_completed", "call_next_action_completed_at",

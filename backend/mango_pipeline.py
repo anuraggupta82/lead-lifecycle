@@ -288,7 +288,6 @@ Instructions:
 - Write a concise clinical summary (3-6 sentences) of the call in professional dental office language.
 - Do NOT repeat the transcript verbatim — summarize what was discussed and resolved.
 - At the end of the summary field, add a section titled "Action Steps:" with a bulleted list of any follow-up items. If there are no action steps, write "Action Steps: None."
-- Never include PHI (patient names, phone numbers, dates of birth, insurance IDs, SSNs) in your response.
 - Keep the summary field under 350 words. Do not truncate — complete every sentence fully.
 - Keep all string values on a single line — do not use line breaks inside JSON string values.
 
@@ -298,14 +297,16 @@ You MUST respond ONLY with valid JSON in this exact format (no markdown, no extr
   "summary": "Clinical summary of the call. Action Steps:\\n* Step 1\\n* Step 2",
   "appointment_scheduled": true,
   "appointment_type": "new patient comprehensive exam",
-  "patient_name": "Matthew Cornwell"
+  "patient_first_name": "Matthew",
+  "patient_last_name": "Cornwell"
 }}
 
 Field rules:
 - "summary": the full clinical summary including Action Steps section
-- "appointment_scheduled": true if an appointment was booked or confirmed during this call, false otherwise
+- "appointment_scheduled": true if an appointment was booked or confirmed during this call, false otherwise. REQUIRED — always set to true or false, never omit.
 - "appointment_type": short label for the appointment type (e.g. "new patient exam", "cleaning", "emergency visit", "consultation", "implant consult") — empty string if no appointment was scheduled
-- "patient_name": the patient's full name (first and last) as spoken during the call — use the PATIENT's name, not the caller's name if they differ. Include last name if the patient stated it (e.g. staff asked for last name and patient answered). Use first name only if last name was never given. Empty string if no name was mentioned at all. Do NOT include phone numbers, dates of birth, or other PHI beyond the patient name.
+- "patient_first_name": the patient's first name as spoken during the call. Use the PATIENT's name, not the caller's name if different. Empty string if no name was mentioned.
+- "patient_last_name": the patient's last name as spoken during the call. Empty string if the last name was never stated.
 
 Transcript:
 {transcript}
@@ -493,13 +494,10 @@ def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
     are set to None/"" and only summary is populated.
     """
     cleaned, voicemail = _strip_greeting(transcript)
-    # For live calls: do NOT scrub caller_name from the transcript.
-    # Gemini needs to read the caller's name to extract patient_name.
-    # Scrubbing caller_name defeats name extraction when caller IS the patient
-    # (the common case). Caller name is only scrubbed for voicemails.
-    scrubbed = _scrub_phi(cleaned, caller_name if voicemail else "")
+    # No PHI scrubbing — GDC has a BAA with Google covering Vertex AI / Gemini,
+    # so PHI may be sent directly. Scrubbing would defeat patient name extraction.
     prompt_tmpl = _SUMMARY_PROMPT_VOICEMAIL if voicemail else _SUMMARY_PROMPT_LIVE
-    prompt = prompt_tmpl.format(transcript=scrubbed)
+    prompt = prompt_tmpl.format(transcript=cleaned)
 
     # Live calls use response_mime_type=application/json; voicemails use plain text
     extra_kwargs = {} if voicemail else {"response_mime_type": "application/json"}
@@ -528,6 +526,7 @@ def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
 
     # Live call — parse JSON response
     raw = text.strip()
+    log.info("[pipeline] Gemini raw response for %s: %r", call_uuid, raw[:500])
     if raw.startswith("```"):
         raw = re.sub(r'^```\w*\n?', '', raw)
         raw = re.sub(r'\n?```$', '', raw)
@@ -538,21 +537,33 @@ def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
         raw = _m.group(0)
     try:
         parsed = json.loads(raw)
+        log.info("[pipeline] Gemini parsed OK for %s: name=%r appt=%r type=%r",
+                 call_uuid, parsed.get("patient_first_name") or parsed.get("patient_name"),
+                 parsed.get("appointment_scheduled"), parsed.get("appointment_type"))
     except (json.JSONDecodeError, ValueError):
         # Second attempt: sanitize embedded control chars (same tier as _grade fallback)
         try:
-            # Replace literal newlines inside string values with \n escape
             _sanitized = re.sub(r'(?<=: ")([^"]*?)(?=")', lambda mo: mo.group(0).replace('\n', '\\n').replace('\r', '\\r'), raw)
             parsed = json.loads(_sanitized)
+            log.info("[pipeline] Gemini parsed OK (sanitized) for %s", call_uuid)
         except (json.JSONDecodeError, ValueError):
-            log.warning("[pipeline] Summary JSON parse failed for %s — appointment_scheduled will be None", call_uuid)
+            log.warning("[pipeline] Summary JSON parse failed for %s — raw was: %r", call_uuid, raw[:300])
             parsed = {}
+
+    # Build full patient name from split fields (new format) or legacy single field
+    first = (parsed.get("patient_first_name") or "").strip()
+    last  = (parsed.get("patient_last_name") or "").strip()
+    if first or last:
+        patient_name = f"{first} {last}".strip()
+    else:
+        # Legacy fallback: single patient_name field
+        patient_name = (parsed.get("patient_name") or "").strip()
 
     return {
         "summary": parsed.get("summary") or text,
         "appointment_scheduled": parsed.get("appointment_scheduled"),  # bool or None
         "appointment_type": (parsed.get("appointment_type") or "").strip(),
-        "patient_name": (parsed.get("patient_name") or "").strip(),
+        "patient_name": patient_name,
         "_voicemail": False,
     }
 
@@ -560,9 +571,9 @@ def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
 def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
            vertex_credentials_path: str, vertex_model: str,
            call_uuid: str, caller_name: str = "") -> dict:
-    """PHI-scrub, build grading prompt, call Gemini. Logs cost. Returns grade dict."""
+    """Build grading prompt, call Gemini. Logs cost. Returns grade dict."""
     cleaned, _ = _strip_greeting(transcript)
-    scrubbed = _scrub_phi(cleaned, caller_name)
+    # No PHI scrubbing — GDC has a BAA with Google covering Vertex AI / Gemini.
 
     criteria = db.get_call_grading_criteria()
     criteria_lines = [
@@ -572,7 +583,7 @@ def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
     ]
     criteria_text = "\n".join(criteria_lines)
 
-    prompt = _GRADING_PROMPT.format(criteria_text=criteria_text, transcript=scrubbed)
+    prompt = _GRADING_PROMPT.format(criteria_text=criteria_text, transcript=cleaned)
 
     raw, in_tok, out_tok = _call_vertex(
         prompt, vertex_model, vertex_project_id, vertex_location,

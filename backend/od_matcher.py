@@ -1120,6 +1120,40 @@ def _find_od_appointment_near_call(conn, pat_num: str, call_dt: datetime,
         return None
 
 
+def _get_od_appointment_type(conn, apt_num: str) -> str:
+    """
+    Fetch appointment type label for a given AptNum.
+    Priority:
+      1. appointmenttype.AppointmentTypeName (when AppointmentTypeNum > 0)
+      2. appointment.ProcDescript (procedure codes/names assigned to the slot)
+      3. "" (empty — caller will fall back to Gemini's ai_appointment_type in UI)
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT a.AppointmentTypeNum, a.ProcDescript,
+                          COALESCE(at.AppointmentTypeName, '') AS type_name
+                   FROM appointment a
+                   LEFT JOIN appointmenttype at
+                          ON at.AppointmentTypeNum = a.AppointmentTypeNum
+                   WHERE a.AptNum = %s
+                   LIMIT 1""",
+                (int(apt_num),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return ""
+            type_num, proc_descript, type_name = row
+            if type_num and int(type_num) > 0 and type_name:
+                return type_name.strip()
+            if proc_descript and proc_descript.strip():
+                return proc_descript.strip()
+            return ""
+    except Exception as e:
+        logger.warning(f"[call_od_match] _get_od_appointment_type failed for AptNum={apt_num}: {e}")
+        return ""
+
+
 def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> dict:
     """
     For Mango calls graded as booked but not yet linked to an OD appointment:
@@ -1227,12 +1261,15 @@ def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> d
                     skipped += 1
                     continue
 
+                # Fetch OD appointment type: AppointmentTypeName → ProcDescript fallback
+                od_appt_type = _get_od_appointment_type(od_conn, apt_num)
+
                 # Store the match + stamp attempt timestamp
                 # Also write od_patient_num if matched via name (phone-matched calls
                 # already have od_patient_num set from the patient enrichment step)
                 _now_iso = datetime.now(timezone.utc).isoformat()
                 update_mango_call_od_appointment(call["uuid"], apt_num)
-                _extra = {"od_match_attempted_at": _now_iso}
+                _extra = {"od_match_attempted_at": _now_iso, "od_appointment_type": od_appt_type}
                 existing_od_pat = call.get("od_patient_num") or ""
                 if not existing_od_pat and pat_num and match_method.startswith("ai_name"):
                     _extra["od_patient_num"] = pat_num
