@@ -1525,6 +1525,27 @@ def _migrate(conn):
                 pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_od_status ON mango_calls(od_patient_status)")
 
+    # ── Mango calls structured summary fields (May 2026) ─────────────────────
+    # Gemini now returns JSON from the summary prompt so booking detection is
+    # reliable even when the caller is a family member with a different phone.
+    # Re-fetch mango_cols so we include any columns added by patient-enrichment block above.
+    mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
+    _mango_summary_cols = [
+        ("ai_appointment_scheduled", "INTEGER DEFAULT NULL"),  # 1=yes, 0=no, NULL=unknown
+        ("ai_appointment_type",      "TEXT DEFAULT ''"),       # e.g. "new patient exam", "cleaning", "emergency"
+        ("ai_patient_name",          "TEXT DEFAULT ''"),       # first name only (PHI-safe)
+        # Tracks last time the OD appointment matcher ran for this call.
+        # Prevents infinite re-querying for calls that are booked via Gemini signal
+        # but whose caller phone doesn't resolve to an OD patient (family-member callers).
+        ("od_match_attempted_at",    "TEXT DEFAULT ''"),       # ISO timestamp; '' = never tried
+    ]
+    for col_name, col_type in _mango_summary_cols:
+        if col_name not in mango_cols:
+            try:
+                conn.execute(f"ALTER TABLE mango_calls ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+
     # ── call_flags — auto-generated flags for missed/short Google Ads calls ──
     conn.execute("""
         CREATE TABLE IF NOT EXISTS call_flags (
@@ -6614,6 +6635,8 @@ def get_mango_calls(
                        mc.grade_gradeable, mc.grade_scores_json, mc.is_empty,
                        -- OD patient enrichment
                        mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
+                       -- Gemini structured summary fields
+                       mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name,
                        -- Keyword attribution
                        mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
                        mc.attributed_keyword_method, mc.attributed_keyword_confidence,
@@ -6666,6 +6689,8 @@ def get_mango_call(uuid: str) -> dict | None:
                       mc.grade_gradeable, mc.grade_scores_json, mc.is_empty,
                       -- OD patient enrichment
                       mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
+                      -- Gemini structured summary fields
+                      mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name,
                       -- Keyword attribution
                       mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
                       mc.attributed_keyword_method, mc.attributed_keyword_confidence,
@@ -6729,26 +6754,44 @@ def update_mango_call_od_appointment(uuid: str, od_appointment_id: str) -> None:
 
 def get_booked_calls_needing_od_match(days: int = 90) -> list:
     """
-    Return inbound calls that have an OD patient match but no OD appointment yet.
-    booked_outcome was never written by the pipeline (the grading prompt never returned
-    it), so we gate on od_patient_num instead — any call where we know the patient
-    is a candidate for appointment matching.
+    Return inbound calls that need OD appointment matching.
+    Two cases:
+      1. od_patient_num is set (phone matched an OD patient) — original case
+      2. booked_outcome='booked' set via Gemini structured field (family-member callers
+         whose phone doesn't match OD — e.g. parent calling for child)
+    Both cases have no od_appointment_id yet.
+
+    Calls that were already attempted within the last 7 days and still have no
+    od_patient_num are excluded to prevent infinite re-querying against OD MySQL
+    for callers whose phone will never resolve to a patient record.
     """
     cutoff = (datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     ) - __import__("datetime").timedelta(days=days)).isoformat()
+    retry_cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=7)).isoformat()
     with _conn() as conn:
         rows = conn.execute(
             """SELECT mc.uuid, mc.started_at, mc.from_number, mc.caller_id_number,
-                      mc.booked_outcome, mc.od_appointment_id, mc.lead_id
+                      mc.booked_outcome, mc.od_appointment_id, mc.lead_id,
+                      mc.caller_id_name, mc.ai_patient_name, mc.od_patient_num
                FROM mango_calls mc
                WHERE mc.direction = 'inbound'
-                 AND mc.od_patient_num IS NOT NULL
-                 AND mc.od_patient_num != ''
                  AND (mc.od_appointment_id IS NULL OR mc.od_appointment_id = '')
                  AND mc.started_at >= ?
+                 AND (
+                   (mc.od_patient_num IS NOT NULL AND mc.od_patient_num != '')
+                   OR mc.booked_outcome = 'booked'
+                 )
+                 AND (
+                   -- Never attempted, OR has an od_patient_num (phone-matched — always retry),
+                   -- OR last attempt was >7 days ago (throttle phone-unmatched booked calls)
+                   mc.od_match_attempted_at IS NULL
+                   OR mc.od_match_attempted_at = ''
+                   OR (mc.od_patient_num IS NOT NULL AND mc.od_patient_num != '')
+                   OR mc.od_match_attempted_at < ?
+                 )
                ORDER BY mc.started_at DESC""",
-            (cutoff,),
+            (cutoff, retry_cutoff),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -7467,6 +7510,9 @@ def update_mango_call_analysis(uuid: str, **kwargs) -> None:
         "lead_id", "gads_resource_name", "transcription_status",
         # Call classification fields (set after OD match / grading)
         "booked_outcome", "lead_quality", "handling_grade", "call_category",
+        # Structured summary fields (Gemini JSON response — May 2026)
+        "ai_appointment_scheduled", "ai_appointment_type", "ai_patient_name",
+        "od_match_attempted_at",
         # Phase 3: AI next-action columns
         "call_next_action", "call_next_action_type", "call_next_action_due",
         "call_next_action_completed", "call_next_action_completed_at",

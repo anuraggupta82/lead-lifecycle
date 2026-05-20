@@ -287,15 +287,29 @@ Instructions:
 - If any automated IVR greeting still appears, ignore it entirely.
 - Write a concise clinical summary (3-6 sentences) of the call in professional dental office language.
 - Do NOT repeat the transcript verbatim — summarize what was discussed and resolved.
-- At the end, add a section titled "Action Steps:" with a bulleted list of any follow-up items.
-- If there are no action steps, write "Action Steps: None."
+- At the end of the summary field, add a section titled "Action Steps:" with a bulleted list of any follow-up items. If there are no action steps, write "Action Steps: None."
 - Never include PHI (patient names, phone numbers, dates of birth, insurance IDs, SSNs) in your response.
-- Keep the total response under 350 words. Do not truncate — complete every sentence fully.
+- Keep the summary field under 350 words. Do not truncate — complete every sentence fully.
+- Keep all string values on a single line — do not use line breaks inside JSON string values.
+
+You MUST respond ONLY with valid JSON in this exact format (no markdown, no extra text):
+
+{{
+  "summary": "Clinical summary of the call. Action Steps:\\n* Step 1\\n* Step 2",
+  "appointment_scheduled": true,
+  "appointment_type": "new patient comprehensive exam",
+  "patient_name": "Matthew Cornwell"
+}}
+
+Field rules:
+- "summary": the full clinical summary including Action Steps section
+- "appointment_scheduled": true if an appointment was booked or confirmed during this call, false otherwise
+- "appointment_type": short label for the appointment type (e.g. "new patient exam", "cleaning", "emergency visit", "consultation", "implant consult") — empty string if no appointment was scheduled
+- "patient_name": the patient's full name (first and last) as spoken during the call — use the PATIENT's name, not the caller's name if they differ. Include last name if the patient stated it (e.g. staff asked for last name and patient answered). Use first name only if last name was never given. Empty string if no name was mentioned at all. Do NOT include phone numbers, dates of birth, or other PHI beyond the patient name.
 
 Transcript:
 {transcript}
-
-Summary:"""
+"""
 
 _SUMMARY_PROMPT_VOICEMAIL = """\
 You are a clinical assistant for Grafton Dental Care summarizing patient voicemail messages for the patient chart.
@@ -465,16 +479,34 @@ def _call_vertex(prompt: str, model: str, project_id: str, location: str,
 
 def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
                vertex_credentials_path: str, vertex_model: str,
-               call_uuid: str, caller_name: str = "") -> str:
-    """PHI-scrub, strip greeting, summarize via Vertex AI Gemini. Logs cost."""
+               call_uuid: str, caller_name: str = "") -> dict:
+    """PHI-scrub, strip greeting, summarize via Vertex AI Gemini. Logs cost.
+
+    Returns a dict with keys:
+      summary              (str)  — clinical summary text including Action Steps
+      appointment_scheduled (bool | None) — True if appointment booked
+      appointment_type      (str)  — short label e.g. "new patient exam"
+      patient_name          (str)  — patient first name only (PHI-safe)
+      _voicemail            (bool) — internal flag; True if this was a voicemail
+
+    For voicemails the prompt returns plain text (not JSON), so structured fields
+    are set to None/"" and only summary is populated.
+    """
     cleaned, voicemail = _strip_greeting(transcript)
-    scrubbed = _scrub_phi(cleaned, caller_name)
+    # For live calls: do NOT scrub caller_name from the transcript.
+    # Gemini needs to read the caller's name to extract patient_name.
+    # Scrubbing caller_name defeats name extraction when caller IS the patient
+    # (the common case). Caller name is only scrubbed for voicemails.
+    scrubbed = _scrub_phi(cleaned, caller_name if voicemail else "")
     prompt_tmpl = _SUMMARY_PROMPT_VOICEMAIL if voicemail else _SUMMARY_PROMPT_LIVE
     prompt = prompt_tmpl.format(transcript=scrubbed)
 
+    # Live calls use response_mime_type=application/json; voicemails use plain text
+    extra_kwargs = {} if voicemail else {"response_mime_type": "application/json"}
     text, in_tok, out_tok = _call_vertex(
         prompt, vertex_model, vertex_project_id, vertex_location,
         vertex_credentials_path, temperature=0.25, max_tokens=1200,
+        **extra_kwargs,
     )
     log_gemini(
         purpose="call_summary",
@@ -483,7 +515,46 @@ def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
         output_tokens=out_tok,
         call_id=call_uuid,
     )
-    return text
+
+    # Voicemail — plain text response, no structured fields
+    if voicemail:
+        return {
+            "summary": text,
+            "appointment_scheduled": None,
+            "appointment_type": "",
+            "patient_name": "",
+            "_voicemail": True,
+        }
+
+    # Live call — parse JSON response
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r'^```\w*\n?', '', raw)
+        raw = re.sub(r'\n?```$', '', raw)
+        raw = raw.strip()
+    # M3 fix: try to extract a JSON object via regex (handles extra surrounding text)
+    _m = re.search(r'\{[\s\S]*\}', raw)
+    if _m:
+        raw = _m.group(0)
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        # Second attempt: sanitize embedded control chars (same tier as _grade fallback)
+        try:
+            # Replace literal newlines inside string values with \n escape
+            _sanitized = re.sub(r'(?<=: ")([^"]*?)(?=")', lambda mo: mo.group(0).replace('\n', '\\n').replace('\r', '\\r'), raw)
+            parsed = json.loads(_sanitized)
+        except (json.JSONDecodeError, ValueError):
+            log.warning("[pipeline] Summary JSON parse failed for %s — appointment_scheduled will be None", call_uuid)
+            parsed = {}
+
+    return {
+        "summary": parsed.get("summary") or text,
+        "appointment_scheduled": parsed.get("appointment_scheduled"),  # bool or None
+        "appointment_type": (parsed.get("appointment_type") or "").strip(),
+        "patient_name": (parsed.get("patient_name") or "").strip(),
+        "_voicemail": False,
+    }
 
 
 def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
@@ -871,13 +942,35 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
         vertex_creds    = msettings["vertex_credentials_path"]
         vertex_model    = msettings["vertex_model"]
 
-        summary = _summarize(
+        summary_result = _summarize(
             transcript, vertex_project, vertex_location, vertex_creds, vertex_model,
             uuid, caller_name,
         )
+        summary = summary_result["summary"]  # plain text for backward compat
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Persist transcript + summary now (in case grading fails)
+        # M6 fix: if Gemini returned empty text (e.g. safety block), record as pipeline error
+        if not summary or not summary.strip():
+            log.warning("[pipeline] Vertex AI returned empty summary for %s — safety block?", uuid)
+            db.update_mango_call_analysis(
+                uuid,
+                call_transcript=transcript,
+                transcription_status="done",
+                summarized_at=now_iso,
+                pipeline_error="Vertex AI returned empty summary (possible safety block)",
+            )
+            return
+
+        # Persist transcript + summary + structured fields now (in case grading fails)
+        _ai_appt_scheduled = summary_result.get("appointment_scheduled")  # bool, str, or None
+        # M2 fix: Gemini may return "true"/"false" as strings; normalise defensively
+        _appt_str = str(_ai_appt_scheduled).lower() if _ai_appt_scheduled is not None else ""
+        if _ai_appt_scheduled is True or _appt_str == "true":
+            ai_appt_int = 1
+        elif _ai_appt_scheduled is False or _appt_str == "false":
+            ai_appt_int = 0
+        else:
+            ai_appt_int = None
         db.update_mango_call_analysis(
             uuid,
             call_transcript=transcript,
@@ -886,7 +979,15 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             summarized_at=now_iso,
             pipeline_error="",
             pipeline_attempts=0,  # reset attempt counter on success
+            ai_appointment_scheduled=ai_appt_int,
+            ai_appointment_type=summary_result.get("appointment_type") or "",
+            ai_patient_name=summary_result.get("patient_name") or "",
         )
+        if ai_appt_int == 1:
+            log.info(
+                "[pipeline] Gemini detected appointment booked: type=%r patient=%r for %s",
+                summary_result.get("appointment_type"), summary_result.get("patient_name"), uuid,
+            )
 
         # ── 5. Resolve team member ────────────────────────────────────────────
         team_member = _resolve_team_member(call_row, transcript)
@@ -919,7 +1020,22 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
                         for s in raw_scores
                     ]
                     raw_overall = float(grade.get("overall_score") or 0)
-                    overall_pct = round(raw_overall * 10)
+                    # Guard: if Gemini returned overall_score=0 but criterion scores
+                    # exist (e.g. family-member call where overall was skipped),
+                    # compute from the mean of criterion scores (already on 0-100 scale).
+                    if raw_overall == 0 and normalised_scores:
+                        # M5 fix: criterion scores are already 0-100; compute mean directly
+                        _crit_scores = [s["score"] for s in normalised_scores if s["score"] > 0]
+                        if _crit_scores:
+                            overall_pct = round(sum(_crit_scores) / len(_crit_scores))
+                            log.info(
+                                "[pipeline] overall_score was 0 — computed from criterion mean: "
+                                "%d%% for %s", overall_pct, uuid
+                            )
+                        else:
+                            overall_pct = 0  # no non-zero criterion scores either
+                    else:
+                        overall_pct = round(raw_overall * 10)
                     scores_json = json.dumps(normalised_scores)
                     recs_json = json.dumps(grade.get("recommendations", []))
                     db.update_mango_call_analysis(
@@ -990,17 +1106,17 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
 
         # ── Step 8: Auto-match to OD appointment + set booked_outcome ───────
         # Non-blocking — failure must NOT affect the rest of the pipeline.
-        # booked_outcome is derived from od_appointment_id (the grading prompt
-        # never returned it, so it was always NULL — we set it here instead).
+        #
+        # Priority order for booking detection:
+        #   1. OD appointment match by phone (most authoritative)
+        #   2. Gemini structured field ai_appointment_scheduled=1 (reliable — covers
+        #      family-member callers whose phone doesn't match OD patient)
         #
         # Guard: never stamp booked_outcome='booked' on voicemail/IVR calls.
-        # An OD appointment match means the caller is a known patient, NOT that
-        # they booked the appointment during this call.
         try:
             refreshed = db.get_mango_call(uuid) or {}
 
-            # Detect voicemail/IVR: pipeline summary starts with VOICEMAIL,
-            # or grading was skipped (grade_gradeable=0), or is_empty flag set.
+            # Detect voicemail/IVR
             call_summary = (refreshed.get("call_summary") or "").upper()
             is_voicemail = (
                 call_summary.startswith("VOICEMAIL")
@@ -1019,8 +1135,22 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
                     db.update_mango_call_analysis(uuid, booked_outcome="booked")
                     log.info("[pipeline] Step 8: OD appointment matched → booked_outcome=booked for %s", uuid)
                 else:
-                    log.debug("[pipeline] Step 8: No OD appointment found for call %s "
-                              "(new patient or OD offline)", uuid)
+                    # OD phone lookup failed (new patient not yet in OD, or family-member caller).
+                    # Use Gemini's structured ai_appointment_scheduled field — it read the transcript
+                    # directly and is far more reliable than keyword heuristics.
+                    _ai_booked = refreshed.get("ai_appointment_scheduled")
+                    if _ai_booked == 1:
+                        db.update_mango_call_analysis(uuid, booked_outcome="booked")
+                        _appt_type = refreshed.get("ai_appointment_type") or ""
+                        _pt_name   = refreshed.get("ai_patient_name") or ""
+                        log.info(
+                            "[pipeline] Step 8: Gemini confirmed booking (OD phone match failed — "
+                            "likely new patient or family-member caller): type=%r patient=%r → "
+                            "booked_outcome=booked for %s", _appt_type, _pt_name, uuid
+                        )
+                    else:
+                        log.debug("[pipeline] Step 8: No booking detected for call %s "
+                                  "(OD no match, Gemini ai_appointment_scheduled=%s)", uuid, _ai_booked)
             else:
                 # Already has od_appointment_id — ensure booked_outcome is set
                 if not refreshed.get("booked_outcome"):

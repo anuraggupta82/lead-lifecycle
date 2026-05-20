@@ -4474,9 +4474,14 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                       <span style={{fontSize:10,color:'var(--text-muted)'}}>PatNum: {call.od_patient_num}</span>
                     )}
                   </div>
-                  {call.od_patient_status === 'new_patient' && (
+                  {call.od_patient_status === 'new_patient' && !call.od_patient_num && (
                     <div style={{marginTop:4,fontSize:10,color:'#15803d'}}>
                       📋 Phone not found in OpenDental — likely a new patient inquiry
+                    </div>
+                  )}
+                  {call.od_patient_status === 'new_patient' && call.od_patient_num && (
+                    <div style={{marginTop:4,fontSize:10,color:'#15803d'}}>
+                      📋 New patient — matched via{call.ai_patient_name ? ` Gemini (${call.ai_patient_name})` : ' phone'}
                     </div>
                   )}
                   {call.od_patient_status === 'existing_active' && (
@@ -4735,6 +4740,52 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                     <div style={{color:'#92400e'}}>⏳ Graded booked — OD match pending</div>
                   </React.Fragment>
                 ) : null}
+
+                {/* ── Gemini Patient Intelligence ── */}
+                {(call.ai_patient_name || call.ai_appointment_type || call.ai_appointment_scheduled === 1 || call.ai_appointment_scheduled === 0) && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500,paddingTop:4,borderTop:'1px solid var(--border)',fontSize:11,letterSpacing:'0.05em',textTransform:'uppercase'}}>Gemini Analysis</div>
+                  <div/>
+                </React.Fragment>)}
+
+                {call.ai_patient_name && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Patient Name</div>
+                  <div style={{fontWeight:600}}>
+                    {call.ai_patient_name}
+                    {call.caller_id_name && call.ai_patient_name.toLowerCase() !== (call.caller_id_name||'').toLowerCase().split(' ')[0] && (
+                      <span style={{marginLeft:6,fontSize:10,background:'#fef3c7',color:'#92400e',padding:'1px 5px',borderRadius:3}}>
+                        caller: {call.caller_id_name}
+                      </span>
+                    )}
+                  </div>
+                </React.Fragment>)}
+
+                {(call.ai_appointment_scheduled === 1 || call.ai_appointment_scheduled === 0) && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Appt Scheduled</div>
+                  <div style={{fontWeight:600,color:call.ai_appointment_scheduled===1?'#16a34a':'#dc2626'}}>
+                    {call.ai_appointment_scheduled===1 ? '✓ Yes' : '✗ No'}
+                  </div>
+                </React.Fragment>)}
+
+                {call.ai_appointment_type && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500}}>Appt Type</div>
+                  <div style={{color:'var(--text-secondary)'}}>{call.ai_appointment_type}</div>
+                </React.Fragment>)}
+
+                {call.od_patient_num && (<React.Fragment>
+                  <div style={{color:'var(--text-muted)',fontWeight:500}}>OD Patient #</div>
+                  <div>
+                    <span style={{fontWeight:600,fontFamily:'monospace'}}>#{call.od_patient_num}</span>
+                    {call.od_patient_name && <span style={{marginLeft:6,color:'var(--text-secondary)'}}>{call.od_patient_name}</span>}
+                    {call.od_patient_status && (
+                      <span style={{marginLeft:6,fontSize:10,
+                        background:call.od_patient_status==='new_patient'?'#dcfce7':'#dbeafe',
+                        color:call.od_patient_status==='new_patient'?'#14532d':'#1e40af',
+                        padding:'1px 5px',borderRadius:3}}>
+                        {call.od_patient_status==='new_patient'?'New':call.od_patient_status==='existing_active'?'Existing':call.od_patient_status}
+                      </span>
+                    )}
+                  </div>
+                </React.Fragment>)}
 
                 {call.gads_call_id && (<React.Fragment>
                   <div style={{color:'var(--text-muted)',fontWeight:500}}>GAds Call ID</div>

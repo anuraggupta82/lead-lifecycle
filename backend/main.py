@@ -8735,11 +8735,18 @@ def admin_calls_campaign_attribution_early(days: int = 30):
                  ) AS campaign_id,
                  COUNT(*) AS total_calls,
                  SUM(CASE WHEN mc.booked_outcome='booked' THEN 1 ELSE 0 END) AS booked_calls,
-                 SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
-                           AND mc.od_appointment_id != '' THEN 1 ELSE 0 END) AS confirmed_appts,
-                 SUM(CASE WHEN mc.od_appointment_id IS NOT NULL
-                           AND mc.od_appointment_id != ''
-                           AND mc.od_patient_status = 'new_patient' THEN 1 ELSE 0 END) AS new_appts
+                 -- confirmed_appts: OD-matched appointments OR Gemini-confirmed bookings
+                 SUM(CASE WHEN (mc.od_appointment_id IS NOT NULL AND mc.od_appointment_id != '')
+                               OR mc.booked_outcome='booked'
+                           THEN 1 ELSE 0 END) AS confirmed_appts,
+                 -- new_appts: OD new_patient match OR Gemini-confirmed booking with no OD match
+                 -- (family-member callers, new patients not yet in OD)
+                 SUM(CASE WHEN (mc.od_appointment_id IS NOT NULL AND mc.od_appointment_id != ''
+                                AND mc.od_patient_status = 'new_patient')
+                               OR (mc.booked_outcome='booked'
+                                   AND (mc.od_appointment_id IS NULL OR mc.od_appointment_id = '')
+                                   AND mc.ai_appointment_scheduled = 1)
+                           THEN 1 ELSE 0 END) AS new_appts
                FROM mango_calls mc
                LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
                LEFT JOIN leads l ON l.id = mc.lead_id

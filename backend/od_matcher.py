@@ -909,6 +909,95 @@ def _normalize_phone(raw: str) -> str:
     return digits[-10:] if len(digits) >= 10 else digits
 
 
+def _get_od_patient_by_name(conn, full_name: str) -> tuple[str | None, str]:
+    """
+    Look up OD PatNum by patient name from Gemini ai_patient_name.
+    Accepts full name ("Matthew Cornwell") or first name only ("Matthew").
+    Returns (PatNum | None, confidence) where confidence is one of:
+      "full_name"   — first + last matched exactly → highest confidence
+      "last_name"   — last name only, single unambiguous match
+      "first_name"  — first name only, single unambiguous match → lowest
+      "none"        — no match or ambiguous
+
+    Tiered strategy (stops at first success):
+      Tier 1: LOWER(FName)=first AND LOWER(LName)=last  → unambiguous regardless of count
+      Tier 2: LOWER(LName)=last                         → only if exactly 1 active match
+      Tier 3: LOWER(FName)=first                        → only if exactly 1 active match
+
+    Caller's identity is confirmed by Gemini reading the transcript.
+    This is just to find the right OD record to link.
+    """
+    if not full_name or len(full_name.strip()) < 2:
+        return None, "none"
+
+    tokens = full_name.strip().split()
+    first = tokens[0].lower() if tokens else ""
+    last  = tokens[-1].lower() if len(tokens) >= 2 else ""
+
+    try:
+        with conn.cursor() as cur:
+            # ── Tier 1: full name match (first + last) ────────────────────────
+            if first and last:
+                cur.execute(
+                    """SELECT PatNum FROM patient
+                       WHERE PatStatus = 0
+                         AND LOWER(FName) = %s
+                         AND LOWER(LName) = %s
+                       ORDER BY PatNum DESC LIMIT 5""",
+                    (first, last),
+                )
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    logger.info(f"[call_od_match] Name lookup '{full_name}' → Tier 1 full match PatNum={rows[0][0]}")
+                    return str(rows[0][0]), "full_name"
+                if len(rows) > 1:
+                    # Multiple patients share same first+last — refuse to guess.
+                    # Linking the wrong family member would corrupt income attribution.
+                    logger.info(f"[call_od_match] Name lookup '{full_name}' → Tier 1 {len(rows)} matches (ambiguous) — skipping")
+                    return None, "none"
+
+            # ── Tier 2: last name only ────────────────────────────────────────
+            # Skip Tier 2 when Gemini gave us both first AND last name but Tier 1
+            # failed — using last name alone would risk matching a different family
+            # member. Only use Tier 2 when we have last name but no first name.
+            if last and not first:
+                cur.execute(
+                    """SELECT PatNum FROM patient
+                       WHERE PatStatus = 0
+                         AND LOWER(LName) = %s
+                       ORDER BY PatNum DESC LIMIT 5""",
+                    (last,),
+                )
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    logger.info(f"[call_od_match] Name lookup '{full_name}' → Tier 2 last-name match PatNum={rows[0][0]}")
+                    return str(rows[0][0]), "last_name"
+                if len(rows) > 1:
+                    logger.info(f"[call_od_match] Name lookup last='{last}' → {len(rows)} matches, ambiguous — skipping")
+
+            # ── Tier 3: first name only ───────────────────────────────────────
+            if first:
+                cur.execute(
+                    """SELECT PatNum FROM patient
+                       WHERE PatStatus = 0
+                         AND LOWER(FName) = %s
+                       ORDER BY PatNum DESC LIMIT 5""",
+                    (first,),
+                )
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    logger.info(f"[call_od_match] Name lookup '{full_name}' → Tier 3 first-name-only match PatNum={rows[0][0]}")
+                    return str(rows[0][0]), "first_name"
+                if len(rows) > 1:
+                    logger.info(f"[call_od_match] Name lookup first='{first}' → {len(rows)} matches, ambiguous — skipping")
+
+        return None, "none"
+
+    except Exception as e:
+        logger.warning(f"OD name lookup failed for '{full_name}': {e}")
+        return None, "none"
+
+
 def _get_od_patient_by_phone(conn, phone_10: str) -> str | None:
     """
     Look up OD PatNum by phone number (home or wireless).
@@ -1045,7 +1134,7 @@ def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> d
 
     Returns dict with matched/skipped/errors counts.
     """
-    from database import get_booked_calls_needing_od_match, update_mango_call_od_appointment
+    from database import get_booked_calls_needing_od_match, update_mango_call_od_appointment, update_mango_call_analysis
 
     od_conn = _get_db()
     if not od_conn:
@@ -1081,10 +1170,50 @@ def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> d
                 started_str = call["started_at"].replace("Z", "+00:00")
                 call_dt = datetime.fromisoformat(started_str)
 
-                # Look up OD patient
+                # Look up OD patient — phone first, then Gemini name fallback
+                ai_patient_name = (call.get("ai_patient_name") or "").strip()
+                caller_id_name  = (call.get("caller_id_name") or "").strip()
+                match_method    = "phone"
+
                 pat_num = _get_od_patient_by_phone(od_conn, phone_10)
+
+                if not pat_num and ai_patient_name:
+                    # Phone lookup failed — try Gemini's patient name from transcript.
+                    # Gemini read the actual conversation so it knows the real patient,
+                    # even when the caller (phone account holder) is a different person.
+                    pat_num, name_tier = _get_od_patient_by_name(od_conn, ai_patient_name)
+                    if pat_num:
+                        # Confidence:
+                        #   phone+name agree → high (caller IS the patient, name confirmed)
+                        #   phone failed, full name matched → gemini-wins (name-based)
+                        #   phone failed, last-name only → name-last
+                        #   phone failed, first-name only → name-first (weakest)
+                        cnam_tokens = set(t.lower() for t in caller_id_name.split() if len(t) >= 3)
+                        name_tokens = set(t.lower() for t in ai_patient_name.split() if len(t) >= 3)
+                        cnam_matches = bool(cnam_tokens & name_tokens)
+                        if cnam_matches:
+                            conf = "high"
+                        elif name_tier == "full_name":
+                            conf = "gemini-wins"
+                        elif name_tier == "last_name":
+                            conf = "name-last"
+                        else:
+                            conf = "name-first"
+                        match_method = f"ai_name({ai_patient_name}, tier={name_tier}, conf={conf})"
+                        logger.info(
+                            f"[call_od_match] uuid={call['uuid']} phone={phone_10} — "
+                            f"phone miss, matched via Gemini name '{ai_patient_name}' "
+                            f"tier={name_tier} conf={conf} → PatNum={pat_num}"
+                        )
+
                 if not pat_num:
-                    logger.debug(f"[call_od_match] uuid={call['uuid']} phone={phone_10} — no OD patient found")
+                    logger.debug(
+                        f"[call_od_match] uuid={call['uuid']} phone={phone_10} "
+                        f"ai_name='{ai_patient_name}' — no OD patient found"
+                    )
+                    # Stamp attempt timestamp so throttle prevents infinite re-querying
+                    _now_iso = datetime.now(timezone.utc).isoformat()
+                    update_mango_call_analysis(call["uuid"], od_match_attempted_at=_now_iso)
                     skipped += 1
                     continue
 
@@ -1092,13 +1221,25 @@ def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> d
                 apt_num = _find_od_appointment_near_call(od_conn, pat_num, call_dt)
                 if not apt_num:
                     logger.debug(f"[call_od_match] uuid={call['uuid']} PatNum={pat_num} — no appointment in window")
+                    # M1 fix: stamp attempt timestamp
+                    _now_iso = datetime.now(timezone.utc).isoformat()
+                    update_mango_call_analysis(call["uuid"], od_match_attempted_at=_now_iso)
                     skipped += 1
                     continue
 
-                # Store the match
+                # Store the match + stamp attempt timestamp
+                # Also write od_patient_num if matched via name (phone-matched calls
+                # already have od_patient_num set from the patient enrichment step)
+                _now_iso = datetime.now(timezone.utc).isoformat()
                 update_mango_call_od_appointment(call["uuid"], apt_num)
+                _extra = {"od_match_attempted_at": _now_iso}
+                existing_od_pat = call.get("od_patient_num") or ""
+                if not existing_od_pat and pat_num and match_method.startswith("ai_name"):
+                    _extra["od_patient_num"] = pat_num
+                    _extra["od_patient_status"] = "new_patient"  # name-matched = new patient inquiry
+                update_mango_call_analysis(call["uuid"], **_extra)
                 logger.info(
-                    f"[call_od_match] uuid={call['uuid']} phone={phone_10} "
+                    f"[call_od_match] uuid={call['uuid']} method={match_method} "
                     f"PatNum={pat_num} → AptNum={apt_num}"
                 )
                 matched += 1
