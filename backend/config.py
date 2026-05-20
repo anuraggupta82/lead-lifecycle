@@ -153,6 +153,12 @@ class Settings(BaseSettings):
     mango_whisper_mode: str = "api"
     mango_whisper_local_model: str = "large-v2"
 
+    # ── Google Ads Attribution Window (PR 2) ─────────────────────────────────
+    # Number of days after lead/call anchor to count as 365d attribution window.
+    # Default 365 (one year). PR 3 will expose this in the Admin UI.
+    # No environment variable required — config-driven only.
+    gads_attribution_window_days: int = 365
+
     class Config:
         env_file = ".env"
         case_sensitive = False

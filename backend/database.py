@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS leads (
     appointment_status TEXT DEFAULT '',    -- from OD: scheduled, confirmed, broken, complete
     no_show_count INTEGER DEFAULT 0,      -- number of broken appointments
     notes       TEXT DEFAULT '',
+    -- OD Payment Sync (PR 2) — actual collected payments from OD payment/paysplit
+    paid_amount_365d   REAL DEFAULT 0.0,  -- payments within 365d of anchor (created_at)
+    paid_amount_ltv    REAL DEFAULT 0.0,  -- all payments on/after anchor (no upper bound)
+    first_payment_date TEXT DEFAULT '',   -- ISO date of first OD payment after anchor
+    paid_through_date  TEXT DEFAULT '',   -- ISO date of latest OD payment pulled
+    payment_synced_at  TEXT DEFAULT '',   -- when od_payment_sync last touched this lead
     -- Google Ads resolved fields (populated by google_ads_sync.py)
     keyword_text    TEXT DEFAULT '',       -- matched keyword from Google Ads
     search_term     TEXT DEFAULT '',       -- actual search query the user typed
@@ -571,6 +577,10 @@ CREATE TABLE IF NOT EXISTS keyword_production_log (
     procedure_codes     TEXT NOT NULL DEFAULT '[]',     -- JSON array of procedure codes
     match_method        TEXT NOT NULL DEFAULT '',       -- 'email','phone','manual'
     appointment_date    TEXT NOT NULL DEFAULT '',       -- YYYY-MM-DD of OD appointment
+    -- OD Payment Sync (PR 2) — actual collected payments for call-path rows
+    paid_amount_365d   REAL DEFAULT 0.0,               -- payments within 365d of call anchor
+    paid_amount_ltv    REAL DEFAULT 0.0,               -- all payments on/after call anchor
+    payment_synced_at  TEXT DEFAULT '',                -- when od_payment_sync last touched
     FOREIGN KEY (lead_id) REFERENCES leads(id),
     -- M4 fix: dedup guard — one row per (lead, patient); INSERT OR REPLACE updates production
     UNIQUE(lead_id, od_patient_num)
@@ -1541,6 +1551,18 @@ def _migrate(conn):
         # OD-sourced appointment type: AppointmentTypeName or ProcDescript fallback.
         # More reliable than Gemini's ai_appointment_type for bid optimization.
         ("od_appointment_type",      "TEXT DEFAULT ''"),
+        # ── Patient income/production snapshot (PR5 — May 2026) ──────────────
+        # Populated when a call is phone-matched (or name-matched) to an OD patient.
+        # NULL = never computed (distinguishes "not yet matched" from "matched, $0 spent").
+        # 0.0  = matched but legitimately zero collections/production.
+        # Only filled for ads-attributed calls (gads_call_id or lead_id present).
+        ("od_patient_income",     "REAL DEFAULT NULL"),   # SUM(paysplit.SplitAmt) lifetime
+        ("od_patient_production", "REAL DEFAULT NULL"),   # _get_patient_production()["total"]
+        ("od_income_synced_at",   "TEXT DEFAULT ''"),     # ISO timestamp of last refresh
+        # ── Match method (PR8 — May 2026) ──────────────────────────────────────
+        # "phone"  = matched by phone number (highest confidence)
+        # "ai_name(...)"  = matched via Gemini transcript name (with tier/conf detail)
+        ("od_match_method",       "TEXT DEFAULT ''"),     # how the OD patient was matched
     ]
     for col_name, col_type in _mango_summary_cols:
         if col_name not in mango_cols:
@@ -2549,6 +2571,30 @@ GROUP BY a.campaign_id, c.campaign_name;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ab_experiments_status ON ab_experiments(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ab_experiments_base ON ab_experiments(base_campaign_resource)")
 
+    # ── PR 2: OD Payment Sync — paid_amount_365d / paid_amount_ltv columns ───
+    # Idempotent: PRAGMA table_info check before each ALTER TABLE ADD COLUMN.
+    _leads_pr2_cols = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
+    _leads_pr2_new = [
+        ("paid_amount_365d",  "REAL DEFAULT 0.0"),
+        ("paid_amount_ltv",   "REAL DEFAULT 0.0"),
+        ("first_payment_date","TEXT DEFAULT ''"),
+        ("paid_through_date", "TEXT DEFAULT ''"),
+        ("payment_synced_at", "TEXT DEFAULT ''"),
+    ]
+    for _col, _def in _leads_pr2_new:
+        if _col not in _leads_pr2_cols:
+            conn.execute(f"ALTER TABLE leads ADD COLUMN {_col} {_def}")
+
+    _kpl_pr2_cols = {row[1] for row in conn.execute("PRAGMA table_info(keyword_production_log)").fetchall()}
+    _kpl_pr2_new = [
+        ("paid_amount_365d",  "REAL DEFAULT 0.0"),
+        ("paid_amount_ltv",   "REAL DEFAULT 0.0"),
+        ("payment_synced_at", "TEXT DEFAULT ''"),
+    ]
+    for _col, _def in _kpl_pr2_new:
+        if _col not in _kpl_pr2_cols:
+            conn.execute(f"ALTER TABLE keyword_production_log ADD COLUMN {_col} {_def}")
+
 
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
@@ -3442,6 +3488,25 @@ def get_campaign_stats() -> list:
                 FROM gads_keywords_cache
                 WHERE days = 30 AND campaign_name != ''
                 GROUP BY campaign_name
+            ),
+            -- PR9: call income rollup by campaign — new_patient calls only.
+            -- attributed_ad_group is stored as "Campaign > Ad Group"; extract campaign
+            -- by splitting on ' > ' so no join to gads_daily_stats needed.
+            call_income_by_campaign AS (
+                SELECT
+                    LOWER(TRIM(
+                        CASE WHEN INSTR(attributed_ad_group, ' > ') > 0
+                             THEN SUBSTR(attributed_ad_group, 1, INSTR(attributed_ad_group, ' > ') - 1)
+                             ELSE attributed_ad_group
+                        END
+                    )) AS campaign_key,
+                    COUNT(*)                           AS call_count,
+                    COALESCE(SUM(od_patient_income), 0) AS call_income
+                FROM mango_calls
+                WHERE od_patient_status = 'new_patient'
+                  AND od_patient_income IS NOT NULL
+                  AND attributed_ad_group != ''
+                GROUP BY campaign_key
             )
             SELECT
                 cl.campaign,
@@ -3472,9 +3537,13 @@ def get_campaign_stats() -> list:
                     ELSE 0 END as roas,
                 CASE WHEN cl.lead_count > 0
                     THEN ROUND(CAST(cl.treated_count AS REAL) / cl.lead_count * 100, 1)
-                    ELSE 0 END as conversion_rate
+                    ELSE 0 END as conversion_rate,
+                -- PR9: call-attributed income for this campaign
+                COALESCE(cc.call_income, 0) AS call_income,
+                COALESCE(cc.call_count,  0) AS call_count
             FROM campaign_leads cl
             LEFT JOIN campaign_gads_cost gc ON LOWER(cl.campaign) = LOWER(gc.campaign_name)
+            LEFT JOIN call_income_by_campaign cc ON cc.campaign_key = LOWER(cl.campaign)
             ORDER BY cl.lead_count DESC
         """).fetchall()
         return [dict(r) for r in rows]
@@ -3571,15 +3640,54 @@ def get_unified_campaigns(days: int = 30) -> list:
         lead_rows = conn.execute("""
             SELECT
                 LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign))) AS k,
-                COUNT(*)                   AS lead_count,
-                SUM(attributed_income)     AS attributed_income,
-                SUM(attributed_production) AS attributed_production
+                COUNT(*)                              AS lead_count,
+                SUM(attributed_income)                AS attributed_income,
+                SUM(attributed_production)            AS attributed_production,
+                SUM(COALESCE(paid_amount_365d, 0.0))  AS paid_income_365d,
+                SUM(COALESCE(paid_amount_ltv,  0.0))  AS paid_income_ltv
             FROM leads
             WHERE created_at >= DATE('now', ?)
               AND (campaign_name != '' OR utm_campaign != '')
             GROUP BY LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign)))
         """, (f"-{days} day",)).fetchall()
         leads_by_key = {r["k"]: dict(r) for r in lead_rows}
+
+        # ── Call income per campaign (PR9/PR14) ───────────────────────────
+        # attributed_ad_group is stored as "Campaign > Ad Group" — extract campaign
+        # by taking everything before the first " > " separator.
+        # new_patient calls only (genuine new acquisitions from ads).
+        call_income_rows = conn.execute("""
+            SELECT
+                LOWER(TRIM(
+                    CASE WHEN INSTR(attributed_ad_group, ' > ') > 0
+                         THEN SUBSTR(attributed_ad_group, 1, INSTR(attributed_ad_group, ' > ') - 1)
+                         ELSE attributed_ad_group
+                    END
+                )) AS k,
+                COUNT(*)                           AS call_count,
+                COALESCE(SUM(od_patient_income), 0) AS call_income
+            FROM mango_calls
+            WHERE od_patient_status = 'new_patient'
+              AND od_patient_income IS NOT NULL
+              AND attributed_ad_group != ''
+            GROUP BY k
+        """).fetchall()
+        call_income_by_key = {r["k"]: dict(r) for r in call_income_rows}
+
+        # ── PR 2: Call paid 365d / LTV per campaign from keyword_production_log ─
+        # Sum paid_amount_365d / paid_amount_ltv from KPL call:: rows, grouped by
+        # campaign_name. Complements the lead-path paid amounts in leads_by_key.
+        call_paid_rows = conn.execute("""
+            SELECT
+                LOWER(TRIM(campaign_name))            AS k,
+                SUM(COALESCE(paid_amount_365d, 0.0))  AS call_paid_365d,
+                SUM(COALESCE(paid_amount_ltv,  0.0))  AS call_paid_ltv
+            FROM keyword_production_log
+            WHERE lead_id LIKE 'call::%'
+              AND campaign_name != ''
+            GROUP BY LOWER(TRIM(campaign_name))
+        """).fetchall()
+        call_paid_by_key = {r["k"]: dict(r) for r in call_paid_rows}
 
         # ── Managed campaigns ─────────────────────────────────────────────
         managed = conn.execute("""
@@ -3612,12 +3720,21 @@ def get_unified_campaigns(days: int = 30) -> list:
                 # Also register the GAds name key as managed so it won't create a synthetic row
                 managed_keys.add((wm.get("gads_name") or "").strip().lower())
             lm = leads_by_key.get(name_key, {})
+            cm = call_income_by_key.get(name_key, {})
+            cp2 = call_paid_by_key.get(name_key, {})
             cost = (wm.get("cost_micros") or 0) / 1_000_000.0
             leads = lm.get("lead_count") or 0
             revenue = lm.get("attributed_income") or 0
             production = lm.get("attributed_production") or 0
+            call_income = cm.get("call_income") or 0.0
+            call_count  = cm.get("call_count") or 0
+            # income = all verified OD collections: leads income + call income (new patients)
+            income = revenue + call_income
+            # PR 2: actual paid income — leads.paid_amount_* + kpl call:: paid amounts
+            income_365d = (lm.get("paid_income_365d") or 0.0) + (cp2.get("call_paid_365d") or 0.0)
+            income_ltv  = (lm.get("paid_income_ltv") or 0.0) + (cp2.get("call_paid_ltv") or 0.0)
             cpl = round(cost / leads, 2) if leads > 0 else None
-            roi = round((revenue - cost) / cost * 100, 1) if cost > 0 else None
+            roi = round((income - cost) / cost * 100, 1) if cost > 0 else None
 
             # UNMANAGED rows are orphaned imports — treat as unlinked so the UI shows 🗑 not ⏹ Stop
             is_gads_linked = bool(
@@ -3638,14 +3755,19 @@ def get_unified_campaigns(days: int = 30) -> list:
                 "is_synthetic": False,
                 "is_gads_linked": is_gads_linked,
                 "metrics": {
-                    "impressions": wm.get("impressions") or 0,
-                    "clicks": wm.get("clicks") or 0,
-                    "cost": round(cost, 2),
-                    "leads": leads,
-                    "revenue": round(revenue, 2),
-                    "production": round(production, 2),
-                    "cpl": cpl,
-                    "roi": roi,
+                    "impressions":  wm.get("impressions") or 0,
+                    "clicks":       wm.get("clicks") or 0,
+                    "cost":         round(cost, 2),
+                    "leads":        leads,
+                    "revenue":      round(revenue, 2),
+                    "production":   round(production, 2),
+                    "call_income":  round(call_income, 2),
+                    "call_count":   call_count,
+                    "income":       round(income, 2),         # leads + calls combined (planned)
+                    "income_365d":  round(income_365d, 2),    # PR 2: actual paid 365d
+                    "income_ltv":   round(income_ltv, 2),     # PR 2: actual paid lifetime
+                    "cpl":          cpl,
+                    "roi":          roi,                       # based on income (not just leads)
                 },
                 "last_activity_date": last,
                 "is_inactive_90d": is_inactive_90d,
@@ -3657,12 +3779,19 @@ def get_unified_campaigns(days: int = 30) -> list:
             if k in managed_keys:
                 continue
             lm = leads_by_key.get(k, {})
+            cm = call_income_by_key.get(k, {})
+            cp2 = call_paid_by_key.get(k, {})
             cost = (wm.get("cost_micros") or 0) / 1_000_000.0
             leads = lm.get("lead_count") or 0
             revenue = lm.get("attributed_income") or 0
             production = lm.get("attributed_production") or 0
+            call_income = cm.get("call_income") or 0.0
+            call_count  = cm.get("call_count") or 0
+            income = revenue + call_income
+            income_365d = (lm.get("paid_income_365d") or 0.0) + (cp2.get("call_paid_365d") or 0.0)
+            income_ltv  = (lm.get("paid_income_ltv") or 0.0) + (cp2.get("call_paid_ltv") or 0.0)
             cpl = round(cost / leads, 2) if leads > 0 else None
-            roi = round((revenue - cost) / cost * 100, 1) if cost > 0 else None
+            roi = round((income - cost) / cost * 100, 1) if cost > 0 else None
             last = last_activity_by_key.get(k)
             is_inactive_90d = (last is None) or (last < cutoff_90d)
 
@@ -3685,14 +3814,19 @@ def get_unified_campaigns(days: int = 30) -> list:
                 "is_synthetic": True,
                 "is_gads_linked": True,
                 "metrics": {
-                    "impressions": wm.get("impressions") or 0,
-                    "clicks": wm.get("clicks") or 0,
-                    "cost": round(cost, 2),
-                    "leads": leads,
-                    "revenue": round(revenue, 2),
-                    "production": round(production, 2),
-                    "cpl": cpl,
-                    "roi": roi,
+                    "impressions":  wm.get("impressions") or 0,
+                    "clicks":       wm.get("clicks") or 0,
+                    "cost":         round(cost, 2),
+                    "leads":        leads,
+                    "revenue":      round(revenue, 2),
+                    "production":   round(production, 2),
+                    "call_income":  round(call_income, 2),
+                    "call_count":   call_count,
+                    "income":       round(income, 2),
+                    "income_365d":  round(income_365d, 2),
+                    "income_ltv":   round(income_ltv, 2),
+                    "cpl":          cpl,
+                    "roi":          roi,
                 },
                 "last_activity_date": last,
                 "is_inactive_90d": is_inactive_90d,
@@ -4124,6 +4258,13 @@ def get_keyword_stats() -> list:
                        (phone-call path via call_production_log.py)
       - revenue:       lead_revenue + call_revenue (total for ROAS calculation)
 
+    PR 2 additions:
+      - income_365d:   actual paid 365d (leads.paid_amount_365d + kpl.paid_amount_365d
+                       for call:: rows) with the same call_attributed_patients dedup logic
+      - income_ltv:    actual paid lifetime (same sources, no upper bound)
+
+    roas and cpl still use revenue (planned production). PR 3 will switch optimizer.
+
     Double-counting guard: keyword_production_log.py already skips call rows when a
     lead-path row exists for the same od_patient_num, so summing both is safe.
     """
@@ -4136,9 +4277,11 @@ def get_keyword_stats() -> list:
             -- lead_revenue below (same patient can't appear in both).
             WITH call_prod AS (
                 SELECT
-                    LOWER(TRIM(keyword_text))      AS kw,
-                    SUM(production_amount)         AS call_revenue,
-                    COUNT(DISTINCT od_patient_num) AS call_patients
+                    LOWER(TRIM(keyword_text))          AS kw,
+                    SUM(production_amount)             AS call_revenue,
+                    COUNT(DISTINCT od_patient_num)     AS call_patients,
+                    SUM(COALESCE(paid_amount_365d,0.0)) AS call_paid_365d,
+                    SUM(COALESCE(paid_amount_ltv, 0.0)) AS call_paid_ltv
                 FROM keyword_production_log
                 WHERE lead_id LIKE 'call::%'
                   AND keyword_text != ''
@@ -4199,7 +4342,20 @@ def get_keyword_stats() -> list:
                               OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
                          THEN l.attributed_production ELSE 0 END
                 ), 0) + COALESCE(cp.call_revenue, 0.0)         AS revenue,
-                -- Calculated metrics
+                -- PR 2: actual paid income (365d window + lifetime), deduped same as revenue
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN COALESCE(l.paid_amount_365d, 0.0) ELSE 0 END
+                ), 0) + COALESCE(cp.call_paid_365d, 0.0)       AS income_365d,
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN COALESCE(l.paid_amount_ltv, 0.0) ELSE 0 END
+                ), 0) + COALESCE(cp.call_paid_ltv, 0.0)        AS income_ltv,
+                -- Calculated metrics (roas/cpl still use revenue — PR 3 will switch)
                 CASE WHEN COUNT(l.id) > 0
                     THEN ROUND(COALESCE(k.cost, SUM(l.click_cost)) / COUNT(l.id), 2)
                     ELSE 0 END AS cpl,
@@ -4263,6 +4419,19 @@ def get_keyword_stats() -> list:
                               OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
                          THEN l.attributed_production ELSE 0 END
                 ), 0) + COALESCE(cp2.call_revenue, 0.0)        AS revenue,
+                -- PR 2: actual paid income (365d + LTV) for leads-only path
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN COALESCE(l.paid_amount_365d, 0.0) ELSE 0 END
+                ), 0) + COALESCE(cp2.call_paid_365d, 0.0)      AS income_365d,
+                COALESCE(SUM(
+                    CASE WHEN l.od_patient_num IS NULL
+                              OR l.od_patient_num = ''
+                              OR l.od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                         THEN COALESCE(l.paid_amount_ltv, 0.0) ELSE 0 END
+                ), 0) + COALESCE(cp2.call_paid_ltv, 0.0)       AS income_ltv,
                 CASE WHEN COUNT(l.id) > 0 THEN ROUND(SUM(l.click_cost) / COUNT(l.id), 2) ELSE 0 END AS cpl,
                 CASE WHEN SUM(l.click_cost) > 0
                     THEN ROUND(
@@ -4412,7 +4581,37 @@ def get_search_term_stats(campaign_name: str = "", days: int = 30) -> list:
                 s.cpc,
                 COUNT(l.id)    AS lead_count,
                 COALESCE(SUM(l.attributed_production), 0) AS revenue,
-                s.synced_at
+                s.synced_at,
+                -- PR9: call-attributed income for this search term.
+                -- attributed_keyword holds the matched keyword (not the raw search term),
+                -- so we match keyword→search_term exactly as GAds does.
+                -- Campaign scoping: join attributed_ad_group→gads_daily_stats for campaign_name.
+                COALESCE((
+                    SELECT SUM(mc.od_patient_income)
+                    FROM mango_calls mc
+                    JOIN (
+                        SELECT ad_group_name, MAX(campaign_name) AS campaign_name
+                        FROM gads_daily_stats WHERE ad_group_name != ''
+                        GROUP BY ad_group_name
+                    ) ds2 ON LOWER(ds2.ad_group_name) = LOWER(mc.attributed_ad_group)
+                    WHERE mc.od_patient_status = 'new_patient'
+                      AND mc.od_patient_income IS NOT NULL
+                      AND LOWER(mc.attributed_keyword) = LOWER(s.search_term)
+                      AND LOWER(ds2.campaign_name) LIKE '%' || LOWER(s.campaign_name) || '%'
+                ), 0) AS call_income,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM mango_calls mc
+                    JOIN (
+                        SELECT ad_group_name, MAX(campaign_name) AS campaign_name
+                        FROM gads_daily_stats WHERE ad_group_name != ''
+                        GROUP BY ad_group_name
+                    ) ds3 ON LOWER(ds3.ad_group_name) = LOWER(mc.attributed_ad_group)
+                    WHERE mc.od_patient_status = 'new_patient'
+                      AND mc.od_patient_income IS NOT NULL
+                      AND LOWER(mc.attributed_keyword) = LOWER(s.search_term)
+                      AND LOWER(ds3.campaign_name) LIKE '%' || LOWER(s.campaign_name) || '%'
+                ), 0) AS call_count
             FROM gads_search_terms_cache s
             LEFT JOIN leads l ON LOWER(l.search_term) = LOWER(s.search_term)
             {where}
@@ -5268,6 +5467,18 @@ def get_ad_group_stats(days: int = 30) -> list:
                 FROM gads_daily_stats
                 WHERE date >= date('now', 'localtime', ?)
                 GROUP BY ad_group_id, campaign_id
+            ),
+            -- PR9: call income rollup by ad group — new_patient calls only
+            call_income_by_ag AS (
+                SELECT
+                    LOWER(attributed_ad_group) AS ad_group_key,
+                    COUNT(*)                   AS call_count,
+                    COALESCE(SUM(od_patient_income), 0) AS call_income
+                FROM mango_calls
+                WHERE od_patient_status = 'new_patient'
+                  AND od_patient_income IS NOT NULL
+                  AND attributed_ad_group != ''
+                GROUP BY LOWER(attributed_ad_group)
             )
             SELECT
                 ag.ad_group_id,
@@ -5295,11 +5506,16 @@ def get_ad_group_stats(days: int = 30) -> list:
                             'treatment_accepted','treatment_completed'
                         ) THEN 1 ELSE 0 END) AS REAL)
                         / COUNT(DISTINCT l.id) * 100, 1)
-                    ELSE 0 END AS conversion_rate
+                    ELSE 0 END AS conversion_rate,
+                -- PR9: call-attributed income for this ad group
+                COALESCE(ci.call_income, 0) AS call_income,
+                COALESCE(ci.call_count,  0) AS call_count
             FROM ag_metrics ag
             LEFT JOIN leads l
                 ON LOWER(l.ad_group_name) = LOWER(ag.ad_group_name)
                AND LOWER(l.campaign_name) = LOWER(ag.campaign_name)
+            LEFT JOIN call_income_by_ag ci
+                ON ci.ad_group_key = LOWER(ag.ad_group_name)
             GROUP BY ag.ad_group_id, ag.campaign_id
             ORDER BY ag.cost DESC
         """, (modifier,)).fetchall()
@@ -6640,6 +6856,10 @@ def get_mango_calls(
                        mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
                        -- Gemini structured summary fields
                        mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name, mc.od_appointment_type,
+                       -- PR5: OD income/production snapshot
+                       mc.od_patient_income, mc.od_patient_production, mc.od_income_synced_at,
+                       -- PR8: match method
+                       mc.od_match_method,
                        -- Keyword attribution
                        mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
                        mc.attributed_keyword_method, mc.attributed_keyword_confidence,
@@ -6694,6 +6914,10 @@ def get_mango_call(uuid: str) -> dict | None:
                       mc.od_patient_num, mc.od_patient_name, mc.od_patient_status, mc.od_matched_at,
                       -- Gemini structured summary fields
                       mc.ai_appointment_scheduled, mc.ai_appointment_type, mc.ai_patient_name, mc.od_appointment_type,
+                      -- PR5: OD income/production snapshot
+                      mc.od_patient_income, mc.od_patient_production, mc.od_income_synced_at,
+                      -- PR8: match method
+                      mc.od_match_method,
                       -- Keyword attribution
                       mc.attributed_keyword, mc.attributed_match_type, mc.attributed_ad_group,
                       mc.attributed_keyword_method, mc.attributed_keyword_confidence,
@@ -6767,16 +6991,43 @@ def get_booked_calls_needing_od_match(days: int = 90) -> list:
     Calls that were already attempted within the last 7 days and still have no
     od_patient_num are excluded to prevent infinite re-querying against OD MySQL
     for callers whose phone will never resolve to a patient record.
+
+    Lookback window: anchored to the oldest unmatched booked call (not a fixed 90 days),
+    so the scan window shrinks naturally as the DB grows and calls get matched.
+    Falls back to `days` param only when no unmatched calls exist.
     """
-    cutoff = (datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ) - __import__("datetime").timedelta(days=days)).isoformat()
-    retry_cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=7)).isoformat()
+    import datetime as _dt
+    _now = datetime.now(timezone.utc)
+    retry_cutoff = (_now - _dt.timedelta(days=7)).isoformat()
+
+    with _conn() as conn:
+        # Find oldest unmatched booked call to anchor the cutoff dynamically
+        oldest_row = conn.execute(
+            """SELECT MIN(started_at) FROM mango_calls
+               WHERE direction = 'inbound'
+                 AND (od_appointment_id IS NULL OR od_appointment_id = '')
+                 AND (
+                   (od_patient_num IS NOT NULL AND od_patient_num != '')
+                   OR booked_outcome = 'booked'
+                 )"""
+        ).fetchone()
+        oldest_ts = oldest_row[0] if oldest_row and oldest_row[0] else None
+
+    if oldest_ts:
+        # Use oldest unmatched call minus 1 day buffer as cutoff
+        try:
+            oldest_dt = datetime.fromisoformat(oldest_ts.replace("Z", "+00:00"))
+            cutoff = (oldest_dt - _dt.timedelta(days=1)).isoformat()
+        except Exception:
+            cutoff = (_now - _dt.timedelta(days=days)).isoformat()
+    else:
+        cutoff = (_now - _dt.timedelta(days=days)).isoformat()
     with _conn() as conn:
         rows = conn.execute(
             """SELECT mc.uuid, mc.started_at, mc.from_number, mc.caller_id_number,
                       mc.booked_outcome, mc.od_appointment_id, mc.lead_id,
-                      mc.caller_id_name, mc.ai_patient_name, mc.od_patient_num
+                      mc.caller_id_name, mc.ai_patient_name, mc.od_patient_num,
+                      mc.od_patient_status, mc.od_patient_income
                FROM mango_calls mc
                WHERE mc.direction = 'inbound'
                  AND (mc.od_appointment_id IS NULL OR mc.od_appointment_id = '')
@@ -6866,6 +7117,33 @@ def update_mango_call_od_status(
                SET od_patient_num=?, od_patient_status=?, od_patient_name=?, od_matched_at=?, updated_at=?
                WHERE uuid=?""",
             (od_patient_num, od_patient_status, od_patient_name, now, now, uuid),
+        )
+
+
+def update_mango_call_od_income(
+    uuid: str,
+    od_patient_income: float,
+    od_patient_production: float,
+) -> None:
+    """Persist OD patient lifetime income + production snapshot on a Mango call.
+
+    Always overwrites (refresh-safe) — these values are recomputed from paysplit /
+    procedurelog every time the matcher runs for a given uuid, so latest wins.
+    Pass 0.0 (not None) for patients with no payments/production yet; NULL is
+    reserved for 'never computed'.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE mango_calls
+               SET od_patient_income=?,
+                   od_patient_production=?,
+                   od_income_synced_at=?,
+                   updated_at=?
+               WHERE uuid=?""",
+            (float(od_patient_income or 0.0),
+             float(od_patient_production or 0.0),
+             now, now, uuid),
         )
 
 
@@ -7526,6 +7804,9 @@ def update_mango_call_analysis(uuid: str, **kwargs) -> None:
         # Structured summary fields (Gemini JSON response — May 2026)
         "ai_appointment_scheduled", "ai_appointment_type", "ai_patient_name",
         "od_match_attempted_at", "od_appointment_type",
+        # OD patient fields — needed so name-matched calls can write od_patient_num/status
+        "od_patient_num", "od_patient_status", "od_patient_name", "od_matched_at",
+        "od_match_method",
         # Phase 3: AI next-action columns
         "call_next_action", "call_next_action_type", "call_next_action_due",
         "call_next_action_completed", "call_next_action_completed_at",

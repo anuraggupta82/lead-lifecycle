@@ -2848,6 +2848,7 @@ function AdGroupsView({ adGroupStats, dailyStats }) {
             <th className="num">Leads</th>
             <th className="num">CPL</th>
             <th className="num">Conv%</th>
+            <th className="num" title="Lifetime income from new patients acquired via calls attributed to this ad group">Call Income</th>
           </tr>
         </thead>
         <tbody>
@@ -2862,6 +2863,12 @@ function AdGroupsView({ adGroupStats, dailyStats }) {
               <td className="num">{r.lead_count||0}</td>
               <td className="num">{r.cpl > 0 ? '$'+Number(r.cpl).toFixed(0) : '—'}</td>
               <td className="num">{r.conversion_rate > 0 ? r.conversion_rate+'%' : '—'}</td>
+              <td className="num" style={{color: r.call_income > 0 ? '#15803d' : 'var(--text-muted)', fontWeight: r.call_income > 0 ? 600 : 400}}>
+                {r.call_income > 0
+                  ? '$' + Number(r.call_income).toLocaleString('en-US', {minimumFractionDigits:0, maximumFractionDigits:0})
+                  + (r.call_count > 0 ? ` (${r.call_count})` : '')
+                  : '—'}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -3011,6 +3018,7 @@ function SearchTermsView({ searchTermStats, onRefreshSearchTerms }) {
             <th className="num">Cost</th>
             <th className="num">CPC</th>
             <th className="num">Leads</th>
+            <th className="num" title="Lifetime income from new patients acquired via calls attributed to this keyword">Call Income</th>
           </tr>
         </thead>
         <tbody>
@@ -3028,6 +3036,12 @@ function SearchTermsView({ searchTermStats, onRefreshSearchTerms }) {
               <td className="num">{fmtMoney(r.cost||0)}</td>
               <td className="num">{r.cpc > 0 ? '$'+Number(r.cpc).toFixed(2) : '—'}</td>
               <td className="num">{r.lead_count||0}</td>
+              <td className="num" style={{color: r.call_income > 0 ? '#15803d' : 'var(--text-muted)', fontWeight: r.call_income > 0 ? 600 : 400}}>
+                {r.call_income > 0
+                  ? '$' + Number(r.call_income).toLocaleString('en-US', {minimumFractionDigits:0, maximumFractionDigits:0})
+                  + (r.call_count > 0 ? ` (${r.call_count})` : '')
+                  : '—'}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -3564,6 +3578,9 @@ function CallsSubView() {
   const [bulkMsg, setBulkMsg] = useState('');
   const [odMatchRunning, setOdMatchRunning] = useState(false);
   const [odMatchMsg, setOdMatchMsg]       = useState('');
+  const [incomeBackfillRunning, setIncomeBackfillRunning] = useState(false);
+  const [incomeBackfillMsg, setIncomeBackfillMsg] = useState('');
+  const [incomeRefreshRunning, setIncomeRefreshRunning] = useState(false);
   const bulkPollInFlight = React.useRef(false);
   const activePolls = React.useRef({}); // uuid → intervalId, for cleanup on unmount
   // Call flags panel
@@ -3836,6 +3853,26 @@ function CallsSubView() {
       await loadCalls();
     } catch(e) { setOdMatchMsg('✗ ' + (e.message||'error')); }
     finally { setOdMatchRunning(false); }
+  }
+
+  async function handleIncomeBackfill() {
+    setIncomeBackfillRunning(true); setIncomeBackfillMsg('');
+    try {
+      const d = await api('/api/admin/calls/backfill-income', { method: 'POST' });
+      setIncomeBackfillMsg(d.backfilled > 0 ? `✓ Income: ${d.backfilled} updated` : `✓ All caught up (${d.total||0} already have income)`);
+      await loadCalls();
+    } catch(e) { setIncomeBackfillMsg('✗ ' + (e.message||'error')); }
+    finally { setIncomeBackfillRunning(false); }
+  }
+
+  async function handleIncomeRefresh() {
+    setIncomeRefreshRunning(true); setIncomeBackfillMsg('');
+    try {
+      const d = await api('/api/admin/calls/refresh-income', { method: 'POST' });
+      setIncomeBackfillMsg(`✓ Refreshed ${d.refreshed} calls (${d.unique_patients} patients)`);
+      await loadCalls();
+    } catch(e) { setIncomeBackfillMsg('✗ ' + (e.message||'error')); }
+    finally { setIncomeRefreshRunning(false); }
   }
 
   async function handleBulkProcess() {
@@ -4277,6 +4314,20 @@ function CallsSubView() {
             color:odMatchRunning?'var(--text-muted)':'#fff'}}>
           {odMatchRunning ? '⟳ Matching…' : '🦷 Match OD'}
         </button>
+        <button onClick={handleIncomeBackfill} disabled={incomeBackfillRunning}
+          title="Backfill lifetime income for new-patient calls missing income data (requires office network)"
+          style={{padding:'4px 12px',fontSize:11,border:'1px solid #16a34a',borderRadius:4,cursor:'pointer',
+            background:incomeBackfillRunning?'var(--bg-card)':'#16a34a',
+            color:incomeBackfillRunning?'var(--text-muted)':'#fff'}}>
+          {incomeBackfillRunning ? '⟳ Backfilling…' : '💰 Backfill Income'}
+        </button>
+        <button onClick={handleIncomeRefresh} disabled={incomeRefreshRunning}
+          title="Re-fetch latest income from OD for all matched new-patient calls (use after a patient makes a payment)"
+          style={{padding:'4px 12px',fontSize:11,border:'1px solid #0d7a7f',borderRadius:4,cursor:'pointer',
+            background:incomeRefreshRunning?'var(--bg-card)':'#0d7a7f',
+            color:incomeRefreshRunning?'var(--text-muted)':'#fff'}}>
+          {incomeRefreshRunning ? '⟳ Refreshing…' : '🔄 Refresh Income'}
+        </button>
         <button onClick={loadCalls} disabled={loading}
           style={{padding:'4px 10px',fontSize:11,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
             background:'#fff',color:'var(--text-muted)'}}>
@@ -4285,6 +4336,7 @@ function CallsSubView() {
         {syncMsg && <span style={{fontSize:11,color:syncMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{syncMsg}</span>}
         {bulkMsg && <span style={{fontSize:11,color:bulkMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{bulkMsg}</span>}
         {odMatchMsg && <span style={{fontSize:11,color:odMatchMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{odMatchMsg}</span>}
+        {incomeBackfillMsg && <span style={{fontSize:11,color:incomeBackfillMsg.startsWith('✓')?'#16a34a':'#dc2626'}}>{incomeBackfillMsg}</span>}
         {loading && <span style={{fontSize:11,color:'var(--text-muted)'}}>Loading…</span>}
         {!loading && lastRefreshed && <span style={{fontSize:10,color:'var(--text-muted)',marginLeft:'auto'}}>↻ {lastRefreshed.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true})}</span>}
       </div>
@@ -4582,27 +4634,58 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
               {call.transcription_status === 'done' && (
                 <div style={{marginTop:12,background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,padding:'12px 14px',fontSize:12}}>
                   <div style={{fontSize:10,fontWeight:600,color:'#15803d',marginBottom:8,textTransform:'uppercase',letterSpacing:'0.05em'}}>Patient Intelligence</div>
-                  <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'6px 14px',alignItems:'center'}}>
-                    <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Patient Name</span>
-                    <span style={{fontWeight:600,color:call.ai_patient_name?'var(--text)':'var(--text-muted)',fontStyle:call.ai_patient_name?'normal':'italic'}}>
-                      {call.ai_patient_name || '—'}
-                    </span>
-                    <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Appt Scheduled</span>
-                    <span style={{fontWeight:600,
-                      color:call.ai_appointment_scheduled===1?'#16a34a':call.ai_appointment_scheduled===0?'#dc2626':'var(--text-muted)'}}>
-                      {call.ai_appointment_scheduled===1 ? '✓ Yes' : call.ai_appointment_scheduled===0 ? '✗ No' : '—'}
-                    </span>
-                    <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Appt Type</span>
-                    <span style={{color:(call.od_appointment_type||call.ai_appointment_type)?'var(--text-secondary)':'var(--text-muted)',
-                      fontStyle:(call.od_appointment_type||call.ai_appointment_type)?'normal':'italic'}}>
-                      {call.od_appointment_type || call.ai_appointment_type || '—'}
-                      {call.od_appointment_type
-                        ? <span style={{marginLeft:5,fontSize:9,background:'#dbeafe',color:'#1d4ed8',padding:'1px 4px',borderRadius:3}}>OD</span>
-                        : call.ai_appointment_type
-                          ? <span style={{marginLeft:5,fontSize:9,background:'#f3f4f6',color:'#6b7280',padding:'1px 4px',borderRadius:3}}>Gemini</span>
-                          : null}
-                    </span>
-                  </div>
+                  {(() => {
+                    const inc = call.od_patient_income;
+                    // PR8: parse od_match_method for confidence badge
+                    const mm = call.od_match_method || '';
+                    const matchBadge = (() => {
+                      if (!mm || mm === 'phone-no-match') return null;
+                      if (mm === 'phone') return {label:'📞 Phone', bg:'#dbeafe', color:'#1d4ed8', title:'Matched by phone number in OpenDental'};
+                      // ai_name(..., conf=...)
+                      const confMatch = mm.match(/conf=([^,)]+)/);
+                      const conf = confMatch ? confMatch[1] : '';
+                      if (conf === 'high') return {label:'✓ Name+Phone', bg:'#dcfce7', color:'#15803d', title:'Gemini name confirmed by caller ID'};
+                      if (conf === 'gemini-wins') return {label:'🤖 Gemini Full', bg:'#f3e8ff', color:'#7c3aed', title:'Matched by full name from transcript'};
+                      if (conf === 'name-last') return {label:'🤖 Gemini Last', bg:'#fef3c7', color:'#92400e', title:'Matched by last name only — moderate confidence'};
+                      return {label:'🤖 Gemini Partial', bg:'#fef3c7', color:'#92400e', title:'Partial name match — low confidence'};
+                    })();
+                    return (
+                      <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'6px 14px',alignItems:'center'}}>
+                        <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Patient Name</span>
+                        <span style={{display:'flex',alignItems:'center',gap:6,fontWeight:600,color:call.ai_patient_name?'var(--text)':'var(--text-muted)',fontStyle:call.ai_patient_name?'normal':'italic'}}>
+                          {call.ai_patient_name || '—'}
+                          {matchBadge && <span style={{fontSize:9,fontWeight:700,padding:'1px 5px',borderRadius:3,background:matchBadge.bg,color:matchBadge.color,whiteSpace:'nowrap'}} title={matchBadge.title}>{matchBadge.label}</span>}
+                        </span>
+                        <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Appt Scheduled</span>
+                        <span style={{fontWeight:600,
+                          color:call.ai_appointment_scheduled===1?'#16a34a':call.ai_appointment_scheduled===0?'#dc2626':'var(--text-muted)'}}>
+                          {call.ai_appointment_scheduled===1 ? '✓ Yes' : call.ai_appointment_scheduled===0 ? '✗ No' : '—'}
+                        </span>
+                        <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Appt Type</span>
+                        <span style={{color:(call.od_appointment_type||call.ai_appointment_type)?'var(--text-secondary)':'var(--text-muted)',
+                          fontStyle:(call.od_appointment_type||call.ai_appointment_type)?'normal':'italic'}}>
+                          {call.od_appointment_type || call.ai_appointment_type || '—'}
+                          {call.od_appointment_type
+                            ? <span style={{marginLeft:5,fontSize:9,background:'#dbeafe',color:'#1d4ed8',padding:'1px 4px',borderRadius:3}}>OD</span>
+                            : call.ai_appointment_type
+                              ? <span style={{marginLeft:5,fontSize:9,background:'#f3f4f6',color:'#6b7280',padding:'1px 4px',borderRadius:3}}>Gemini</span>
+                              : null}
+                        </span>
+                        {inc != null && (<>
+                          <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Lifetime Income</span>
+                          <span style={{fontWeight:700,color:'var(--text)'}}>
+                            ${inc.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0})}
+                          </span>
+                          {call.od_patient_production > 0 && (<>
+                            <span style={{color:'#166534',fontWeight:500,whiteSpace:'nowrap'}}>Production</span>
+                            <span style={{color:'var(--text-secondary)',fontSize:11}}>
+                              ${call.od_patient_production.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0})}
+                            </span>
+                          </>)}
+                        </>)}
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
@@ -7361,9 +7444,15 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                            : m.roi > 0 ? '#059669' : m.roi < 0 ? 'var(--red)' : 'var(--text-muted)'
                     }}>{m.roi != null ? Math.round(m.roi)+'%' : '—'}</td>
 
-                    {/* Income — attributed_production from OD */}
-                    <td className="num" style={{color: (m.production||0) > 0 ? '#059669' : 'var(--text-muted)'}}>
-                      {(m.production||0) > 0 ? fmtMoney(m.production) : '—'}
+                    {/* Income — leads attributed_income + call income (new patients) */}
+                    {/* PR 2: tooltip shows Planned production + Paid 365d + Paid LTV breakdown */}
+                    <td className="num" style={{color: (m.income||0) > 0 ? '#059669' : 'var(--text-muted)'}}
+                      title={[
+                        `Planned production:  ${(m.income||0) > 0 ? '$' + Number(m.income).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0'}`,
+                        `Paid (365d):         ${(m.income_365d||0) > 0 ? '$' + Number(m.income_365d).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0 (no OD payment data yet)'}`,
+                        `Paid (LTV):          ${(m.income_ltv||0) > 0 ? '$' + Number(m.income_ltv).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0 (no OD payment data yet)'}`
+                      ].join('\n')}>
+                      {(m.income||0) > 0 ? fmtMoney(m.income) : '—'}
                     </td>
 
                     {/* Actions */}
@@ -16097,12 +16186,99 @@ function PendingApprovalsPanel() {
   );
 }
 
-function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCallProduction, onCallProductionBackfill, onGA4Refresh, onOptimize, onTabSwitch }) {
+// ── UnifiedSyncProgress component ─────────────────────────────────────────────
+// Shows all 7 steps as a vertical list with status icons.
+// Polls /api/admin/sync-od-all/progress every 1500ms while running=true.
+// Stops polling when running=false (called from AdminTab via onDone callback).
+function UnifiedSyncProgress({ progress }) {
+  const STEP_NAMES = [
+    'Firestore Sync',
+    'Google Ads Resolver',
+    'OpenDental Patient Match',
+    'OpenDental Payments',
+    'Call → Keyword',
+    'Call Production Log',
+    'Conversion Upload',
+  ];
+
+  const stepResults = (progress && progress.step_results) || [];
+  const totalSteps = (progress && progress.total_steps) || 7;
+  const pct = (progress && progress.pct) || 0;
+  const currentIdx = (progress && progress.step_index) || 0;
+  const running = progress && progress.running;
+
+  // Build a map of step label → result for completed steps
+  const resultByLabel = {};
+  stepResults.forEach(r => { resultByLabel[r.step] = r; });
+
+  function stepIcon(name, idx) {
+    const r = resultByLabel[name];
+    if (r) {
+      if (r.status === 'ok') return <span style={{color:'#10b981',marginRight:6}}>&#10003;</span>;
+      if (r.status === 'error') return <span style={{color:'#ef4444',marginRight:6}} title={r.error || ''}>&#10007;</span>;
+    }
+    if (running && idx === currentIdx) return <span style={{color:'#0d9488',marginRight:6}}>&#x21BB;</span>;
+    return <span style={{color:'#9ca3af',marginRight:6}}>&#9711;</span>;
+  }
+
+  return (
+    <div style={{marginTop:16}}>
+      {/* Progress bar */}
+      <div style={{background:'var(--border)',borderRadius:4,height:6,marginBottom:12,overflow:'hidden'}}>
+        <div style={{background:'#0d9488',height:'100%',width:pct+'%',transition:'width 0.4s ease'}} />
+      </div>
+      {/* Current step label */}
+      {running && progress.step_label && (
+        <div style={{fontSize:12,color:'var(--text-muted)',marginBottom:10}}>
+          {progress.step_label}: <em>{progress.step_detail}</em>
+          {progress.elapsed_sec > 0 && <span style={{marginLeft:8}}>{progress.elapsed_sec}s</span>}
+        </div>
+      )}
+      {/* Step list */}
+      <div style={{display:'flex',flexDirection:'column',gap:6}}>
+        {STEP_NAMES.map((name, idx) => {
+          const r = resultByLabel[name];
+          return (
+            <div key={name} style={{display:'flex',alignItems:'flex-start',fontSize:12}}>
+              {stepIcon(name, idx)}
+              <div>
+                <span style={{fontWeight: r ? 500 : 400}}>{name}</span>
+                {r && r.summary && r.summary !== 'completed' && (
+                  <span style={{color:'var(--text-muted)',marginLeft:6}}>{r.summary}</span>
+                )}
+                {r && r.status === 'error' && (
+                  <span style={{color:'#ef4444',marginLeft:6,fontSize:11}} title={r.error || ''}>(failed — hover for detail)</span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {/* Done line */}
+      {!running && pct === 100 && (
+        <div style={{marginTop:10,fontSize:12,color:'#10b981',fontWeight:500}}>
+          Done &mdash; {stepResults.filter(s=>s.status==='ok').length}/{totalSteps} steps ok
+          {progress.elapsed_sec > 0 && <span style={{color:'var(--text-muted)',fontWeight:400,marginLeft:6}}>({progress.elapsed_sec}s)</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCallProduction, onCallProductionBackfill, onGA4Refresh, onOptimize, onSyncPayments, onBackfillPayments, onTabSwitch }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
 
+  // Unified sync state
+  const [unifiedSyncRunning, setUnifiedSyncRunning] = useState(false);
+  const [unifiedSyncProgress, setUnifiedSyncProgress] = useState(null);
+  const [lastSyncDisplay, setLastSyncDisplay] = useState(null);
+
   // Scroll page to top on mount so we always start at Admin Actions
-  useEffect(() => { window.scrollTo(0, 0); }, []);
+  useEffect(() => {
+    window.scrollTo(0, 0);
+    loadLastSync();   // show last-run line on mount even without clicking the button
+  }, []);
 
   async function handleAction(key, fn) {
     setLoading(prev=>({...prev, [key]:true}));
@@ -16111,49 +16287,138 @@ function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCa
     setLoading(prev=>({...prev, [key]:false}));
   }
 
+  // ── Unified sync helpers ──────────────────────────────────────────────────
+  async function startUnifiedSync() {
+    try {
+      setUnifiedSyncRunning(true);
+      setUnifiedSyncProgress(null);
+      await api('/api/admin/sync-od-all', { method: 'POST' });
+      pollUnifiedSync();
+    } catch (e) {
+      alert('Failed to start sync: ' + e.message);
+      setUnifiedSyncRunning(false);
+    }
+  }
+
+  async function pollUnifiedSync() {
+    try {
+      const p = await api('/api/admin/sync-od-all/progress');
+      setUnifiedSyncProgress(p);
+      if (p.running) {
+        setTimeout(pollUnifiedSync, 1500);
+      } else {
+        setUnifiedSyncRunning(false);
+        loadLastSync();   // refresh the "Last synced" line once complete
+      }
+    } catch (e) {
+      setUnifiedSyncRunning(false);
+    }
+  }
+
+  async function loadLastSync() {
+    try {
+      const r = await api('/api/admin/sync-od-all/last-run');
+      if (!r.never_run && r.started_at) {
+        const okCount = (r.step_results || []).filter(s => s.status === 'ok').length;
+        const total = r.total_steps || 7;
+        const startedMs = typeof r.started_at === 'number'
+          ? r.started_at * 1000
+          : new Date(r.started_at).getTime();
+        const elapsed = r.elapsed_sec ? ` (${r.elapsed_sec}s)` : '';
+        setLastSyncDisplay({
+          relative: timeAgo(new Date(startedMs).toISOString()) + ' ago',
+          summary:  `${okCount}/${total} ok${elapsed}`,
+        });
+      }
+    } catch (_) {}
+  }
+
   return (
     <div>
-      <div className="report-section">
-        <div className="report-title">Admin Actions</div>
-        <div className="admin-actions">
-          <button className="btn btn-teal" onClick={()=>handleAction('sync', onSync)} disabled={loading.sync}>
-            {loading.sync?'Syncing...':'Sync Firestore'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('match', onMatch)} disabled={loading.match}>
-            {loading.match?'Matching...':'Match OpenDental'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('gads', onGAds)} disabled={loading.gads || loading.gadsbackfill}>
-            {loading.gads?'Syncing...':'Google Ads Sync'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>{
-            if (!confirm('Backfill 90 days of GAds clicks, then re-run keyword attribution + call production? This may take 1–2 minutes.')) return;
-            handleAction('gadsbackfill', onGAdsBackfill);
-          }} disabled={loading.gadsbackfill || loading.gads}
-            style={{background:'#0e7490'}}>
-            {loading.gadsbackfill?'Backfilling...':'🔄 Backfill Clicks (90d)'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('ga4', onGA4Refresh)} disabled={loading.ga4}>
-            {loading.ga4?'Pulling...':'Refresh GA4 Data'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('conversions', onConversions)} disabled={loading.conversions}>
-            {loading.conversions?'Uploading...':'Upload Conversions'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>handleAction('callprod', onCallProduction)} disabled={loading.callprod || loading.callprodbackfill}>
-            {loading.callprod?'Syncing...':'Sync Call Production'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>{
-            if (!confirm('Run 60-day call production backfill? This may take a moment.')) return;
-            handleAction('callprodbackfill', onCallProductionBackfill);
-          }} disabled={loading.callprodbackfill || loading.callprod}
-            style={{background:'#b45309'}}>
-            {loading.callprodbackfill?'Backfilling...':'📞 Backfill Calls (60d)'}
-          </button>
-          <button className="btn btn-teal" onClick={()=>onTabSwitch && onTabSwitch('ai_optimizer')}
-            style={{background:'#7c3aed'}}>
-            🤖 AI Optimizer →
-          </button>
-        </div>
+      {/* ── Primary Sync Card ─────────────────────────────────────────────── */}
+      <div style={{marginBottom:24, padding:16, background:'var(--bg-card)', borderRadius:8, border:'1px solid var(--border)'}}>
+        <h3 style={{marginTop:0,marginBottom:6}}>Sync OpenDental</h3>
+        <p style={{color:'var(--text-muted)', fontSize:13, marginBottom:12}}>
+          Pulls new leads, resolves Google Ads attribution, matches patients,
+          pulls payments, and uploads conversions. Runs nightly at 10 PM ET.
+        </p>
+        <button
+          className="btn btn-teal"
+          style={{fontSize:16, padding:'10px 20px'}}
+          onClick={startUnifiedSync}
+          disabled={unifiedSyncRunning}
+        >
+          {unifiedSyncRunning ? '⟳ Syncing…' : '🔄 Sync OpenDental Now'}
+        </button>
+        {(unifiedSyncRunning || (unifiedSyncProgress && unifiedSyncProgress.pct === 100)) && (
+          <UnifiedSyncProgress progress={unifiedSyncProgress} />
+        )}
+        {lastSyncDisplay && !unifiedSyncRunning && (
+          <div style={{marginTop:12, fontSize:13, color:'var(--text-muted)'}}>
+            Last synced: {lastSyncDisplay.relative} &middot; {lastSyncDisplay.summary}
+          </div>
+        )}
       </div>
+
+      {/* ── Advanced (collapsed by default) ──────────────────────────────── */}
+      <details style={{marginBottom:24}}>
+        <summary style={{cursor:'pointer', color:'var(--text-muted)', fontSize:13, userSelect:'none'}}>
+          Advanced &mdash; run individual sync steps
+        </summary>
+        <div style={{marginTop:12}}>
+          <div className="report-section">
+            <div className="report-title">Individual Sync Steps</div>
+            <div className="admin-actions">
+              <button className="btn btn-teal" onClick={()=>handleAction('sync', onSync)} disabled={loading.sync}>
+                {loading.sync?'Syncing...':'Sync Firestore'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>handleAction('match', onMatch)} disabled={loading.match}>
+                {loading.match?'Matching...':'Match OpenDental'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>handleAction('gads', onGAds)} disabled={loading.gads || loading.gadsbackfill}>
+                {loading.gads?'Syncing...':'Google Ads Sync'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>{
+                if (!confirm('Backfill 90 days of GAds clicks, then re-run keyword attribution + call production? This may take 1–2 minutes.')) return;
+                handleAction('gadsbackfill', onGAdsBackfill);
+              }} disabled={loading.gadsbackfill || loading.gads}
+                style={{background:'#0e7490'}}>
+                {loading.gadsbackfill?'Backfilling...':'🔄 Backfill Clicks (90d)'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>handleAction('ga4', onGA4Refresh)} disabled={loading.ga4}>
+                {loading.ga4?'Pulling...':'Refresh GA4 Data'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>handleAction('conversions', onConversions)} disabled={loading.conversions}>
+                {loading.conversions?'Uploading...':'Upload Conversions'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>handleAction('callprod', onCallProduction)} disabled={loading.callprod || loading.callprodbackfill}>
+                {loading.callprod?'Syncing...':'Sync Call Production'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>{
+                if (!confirm('Run 60-day call production backfill? This may take a moment.')) return;
+                handleAction('callprodbackfill', onCallProductionBackfill);
+              }} disabled={loading.callprodbackfill || loading.callprod}
+                style={{background:'#b45309'}}>
+                {loading.callprodbackfill?'Backfilling...':'📞 Backfill Calls (60d)'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>handleAction('payments', onSyncPayments)} disabled={loading.payments || loading.paymentsbackfill}>
+                {loading.payments?'Syncing...':'Sync OD Payments'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>{
+                if (!confirm('Backfill ALL attributed patients payment history from OD? This rebuilds paid_amount_365d and paid_amount_ltv from scratch. Use once after deploying PR 2.')) return;
+                handleAction('paymentsbackfill', onBackfillPayments);
+              }} disabled={loading.paymentsbackfill || loading.payments}
+                style={{background:'#065f46'}}>
+                {loading.paymentsbackfill?'Backfilling...':'💰 Backfill All Payments'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>onTabSwitch && onTabSwitch('ai_optimizer')}
+                style={{background:'#7c3aed'}}>
+                🤖 AI Optimizer &rarr;
+              </button>
+            </div>
+          </div>
+        </div>
+      </details>
 
       <PracticeSettingsCard />
 
@@ -18149,6 +18414,8 @@ function App() {
                 }}
                 onGA4Refresh={() => api('/api/admin/ga4/refresh', { method: 'POST' })}
                 onOptimize={() => api('/api/admin/optimize', { method: 'POST' })}
+                onSyncPayments={() => api('/api/admin/sync-payments?days=7', { method: 'POST' })}
+                onBackfillPayments={() => api('/api/admin/sync-payments?full=true', { method: 'POST' })}
                 onTabSwitch={setTab} />
             )}
           </React.Fragment>

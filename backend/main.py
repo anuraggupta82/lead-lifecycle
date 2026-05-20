@@ -351,6 +351,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Keyword intelligence rebuild failed: {e}")
 
+    # 10:15 PM — OD Payment Sync (runs after OD match at 10PM, before call production at 10:30PM)
+    def _od_payment_sync_job():
+        _stamp("od_payment_sync")
+        try:
+            from od_payment_sync import sync_od_payments
+            result = sync_od_payments(days_back=7)
+            logger.info(f"Scheduled OD payment sync: {result}")
+        except Exception as e:
+            logger.error(f"Scheduled OD payment sync failed: {e}")
+
     # 10:30 PM — Link phone-call patients to keyword production log (runs after OD sync at 10PM)
     def _call_production_job():
         _stamp("call_production")
@@ -379,18 +389,47 @@ async def lifespan(app: FastAPI):
                           max_instances=1, coalesce=True, replace_existing=True)
     ads_scheduler.add_job(_ga4_pull_job, CronTrigger(hour=5, minute=30),
                           id="ga4_pull", name="GA4 Analytics Data Pull", replace_existing=True)
-    ads_scheduler.add_job(_gads_sync_job, CronTrigger(hour=6, minute=0),
-                          id="gads_sync", name="Google Ads GCLID Sync", replace_existing=True)
+    # 6 AM — GAds morning refresh: keeps keyword cache fresh for the 7 AM AI optimizer.
+    # Note: the full gclid→keyword attribution for income purposes runs again at 22:00
+    # as step 2 of the unified_od_sync chain, so no attribution work is lost.
+    def _gads_morning_refresh_job():
+        _stamp("gads_morning_refresh")
+        try:
+            from google_ads_sync import sync_gclids_to_keywords
+            result = sync_gclids_to_keywords(days_back=7)
+            logger.info(f"GAds morning refresh: {result}")
+        except Exception as e:
+            logger.error(f"GAds morning refresh failed: {e}")
+
+    ads_scheduler.add_job(_gads_morning_refresh_job, CronTrigger(hour=6, minute=0),
+                          id="gads_morning_refresh", name="Google Ads Morning Keyword Refresh",
+                          replace_existing=True)
     ads_scheduler.add_job(_keyword_intelligence_job, CronTrigger(hour=6, minute=30),
                           id="keyword_intelligence", name="Keyword Intelligence Rebuild", replace_existing=True)
     ads_scheduler.add_job(_optimizer_job, CronTrigger(hour=7, minute=0),
                           id="ai_optimizer", name="AI Campaign Optimizer", replace_existing=True)
-    ads_scheduler.add_job(_od_sync_job, CronTrigger(hour=22, minute=0),
-                          id="od_sync", name="OpenDental Patient Match + Treatment Stages", replace_existing=True)
-    ads_scheduler.add_job(_call_production_job, CronTrigger(hour=22, minute=30),
-                          id="call_production", name="Call→Keyword Production Attribution", replace_existing=True)
-    ads_scheduler.add_job(_conversion_upload_job, CronTrigger(hour=23, minute=0),
-                          id="conversion_upload", name="Google Ads Conversion Upload", replace_existing=True)
+
+    # 10 PM — Unified OD sync: replaces the former 5 individual evening jobs
+    # (_gads_sync at 06:00, _od_sync at 22:00, _od_payment_sync at 22:15,
+    # _call_production at 22:30, _conversion_upload at 23:00).
+    # The individual job functions (_gads_sync_job, _od_sync_job, _od_payment_sync_job,
+    # _call_production_job, _conversion_upload_job) are KEPT — they are still called
+    # by the individual Admin endpoints in the Advanced disclosure.
+    def _unified_od_sync_job():
+        _stamp("unified_od_sync")
+        try:
+            from unified_od_sync import run_unified_od_sync
+            result = run_unified_od_sync(trigger="scheduled")
+            logger.info(
+                f"Scheduled unified OD sync: pct={result.get('pct')}, "
+                f"steps={len(result.get('step_results', []))}"
+            )
+        except Exception as e:
+            logger.error(f"Scheduled unified OD sync failed: {e}", exc_info=True)
+
+    ads_scheduler.add_job(_unified_od_sync_job, CronTrigger(hour=22, minute=0),
+                          id="unified_od_sync", name="Unified OD Sync (chain)",
+                          max_instances=1, coalesce=True, replace_existing=True)
 
     # Domain crawler — runs on the 1st of every month at 2 AM.
     # Incremental: only re-crawls pages whose HTML has changed (hash diff).
@@ -950,6 +989,22 @@ def admin_sync_call_production(days: int = 7):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/sync-payments", dependencies=[Depends(_require_admin)])
+def admin_sync_payments(days: int = 7, full: bool = False):
+    """
+    On-demand: pull OD payments for all attributed patients.
+    days=N to re-sync patients last touched > N days ago.
+    full=true to rebuild from scratch (use after deploying PR 2).
+    """
+    try:
+        from od_payment_sync import sync_od_payments
+        result = sync_od_payments(days_back=days, full_resync=full)
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"OD payment sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/backfill-booked-outcome", dependencies=[Depends(_require_admin)])
 def admin_backfill_booked_outcome():
     """
@@ -964,6 +1019,60 @@ def admin_backfill_booked_outcome():
     except Exception as e:
         logger.error(f"booked_outcome backfill failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/sync-od-all", dependencies=[Depends(_require_admin)])
+def admin_sync_od_all():
+    """
+    Kicks off the unified 7-step OD sync chain in a background thread.
+    Returns immediately — poll progress via GET /api/admin/sync-od-all/progress.
+    Double-click safe: returns {"status": "already_running"} if chain is active.
+    """
+    import threading
+    from unified_od_sync import run_unified_od_sync, get_unified_sync_progress
+    progress = get_unified_sync_progress()
+    if progress.get("running"):
+        return {"status": "already_running", "progress": progress}
+
+    def _run():
+        try:
+            run_unified_od_sync(trigger="manual")
+        except Exception as e:
+            logger.error(f"Unified OD sync failed: {e}", exc_info=True)
+            try:
+                from unified_od_sync import _set_progress_done
+                _set_progress_done(error=str(e))
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/api/admin/sync-od-all/progress", dependencies=[Depends(_require_admin)])
+def admin_sync_od_all_progress():
+    """Return current unified sync progress state (dict). Polled by the frontend every 1.5s."""
+    from unified_od_sync import get_unified_sync_progress
+    return get_unified_sync_progress()
+
+
+@app.get("/api/admin/sync-od-all/last-run", dependencies=[Depends(_require_admin)])
+def admin_sync_od_all_last_run():
+    """
+    Return the last completed run's progress dict (persisted in sqlite settings row).
+    Used by the UI to show "Last synced: 14 minutes ago · 7/7 ok" on page load
+    even if the user wasn't watching the sync run.
+    Returns {"never_run": True} if the key is missing or the JSON is corrupted.
+    """
+    import json
+    raw = get_setting("unified_od_sync_last_run")
+    if not raw:
+        return {"never_run": True}
+    try:
+        return json.loads(raw)
+    except Exception:
+        # JSON corruption resilience — never raise, always return safe fallback
+        return {"never_run": True}
 
 
 @app.post("/api/admin/optimize", dependencies=[Depends(_require_admin)])
@@ -9069,6 +9178,98 @@ def admin_match_single_call_to_od(uuid: str):
             # Not an error — just no match found (patient not in OD or no appt in window)
             return {"matched": 0, "message": "No matching OD appointment found", **result}
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/backfill-income", dependencies=[Depends(_require_admin)])
+def admin_backfill_call_income():
+    """
+    For all mango_calls that have od_patient_num set (new_patient status only)
+    but od_patient_income IS NULL, fetch income from OD paysplit and store it.
+    Use this to backfill income on calls matched before PR5 shipped.
+    Requires office LAN access to OpenDental MySQL.
+    """
+    try:
+        from od_matcher import _get_db, _get_patient_income, _get_patient_production
+        from database import update_mango_call_od_income, _conn
+
+        od_conn = _get_db()
+        if not od_conn:
+            raise HTTPException(status_code=503, detail="OpenDental unavailable (office network required)")
+
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT uuid, od_patient_num FROM mango_calls
+                   WHERE od_patient_num IS NOT NULL AND od_patient_num != ''
+                     AND od_patient_status = 'new_patient'
+                     AND od_patient_income IS NULL"""
+            ).fetchall()
+
+        updated = errors = 0
+        for row in rows:
+            try:
+                income = _get_patient_income(od_conn, row["od_patient_num"])
+                prod   = _get_patient_production(od_conn, row["od_patient_num"])
+                update_mango_call_od_income(row["uuid"], income, prod.get("total", 0.0))
+                updated += 1
+            except Exception as e:
+                logger.warning(f"[backfill_income] uuid={row['uuid']} PatNum={row['od_patient_num']}: {e}")
+                errors += 1
+
+        od_conn.close()
+        return {"backfilled": updated, "errors": errors, "total": len(rows)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/calls/refresh-income", dependencies=[Depends(_require_admin)])
+def admin_refresh_call_income():
+    """
+    Re-fetch OD paysplit income for ALL new_patient calls that already have
+    od_patient_num set — regardless of whether income was previously fetched.
+    Use this when a patient makes a new payment and you want updated totals.
+    De-dupes by PatNum so each OD patient is only queried once.
+    Requires office LAN access to OpenDental MySQL.
+    """
+    try:
+        from od_matcher import _get_db, _get_patient_income, _get_patient_production
+        from database import update_mango_call_od_income, _conn
+
+        od_conn = _get_db()
+        if not od_conn:
+            raise HTTPException(status_code=503, detail="OpenDental unavailable (office network required)")
+
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT uuid, od_patient_num FROM mango_calls
+                   WHERE od_patient_num IS NOT NULL AND od_patient_num != ''
+                     AND od_patient_status = 'new_patient'"""
+            ).fetchall()
+
+        # De-dupe: fetch each PatNum once, then apply to all matching uuids
+        pat_cache: dict = {}
+        updated = errors = 0
+        for row in rows:
+            pat_num = row["od_patient_num"]
+            try:
+                if pat_num not in pat_cache:
+                    income = _get_patient_income(od_conn, pat_num)
+                    prod   = _get_patient_production(od_conn, pat_num)
+                    pat_cache[pat_num] = (income, prod.get("total", 0.0))
+                income, production = pat_cache[pat_num]
+                update_mango_call_od_income(row["uuid"], income, production)
+                updated += 1
+            except Exception as e:
+                logger.warning(f"[refresh_income] uuid={row['uuid']} PatNum={pat_num}: {e}")
+                errors += 1
+
+        od_conn.close()
+        return {"refreshed": updated, "errors": errors, "total": len(rows), "unique_patients": len(pat_cache)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

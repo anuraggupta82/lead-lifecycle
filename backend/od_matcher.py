@@ -1168,7 +1168,12 @@ def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> d
 
     Returns dict with matched/skipped/errors counts.
     """
-    from database import get_booked_calls_needing_od_match, update_mango_call_od_appointment, update_mango_call_analysis
+    from database import (
+        get_booked_calls_needing_od_match,
+        update_mango_call_od_appointment,
+        update_mango_call_analysis,
+        update_mango_call_od_income,
+    )
 
     od_conn = _get_db()
     if not od_conn:
@@ -1269,12 +1274,39 @@ def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> d
                 # already have od_patient_num set from the patient enrichment step)
                 _now_iso = datetime.now(timezone.utc).isoformat()
                 update_mango_call_od_appointment(call["uuid"], apt_num)
-                _extra = {"od_match_attempted_at": _now_iso, "od_appointment_type": od_appt_type}
+                _extra = {
+                    "od_match_attempted_at": _now_iso,
+                    "od_appointment_type": od_appt_type,
+                    "od_match_method": match_method,  # PR8: store how OD patient was matched
+                }
                 existing_od_pat = call.get("od_patient_num") or ""
                 if not existing_od_pat and pat_num and match_method.startswith("ai_name"):
                     _extra["od_patient_num"] = pat_num
                     _extra["od_patient_status"] = "new_patient"  # name-matched = new patient inquiry
                 update_mango_call_analysis(call["uuid"], **_extra)
+
+                # PR5: fetch income ONLY for new patients acquired via ads.
+                # existing_active/inactive patients already have revenue in OD —
+                # attributing it to this call would inflate ads acquisition ROI.
+                # new_patient status = phone not in OD at call time (genuine acquisition).
+                # Also covers Gemini name-matched calls (match_method='ai_name(...)') which
+                # are always treated as new_patient acquisitions.
+                _existing_status = call.get("od_patient_status") or ""
+                _is_existing = _existing_status in ("existing_active", "existing_inactive")
+                _needs_income = (call.get("od_patient_income") is None) and not _is_existing
+                if pat_num and _needs_income:
+                    try:
+                        _income = _get_patient_income(od_conn, pat_num)
+                        _prod   = _get_patient_production(od_conn, pat_num)
+                        update_mango_call_od_income(
+                            call["uuid"], _income, _prod.get("total", 0.0)
+                        )
+                    except Exception as _e:
+                        logger.warning(
+                            f"[call_od_match] income fetch failed uuid={call['uuid']} "
+                            f"PatNum={pat_num}: {_e}"
+                        )
+
                 logger.info(
                     f"[call_od_match] uuid={call['uuid']} method={match_method} "
                     f"PatNum={pat_num} → AptNum={apt_num}"
@@ -1465,7 +1497,12 @@ def match_mango_calls_to_od_patients(limit: int = 500) -> dict:
       1. Show New/Existing badge in the call inbox
       2. Gate offline conversion uploads (skip existing patients)
     """
-    from database import get_mango_calls_needing_od_match, update_mango_call_od_status
+    from database import (
+        get_mango_calls_needing_od_match,
+        update_mango_call_od_status,
+        update_mango_call_od_income,
+        update_mango_call_analysis,
+    )
 
     od_conn = _get_db()
     if od_conn is None:
@@ -1515,6 +1552,18 @@ def match_mango_calls_to_od_patients(limit: int = 500) -> dict:
                     pat_name = f"{fn} {ln}".strip()
 
                 update_mango_call_od_status(call["uuid"], pat_num, status, pat_name)
+                # PR8: record match method (phone = phone number lookup)
+                _match_m = "phone" if pat_num else "phone-no-match"
+                update_mango_call_analysis(call["uuid"], od_match_method=_match_m)
+
+                # PR5: income is only meaningful for NEW patients from ads.
+                # Existing patients (existing_active/inactive) already have revenue
+                # in OD — attributing it to this call would inflate ads ROI.
+                # new_patient = no OD record found → pat_num is empty → skip.
+                # So: only fetch income when status is NOT new_patient AND pat_num exists,
+                # which means an existing patient called — but we intentionally skip those too.
+                # Income columns stay NULL for all cases here; appointment matcher handles
+                # the new-patient income path via Gemini name match.
 
                 if status == "new_patient":
                     new_patient += 1
