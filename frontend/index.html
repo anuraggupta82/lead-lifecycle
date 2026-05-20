@@ -6105,6 +6105,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   // Unified campaigns
   const [unifiedCamps, setUnifiedCamps] = useState([]);
   const [unifiedLoading, setUnifiedLoading] = useState(false);
+  // PR 3: income display mode — persisted in localStorage
+  const [incomeMode, setIncomeMode] = useState(
+    localStorage.getItem('gdc_income_mode') || 'paid_365d'
+  );
   const [showInactive, setShowInactive] = useState(false);
   const [campStatusFilter, setCampStatusFilter] = useState('active'); // 'active' | 'paused' | 'all'
   const [syncAllLoading, setSyncAllLoading] = useState(false);
@@ -7075,6 +7079,14 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8,marginBottom:12}}>
           <div style={{display:'flex',alignItems:'center',gap:8}}>
             <div className="report-title" style={{marginBottom:0}}>Campaigns</div>
+            {incomeMode !== 'paid_365d' && (
+              <span style={{
+                marginLeft:8, fontSize:11, padding:'2px 6px',
+                background:'#fef3c7', color:'#92400e', borderRadius:4
+              }}>
+                🕐 {incomeMode === 'paid_ltv' ? 'LTV' : 'Planned'} mode
+              </span>
+            )}
             <button className="btn btn-teal btn-sm" style={{fontSize:11}} onClick={openWizard}>+ New Campaign</button>
             <button className="btn btn-sm" style={{fontSize:10,background:'#4285f4',color:'#fff',border:'none',cursor:'pointer',padding:'3px 10px',borderRadius:4}}
               onClick={openGadsImport}>⬇ Import from Google Ads</button>
@@ -7318,7 +7330,20 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
               <th className="num">Cost</th>
               <th className="num">CPL</th>
               <th className="num">ROI</th>
-              <th className="num" title="Attributed production value from OD (new patients only)">Income</th>
+              <th className="num" title="Attributed income — switch between 365d paid, lifetime paid, or planned production">
+                <span style={{display:'inline-flex',alignItems:'center',gap:6}}>
+                  Income
+                  <select
+                    value={incomeMode}
+                    onChange={e => { setIncomeMode(e.target.value); localStorage.setItem('gdc_income_mode', e.target.value); }}
+                    style={{fontSize:11, padding:'1px 4px', background:'transparent', border:'1px solid var(--border)', borderRadius:3, color:'var(--text)'}}
+                  >
+                    <option value="paid_365d">365d</option>
+                    <option value="paid_ltv">LTV</option>
+                    <option value="planned">Planned</option>
+                  </select>
+                </span>
+              </th>
               <th style={{width:190}}>Actions</th>
             </tr>
           </thead>
@@ -7439,21 +7464,43 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                     })()}
                     <td className="num">{m.cost > 0 ? fmtMoney(m.cost) : '—'}</td>
                     <td className="num">{m.cpl != null ? '$'+Number(m.cpl).toFixed(0) : '—'}</td>
-                    <td className="num" style={{
-                      color: m.roi == null ? 'var(--text-muted)'
-                           : m.roi > 0 ? '#059669' : m.roi < 0 ? 'var(--red)' : 'var(--text-muted)'
-                    }}>{m.roi != null ? Math.round(m.roi)+'%' : '—'}</td>
+                    {/* PR 3: ROI computed client-side from displayedIncome + cost so it tracks incomeMode.
+                        ROI basis mirrors the server fallback in get_unified_campaigns(): when the
+                        selected paid bucket is 0 we fall back to planned income, so brand-new
+                        campaigns with no OD payments yet don't all show -100%. The displayed Income
+                        cell still shows '—' (so the user can see "no paid data") but the ROI tracks
+                        the same number the optimizer is using. */}
+                    {(() => {
+                      const displayedIncome =
+                        incomeMode === 'paid_365d' ? (m.income_365d || 0) :
+                        incomeMode === 'paid_ltv'  ? (m.income_ltv  || 0) :
+                                                     (m.income      || 0);  // planned
+                      const roiBasis = displayedIncome > 0 ? displayedIncome : (m.income || 0);
+                      const displayedRoi =
+                        (m.cost || 0) > 0
+                          ? Math.round(((roiBasis - m.cost) / m.cost) * 100)
+                          : null;
+                      return (
+                        <>
+                          <td className="num" style={{
+                            color: displayedRoi == null ? 'var(--text-muted)'
+                                 : displayedRoi > 0 ? '#059669' : displayedRoi < 0 ? 'var(--red)' : 'var(--text-muted)'
+                          }}>{displayedRoi != null ? displayedRoi+'%' : '—'}</td>
 
-                    {/* Income — leads attributed_income + call income (new patients) */}
-                    {/* PR 2: tooltip shows Planned production + Paid 365d + Paid LTV breakdown */}
-                    <td className="num" style={{color: (m.income||0) > 0 ? '#059669' : 'var(--text-muted)'}}
-                      title={[
-                        `Planned production:  ${(m.income||0) > 0 ? '$' + Number(m.income).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0'}`,
-                        `Paid (365d):         ${(m.income_365d||0) > 0 ? '$' + Number(m.income_365d).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0 (no OD payment data yet)'}`,
-                        `Paid (LTV):          ${(m.income_ltv||0) > 0 ? '$' + Number(m.income_ltv).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0 (no OD payment data yet)'}`
-                      ].join('\n')}>
-                      {(m.income||0) > 0 ? fmtMoney(m.income) : '—'}
-                    </td>
+                          {/* Income — leads attributed_income + call income (new patients) */}
+                          {/* PR 2: tooltip shows Planned production + Paid 365d + Paid LTV breakdown */}
+                          {/* PR 3: displayed value follows incomeMode dropdown; tooltip always shows all three */}
+                          <td className="num" style={{color: displayedIncome > 0 ? '#059669' : 'var(--text-muted)'}}
+                            title={[
+                              `Planned production:  ${(m.income||0) > 0 ? '$' + Number(m.income).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0'}`,
+                              `Paid (365d):         ${(m.income_365d||0) > 0 ? '$' + Number(m.income_365d).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0 (no OD payment data yet)'}`,
+                              `Paid (LTV):          ${(m.income_ltv||0) > 0 ? '$' + Number(m.income_ltv).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) : '$0 (no OD payment data yet)'}`
+                            ].join('\n')}>
+                            {displayedIncome > 0 ? fmtMoney(displayedIncome) : '—'}
+                          </td>
+                        </>
+                      );
+                    })()}
 
                     {/* Actions */}
                     <td style={{textAlign:'right'}}>
@@ -15552,6 +15599,75 @@ function AISpendCard() {
   );
 }
 
+// ── Google Ads Attribution Settings Card ─────────────────────────────────────
+// PR 3: Exposes gads_attribution_window_days in Admin → Settings.
+// Changing the window is informational only this PR — recomputing paid_amount_365d
+// for a non-365 window requires running "Backfill All Payments" afterward.
+function GadsAttributionSettingsCard() {
+  const [windowDays, setWindowDays] = React.useState(365);
+  const [loaded, setLoaded] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [msg, setMsg] = React.useState('');
+
+  React.useEffect(() => {
+    api('/api/admin/gads-attribution-settings').then(d => {
+      setWindowDays(d.gads_attribution_window_days || 365);
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  async function handleSave(e) {
+    e.preventDefault();
+    setSaving(true); setMsg('');
+    try {
+      await api('/api/admin/gads-attribution-settings', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ gads_attribution_window_days: windowDays }),
+      });
+      setMsg('Saved ✓');
+      setTimeout(() => setMsg(''), 3000);
+    } catch(err) { setMsg('Error: ' + err.message); }
+    setSaving(false);
+  }
+
+  if (!loaded) return null;
+
+  return (
+    <div className="report-section" style={{marginBottom:12}}>
+      <div className="report-title" style={{marginBottom:12}}>📅 Google Ads Attribution Window</div>
+      <form onSubmit={handleSave}>
+        <div style={{marginBottom:10}}>
+          <label style={{fontSize:11,color:'var(--text-muted)',display:'block',marginBottom:4}}>
+            Attribution window (days after click that counts toward campaign ROI)
+          </label>
+          <select
+            value={windowDays}
+            onChange={e => setWindowDays(parseInt(e.target.value))}
+            style={{padding:'4px 8px',fontSize:11,border:'1px solid var(--border)',borderRadius:4}}
+          >
+            <option value={90}>90 days</option>
+            <option value={180}>180 days</option>
+            <option value={365}>365 days (default)</option>
+            <option value={730}>730 days</option>
+          </select>
+        </div>
+        <p style={{fontSize:11,color:'var(--text-muted)',marginBottom:10,marginTop:0}}>
+          How long after a Google Ads click counts toward that campaign&apos;s ROI.
+          Default: 365 days. Changing this requires running &ldquo;Backfill All Payments&rdquo;
+          afterward to recompute paid_amount_365d for all patients.
+          <strong> Note: changing this value does NOT automatically recompute existing rows.</strong>
+        </p>
+        <button type="submit" className="btn btn-teal btn-sm" disabled={saving}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        {msg && <span style={{marginLeft:8,fontSize:11,color:'#059669'}}>{msg}</span>}
+      </form>
+    </div>
+  );
+}
+
+
 function ODConnectionCard() {
   const [form, setForm] = React.useState({
     od_db_host: '', od_db_port: 3306, od_db_user: '', od_db_password: '',
@@ -16427,6 +16543,8 @@ function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCa
       <MangoSettingsCard />
 
       <AISpendCard />
+
+      <GadsAttributionSettingsCard />
 
       <ODConnectionCard />
 

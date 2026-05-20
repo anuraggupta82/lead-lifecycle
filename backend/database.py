@@ -3734,7 +3734,10 @@ def get_unified_campaigns(days: int = 30) -> list:
             income_365d = (lm.get("paid_income_365d") or 0.0) + (cp2.get("call_paid_365d") or 0.0)
             income_ltv  = (lm.get("paid_income_ltv") or 0.0) + (cp2.get("call_paid_ltv") or 0.0)
             cpl = round(cost / leads, 2) if leads > 0 else None
-            roi = round((income - cost) / cost * 100, 1) if cost > 0 else None
+            # PR 3: ROI now keys off paid 365d (actual collected dollars), not planned production.
+            # Fall back to income (planned) only when no payment data exists yet for the campaign.
+            roi_basis = income_365d if income_365d > 0 else income
+            roi = round((roi_basis - cost) / cost * 100, 1) if cost > 0 else None
 
             # UNMANAGED rows are orphaned imports — treat as unlinked so the UI shows 🗑 not ⏹ Stop
             is_gads_linked = bool(
@@ -3791,7 +3794,10 @@ def get_unified_campaigns(days: int = 30) -> list:
             income_365d = (lm.get("paid_income_365d") or 0.0) + (cp2.get("call_paid_365d") or 0.0)
             income_ltv  = (lm.get("paid_income_ltv") or 0.0) + (cp2.get("call_paid_ltv") or 0.0)
             cpl = round(cost / leads, 2) if leads > 0 else None
-            roi = round((income - cost) / cost * 100, 1) if cost > 0 else None
+            # PR 3: ROI now keys off paid 365d (actual collected dollars), not planned production.
+            # Fall back to income (planned) only when no payment data exists yet for the campaign.
+            roi_basis = income_365d if income_365d > 0 else income
+            roi = round((roi_basis - cost) / cost * 100, 1) if cost > 0 else None
             last = last_activity_by_key.get(k)
             is_inactive_90d = (last is None) or (last < cutoff_90d)
 

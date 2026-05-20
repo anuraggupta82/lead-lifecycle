@@ -1568,6 +1568,7 @@ def _get_keyword_attribution() -> dict:
         if stage in ("treatment_accepted", "treatment_completed"):
             attribution[keyword]["treated"] += 1
 
+        # TODO PR 3+: switch to leads.paid_amount_365d once per-keyword rollup exists
         attribution[keyword]["production"] += float(lead.get("attributed_production", 0))
 
     return attribution
@@ -1774,7 +1775,7 @@ def _get_od_production_summary(days: int = 30) -> dict:
         with _conn() as conn:
             rows = conn.execute("""
                 SELECT COALESCE(NULLIF(campaign_name,''),'(unknown)') AS campaign_name,
-                       SUM(COALESCE(attributed_production,0))         AS prod
+                       SUM(COALESCE(attributed_production,0))         AS prod  -- TODO PR 3+: switch to leads.paid_amount_365d once per-keyword rollup exists
                   FROM leads
                  WHERE created_at >= ?
                  GROUP BY campaign_name
@@ -7573,7 +7574,14 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 "cost_30d_usd":     round(cost, 2),
                 "conversions_30d":  round(conv, 2),
                 "lead_count_30d":   int(ag.get("lead_count") or 0),
-                "revenue_30d":      float(ag.get("revenue") or 0),
+                # PR 3: optimizer reads paid 365d income, not planned production.
+                # Falls back to revenue (planned) when no payment data yet for the ad group.
+                # Note: get_ad_group_stats() does not yet JOIN paid_amount_365d from leads —
+                # so ag.get("paid_income_365d") will always be None today, making this
+                # effectively identical to the old behaviour. A future PR should add
+                # SUM(l.paid_amount_365d) to the get_ad_group_stats() SQL so the fallback
+                # chain becomes meaningful. Left as-is per spec (cheapest safe path).
+                "revenue_30d":      float(ag.get("paid_income_365d") or ag.get("revenue") or 0),
                 "ctr":              round((clicks / impr) if impr > 0 else 0, 4),
                 "avg_campaign_ctr": round(avg_ctr, 4),
                 "cpl":              float(ag.get("cpl") or 0),

@@ -12493,6 +12493,32 @@ def admin_save_practice_settings(body: PracticeSettingsRequest):
     return {"ok": True}
 
 
+# ─── Google Ads Attribution Window Settings (PR 3) ───────────────────────────
+
+class GadsAttributionSettingsRequest(BaseModel):
+    gads_attribution_window_days: int = 365
+
+
+@app.get("/api/admin/gads-attribution-settings", dependencies=[Depends(_require_admin)])
+def admin_get_gads_attribution_settings():
+    from config import get_settings as _get_cfg
+    default_window = _get_cfg().gads_attribution_window_days
+    raw = get_setting("gads_attribution_window_days")
+    window = int(raw) if raw and raw.isdigit() else default_window
+    return {"gads_attribution_window_days": window}
+
+
+@app.post("/api/admin/gads-attribution-settings", dependencies=[Depends(_require_admin)])
+def admin_save_gads_attribution_settings(body: GadsAttributionSettingsRequest):
+    valid_windows = {90, 180, 365, 730}
+    window = body.gads_attribution_window_days
+    if window not in valid_windows:
+        raise HTTPException(status_code=422, detail=f"gads_attribution_window_days must be one of {sorted(valid_windows)}")
+    save_setting("gads_attribution_window_days", str(window))
+    logger.info(f"gads_attribution_window_days updated to {window}")
+    return {"ok": True, "gads_attribution_window_days": window}
+
+
 # ─── Account Monthly Budget ──────────────────────────────────────────────────
 
 class AccountBudgetRequest(BaseModel):
