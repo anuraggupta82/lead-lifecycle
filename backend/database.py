@@ -2595,6 +2595,13 @@ GROUP BY a.campaign_id, c.campaign_name;
         if _col not in _kpl_pr2_cols:
             conn.execute(f"ALTER TABLE keyword_production_log ADD COLUMN {_col} {_def}")
 
+    # PR 4: confidence_tier column on keyword_production_log.
+    # Values: 'high' (>=0.55), 'low' (0.30-0.54), 'booked_override' (od_appointment_id set, any confidence).
+    # NULL / missing means pre-migration row — treated as 'high' (written under old 0.55 floor).
+    _kpl_pr4_cols = {row[1] for row in conn.execute("PRAGMA table_info(keyword_production_log)").fetchall()}
+    if "confidence_tier" not in _kpl_pr4_cols:
+        conn.execute("ALTER TABLE keyword_production_log ADD COLUMN confidence_tier TEXT DEFAULT NULL")
+
 
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
@@ -3674,9 +3681,15 @@ def get_unified_campaigns(days: int = 30) -> list:
         """).fetchall()
         call_income_by_key = {r["k"]: dict(r) for r in call_income_rows}
 
-        # ── PR 2: Call paid 365d / LTV per campaign from keyword_production_log ─
+        # ── PR 2 + PR 4: Call paid 365d / LTV per campaign from keyword_production_log ─
         # Sum paid_amount_365d / paid_amount_ltv from KPL call:: rows, grouped by
         # campaign_name. Complements the lead-path paid amounts in leads_by_key.
+        # PR 4: extend filter to include 'low' and 'booked_override' tiers so that
+        # calls with od_appointment_id set (booked_override) and low-confidence calls
+        # (0.30-0.54) contribute to income_365d / income_ltv on the campaign rollup.
+        # NULL confidence_tier means a pre-migration row written under the old 0.55 floor
+        # — treat as 'high' (equivalent) so existing data is not hidden.
+        # Optimizer-bound queries use confidence_tier='high' only (unchanged by PR 4).
         call_paid_rows = conn.execute("""
             SELECT
                 LOWER(TRIM(campaign_name))            AS k,
@@ -3685,6 +3698,10 @@ def get_unified_campaigns(days: int = 30) -> list:
             FROM keyword_production_log
             WHERE lead_id LIKE 'call::%'
               AND campaign_name != ''
+              AND (
+                confidence_tier IN ('high', 'low', 'booked_override')
+                OR confidence_tier IS NULL
+              )
             GROUP BY LOWER(TRIM(campaign_name))
         """).fetchall()
         call_paid_by_key = {r["k"]: dict(r) for r in call_paid_rows}

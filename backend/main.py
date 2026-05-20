@@ -1005,6 +1005,22 @@ def admin_sync_payments(days: int = 7, full: bool = False):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/refresh-call-income", dependencies=[Depends(_require_admin)])
+def admin_refresh_call_income(days: int = 90):
+    """
+    PR 4: Re-query OpenDental for the current paid total for all new-patient calls
+    matched in the last `days` days. Updates mango_calls.od_patient_income and any
+    linked keyword_production_log rows. Safe to run multiple times (idempotent).
+    """
+    try:
+        from od_payment_sync import refresh_call_od_income
+        result = refresh_call_od_income(days=days)
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"Refresh call income failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/backfill-booked-outcome", dependencies=[Depends(_require_admin)])
 def admin_backfill_booked_outcome():
     """

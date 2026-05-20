@@ -1,5 +1,5 @@
 """
-unified_od_sync.py — Canonical 7-step Google Ads income attribution chain.
+unified_od_sync.py — Canonical 8-step Google Ads income attribution chain.
 
 Runs all steps in order, wrapping each in try/except so a single failure
 never blocks downstream steps. Progress is written to a module-level dict
@@ -9,10 +9,12 @@ Canonical step order (non-negotiable — wrong order = wrong attribution):
   1. Firestore Sync         — new leads must exist before anything attributes them
   2. Google Ads gclid→kw    — stamps campaign/ad_group/keyword before OD match
   3. OD Patient Match       — sets od_patient_num before payment pull
-  4. OD Payments            — paid amounts before call production dedup
-  5. Call → Keyword         — needs gads_clicks table (step 2) and OD match (step 3)
-  6. Call Production Log    — needs call attribution (step 5) + OD match (step 3)
-  7. Conversion Upload      — needs everything above to be fresh
+  4. Refresh Call Income    — re-pulls OD paid amounts for new-patient calls (PR 4)
+                             Must run BEFORE OD Payments so fresh data is available.
+  5. OD Payments            — paid amounts before call production dedup
+  6. Call → Keyword         — needs gads_clicks table (step 2) and OD match (step 3)
+  7. Call Production Log    — needs call attribution (step 6) + OD match (step 3)
+  8. Conversion Upload      — needs everything above to be fresh
 """
 import logging
 import threading
@@ -29,6 +31,7 @@ UNIFIED_SYNC_STEPS = [
     ("Firestore Sync",           "Pulling new leads from web forms…"),
     ("Google Ads Resolver",      "Resolving gclids to campaign/ad group/keyword…"),
     ("OpenDental Patient Match", "Matching leads to OD patients + treatment stages…"),
+    ("Refresh Call Income",      "Re-pulling OD paid amounts for new-patient calls…"),   # PR 4 — index 3
     ("OpenDental Payments",      "Pulling paid amounts from OD (365d + LTV)…"),
     ("Call → Keyword",           "Attributing phone calls to paid clicks…"),
     ("Call Production Log",      "Writing call-path keyword production…"),
@@ -139,6 +142,19 @@ def _summarize_od_match(r) -> str:
         return "completed"
 
 
+def _summarize_refresh_call_income(r) -> str:
+    """r is the return value of refresh_call_od_income (PR 4)."""
+    try:
+        if (r or {}).get("status") == "skipped":
+            return "skipped (OD unavailable)"
+        updated = (r or {}).get("calls_updated", 0)
+        total   = (r or {}).get("calls_refreshed", 0)
+        income  = (r or {}).get("total_income_synced", 0.0) or 0.0
+        return f"{updated}/{total} calls updated, ${income:,.0f} total income"
+    except Exception:
+        return "completed"
+
+
 def _summarize_od_payments(r) -> str:
     """r is the return value of sync_od_payments."""
     try:
@@ -163,8 +179,9 @@ def _summarize_call_kw(r) -> str:
 def _summarize_call_production(r) -> str:
     """r is the return value of link_calls_to_keyword_production."""
     try:
-        written = (r or {}).get("rows_written", 0)
-        return f"{written} new call::%% rows written"
+        # 'written' is the key in the counts dict; 'rows_written' is an alias
+        written = (r or {}).get("written", 0) or (r or {}).get("rows_written", 0)
+        return f"{written} call:: rows written/updated"
     except Exception:
         return "completed"
 
@@ -241,13 +258,13 @@ def run_unified_od_sync(trigger: str = "manual") -> dict:
                 "summary":     summary,
             }
             step_results.append(entry)
-            logger.info(f"[unified_sync] Step {step_idx+1}/7 '{label}' ok — {summary} ({duration_ms}ms)")
+            logger.info(f"[unified_sync] Step {step_idx+1}/{len(UNIFIED_SYNC_STEPS)} '{label}' ok — {summary} ({duration_ms}ms)")
             return "ok", result
         except Exception as exc:
             duration_ms = int((_time_mod.time() - t_start) * 1000)
             error_msg = str(exc)[:500]
             logger.error(
-                f"[unified_sync] Step {step_idx+1}/7 '{label}' FAILED: {exc}\n"
+                f"[unified_sync] Step {step_idx+1}/{len(UNIFIED_SYNC_STEPS)} '{label}' FAILED: {exc}\n"
                 + traceback.format_exc()
             )
             entry = {
@@ -287,33 +304,42 @@ def run_unified_od_sync(trigger: str = "manual") -> dict:
 
         _run_step(2, _do_od_match, _summarize_od_match)
 
-        # ── Step 4: OD Payment Pull (PR 2) ────────────────────────────────────
+        # ── Step 4: Refresh Call OD Income (PR 4) ────────────────────────────
+        # Must run BEFORE OD Payments (step 5) so fresh mango_calls.od_patient_income
+        # is available and any new KPL rows from step 7 get correct paid amounts.
+        def _do_refresh_call_income():
+            from od_payment_sync import refresh_call_od_income
+            return refresh_call_od_income(days=90)
+
+        _run_step(3, _do_refresh_call_income, _summarize_refresh_call_income)
+
+        # ── Step 5: OD Payment Pull (PR 2) ────────────────────────────────────
         def _do_od_payments():
             from od_payment_sync import sync_od_payments
             return sync_od_payments(days_back=7)
 
-        _run_step(3, _do_od_payments, _summarize_od_payments)
+        _run_step(4, _do_od_payments, _summarize_od_payments)
 
-        # ── Step 5: Call → Keyword Attribution ───────────────────────────────
+        # ── Step 6: Call → Keyword Attribution ───────────────────────────────
         def _do_call_kw():
             from call_keyword_attribution import attribute_calls_to_keywords
             return attribute_calls_to_keywords(days=7)
 
-        _run_step(4, _do_call_kw, _summarize_call_kw)
+        _run_step(5, _do_call_kw, _summarize_call_kw)
 
-        # ── Step 6: Call Production Log ───────────────────────────────────────
+        # ── Step 7: Call Production Log ───────────────────────────────────────
         def _do_call_production():
             from call_production_log import link_calls_to_keyword_production
             return link_calls_to_keyword_production(days=7)
 
-        _run_step(5, _do_call_production, _summarize_call_production)
+        _run_step(6, _do_call_production, _summarize_call_production)
 
-        # ── Step 7: Conversion Upload to Google Ads ───────────────────────────
+        # ── Step 8: Conversion Upload to Google Ads ───────────────────────────
         def _do_conversions():
             from google_ads_conversions import upload_offline_conversions
             return upload_offline_conversions()
 
-        _run_step(6, _do_conversions, _summarize_conversions)
+        _run_step(7, _do_conversions, _summarize_conversions)
 
     finally:
         # Always mark done and persist, even if something panicked above
@@ -330,8 +356,9 @@ def run_unified_od_sync(trigger: str = "manual") -> dict:
             logger.error(f"[unified_sync] Failed to persist last-run to settings: {exc}")
 
         ok_count = sum(1 for s in step_results if s.get("status") == "ok")
+        total_n = len(UNIFIED_SYNC_STEPS)
         logger.info(
-            f"[unified_sync] Chain complete — {ok_count}/{len(UNIFIED_SYNC_STEPS)} steps ok "
+            f"[unified_sync] Chain complete — {ok_count}/{total_n} steps ok "
             f"trigger={trigger} elapsed={_unified_sync_progress.get('elapsed_sec')}s"
         )
 

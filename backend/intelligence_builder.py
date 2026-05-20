@@ -191,12 +191,17 @@ def rebuild_keyword_intelligence() -> dict:
             name_to_id = {r["campaign_name"]: r["campaign_id"] for r in camp_rows}
 
             # ── 3. Aggregate OD production log (90d) by keyword+campaign ─────
+            # PR 4: filter to 'high' tier rows only (>= 0.55 confidence) to keep
+            # keyword_intelligence — and therefore the AI optimizer — protected from
+            # low-confidence ('low'/'booked_override') attributions. NULL means a
+            # pre-PR 4 row written under the old 0.55 floor; treat as 'high'.
             prod_rows = conn.execute("""
                 SELECT keyword_text, campaign_id, campaign_name,
                        COUNT(*) AS appointments,
                        SUM(production_amount) AS total_production
                 FROM keyword_production_log
                 WHERE logged_at >= ?
+                  AND (confidence_tier = 'high' OR confidence_tier IS NULL)
                 GROUP BY LOWER(keyword_text), campaign_id
             """, (cutoff_90d + "T00:00:00+00:00",)).fetchall()
 

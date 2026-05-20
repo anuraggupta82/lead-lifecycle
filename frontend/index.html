@@ -16381,7 +16381,7 @@ function UnifiedSyncProgress({ progress }) {
   );
 }
 
-function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCallProduction, onCallProductionBackfill, onGA4Refresh, onOptimize, onSyncPayments, onBackfillPayments, onTabSwitch }) {
+function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCallProduction, onCallProductionBackfill, onGA4Refresh, onOptimize, onSyncPayments, onBackfillPayments, onRefreshCallIncome, onTabSwitch }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
 
@@ -16519,6 +16519,13 @@ function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCa
               </button>
               <button className="btn btn-teal" onClick={()=>handleAction('payments', onSyncPayments)} disabled={loading.payments || loading.paymentsbackfill}>
                 {loading.payments?'Syncing...':'Sync OD Payments'}
+              </button>
+              <button className="btn btn-teal" onClick={()=>{
+                if (!confirm('This will re-query OpenDental for all new-patient calls in the last 90 days. Takes ~10 seconds. Continue?')) return;
+                handleAction('refreshcallincome', onRefreshCallIncome);
+              }} disabled={loading.refreshcallincome}
+                style={{background:'#0f766e'}}>
+                {loading.refreshcallincome?'Refreshing...':'Refresh Call Income'}
               </button>
               <button className="btn btn-teal" onClick={()=>{
                 if (!confirm('Backfill ALL attributed patients payment history from OD? This rebuilds paid_amount_365d and paid_amount_ltv from scratch. Use once after deploying PR 2.')) return;
@@ -18534,6 +18541,7 @@ function App() {
                 onOptimize={() => api('/api/admin/optimize', { method: 'POST' })}
                 onSyncPayments={() => api('/api/admin/sync-payments?days=7', { method: 'POST' })}
                 onBackfillPayments={() => api('/api/admin/sync-payments?full=true', { method: 'POST' })}
+                onRefreshCallIncome={() => api('/api/admin/refresh-call-income?days=90', { method: 'POST' })}
                 onTabSwitch={setTab} />
             )}
           </React.Fragment>

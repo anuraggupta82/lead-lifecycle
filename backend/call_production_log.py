@@ -57,11 +57,15 @@ _ET = ZoneInfo("America/New_York")
 # 'no_signal' and '' provide nothing useful.
 _SKIP_METHODS = {"no_signal", "", None}
 
-# Minimum call confidence to write production. Weak (campaign_only) calls get
-# campaign-level attribution in the dashboard but no production log entry —
-# we don't want to pollute keyword ROAS with low-confidence attributions.
-# 'campaign_only' is 0.30; we require at least 0.55 (moderate tier).
+# Optimizer-bound confidence threshold — KPL rows written at this confidence
+# or above are stamped confidence_tier='high'. The AI optimizer reads ONLY
+# 'high' rows so its learning is not polluted by weak attributions.
 _MIN_CONFIDENCE_FOR_PRODUCTION = 0.55
+
+# PR 4: Lower display threshold. Calls with confidence >= 0.30 also get a KPL
+# row but are stamped confidence_tier='low'. Dashboard INCOME rollup includes
+# 'high', 'low', and 'booked_override' rows. Optimizer is unchanged.
+_MIN_CONFIDENCE_FOR_DISPLAY = 0.30
 
 
 def _get_od_conn():
@@ -115,6 +119,10 @@ def _fetch_call_production_data(days: int = 60) -> list:
                 mc.attributed_keyword_method,
                 mc.attributed_keyword_confidence,
                 mc.od_patient_status,
+                -- PR 4: include the already-refreshed income so booked_override rows
+                -- can write paid_amount_365d from mango_calls without waiting for
+                -- a second sync run.
+                COALESCE(mc.od_patient_income, 0.0) AS od_patient_income,
                 -- Campaign info: prefer from lead (Method A/B), fall back to gads_call_view (C)
                 COALESCE(l.campaign_id,   gcv.campaign_id,   '') AS campaign_id,
                 COALESCE(l.campaign_name, gcv.campaign_name, '') AS campaign_name,
@@ -135,12 +143,17 @@ def _fetch_call_production_data(days: int = 60) -> list:
               AND mc.attributed_keyword_method IS NOT NULL
               AND mc.attributed_keyword_method != ''
               AND mc.attributed_keyword_method != 'no_signal'
-              AND mc.attributed_keyword_method != 'campaign_only'
-              AND COALESCE(mc.attributed_keyword_confidence, 0) >= ?
+              -- PR 4: include calls if confidence >= 0.30 (display tier) OR
+              -- od_appointment_id is set (booked_override — OD confirmed the booking,
+              -- bypassing the confidence gate entirely).
+              AND (
+                COALESCE(mc.attributed_keyword_confidence, 0) >= ?
+                OR (mc.od_appointment_id IS NOT NULL AND mc.od_appointment_id != '')
+              )
               -- Exclude pre-existing patients — their production is not new-patient acquisition
               AND COALESCE(mc.od_patient_status, '') NOT IN ('existing_active', 'existing_inactive')
             ORDER BY mc.started_at DESC
-        """, (cutoff, _MIN_CONFIDENCE_FOR_PRODUCTION)).fetchall()
+        """, (cutoff, _MIN_CONFIDENCE_FOR_DISPLAY)).fetchall()
 
     return [dict(r) for r in rows]
 
@@ -223,6 +236,46 @@ def _appointment_date_from_uuid(call_row: dict) -> str:
         return started_at[:10]
 
 
+def _derive_confidence_tier(call_row: dict) -> str:
+    """
+    Determine the confidence_tier value for a KPL row.
+
+    PR 4 tiers:
+      'booked_override' — od_appointment_id is set (OD confirmed booking, any confidence)
+      'high'            — confidence >= 0.55 (optimizer-safe)
+      'low'             — confidence >= 0.30 and < 0.55 (display-only)
+
+    NOTE: calls below 0.30 without od_appointment_id are excluded by the upstream
+    SQL filter so they never reach this function.
+    """
+    od_appt_id = call_row.get("od_appointment_id") or ""
+    if od_appt_id:
+        return "booked_override"
+    conf = float(call_row.get("attributed_keyword_confidence") or 0.0)
+    if conf >= _MIN_CONFIDENCE_FOR_PRODUCTION:
+        return "high"
+    return "low"
+
+
+def _extract_campaign_name_from_ad_group(attributed_ad_group: str, campaign_name: str) -> str:
+    """
+    For booked-override calls, campaign_name may be empty but attributed_ad_group
+    is stored as 'Campaign Name > Ad Group Name'. Extract campaign portion.
+
+    Returns the existing campaign_name if non-empty, otherwise extracts from
+    attributed_ad_group by splitting on first ' > ' occurrence.
+    """
+    if campaign_name:
+        return campaign_name
+    if not attributed_ad_group:
+        return ""
+    sep = " > "
+    idx = attributed_ad_group.find(sep)
+    if idx > 0:
+        return attributed_ad_group[:idx]
+    return attributed_ad_group
+
+
 def _write_call_production_row(call_row: dict, production: dict) -> bool:
     """
     Write one keyword_production_log row sourced from a Mango call.
@@ -231,8 +284,11 @@ def _write_call_production_row(call_row: dict, production: dict) -> bool:
     real lead rows under the UNIQUE(lead_id, od_patient_num) constraint.
 
     On conflict (same call already logged): refreshes production_amount,
-    procedure_codes, and logged_at so nightly runs pick up newly completed
-    procedures without churning the row's id PK or audit trail.
+    procedure_codes, logged_at, and confidence_tier so nightly runs pick up
+    newly completed procedures without churning the row's id PK or audit trail.
+
+    PR 4: also writes confidence_tier ('high', 'low', or 'booked_override') so
+    the dashboard rollup can include all tiers while the optimizer stays strict.
 
     Returns True if a row was inserted or updated, False if unchanged.
     """
@@ -243,27 +299,51 @@ def _write_call_production_row(call_row: dict, production: dict) -> bool:
     keyword = (call_row.get("attributed_keyword") or "").lower().strip()
     match_type = call_row.get("attributed_match_type") or ""
     campaign_id = call_row.get("campaign_id") or ""
-    campaign_name = call_row.get("campaign_name") or ""
+    # PR 4: for booked-override calls, campaign_name may be empty but
+    # attributed_ad_group carries "Campaign > Ad Group" — extract campaign portion.
+    raw_campaign_name = call_row.get("campaign_name") or ""
+    attributed_ad_group = call_row.get("attributed_ad_group") or ""
+    campaign_name = _extract_campaign_name_from_ad_group(attributed_ad_group, raw_campaign_name)
     ad_group_name = call_row.get("ad_group_name") or ""
     gclid = call_row.get("gclid") or ""
     apt_date = _appointment_date_from_uuid(call_row)
     method = call_row.get("attributed_keyword_method") or ""
+    confidence_tier = _derive_confidence_tier(call_row)
     now = datetime.now(timezone.utc).isoformat()
     codes_json = json.dumps(production["codes"])
+
+    # PR 4: for booked_override rows, seed paid_amount_365d and paid_amount_ltv
+    # from the already-refreshed mango_calls.od_patient_income. This allows the
+    # KPL row to show revenue on the first sync run without waiting for a second
+    # run of refresh_call_od_income. Non-booked rows get 0.0 (PR 2 sync fills them).
+    od_income = float(call_row.get("od_patient_income") or 0.0)
+    seed_paid_365d = od_income if confidence_tier == "booked_override" else 0.0
+    seed_paid_ltv  = od_income if confidence_tier == "booked_override" else 0.0
 
     with _conn() as conn:
         cur = conn.execute("""
             INSERT INTO keyword_production_log
                (logged_at, lead_id, keyword_text, match_type, campaign_id, campaign_name,
                 ad_group_name, gclid, od_patient_num, production_amount, procedure_codes,
-                match_method, appointment_date)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                match_method, appointment_date, confidence_tier,
+                paid_amount_365d, paid_amount_ltv)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(lead_id, od_patient_num) DO UPDATE SET
                 production_amount = excluded.production_amount,
                 procedure_codes   = excluded.procedure_codes,
+                confidence_tier   = excluded.confidence_tier,
+                -- Only update paid amounts if the new value is higher (avoids wiping
+                -- paid_amount values that were set by refresh_call_od_income or
+                -- od_payment_sync on a previous run)
+                paid_amount_365d  = MAX(excluded.paid_amount_365d,
+                                        COALESCE(keyword_production_log.paid_amount_365d, 0.0)),
+                paid_amount_ltv   = MAX(excluded.paid_amount_ltv,
+                                        COALESCE(keyword_production_log.paid_amount_ltv, 0.0)),
                 logged_at         = excluded.logged_at
             WHERE excluded.production_amount != keyword_production_log.production_amount
                OR excluded.procedure_codes   != keyword_production_log.procedure_codes
+               OR excluded.confidence_tier   != COALESCE(keyword_production_log.confidence_tier, '')
+               OR excluded.paid_amount_365d   > COALESCE(keyword_production_log.paid_amount_365d, 0.0)
         """, (
             now,
             synthetic_lead_id,
@@ -278,6 +358,9 @@ def _write_call_production_row(call_row: dict, production: dict) -> bool:
             codes_json,
             f"call_{method}",   # prefix so it's distinguishable from lead-path match methods
             apt_date,
+            confidence_tier,
+            seed_paid_365d,
+            seed_paid_ltv,
         ))
         return cur.rowcount > 0
 
@@ -355,11 +438,16 @@ def link_calls_to_keyword_production(days: int = 60) -> dict:
                 # Fetch OD production for this patient
                 production = _get_od_production(od_conn, od_patient_num)
 
+                # PR 4: booked-override calls are written even with $0 OD production.
+                # These calls have od_appointment_id set (OD confirmed the booking) so we
+                # always want a KPL row — the revenue will come from paid_amount_365d
+                # written by refresh_call_od_income, not from production_amount.
+                is_booked_override = bool(call_row.get("od_appointment_id") or "")
+
                 # Guard 3: No production yet — patient may not have had procedures
-                # completed. We still write a $0 row so the appointment is tracked,
-                # and it will be refreshed on the next nightly run via INSERT OR REPLACE.
-                # If production is truly $0 and we have no codes, skip for now.
-                if production["total"] == 0.0 and not production["codes"]:
+                # completed. Skip calls with zero production UNLESS they are
+                # booked_override (then write the $0 row for payment tracking).
+                if production["total"] == 0.0 and not production["codes"] and not is_booked_override:
                     logger.debug(
                         f"[call_prod] uuid={uuid} PatNum={od_patient_num}: "
                         f"no completed production yet — skipping"

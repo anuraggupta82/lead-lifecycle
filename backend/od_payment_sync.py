@@ -310,6 +310,203 @@ def _compute_buckets(payment_rows: list, anchor_date_str: str, window_days: int 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PR 4: Refresh call OD income
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _try_date_ge(pdate_str: str, anchor_date) -> bool:
+    """Return True if the payment date string is >= anchor_date. False on any parse error."""
+    try:
+        pdate = date.fromisoformat(str(pdate_str)[:10])
+        return pdate >= anchor_date
+    except Exception:
+        return False
+
+
+def refresh_call_od_income(days: int = 90) -> dict:
+    """
+    Refresh mango_calls.od_patient_income for every new-patient call matched
+    to an OD patient in the last `days` days. Re-queries OD for the current
+    paid total since the call's started_at and writes back.
+
+    Uses the same SUM(paysplit.SplitAmt) query as sync_od_payments to handle
+    family splits and accounting reallocations correctly (PayNum 9780 case
+    with +$165/-$165 nets to $0).
+
+    Anchor: each call's started_at. Payments before that date are excluded
+    (pre-existing patient defense — won't fire for new_patient rows but
+    defensive).
+
+    Also updates keyword_production_log paid amounts for any KPL row keyed
+    to the same call uuid (call::{uuid}), keeping PR 2 data in sync.
+
+    Returns:
+        {
+            "calls_refreshed": int,
+            "calls_updated": int,        # non-zero diff from prior value
+            "total_income_synced": float,
+            "kpl_updated": int,
+            "errors": int,
+            "duration_seconds": float,
+        }
+    """
+    t0 = time.time()
+
+    od_conn = _get_od_conn()
+    if od_conn is None:
+        logger.warning("[refresh_call_income] OpenDental unavailable — skipping")
+        return {"status": "skipped", "reason": "od_unavailable"}
+
+    calls_refreshed = 0
+    calls_updated = 0
+    kpl_updated = 0
+    total_income_synced = 0.0
+    errors = 0
+
+    try:
+        import sqlite3
+        from config import get_settings
+        settings = get_settings()
+        db_conn = sqlite3.connect(settings.db_path, check_same_thread=False, timeout=15)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.execute("PRAGMA foreign_keys=ON")
+        db_conn.execute("PRAGMA busy_timeout=15000")
+
+        try:
+            # ── 1. Fetch target calls ───────────────────────────────────────
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            rows = db_conn.execute("""
+                SELECT uuid, od_patient_num, started_at,
+                       COALESCE(od_patient_income, 0.0) AS od_patient_income,
+                       COALESCE(od_patient_production, 0.0) AS od_patient_production
+                FROM mango_calls
+                WHERE od_patient_status = 'new_patient'
+                  AND od_patient_num IS NOT NULL AND od_patient_num != ''
+                  AND od_appointment_id IS NOT NULL AND od_appointment_id != ''
+                  AND started_at >= ?
+                ORDER BY started_at DESC
+            """, (cutoff,)).fetchall()
+
+            if not rows:
+                logger.info("[refresh_call_income] No eligible calls found")
+                return {
+                    "calls_refreshed": 0,
+                    "calls_updated": 0,
+                    "total_income_synced": 0.0,
+                    "kpl_updated": 0,
+                    "errors": 0,
+                    "duration_seconds": round(time.time() - t0, 2),
+                }
+
+            call_list = [dict(r) for r in rows]
+            patient_nums = list({r["od_patient_num"] for r in call_list if r["od_patient_num"]})
+
+            # ── 2. Bulk-query OD payments for all patients ──────────────────
+            od_payments = _bulk_query_od_payments(od_conn, patient_nums)
+
+            # ── 3. Compute new income per call and collect updates ──────────
+            mango_updates = []   # (new_income, existing_production, uuid)
+            kpl_updates = []     # (paid_365d, paid_ltv, payment_synced_at, kpl_lead_id)
+
+            now_iso = _now_iso()
+
+            for call in call_list:
+                try:
+                    calls_refreshed += 1
+                    uuid = call["uuid"]
+                    pat = call["od_patient_num"]
+                    prior_income = float(call["od_patient_income"] or 0.0)
+                    existing_production = float(call["od_patient_production"] or 0.0)
+
+                    anchor_date = _parse_anchor(call["started_at"])
+                    if anchor_date is None:
+                        logger.warning(f"[refresh_call_income] uuid={uuid}: unparseable started_at, skipping")
+                        errors += 1
+                        continue
+
+                    payment_rows = od_payments.get(pat, [])
+                    # Sum all SplitAmt values on/after anchor_date.
+                    # CRITICAL: do NOT filter negative amounts — they net out correctly
+                    # (PayNum 9780: +165, -165, +34, -34 = $0, not $199)
+                    total_paid = 0.0
+                    for pdate_str, amt in payment_rows:
+                        if _try_date_ge(pdate_str, anchor_date):
+                            total_paid += amt
+
+                    if abs(total_paid - prior_income) < 0.01:
+                        # No meaningful change — skip write
+                        total_income_synced += total_paid
+                        continue
+
+                    mango_updates.append((total_paid, existing_production, now_iso, now_iso, uuid))
+                    calls_updated += 1
+                    total_income_synced += total_paid
+
+                    # Also update KPL row if one exists for this call
+                    synthetic_lead_id = f"call::{uuid}"
+                    kpl_row = db_conn.execute(
+                        "SELECT id FROM keyword_production_log WHERE lead_id = ?",
+                        (synthetic_lead_id,)
+                    ).fetchone()
+                    if kpl_row:
+                        # Compute 365d bucket from anchor_date
+                        paid_365d, paid_ltv, _, _ = _compute_buckets(
+                            payment_rows, call["started_at"], 365
+                        )
+                        kpl_updates.append((paid_365d, paid_ltv, now_iso, kpl_row["id"]))
+                        kpl_updated += 1
+
+                except Exception as e:
+                    logger.error(f"[refresh_call_income] uuid={call.get('uuid','?')} error: {e}")
+                    errors += 1
+
+            # ── 4. Write back ────────────────────────────────────────────────
+            if mango_updates:
+                db_conn.executemany(
+                    """UPDATE mango_calls
+                       SET od_patient_income=?, od_patient_production=?,
+                           od_income_synced_at=?, updated_at=?
+                       WHERE uuid=?""",
+                    mango_updates,
+                )
+
+            if kpl_updates:
+                db_conn.executemany(
+                    """UPDATE keyword_production_log
+                       SET paid_amount_365d=?, paid_amount_ltv=?, payment_synced_at=?
+                       WHERE id=?""",
+                    kpl_updates,
+                )
+
+            db_conn.commit()
+            logger.info(
+                f"[refresh_call_income] Done: refreshed={calls_refreshed} "
+                f"updated={calls_updated} kpl_updated={kpl_updated} "
+                f"errors={errors} total=${total_income_synced:.2f}"
+            )
+
+        finally:
+            db_conn.close()
+
+    except Exception as e:
+        logger.error(f"[refresh_call_income] Unexpected error: {e}")
+        errors += 1
+    finally:
+        try:
+            od_conn.close()
+        except Exception:
+            pass
+
+    return {
+        "calls_refreshed": calls_refreshed,
+        "calls_updated": calls_updated,
+        "total_income_synced": round(total_income_synced, 2),
+        "kpl_updated": kpl_updated,
+        "errors": errors,
+        "duration_seconds": round(time.time() - t0, 2),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
