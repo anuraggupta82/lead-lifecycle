@@ -7321,7 +7321,7 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
     """
     from database import (
         get_campaign_by_id, get_daily_stats, get_ad_group_stats, get_ads_with_metrics,
-        get_search_term_stats
+        get_search_term_stats, get_keyword_kpl_rollup
     )
     import json as _json
 
@@ -7429,6 +7429,9 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
     # Search terms for this campaign (filtered by campaign name)
     search_terms = get_search_term_stats(campaign_name=camp_name, days=days) if camp_name else []
 
+    # PR6: Per-keyword KPL income rollup for the Keywords sub-tab
+    keyword_income = get_keyword_kpl_rollup(camp_name, days=days) if camp_name else []
+
     # Inject computed daily_budget_usd into the campaign dict for the budget editor.
     # Prefer the value from the most recent daily_stats row (reflects actual live budget),
     # then fall back to monthly_budget / 30.4 (local approximation).
@@ -7457,7 +7460,76 @@ def admin_campaign_detail(campaign_id: str, days: int = 30):
         "ad_groups": ad_groups,
         "ads": ads,
         "search_terms": search_terms,
+        "keyword_income": keyword_income,
         "has_gads_data": bool(camp.get("gads_campaign_resource")),
+    }
+
+
+# ─── Attribution confidence breakdown ────────────────────────────────────────
+
+@app.get("/api/admin/attribution-confidence", dependencies=[Depends(_require_admin)])
+def admin_attribution_confidence(days: int = 30):
+    """
+    PR6: Attribution confidence tier breakdown across all campaigns.
+    Returns sums and percentages for high / low / booked_override tiers.
+    Uses kpl.logged_at as the lookback window (same caveat as get_keyword_kpl_rollup).
+    """
+    days = max(min(int(days), 90), 1)
+    cutoff = f"-{days} days"
+    with __import__("database")._conn() as conn:
+        # Dedup: a patient with both call-path and lead-path KPL rows would otherwise
+        # be double-counted. Prefer the call-path row (richer confidence_tier).
+        row = conn.execute("""
+            WITH kpl_dedup AS (
+                SELECT paid_amount_365d, confidence_tier
+                FROM keyword_production_log
+                WHERE (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                  AND od_patient_num != ''
+                  AND logged_at >= date('now', 'localtime', ?)
+                  AND id IN (
+                      SELECT COALESCE(
+                          MAX(CASE WHEN lead_id LIKE 'call::%' THEN id END),
+                          MAX(id)
+                      )
+                      FROM keyword_production_log
+                      WHERE (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                        AND od_patient_num != ''
+                        AND logged_at >= date('now', 'localtime', ?)
+                      GROUP BY od_patient_num
+                  )
+                UNION ALL
+                SELECT paid_amount_365d, confidence_tier
+                FROM keyword_production_log
+                WHERE (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                  AND (od_patient_num = '' OR od_patient_num IS NULL)
+                  AND logged_at >= date('now', 'localtime', ?)
+            )
+            SELECT
+                COALESCE(SUM(CASE WHEN confidence_tier = 'high'            THEN paid_amount_365d ELSE 0 END), 0) AS high_365d,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'low'             THEN paid_amount_365d ELSE 0 END), 0) AS low_365d,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'booked_override' THEN paid_amount_365d ELSE 0 END), 0) AS booked_override_365d,
+                COALESCE(SUM(CASE WHEN confidence_tier IS NULL             THEN paid_amount_365d ELSE 0 END), 0) AS unknown_tier_365d,
+                COALESCE(SUM(paid_amount_365d), 0) AS total_365d
+            FROM kpl_dedup
+        """, (cutoff, cutoff, cutoff)).fetchone()
+
+    total = row["total_365d"] if row else 0.0
+    high = row["high_365d"] if row else 0.0
+    low = row["low_365d"] if row else 0.0
+    booked = row["booked_override_365d"] if row else 0.0
+
+    def pct(val):
+        return round(val / total * 100, 1) if total > 0 else 0.0
+
+    return {
+        "high_365d": round(high, 2),
+        "low_365d": round(low, 2),
+        "booked_override_365d": round(booked, 2),
+        "total_365d": round(total, 2),
+        "high_pct": pct(high),
+        "low_pct": pct(low),
+        "booked_override_pct": pct(booked),
+        "days": days,
     }
 
 
@@ -8916,6 +8988,7 @@ def admin_calls_campaign_appts(campaign_name: str, days: int = 30):
                  mc.duration_sec,
                  mc.od_appointment_id,
                  mc.od_patient_name,
+                 mc.ai_patient_name,
                  mc.od_patient_num,
                  mc.od_patient_status,
                  mc.booked_outcome,
@@ -8925,16 +8998,31 @@ def admin_calls_campaign_appts(campaign_name: str, days: int = 30):
                  COALESCE(gcv.ad_group_name, mc.attributed_ad_group) AS gads_ad_group,
                  COALESCE(NULLIF(l.appointment_date,''), NULLIF(l2.appointment_date,''), NULLIF(kpl.appointment_date,'')) AS od_appt_date,
                  COALESCE(NULLIF(l.appointment_status,''), NULLIF(l2.appointment_status,'')) AS od_appt_status,
-                 COALESCE(NULLIF(mc.od_patient_name,''), NULLIF(TRIM(l.first_name||' '||l.last_name),''), NULLIF(TRIM(l2.first_name||' '||l2.last_name),'')) AS patient_name
+                 COALESCE(
+                     NULLIF(mc.od_patient_name,''),
+                     NULLIF(mc.ai_patient_name,''),
+                     NULLIF(TRIM(l.first_name||' '||l.last_name),''),
+                     NULLIF(TRIM(l2.first_name||' '||l2.last_name),'')
+                 ) AS patient_name,
+                 COALESCE(kpl.paid_amount_365d, 0) AS paid_amount_365d
                FROM mango_calls mc
                LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
                LEFT JOIN leads l ON l.id = mc.lead_id
                LEFT JOIN leads l2 ON l2.od_patient_num = mc.od_patient_num
                                   AND mc.od_patient_num != ''
                                   AND (mc.lead_id IS NULL OR mc.lead_id = '')
-               LEFT JOIN keyword_production_log kpl
-                      ON kpl.od_patient_num = mc.od_patient_num
-                     AND mc.od_patient_num != ''
+               -- PR 5 fix: aggregate KPL by patient — a patient can have multiple KPL
+               -- rows (lead-path + call::uuid_N per call). Without GROUP BY the LEFT JOIN
+               -- multiplied call rows in the modal and made paid_amount_365d ambiguous.
+               LEFT JOIN (
+                 SELECT od_patient_num,
+                        MAX(paid_amount_365d) AS paid_amount_365d,
+                        MAX(appointment_date) AS appointment_date
+                 FROM keyword_production_log
+                 WHERE od_patient_num != ''
+                 GROUP BY od_patient_num
+               ) kpl ON kpl.od_patient_num = mc.od_patient_num
+                    AND mc.od_patient_num != ''
                LEFT JOIN (
                  SELECT ad_group_name, campaign_name
                  FROM gads_call_view

@@ -3694,7 +3694,11 @@ def get_unified_campaigns(days: int = 30) -> list:
             SELECT
                 LOWER(TRIM(campaign_name))            AS k,
                 SUM(COALESCE(paid_amount_365d, 0.0))  AS call_paid_365d,
-                SUM(COALESCE(paid_amount_ltv,  0.0))  AS call_paid_ltv
+                SUM(COALESCE(paid_amount_ltv,  0.0))  AS call_paid_ltv,
+                -- PR6: per-tier breakdown for tooltip display
+                COALESCE(SUM(CASE WHEN confidence_tier = 'high'            THEN paid_amount_365d ELSE 0 END), 0) AS income_high,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'low'             THEN paid_amount_365d ELSE 0 END), 0) AS income_low,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'booked_override' THEN paid_amount_365d ELSE 0 END), 0) AS income_booked_override
             FROM keyword_production_log
             WHERE lead_id LIKE 'call::%'
               AND campaign_name != ''
@@ -3786,6 +3790,10 @@ def get_unified_campaigns(days: int = 30) -> list:
                     "income":       round(income, 2),         # leads + calls combined (planned)
                     "income_365d":  round(income_365d, 2),    # PR 2: actual paid 365d
                     "income_ltv":   round(income_ltv, 2),     # PR 2: actual paid lifetime
+                    # PR6: per-tier breakdown for Campaigns table tooltip
+                    "income_high":            round(cp2.get("income_high") or 0.0, 2),
+                    "income_low":             round(cp2.get("income_low") or 0.0, 2),
+                    "income_booked_override": round(cp2.get("income_booked_override") or 0.0, 2),
                     "cpl":          cpl,
                     "roi":          roi,                       # based on income (not just leads)
                 },
@@ -3848,6 +3856,10 @@ def get_unified_campaigns(days: int = 30) -> list:
                     "income":       round(income, 2),
                     "income_365d":  round(income_365d, 2),
                     "income_ltv":   round(income_ltv, 2),
+                    # PR6: per-tier breakdown for Campaigns table tooltip
+                    "income_high":            round(cp2.get("income_high") or 0.0, 2),
+                    "income_low":             round(cp2.get("income_low") or 0.0, 2),
+                    "income_booked_override": round(cp2.get("income_booked_override") or 0.0, 2),
                     "cpl":          cpl,
                     "roi":          roi,
                 },
@@ -5502,6 +5514,65 @@ def get_ad_group_stats(days: int = 30) -> list:
                   AND od_patient_income IS NOT NULL
                   AND attributed_ad_group != ''
                 GROUP BY LOWER(attributed_ad_group)
+            ),
+            -- PR6: KPL-based income rollup by ad group — includes all display tiers.
+            -- Dedup: a single patient can have BOTH a call-path KPL row (lead_id LIKE 'call::%')
+            -- AND a lead-path KPL row (lead_id = <lead.id>) for the same od_patient_num. Both
+            -- carry the same paid_amount_365d for the same payment window after od_payment_sync,
+            -- so naive SUM double-counts. We collapse to one row per (od_patient_num,
+            -- ad_group_name) by preferring the call-path row when present (it carries the
+            -- richer confidence_tier='booked_override' / 'high' classifications), else lead-path.
+            kpl_income_dedup AS (
+                -- Rows with an od_patient_num: collapse duplicates per (ad_group, patient),
+                -- preferring the call-path row (richer confidence_tier classification).
+                SELECT
+                    LOWER(ad_group_name) AS ad_group_key,
+                    od_patient_num,
+                    paid_amount_365d,
+                    paid_amount_ltv,
+                    confidence_tier
+                FROM keyword_production_log
+                WHERE ad_group_name != ''
+                  AND od_patient_num != ''
+                  AND (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                  AND id IN (
+                      SELECT
+                        COALESCE(
+                          MAX(CASE WHEN lead_id LIKE 'call::%' THEN id END),
+                          MAX(id)
+                        )
+                      FROM keyword_production_log
+                      WHERE ad_group_name != ''
+                        AND od_patient_num != ''
+                        AND (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                      GROUP BY LOWER(ad_group_name), od_patient_num
+                  )
+                UNION ALL
+                -- Rows without an od_patient_num: include each row individually
+                -- (each represents a distinct unmatched lead/call event).
+                SELECT
+                    LOWER(ad_group_name) AS ad_group_key,
+                    od_patient_num,
+                    paid_amount_365d,
+                    paid_amount_ltv,
+                    confidence_tier
+                FROM keyword_production_log
+                WHERE ad_group_name != ''
+                  AND (od_patient_num = '' OR od_patient_num IS NULL)
+                  AND (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+            ),
+            kpl_income_by_ag AS (
+                SELECT
+                    ad_group_key,
+                    COUNT(*) AS kpl_row_count,
+                    COALESCE(SUM(paid_amount_365d), 0) AS paid_income_365d,
+                    COALESCE(SUM(paid_amount_ltv), 0)  AS paid_income_ltv,
+                    COALESCE(SUM(CASE WHEN confidence_tier = 'high'            THEN paid_amount_365d ELSE 0 END), 0) AS income_high,
+                    COALESCE(SUM(CASE WHEN confidence_tier = 'low'             THEN paid_amount_365d ELSE 0 END), 0) AS income_low,
+                    COALESCE(SUM(CASE WHEN confidence_tier = 'booked_override' THEN paid_amount_365d ELSE 0 END), 0) AS income_booked_override,
+                    COALESCE(SUM(CASE WHEN confidence_tier IS NULL             THEN paid_amount_365d ELSE 0 END), 0) AS income_unknown_tier
+                FROM kpl_income_dedup
+                GROUP BY ad_group_key
             )
             SELECT
                 ag.ad_group_id,
@@ -5530,18 +5601,103 @@ def get_ad_group_stats(days: int = 30) -> list:
                         ) THEN 1 ELSE 0 END) AS REAL)
                         / COUNT(DISTINCT l.id) * 100, 1)
                     ELSE 0 END AS conversion_rate,
-                -- PR9: call-attributed income for this ad group
+                -- PR9: call-attributed income for this ad group (legacy)
                 COALESCE(ci.call_income, 0) AS call_income,
-                COALESCE(ci.call_count,  0) AS call_count
+                COALESCE(ci.call_count,  0) AS call_count,
+                -- PR6: KPL-based income fields
+                COALESCE(ki.paid_income_365d, 0)       AS paid_income_365d,
+                COALESCE(ki.paid_income_ltv, 0)        AS paid_income_ltv,
+                COALESCE(ki.kpl_row_count, 0)          AS kpl_row_count,
+                COALESCE(ki.income_high, 0)            AS income_high,
+                COALESCE(ki.income_low, 0)             AS income_low,
+                COALESCE(ki.income_booked_override, 0) AS income_booked_override,
+                COALESCE(ki.income_unknown_tier, 0)    AS income_unknown_tier
             FROM ag_metrics ag
             LEFT JOIN leads l
                 ON LOWER(l.ad_group_name) = LOWER(ag.ad_group_name)
                AND LOWER(l.campaign_name) = LOWER(ag.campaign_name)
             LEFT JOIN call_income_by_ag ci
                 ON ci.ad_group_key = LOWER(ag.ad_group_name)
+            LEFT JOIN kpl_income_by_ag ki
+                ON ki.ad_group_key = LOWER(ag.ad_group_name)
             GROUP BY ag.ad_group_id, ag.campaign_id
             ORDER BY ag.cost DESC
         """, (modifier,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_keyword_kpl_rollup(campaign_name: str, days: int = 30) -> list:
+    """
+    PR6: Return per-keyword income rollup from KPL for a given campaign.
+    Restricted to the lookback window via kpl.created_at.
+    Used by the campaign detail panel Keywords sub-tab.
+    Includes all display tiers (high, low, booked_override, NULL).
+    Optimizer surfaces stay 'high'-only — this is display only.
+    """
+    days = max(min(int(days), 90), 1)
+    cutoff = f"-{days} days"
+    with _conn() as conn:
+        # Dedup: a patient with both call-path ('call::uuid') and lead-path KPL rows
+        # under the same keyword would otherwise be double-counted. Prefer call-path
+        # row (richer confidence_tier). See kpl_income_by_ag CTE in get_ad_group_stats
+        # for full reasoning.
+        rows = conn.execute("""
+            WITH kpl_dedup AS (
+                SELECT
+                    keyword_text,
+                    match_type,
+                    od_patient_num,
+                    paid_amount_365d,
+                    paid_amount_ltv,
+                    confidence_tier
+                FROM keyword_production_log
+                WHERE LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                  AND keyword_text != ''
+                  AND od_patient_num != ''
+                  AND (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                  AND logged_at >= date('now', 'localtime', ?)
+                  AND id IN (
+                      SELECT COALESCE(
+                          MAX(CASE WHEN lead_id LIKE 'call::%' THEN id END),
+                          MAX(id)
+                      )
+                      FROM keyword_production_log
+                      WHERE LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                        AND keyword_text != ''
+                        AND od_patient_num != ''
+                        AND (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                        AND logged_at >= date('now', 'localtime', ?)
+                      GROUP BY keyword_text, match_type, od_patient_num
+                  )
+                UNION ALL
+                SELECT
+                    keyword_text,
+                    match_type,
+                    od_patient_num,
+                    paid_amount_365d,
+                    paid_amount_ltv,
+                    confidence_tier
+                FROM keyword_production_log
+                WHERE LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                  AND keyword_text != ''
+                  AND (od_patient_num = '' OR od_patient_num IS NULL)
+                  AND (confidence_tier IN ('high','low','booked_override') OR confidence_tier IS NULL)
+                  AND logged_at >= date('now', 'localtime', ?)
+            )
+            SELECT
+                keyword_text,
+                match_type,
+                COUNT(*) AS kpl_row_count,
+                COALESCE(SUM(paid_amount_365d), 0) AS paid_income_365d,
+                COALESCE(SUM(paid_amount_ltv), 0)  AS paid_income_ltv,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'high'            THEN paid_amount_365d ELSE 0 END), 0) AS income_high,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'low'             THEN paid_amount_365d ELSE 0 END), 0) AS income_low,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'booked_override' THEN paid_amount_365d ELSE 0 END), 0) AS income_booked_override,
+                COALESCE(SUM(CASE WHEN confidence_tier IS NULL             THEN paid_amount_365d ELSE 0 END), 0) AS income_unknown_tier
+            FROM kpl_dedup
+            GROUP BY keyword_text, match_type
+            ORDER BY paid_income_365d DESC
+        """, (campaign_name, cutoff, campaign_name, cutoff, campaign_name, cutoff)).fetchall()
         return [dict(r) for r in rows]
 
 

@@ -414,15 +414,23 @@ def link_calls_to_keyword_production(days: int = 60) -> dict:
     # Open OD connection once for the full batch
     od_conn = _get_od_conn()
     if od_conn is None:
-        logger.warning("[call_prod] OpenDental unavailable — cannot fetch production amounts")
-        counts["skipped_od_unavailable"] = len(call_rows)
-        return counts
+        logger.warning(
+            "[call_prod] OpenDental unavailable — booked_override rows will still be written; "
+            "production lookups skipped"
+        )
 
     try:
         for call_row in call_rows:
             counts["processed"] += 1
             uuid = call_row["uuid"]
             od_patient_num = call_row["od_patient_num"]
+            is_booked_override = bool(call_row.get("od_appointment_id") or "")
+
+            # PR 5 Bug A: when OD is unavailable, skip non-booked_override rows
+            # but allow booked_override rows through (they don't need OD production).
+            if od_conn is None and not is_booked_override:
+                counts["skipped_od_unavailable"] += 1
+                continue
 
             try:
                 # Guard 1: Lead-path wins — skip if the same patient is already
@@ -435,14 +443,14 @@ def link_calls_to_keyword_production(days: int = 60) -> dict:
                     counts["skipped_lead_wins"] += 1
                     continue
 
-                # Fetch OD production for this patient
-                production = _get_od_production(od_conn, od_patient_num)
+                # Fetch OD production for this patient (only when OD is available)
+                production = _get_od_production(od_conn, od_patient_num) if od_conn is not None else {"total": 0.0, "codes": []}
 
                 # PR 4: booked-override calls are written even with $0 OD production.
                 # These calls have od_appointment_id set (OD confirmed the booking) so we
                 # always want a KPL row — the revenue will come from paid_amount_365d
                 # written by refresh_call_od_income, not from production_amount.
-                is_booked_override = bool(call_row.get("od_appointment_id") or "")
+                # (is_booked_override already set above before the OD-unavailable guard)
 
                 # Guard 3: No production yet — patient may not have had procedures
                 # completed. Skip calls with zero production UNLESS they are
@@ -475,16 +483,17 @@ def link_calls_to_keyword_production(days: int = 60) -> dict:
                 counts["errors"] += 1
 
     finally:
-        try:
-            od_conn.close()
-        except Exception:
-            pass
+        if od_conn is not None:
+            try:
+                od_conn.close()
+            except Exception:
+                pass
 
     logger.info(
         f"[call_prod] Done: processed={counts['processed']} written={counts['written']} "
         f"unchanged={counts['unchanged']} lead_wins={counts['skipped_lead_wins']} "
-        f"no_prod={counts['skipped_no_production']} errors={counts['errors']} "
-        f"total_production=${counts['total_production']:.2f}"
+        f"no_prod={counts['skipped_no_production']} od_unavailable={counts['skipped_od_unavailable']} "
+        f"errors={counts['errors']} total_production=${counts['total_production']:.2f}"
     )
     return counts
 

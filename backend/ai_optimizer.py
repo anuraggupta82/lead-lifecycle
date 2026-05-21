@@ -7574,14 +7574,14 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
                 "cost_30d_usd":     round(cost, 2),
                 "conversions_30d":  round(conv, 2),
                 "lead_count_30d":   int(ag.get("lead_count") or 0),
-                # PR 3: optimizer reads paid 365d income, not planned production.
-                # Falls back to revenue (planned) when no payment data yet for the ad group.
-                # Note: get_ad_group_stats() does not yet JOIN paid_amount_365d from leads —
-                # so ag.get("paid_income_365d") will always be None today, making this
-                # effectively identical to the old behaviour. A future PR should add
-                # SUM(l.paid_amount_365d) to the get_ad_group_stats() SQL so the fallback
-                # chain becomes meaningful. Left as-is per spec (cheapest safe path).
-                "revenue_30d":      float(ag.get("paid_income_365d") or ag.get("revenue") or 0),
+                # PR 3 + PR 6: optimizer reads HIGH-CONFIDENCE paid 365d income only.
+                # PR 6 added paid_income_365d / income_high to get_ad_group_stats. The
+                # 'paid_income_365d' field sums ALL display tiers (high + low +
+                # booked_override + NULL) and MUST NOT be used as an optimizer signal —
+                # see PR 4/PR 6 invariant "optimizer surfaces stay 'high'-only".
+                # We deliberately use 'income_high' here. Falls back to planned revenue
+                # when no high-confidence payment data exists yet for this ad group.
+                "revenue_30d":      float(ag.get("income_high") or ag.get("revenue") or 0),
                 "ctr":              round((clicks / impr) if impr > 0 else 0, 4),
                 "avg_campaign_ctr": round(avg_ctr, 4),
                 "cpl":              float(ag.get("cpl") or 0),

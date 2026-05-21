@@ -181,7 +181,11 @@ def _summarize_call_production(r) -> str:
     try:
         # 'written' is the key in the counts dict; 'rows_written' is an alias
         written = (r or {}).get("written", 0) or (r or {}).get("rows_written", 0)
-        return f"{written} call:: rows written/updated"
+        od_unavail = (r or {}).get("skipped_od_unavailable", 0)
+        msg = f"{written} call:: rows written/updated"
+        if od_unavail > 0:
+            msg += f" ({od_unavail} OD unavail)"
+        return msg
     except Exception:
         return "completed"
 
