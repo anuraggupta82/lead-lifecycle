@@ -313,9 +313,11 @@ def _upsert_callrail_call(
     direction  = call.get("direction", "inbound")
     source     = call.get("source", "")
     campaign   = call.get("campaign", "")
-    keyword    = call.get("keyword", "")
+    # API returns "keywords"; webhooks return "keyword" — accept both
+    keyword    = call.get("keyword") or call.get("keywords") or ""
     gclid      = call.get("gclid", "")
-    landing    = call.get("landing_page", "")
+    # API returns "landing_page_url"; webhooks return "landing_page" — accept both
+    landing    = call.get("landing_page") or call.get("landing_page_url") or ""
     name       = call.get("customer_name", "")
     city       = call.get("customer_city", "")
     state      = call.get("customer_state", "")
@@ -435,8 +437,8 @@ def _create_lead_from_call(call: dict, caller_e164: str, campaign_id_resolved: s
         "gclid": call.get("gclid") or "",
         "campaign_id": campaign_id_resolved or "",
         "campaign_name": call.get("campaign") or "",
-        "keyword_text": call.get("keyword") or "",
-        "landing_url": call.get("landing_page") or "",
+        "keyword_text": call.get("keyword") or call.get("keywords") or "",
+        "landing_url": call.get("landing_page") or call.get("landing_page_url") or "",
         "notes": (
             f"Inbound call via CallRail\n"
             f"Source: {call.get('source', '')}\n"
@@ -452,7 +454,7 @@ def _create_lead_from_call(call: dict, caller_e164: str, campaign_id_resolved: s
             "callrail_call_id": call.get("id", ""),
             "source": call.get("source", ""),
             "campaign": call.get("campaign", ""),
-            "keyword": call.get("keyword", ""),
+            "keyword": call.get("keyword") or call.get("keywords") or "",
             "answered": call.get("answered"),
             "voicemail": call.get("voicemail"),
         }),
@@ -478,10 +480,12 @@ def _link_existing_lead(lead: dict, call: dict, campaign_id_resolved: str) -> di
         updates["campaign_name"] = call["campaign"]
         if campaign_id_resolved and not lead.get("campaign_id"):
             updates["campaign_id"] = campaign_id_resolved
-    if call.get("keyword") and not lead.get("keyword_text"):
-        updates["keyword_text"] = call["keyword"]
-    if call.get("landing_page") and not lead.get("landing_url"):
-        updates["landing_url"] = call["landing_page"]
+    kw = call.get("keyword") or call.get("keywords") or ""
+    if kw and not lead.get("keyword_text"):
+        updates["keyword_text"] = kw
+    lp = call.get("landing_page") or call.get("landing_page_url") or ""
+    if lp and not lead.get("landing_url"):
+        updates["landing_url"] = lp
 
     backfilled = [k for k in updates if k != "id"]
     if backfilled:

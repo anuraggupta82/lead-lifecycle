@@ -556,8 +556,37 @@ async def lifespan(app: FastAPI):
         max_instances=1, coalesce=True, replace_existing=True,
     )
 
+    # Every 15 min (offset 2 min from Firestore/IMAP) — CallRail call polling.
+    # Replaces webhook delivery: polls the API for new completed calls and runs
+    # each through process_webhook() for lead creation and attribution.
+    def _callrail_calls_sync_job():
+        if not get_settings().callrail_api_key:
+            logger.debug("[callrail_sync] calls sync skipped — CALLRAIL_API_KEY not set")
+            return
+        try:
+            from callrail_sync import sync_callrail_calls
+            result = sync_callrail_calls()
+            if result.get("created") or result.get("linked") or result.get("errors"):
+                logger.info(
+                    "[callrail_sync] calls: created=%s linked=%s skipped_existing=%s "
+                    "skipped_outbound=%s errors=%s duration_ms=%s",
+                    result.get("created"), result.get("linked"),
+                    result.get("skipped_existing"), result.get("skipped_outbound"),
+                    result.get("errors"), result.get("duration_ms"),
+                )
+        except Exception as e:
+            logger.error(f"CallRail calls sync failed: {e}", exc_info=True)
+
+    ads_scheduler.add_job(
+        _callrail_calls_sync_job,
+        CronTrigger(minute="2,17,32,47"),
+        id="callrail_calls_sync",
+        name="CallRail Call Poll (every 15 min)",
+        max_instances=1, coalesce=True, replace_existing=True,
+    )
+
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (1AM CallRail sync, 15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 4:30AM SKAG lock, 4:45AM SKAG snapshot, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
+    logger.info("Scheduled jobs started (1AM CallRail number sync, every-15min CallRail call poll, 15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 4:30AM SKAG lock, 4:45AM SKAG snapshot, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
 
     yield
 
@@ -971,6 +1000,25 @@ def admin_callrail_sync():
         return {"status": "ok", "result": result}
     except Exception as e:
         logger.error(f"CallRail sync failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/callrail/sync-calls", dependencies=[Depends(_require_admin)])
+def admin_callrail_sync_calls():
+    """
+    Manually poll CallRail for new completed calls and ingest them via
+    process_webhook().  Uses cursor from settings.callrail_calls_last_sync.
+    Also runs automatically every 15 minutes via APScheduler (at :02/:17/:32/:47).
+    Safe to call at any time — ingestion is fully idempotent.
+    """
+    if not get_settings().callrail_api_key:
+        raise HTTPException(status_code=503, detail="CALLRAIL_API_KEY not configured in .env")
+    try:
+        from callrail_sync import sync_callrail_calls
+        result = sync_callrail_calls()
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"CallRail calls sync failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

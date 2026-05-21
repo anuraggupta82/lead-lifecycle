@@ -142,8 +142,8 @@ def get_calls(
     fields: str = (
         "id,answered,direction,duration,start_time,tracking_phone_number,"
         "customer_phone_number,customer_name,customer_city,customer_state,"
-        "voicemail,recording,source,campaign,keyword,gclid,landing_page,"
-        "first_call,lead_score"
+        "voicemail,recording,source,campaign,keywords,gclid,landing_page_url,"
+        "first_call,lead_score,utm_source,utm_medium,utm_campaign,utm_term"
     ),
 ) -> list[dict]:
     """
