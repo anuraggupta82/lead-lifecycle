@@ -17248,31 +17248,35 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
     { value: 'pool',                label: '🔄 DNI Pool',                 desc: 'Dynamic number insertion rotation (PR 6)' },
   ];
 
+  const LBL = {fontSize:12,fontWeight:700,color:'var(--text)',display:'block',marginBottom:6,textTransform:'uppercase',letterSpacing:0.6};
+  const INPUT = {width:'100%',padding:'8px 11px',border:'1px solid var(--border)',borderRadius:6,background:'var(--bg)',color:'var(--text)',fontSize:14,boxSizing:'border-box'};
+
   return (
-    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:9000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',zIndex:9000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{background:'var(--card)',borderRadius:10,padding:24,width:520,maxHeight:'90vh',overflowY:'auto',boxShadow:'0 8px 32px rgba(0,0,0,0.3)'}}>
-        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+      <div style={{background:'var(--card)',borderRadius:12,padding:28,width:540,maxHeight:'92vh',overflowY:'auto',boxShadow:'0 12px 48px rgba(0,0,0,0.4)',border:'1px solid var(--border)'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:20}}>
           <div>
-            <div style={{fontSize:18,fontWeight:700,color:'var(--text)'}}>Edit Tracking Number</div>
-            <div style={{fontSize:13,color:'var(--text-muted)',fontFamily:'monospace',marginTop:2}}>{number.phone_number}</div>
+            <div style={{fontSize:19,fontWeight:700,color:'var(--text)'}}>Edit Tracking Number</div>
+            <div style={{fontSize:14,color:'var(--text-muted)',fontFamily:'monospace',marginTop:4}}>{number.phone_number}</div>
           </div>
-          <button onClick={onClose} style={{background:'none',border:'none',fontSize:20,cursor:'pointer',color:'var(--text-muted)'}}>✕</button>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:22,cursor:'pointer',color:'var(--text)',lineHeight:1,padding:4}}>✕</button>
         </div>
 
         {/* Assignment type */}
-        <div style={{marginBottom:16}}>
-          <div style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:1,marginBottom:8}}>Assign To</div>
+        <div style={{marginBottom:18}}>
+          <div style={{...LBL,marginBottom:10}}>Assign To</div>
           {typeOptions.map(opt => (
-            <label key={opt.value} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'8px 10px',borderRadius:6,cursor:'pointer',
-              background: assignmentType === opt.value ? 'var(--teal)15' : 'transparent',
-              border: `1px solid ${assignmentType === opt.value ? 'var(--teal)' : 'var(--border)'}`,
-              marginBottom:6}}>
+            <label key={opt.value} onClick={() => setAssignmentType(opt.value)}
+              style={{display:'flex',alignItems:'center',gap:12,padding:'10px 12px',borderRadius:7,cursor:'pointer',marginBottom:6,
+                background: assignmentType === opt.value ? 'rgba(13,148,136,0.12)' : 'var(--bg)',
+                border: `1.5px solid ${assignmentType === opt.value ? '#0d9488' : 'var(--border)'}`,
+              }}>
               <input type="radio" name="assignType" value={opt.value} checked={assignmentType === opt.value}
-                onChange={() => setAssignmentType(opt.value)} style={{marginTop:3}} />
+                onChange={() => setAssignmentType(opt.value)} style={{width:16,height:16,accentColor:'#0d9488',flexShrink:0}} />
               <div>
-                <div style={{fontSize:13,fontWeight:600,color:'var(--text)'}}>{opt.label}</div>
-                <div style={{fontSize:11,color:'var(--text-muted)'}}>{opt.desc}</div>
+                <div style={{fontSize:14,fontWeight:600,color:'var(--text)',lineHeight:1.3}}>{opt.label}</div>
+                <div style={{fontSize:12,color:'var(--text-muted)',marginTop:2}}>{opt.desc}</div>
               </div>
             </label>
           ))}
@@ -17280,10 +17284,9 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
 
         {/* Conditional sub-fields */}
         {assignmentType === 'gads_campaign' && (
-          <div style={{marginBottom:14}}>
-            <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Campaign</label>
-            <select value={assignedCampaignId} onChange={e => setAssignedCampaignId(e.target.value)}
-              style={{width:'100%',padding:'7px 10px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13}}>
+          <div style={{marginBottom:16}}>
+            <label style={LBL}>Campaign</label>
+            <select value={assignedCampaignId} onChange={e => setAssignedCampaignId(e.target.value)} style={INPUT}>
               <option value="">— Select campaign —</option>
               {campaigns.map(c => (
                 <option key={c.id} value={String(c.id)}>{c.campaign_name} [{c.status}]</option>
@@ -17292,47 +17295,43 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
           </div>
         )}
         {assignmentType === 'gads_call_extension' && (
-          <div style={{marginBottom:14}}>
-            <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Call Extension Resource ID <span style={{fontWeight:400}}>(stored for PR 3)</span></label>
-            <input value={extId} onChange={e => setExtId(e.target.value)} placeholder="customers/xxx/callExtensions/yyy"
-              style={{width:'100%',padding:'7px 10px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13,boxSizing:'border-box'}} />
+          <div style={{marginBottom:16}}>
+            <label style={LBL}>Call Extension Resource ID <span style={{fontWeight:400,textTransform:'none'}}>(stored for PR 3)</span></label>
+            <input value={extId} onChange={e => setExtId(e.target.value)} placeholder="customers/xxx/callExtensions/yyy" style={INPUT} />
           </div>
         )}
         {assignmentType === 'static_source' && (
-          <div style={{marginBottom:14}}>
-            <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Source Label</label>
-            <input value={staticLabel} onChange={e => setStaticLabel(e.target.value)} placeholder="GMB / organic / direct_mail_jan2026"
-              style={{width:'100%',padding:'7px 10px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13,boxSizing:'border-box'}} />
+          <div style={{marginBottom:16}}>
+            <label style={LBL}>Source Label</label>
+            <input value={staticLabel} onChange={e => setStaticLabel(e.target.value)} placeholder="GMB / organic / direct_mail_jan2026" style={INPUT} />
           </div>
         )}
 
         {/* Forwarding */}
-        <div style={{borderTop:'1px solid var(--border)',paddingTop:14,marginBottom:14}}>
-          <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Forward To <span style={{fontWeight:400,color:'var(--text-muted)'}}>(E.164: +1XXXXXXXXXX)</span></label>
+        <div style={{borderTop:'1px solid var(--border)',paddingTop:16,marginBottom:16}}>
+          <label style={LBL}>Forward To <span style={{fontWeight:400,textTransform:'none',fontSize:12}}>(+1XXXXXXXXXX)</span></label>
           <input value={forwardTo} onChange={e => { setForwardTo(e.target.value); validateForward(e.target.value); }}
             onBlur={e => validateForward(e.target.value)} placeholder="+15083184477"
-            style={{width:'100%',padding:'7px 10px',border:`1px solid ${forwardErr ? '#ef4444' : 'var(--border)'}`,borderRadius:6,
-              background:'var(--card)',color:'var(--text)',fontSize:13,boxSizing:'border-box'}} />
-          {forwardErr && <div style={{color:'#ef4444',fontSize:11,marginTop:4}}>{forwardErr}</div>}
+            style={{...INPUT, borderColor: forwardErr ? '#ef4444' : 'var(--border)'}} />
+          {forwardErr && <div style={{color:'#ef4444',fontSize:12,marginTop:5}}>{forwardErr}</div>}
         </div>
 
-        <div style={{marginBottom:16}}>
-          <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>
-            Whisper Message <span style={{fontWeight:400}}>({wordCount}/25 words)</span>
+        <div style={{marginBottom:20}}>
+          <label style={LBL}>
+            Whisper Message <span style={{fontWeight:400,textTransform:'none',fontSize:12}}>({wordCount}/25 words)</span>
           </label>
           <textarea value={whisper} onChange={e => setWhisper(e.target.value)} rows={2}
             placeholder='Lead from Google Ads — Implant Search'
-            style={{width:'100%',padding:'7px 10px',border:`1px solid ${wordCount > 25 ? '#f59e0b' : 'var(--border)'}`,
-              borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13,resize:'vertical',boxSizing:'border-box'}} />
-          {wordCount > 25 && <div style={{color:'#f59e0b',fontSize:11,marginTop:4}}>⚠ Over 25 words — CallRail may truncate when played</div>}
+            style={{...INPUT, borderColor: wordCount > 25 ? '#f59e0b' : 'var(--border)', resize:'vertical'}} />
+          {wordCount > 25 && <div style={{color:'#f59e0b',fontSize:12,marginTop:5}}>⚠ Over 25 words — CallRail may truncate when played</div>}
         </div>
 
-        {err && <div style={{color:'#ef4444',fontSize:12,marginBottom:10,padding:'8px 10px',background:'#ef444415',borderRadius:6}}>{err}</div>}
+        {err && <div style={{color:'#ef4444',fontSize:13,marginBottom:12,padding:'10px 12px',background:'rgba(239,68,68,0.1)',borderRadius:6,border:'1px solid #ef4444'}}>{err}</div>}
 
-        <div style={{display:'flex',justifyContent:'flex-end',gap:10}}>
-          <button onClick={onClose} style={{padding:'8px 18px',border:'1px solid var(--border)',borderRadius:6,background:'transparent',color:'var(--text)',cursor:'pointer',fontSize:13}}>Cancel</button>
+        <div style={{display:'flex',justifyContent:'flex-end',gap:10,borderTop:'1px solid var(--border)',paddingTop:16}}>
+          <button onClick={onClose} style={{padding:'9px 20px',border:'1px solid var(--border)',borderRadius:7,background:'var(--bg)',color:'var(--text)',cursor:'pointer',fontSize:14,fontWeight:500}}>Cancel</button>
           <button onClick={handleSave} disabled={saving || !!forwardErr}
-            style={{padding:'8px 18px',border:'none',borderRadius:6,background:'var(--teal)',color:'#fff',cursor:saving ? 'default' : 'pointer',fontSize:13,opacity: saving ? 0.7 : 1}}>
+            style={{padding:'9px 20px',border:'none',borderRadius:7,background:'#0d9488',color:'#fff',cursor:saving ? 'default' : 'pointer',fontSize:14,fontWeight:600,opacity: saving ? 0.7 : 1}}>
             {saving ? 'Saving…' : '✓ Save & Push'}
           </button>
         </div>

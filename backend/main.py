@@ -3426,17 +3426,38 @@ def account_recommendations(status: str = "all", limit: int = 100, offset: int =
             row_dict["impact_estimate"] = {}
         grouped[op].append(row_dict)
 
-    # Build a set of paused campaign names so the frontend can filter the default view
+    # Build a set of paused campaign names so the frontend can filter the default view.
+    # We also resolve audit-log variants (e.g. "Emergency May of 2026 test (05/03 21:55)")
+    # whose base name matches a paused campaigns row ("Emergency May of 2026 test").
     paused_campaign_names: list[str] = []
     try:
         with _db_conn() as _sc:
             _status_rows = _sc.execute(
                 "SELECT campaign_name, status FROM campaigns WHERE status IS NOT NULL"
             ).fetchall()
+            _paused_bases = {
+                r["campaign_name"].strip().lower()
+                for r in _status_rows
+                if (r["status"] or "").upper() not in ("ENABLED", "ACTIVE")
+            }
+            # Start with the base names from campaigns table
             paused_campaign_names = [
                 r["campaign_name"] for r in _status_rows
                 if (r["status"] or "").upper() not in ("ENABLED", "ACTIVE")
             ]
+            if _paused_bases:
+                # Also grab any audit-log campaign_name variants that start with a paused base name
+                # (GAds appends launch timestamps like " (05/03 21:55)" to campaign names)
+                _audit_names = _sc.execute(
+                    "SELECT DISTINCT campaign_name FROM gads_audit_log WHERE campaign_name IS NOT NULL AND campaign_name != ''"
+                ).fetchall()
+                for _an in _audit_names:
+                    _aname = (_an["campaign_name"] or "").strip()
+                    _aname_lower = _aname.lower()
+                    for _base in _paused_bases:
+                        if _aname_lower.startswith(_base) and _aname not in paused_campaign_names:
+                            paused_campaign_names.append(_aname)
+                            break
     except Exception:
         pass  # non-fatal — frontend falls back to showing all
 

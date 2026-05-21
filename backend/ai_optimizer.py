@@ -3533,6 +3533,11 @@ ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa
                         item.get("ad_group_name") or item.get("location_name") or
                         item.get("headline") or item.get("insight", "")[:60]
                     )
+                    # add_asset has no keyword/entity_name — use asset_type as the entity key
+                    # so _was_recently_applied can match "CALLOUT" or "STRUCTURED_SNIPPET"
+                    # against gads_audit_log.entity_name for the same campaign.
+                    if op == "add_asset" and not _entity:
+                        _entity = item.get("asset_type", "")
                     _cr = item.get("campaign_resource", "") or campaign_resource
                     if _was_recently_applied(op, _entity, campaign_resource=_cr, days=14):
                         logger.info(
@@ -7215,7 +7220,7 @@ def _was_recently_applied(operation: str, entity_name: str,
                     SELECT 1 FROM gads_audit_log
                      WHERE operation = ?
                        AND LOWER(entity_name) = ?
-                       AND campaign_resource = ?
+                       AND entity_id = ?
                        AND execution_result = 'success'
                        AND created_at >= datetime('now', ?)
                      LIMIT 1
