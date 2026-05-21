@@ -1084,6 +1084,35 @@ def admin_callrail_campaigns_for_assignment():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/admin/callrail/recent-calls", dependencies=[Depends(_require_admin)])
+def admin_callrail_recent_calls(limit: int = Query(20, ge=1, le=200)):
+    """Most-recent CallRail calls for the Tracking Numbers admin tab (PR 4)."""
+    try:
+        from database import _conn
+        with _conn() as conn:
+            rows = conn.execute("""
+                SELECT
+                    cc.id, cc.callrail_call_id, cc.caller_number, cc.caller_name,
+                    cc.caller_city, cc.caller_state,
+                    cc.called_at, cc.duration_seconds, cc.answered, cc.voicemail,
+                    cc.source, cc.campaign, cc.keyword, cc.gclid, cc.landing_page,
+                    cc.lead_id, cc.mango_call_id,
+                    cn.phone_number   AS tracking_number,
+                    cn.friendly_name  AS tracking_name,
+                    (l.first_name || ' ' || l.last_name) AS lead_name,
+                    l.stage AS lead_stage
+                FROM callrail_calls cc
+                LEFT JOIN callrail_numbers cn ON cn.id = cc.tracking_number_id
+                LEFT JOIN leads l ON l.id = cc.lead_id
+                ORDER BY cc.called_at DESC, cc.id DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        return {"status": "ok", "calls": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"CallRail recent-calls failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/sync", dependencies=[Depends(_require_admin)])
 def admin_sync():
     result = sync_from_firestore()
@@ -3622,6 +3651,57 @@ def _verify_twilio_signature(request_url: str, post_params: dict,
         return validator.validate(request_url, post_params, signature)
     except Exception:
         return False
+
+
+@app.post("/webhooks/callrail/call")
+async def callrail_call_webhook(
+    request: Request,
+    x_callrail_signature: Optional[str] = Header(None),
+    secret: Optional[str] = Query(None),
+):
+    """
+    CallRail webhook for call.created / call.completed / call.recording_completed.
+
+    Auth (in order):
+      1. HMAC-SHA256 in X-CallRail-Signature header over raw body
+         using settings.callrail_webhook_secret.
+      2. ?secret=... query param matching callrail_webhook_secret (dev/fallback).
+
+    Always returns 200 so CallRail doesn't retry on processing errors.
+    """
+    from fastapi.responses import JSONResponse as _JR
+    from callrail_webhook import verify_signature, verify_query_secret, process_webhook
+
+    settings = get_settings()
+    secret_cfg = settings.callrail_webhook_secret or ""
+
+    raw_body = await request.body()
+
+    # Auth — require signature if secret is configured
+    if secret_cfg:
+        hmac_ok  = verify_signature(raw_body, x_callrail_signature or "", secret_cfg)
+        query_ok = verify_query_secret(secret or "", secret_cfg)
+        if not (hmac_ok or query_ok):
+            logger.warning("[callrail_webhook] signature mismatch — rejected")
+            return _JR({"ok": False, "error": "signature_invalid"}, status_code=401)
+    else:
+        logger.warning("[callrail_webhook] CALLRAIL_WEBHOOK_SECRET not set — accepting unverified")
+
+    # Parse JSON — still return 200 on bad body (avoid retries on garbage)
+    try:
+        payload = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception as e:
+        logger.error(f"[callrail_webhook] JSON parse failed: {e}")
+        return _JR({"ok": False, "error": "invalid_json"}, status_code=200)
+
+    # Synchronous processing — call volume is small (~10-50/day)
+    try:
+        result = process_webhook(payload, raw_body)
+        logger.info(f"[callrail_webhook] processed: {result.get('action')} / lead={result.get('lead_id')}")
+        return _JR(result, status_code=200)
+    except Exception as e:
+        logger.error(f"[callrail_webhook] processing failed: {e}", exc_info=True)
+        return _JR({"ok": False, "error": str(e)}, status_code=200)
 
 
 @app.post("/webhooks/twilio/inbound")

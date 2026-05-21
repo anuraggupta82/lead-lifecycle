@@ -2693,6 +2693,20 @@ GROUP BY a.campaign_id, c.campaign_name;
             except Exception:
                 pass  # already exists on concurrent startup
 
+    # ── CallRail PR 4 — Webhook bookkeeping columns on callrail_calls ──────────
+    _cr4_calls_cols = {
+        "event_type":          "TEXT DEFAULT ''",   # last event_type seen (call.created/completed)
+        "webhook_received_at": "TEXT DEFAULT ''",   # most-recent webhook delivery timestamp
+        "lead_match_method":   "TEXT DEFAULT ''",   # 'phone_hash' | 'created' | 'none'
+    }
+    _existing_cc_cols = {row[1] for row in conn.execute("PRAGMA table_info(callrail_calls)").fetchall()}
+    for _col, _defn in _cr4_calls_cols.items():
+        if _col not in _existing_cc_cols:
+            try:
+                conn.execute(f"ALTER TABLE callrail_calls ADD COLUMN {_col} {_defn}")
+            except Exception:
+                pass  # already exists on concurrent startup
+
 
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""

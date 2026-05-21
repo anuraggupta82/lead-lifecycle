@@ -17493,6 +17493,90 @@ function NumbersTable({ numbers, onEdit, onToggleStatus, onRetryGads }) {
   );
 }
 
+// ── PR 4: Recent Calls list ────────────────────────────────────────────────
+function RecentCallsList({ calls, loading, onReload }) {
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    try { return new Date(iso).toLocaleString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' }); }
+    catch(_) { return iso; }
+  }
+  function fmtDuration(sec) {
+    if (!sec) return '—';
+    const m = Math.floor(sec / 60); const s = sec % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  return (
+    <div style={{marginTop:32}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
+        <h3 style={{margin:0,fontSize:15,fontWeight:600,color:'#111827'}}>Recent Calls (last 20)</h3>
+        <button onClick={onReload}
+          style={{padding:'4px 10px',fontSize:12,border:'1px solid #d1d5db',borderRadius:4,
+            background:'#f9fafb',cursor:'pointer',color:'#374151'}}>
+          ↻ Refresh
+        </button>
+      </div>
+
+      {loading ? (
+        <div style={{padding:'20px 0',color:'#6b7280',fontSize:13}}>Loading calls…</div>
+      ) : calls.length === 0 ? (
+        <div style={{padding:'20px 0',color:'#9ca3af',fontSize:13}}>
+          No CallRail calls yet. Calls will appear here once the webhook is configured and calls arrive.
+        </div>
+      ) : (
+        <div style={{border:'1px solid #e5e7eb',borderRadius:6,overflow:'hidden'}}>
+          <table style={{width:'100%',fontSize:12,borderCollapse:'collapse'}}>
+            <thead style={{background:'#f9fafb'}}>
+              <tr>
+                {['When','Caller','Duration','Status','Campaign / Keyword','Lead'].map(h => (
+                  <th key={h} style={{textAlign:'left',padding:'8px 10px',fontWeight:600,color:'#374151',borderBottom:'1px solid #e5e7eb'}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {calls.map(c => (
+                <tr key={c.id} style={{borderTop:'1px solid #f3f4f6'}}>
+                  <td style={{padding:'8px 10px',color:'#374151',whiteSpace:'nowrap'}}>{fmtTime(c.called_at)}</td>
+                  <td style={{padding:'8px 10px'}}>
+                    <div style={{color:'#111827',fontWeight:500}}>{c.caller_number || '—'}</div>
+                    {(c.caller_name || c.caller_city) && (
+                      <div style={{color:'#6b7280',fontSize:11}}>
+                        {c.caller_name}{c.caller_name && c.caller_city ? ' · ' : ''}{c.caller_city}{c.caller_city && c.caller_state ? `, ${c.caller_state}` : ''}
+                      </div>
+                    )}
+                  </td>
+                  <td style={{padding:'8px 10px',color:'#374151'}}>{fmtDuration(c.duration_seconds)}</td>
+                  <td style={{padding:'8px 10px'}}>
+                    {c.voicemail
+                      ? <span style={{color:'#d97706',fontWeight:600,fontSize:11}}>Voicemail</span>
+                      : c.answered
+                        ? <span style={{color:'#16a34a',fontWeight:600,fontSize:11}}>Answered</span>
+                        : <span style={{color:'#dc2626',fontWeight:600,fontSize:11}}>Missed</span>}
+                  </td>
+                  <td style={{padding:'8px 10px',color:'#374151'}}>
+                    <div>{c.campaign || <span style={{color:'#9ca3af'}}>—</span>}</div>
+                    {c.keyword && <div style={{color:'#6b7280',fontSize:11,marginTop:2}}>{c.keyword}</div>}
+                  </td>
+                  <td style={{padding:'8px 10px'}}>
+                    {c.lead_id ? (
+                      <span style={{color:'#0d7a7f',fontWeight:500,fontSize:11}}>
+                        {(c.lead_name || '').trim() || 'Linked'}
+                        {c.lead_stage && <span style={{color:'#6b7280',marginLeft:4}}>({c.lead_stage})</span>}
+                      </span>
+                    ) : (
+                      <span style={{color:'#9ca3af',fontSize:11}}>—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TrackingNumbersTab() {
   const [numbers, setNumbers] = React.useState([]);
   const [campaigns, setCampaigns] = React.useState([]);
@@ -17505,6 +17589,8 @@ function TrackingNumbersTab() {
   const [filterText, setFilterText] = React.useState('');
   const [filterStatus, setFilterStatus] = React.useState('all');
   const [toastMsg, setToastMsg] = React.useState('');
+  const [recentCalls, setRecentCalls] = React.useState([]);
+  const [recentCallsLoading, setRecentCallsLoading] = React.useState(false);
 
   function toast(msg, durationMs) {
     setToastMsg(msg);
@@ -17529,8 +17615,17 @@ function TrackingNumbersTab() {
     } catch(_) {}
   }
 
+  async function loadRecentCalls() {
+    setRecentCallsLoading(true);
+    try {
+      const d = await api('/api/admin/callrail/recent-calls?limit=20');
+      setRecentCalls(d.calls || []);
+    } catch(_) {}
+    finally { setRecentCallsLoading(false); }
+  }
+
   React.useEffect(() => {
-    Promise.all([loadNumbers(), loadCampaigns()]).finally(() => setLoading(false));
+    Promise.all([loadNumbers(), loadCampaigns(), loadRecentCalls()]).finally(() => setLoading(false));
   }, []);
 
   async function handleSync() {
@@ -17663,6 +17758,9 @@ function TrackingNumbersTab() {
         ? <div style={{textAlign:'center',padding:'40px 0',color:'var(--text-muted)'}}>Loading…</div>
         : <NumbersTable numbers={filtered} onEdit={n => setModalNumber(n)} onToggleStatus={handleToggleStatus} onRetryGads={handleRetryGads} />
       }
+
+      {/* PR 4: Recent Calls */}
+      <RecentCallsList calls={recentCalls} loading={recentCallsLoading} onReload={loadRecentCalls} />
 
       {/* Modals */}
       {modalNumber && (
