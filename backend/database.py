@@ -888,6 +888,74 @@ CREATE TABLE IF NOT EXISTS skag_outcomes_30d (
 CREATE INDEX IF NOT EXISTS idx_skag_outcomes_rec
     ON skag_outcomes_30d(skag_recommendation_id, snapshot_date DESC);
 
+-- ── CallRail — tracking numbers (trackers) ──────────────────────────────────
+-- One row per CallRail tracker (tracking number). Synced nightly from API.
+-- assignment_type drives Google Ads auto-placement (PR 3).
+
+CREATE TABLE IF NOT EXISTS callrail_numbers (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    callrail_tracker_id     TEXT UNIQUE NOT NULL,       -- CallRail TRK... resource ID
+    phone_number            TEXT NOT NULL,              -- E.164: +15085459356
+    friendly_name           TEXT DEFAULT '',            -- "Implant Search - Google Ads"
+    assignment_type         TEXT DEFAULT 'unassigned',  -- 'gads_campaign' | 'gads_call_extension'
+                                                        -- | 'static_source' | 'pool' | 'unassigned'
+    assigned_campaign_id    INTEGER DEFAULT NULL,        -- FK to campaigns.id (if gads_*)
+    assigned_call_extension_id TEXT DEFAULT '',          -- GAds call extension resource name
+    static_source_label     TEXT DEFAULT '',            -- 'GMB', 'organic', 'direct_mail_jan2026'
+    forward_to              TEXT DEFAULT '',            -- E.164 destination
+    whisper_message         TEXT DEFAULT '',
+    recording_enabled       INTEGER DEFAULT 0,          -- 0=off (Path B no-BAA); 1=on (BAA required)
+    status                  TEXT DEFAULT 'active',      -- 'active' | 'paused' | 'released'
+    source_type             TEXT DEFAULT '',            -- CallRail source.type: 'offline','search', etc.
+    callscribe_enabled      INTEGER DEFAULT 0,          -- company-level transcription flag
+    raw_payload             TEXT DEFAULT '{}',          -- full CallRail API response (JSON)
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    last_synced_at          TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_callrail_numbers_phone    ON callrail_numbers(phone_number);
+CREATE INDEX IF NOT EXISTS idx_callrail_numbers_status   ON callrail_numbers(status);
+CREATE INDEX IF NOT EXISTS idx_callrail_numbers_type     ON callrail_numbers(assignment_type);
+
+-- ── CallRail — inbound call events ──────────────────────────────────────────
+-- Populated by webhook (PR 4) or polling fallback. One row per call event.
+
+CREATE TABLE IF NOT EXISTS callrail_calls (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    callrail_call_id        TEXT UNIQUE NOT NULL,       -- CallRail CAL... resource ID
+    tracking_number_id      INTEGER DEFAULT NULL,        -- FK to callrail_numbers.id
+    caller_number           TEXT DEFAULT '',            -- E.164
+    caller_name             TEXT DEFAULT '',
+    caller_city             TEXT DEFAULT '',
+    caller_state            TEXT DEFAULT '',
+    called_at               TEXT DEFAULT '',            -- ISO timestamp
+    duration_seconds        INTEGER DEFAULT 0,
+    direction               TEXT DEFAULT 'inbound',     -- 'inbound' | 'outbound'
+    answered                INTEGER DEFAULT 0,
+    voicemail               INTEGER DEFAULT 0,
+    first_call              INTEGER DEFAULT 0,          -- CallRail repeat-caller flag
+    source                  TEXT DEFAULT '',            -- 'google_ads' | 'organic' | etc.
+    campaign                TEXT DEFAULT '',            -- gads campaign name from DNI
+    keyword                 TEXT DEFAULT '',
+    gclid                   TEXT DEFAULT '',
+    landing_page            TEXT DEFAULT '',
+    recording_url           TEXT DEFAULT '',            -- CallRail-hosted (only if BAA signed)
+    -- Cross-linking
+    mango_call_id           TEXT DEFAULT '',            -- matched mango_calls.call_id (phone+time ±2min)
+    lead_id                 TEXT DEFAULT NULL,           -- FK to leads.id if matched
+    od_patient_num          TEXT DEFAULT '',
+    -- Bookkeeping
+    ingested_at             TEXT NOT NULL,
+    raw_payload             TEXT DEFAULT '{}'           -- full webhook/poll body (JSON)
+);
+
+CREATE INDEX IF NOT EXISTS idx_callrail_calls_called_at ON callrail_calls(called_at DESC);
+CREATE INDEX IF NOT EXISTS idx_callrail_calls_caller    ON callrail_calls(caller_number);
+CREATE INDEX IF NOT EXISTS idx_callrail_calls_tracker   ON callrail_calls(tracking_number_id);
+CREATE INDEX IF NOT EXISTS idx_callrail_calls_lead      ON callrail_calls(lead_id);
+CREATE INDEX IF NOT EXISTS idx_callrail_calls_gclid     ON callrail_calls(gclid);
+
 -- ── A/B Experiments ────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ab_experiments (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2601,6 +2669,13 @@ GROUP BY a.campaign_id, c.campaign_name;
     _kpl_pr4_cols = {row[1] for row in conn.execute("PRAGMA table_info(keyword_production_log)").fetchall()}
     if "confidence_tier" not in _kpl_pr4_cols:
         conn.execute("ALTER TABLE keyword_production_log ADD COLUMN confidence_tier TEXT DEFAULT NULL")
+
+    # ── CallRail PR 1 — tracking number registry + call inbox ─────────────────
+    # Tables are defined in _SCHEMA (CREATE TABLE IF NOT EXISTS) so they are
+    # always present on fresh installs.  This block is intentionally empty —
+    # kept as a named section so future column-level ALTER TABLE migrations
+    # for callrail_numbers / callrail_calls are added here.
+    pass  # no additional migrations needed for PR 1
 
 
 def _seed_call_grading_criteria(conn):

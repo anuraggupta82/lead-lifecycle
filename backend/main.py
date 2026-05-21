@@ -531,8 +531,33 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # 1 AM — CallRail number sync: keeps callrail_numbers table current with
+    # any new or updated trackers provisioned in the CallRail dashboard.
+    def _callrail_sync_job():
+        if not get_settings().callrail_api_key:
+            logger.debug("[callrail_sync] skipped — CALLRAIL_API_KEY not set")
+            return
+        try:
+            from callrail_sync import sync_callrail_numbers
+            result = sync_callrail_numbers()
+            if result.get("recording_warnings"):
+                logger.warning(
+                    "[callrail_sync] HIPAA WARNING — recording enabled on trackers: %s",
+                    result["recording_warnings"]
+                )
+        except Exception as e:
+            logger.error(f"CallRail number sync failed: {e}", exc_info=True)
+
+    ads_scheduler.add_job(
+        _callrail_sync_job,
+        CronTrigger(hour=1, minute=0),
+        id="callrail_sync",
+        name="CallRail Number Sync (nightly)",
+        max_instances=1, coalesce=True, replace_existing=True,
+    )
+
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 4:30AM SKAG lock, 4:45AM SKAG snapshot, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
+    logger.info("Scheduled jobs started (1AM CallRail sync, 15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 4:30AM SKAG lock, 4:45AM SKAG snapshot, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
 
     yield
 
@@ -930,6 +955,23 @@ def admin_queue():
 def admin_hot_leads():
     from database import get_hot_leads
     return {"leads": get_hot_leads()}
+
+
+@app.post("/api/admin/callrail/sync", dependencies=[Depends(_require_admin)])
+def admin_callrail_sync():
+    """
+    Manually trigger a CallRail number sync.  Upserts all trackers into
+    callrail_numbers.  Also run nightly at 1 AM via APScheduler.
+    """
+    if not get_settings().callrail_api_key:
+        raise HTTPException(status_code=503, detail="CALLRAIL_API_KEY not configured in .env")
+    try:
+        from callrail_sync import sync_callrail_numbers
+        result = sync_callrail_numbers()
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"CallRail sync failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/admin/sync", dependencies=[Depends(_require_admin)])

@@ -159,6 +159,16 @@ class Settings(BaseSettings):
     # No environment variable required — config-driven only.
     gads_attribution_window_days: int = 365
 
+    # ── CallRail (call tracking — HIPAA Path B: no recording) ────────────────
+    # Recording is DISABLED on all trackers. Do NOT re-enable without signing BAA.
+    # Credentials at: _CREDENTIALS_VAULT/callrail-api.json
+    callrail_api_key: str = ""
+    callrail_account_id: str = "431682122"
+    callrail_company_id: str = "340886676"
+    callrail_company_resource_id: str = "COM019e4b3eeb1878a78c115d6f8a56cd9b"
+    # Webhook secret (HMAC-SHA256) — set in .env after generating in CallRail dashboard
+    callrail_webhook_secret: str = ""
+
     class Config:
         env_file = ".env"
         case_sensitive = False
