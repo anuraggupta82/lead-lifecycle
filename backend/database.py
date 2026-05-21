@@ -2677,6 +2677,22 @@ GROUP BY a.campaign_id, c.campaign_name;
     # for callrail_numbers / callrail_calls are added here.
     pass  # no additional migrations needed for PR 1
 
+    # ── CallRail PR 3 — Google Ads call extension push status ──────────────────
+    _cr3_cols = {
+        "gads_push_status":            "TEXT DEFAULT 'not_applicable'",
+        "gads_call_asset_resource":    "TEXT DEFAULT ''",
+        "gads_campaign_asset_resource":"TEXT DEFAULT ''",
+        "gads_push_error":             "TEXT DEFAULT ''",
+        "gads_push_attempted_at":      "TEXT DEFAULT ''",
+    }
+    _existing_cr_cols = {row[1] for row in conn.execute("PRAGMA table_info(callrail_numbers)").fetchall()}
+    for _col, _defn in _cr3_cols.items():
+        if _col not in _existing_cr_cols:
+            try:
+                conn.execute(f"ALTER TABLE callrail_numbers ADD COLUMN {_col} {_defn}")
+            except Exception:
+                pass  # already exists on concurrent startup
+
 
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""

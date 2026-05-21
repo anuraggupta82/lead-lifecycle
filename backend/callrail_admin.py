@@ -19,6 +19,8 @@ from database import _conn
 logger = logging.getLogger(__name__)
 
 _E164_RE = re.compile(r"^\+1\d{10}$")
+# UI exposes only "unassigned" + "gads_campaign" today.
+# "gads_call_extension", "static_source", "pool" are reserved for PRs 3/6 — kept for forward compatibility.
 _VALID_ASSIGNMENT_TYPES = {"unassigned", "gads_campaign", "gads_call_extension", "static_source", "pool"}
 
 # CallRail status vocab → our DB vocab and back
@@ -209,7 +211,12 @@ def assign_number(number_id: int, payload: dict) -> dict:
         ))
 
     logger.info("[callrail_admin] assigned number id=%d tracker=%s type=%s", number_id, tracker_id, assignment_type)
-    return get_number_detail(number_id)
+
+    # PR 3: push call extension to Google Ads (non-fatal — errors stored in DB row)
+    gads_result = _push_to_gads(number_id)
+    detail = get_number_detail(number_id)
+    detail["gads_push"] = gads_result
+    return detail
 
 
 # ── Status toggle ─────────────────────────────────────────────────────────────
@@ -252,7 +259,12 @@ def set_number_status(number_id: int, new_status: str) -> dict:
         )
 
     logger.info("[callrail_admin] status set to %s for tracker %s", new_status, tracker_id)
-    return get_number_detail(number_id)
+
+    # PR 3: update Google Ads call extension (remove on pause, restore on activate)
+    gads_result = _push_to_gads(number_id)
+    detail = get_number_detail(number_id)
+    detail["gads_push"] = gads_result
+    return detail
 
 
 # ── Reconcile ─────────────────────────────────────────────────────────────────
@@ -328,14 +340,287 @@ def reconcile_with_callrail() -> dict:
                         "for tracker %s but OFF in DB. Disable immediately.", tid
                     )
 
-    clean = not (missing_in_callrail or missing_in_db or field_drift)
+    # PR 3: GAds drift — numbers marked 'pushed' but missing from GAds
+    gads_drift = []
+    try:
+        from google_ads_extensions import find_call_assets_on_campaign
+        pushed_rows = [r for r in db.values()
+                       if r.get("gads_push_status") == "pushed"
+                       and r.get("assigned_campaign_id")]
+        if pushed_rows:
+            # Load campaign resources for the pushed rows
+            campaign_ids = list({r["assigned_campaign_id"] for r in pushed_rows})
+            with _conn() as conn:
+                camps = conn.execute(
+                    f"SELECT id, gads_campaign_resource, campaign_name FROM campaigns "
+                    f"WHERE id IN ({','.join('?' * len(campaign_ids))})",
+                    campaign_ids
+                ).fetchall()
+            camp_map = {c["id"]: dict(c) for c in camps}
+
+            for r in pushed_rows:
+                camp = camp_map.get(r["assigned_campaign_id"])
+                if not camp or not camp.get("gads_campaign_resource"):
+                    continue
+                live_assets = find_call_assets_on_campaign(camp["gads_campaign_resource"])
+                phone_digits = "".join(ch for ch in (r.get("phone_number") or "") if ch.isdigit())
+                stripped = phone_digits[1:] if phone_digits.startswith("1") else phone_digits
+                found = any(
+                    "".join(ch for ch in a["phone_number"] if ch.isdigit()) in (phone_digits, stripped)
+                    for a in live_assets
+                )
+                if not found:
+                    gads_drift.append({
+                        "db_id": r["id"],
+                        "phone_number": r["phone_number"],
+                        "campaign_name": camp["campaign_name"],
+                        "expected": "pushed",
+                        "actual": "missing_from_gads",
+                    })
+    except Exception as e:
+        logger.warning("[callrail_admin] reconcile gads_drift check failed (non-fatal): %s", e)
+
+    clean = not (missing_in_callrail or missing_in_db or field_drift or gads_drift)
     logger.info(
-        "[callrail_admin] reconcile done — missing_in_cr=%d missing_in_db=%d drift=%d",
-        len(missing_in_callrail), len(missing_in_db), len(field_drift)
+        "[callrail_admin] reconcile done — missing_in_cr=%d missing_in_db=%d drift=%d gads_drift=%d",
+        len(missing_in_callrail), len(missing_in_db), len(field_drift), len(gads_drift)
     )
     return {
         "missing_in_callrail": missing_in_callrail,
         "missing_in_db": missing_in_db,
         "field_drift": field_drift,
+        "gads_drift": gads_drift,
         "clean": clean,
     }
+
+
+# ── Google Ads push helpers (PR 3) ────────────────────────────────────────────
+
+def _push_to_gads(number_id: int) -> dict:
+    """
+    Push (or remove) the Google Ads call extension based on the current DB
+    state of callrail_numbers[number_id].
+
+    Decision matrix:
+      released or paused                  → remove call extension from GAds
+      unassigned + active                 → remove call extension from GAds
+      gads_campaign + active:
+        campaign has gads_campaign_resource → push (create or reuse)
+        campaign missing resource           → set pending (not yet on GAds)
+      other assignment types              → not_applicable (no GAds push)
+
+    Returns status dict and writes result back to DB.
+    Never raises — errors are captured in the dict and stored in the DB row.
+    """
+    result = {
+        "status": "not_applicable",
+        "asset_resource": "",
+        "campaign_asset_resource": "",
+        "error": "",
+    }
+
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM callrail_numbers WHERE id = ?", (number_id,)).fetchone()
+    if not row:
+        result["error"] = f"callrail_numbers id={number_id} not found"
+        return result
+    row = dict(row)
+
+    assignment_type = row.get("assignment_type", "unassigned")
+    status          = row.get("status", "active")
+    phone           = row.get("phone_number", "")
+    prev_camp_asset = row.get("gads_campaign_asset_resource", "")
+
+    # ── Determine action ─────────────────────────────────────────────────────
+    should_remove = (
+        status in ("released", "paused") or
+        assignment_type == "unassigned"
+    )
+    should_push = (assignment_type == "gads_campaign" and status == "active")
+
+    if not should_remove and not should_push:
+        # static_source, pool, gads_call_extension — no GAds push,
+        # but if this number was previously pushed we must remove the stale extension.
+        if prev_camp_asset:
+            assigned_campaign_id = row.get("assigned_campaign_id")
+            campaign_resource = ""
+            if assigned_campaign_id:
+                with _conn() as conn:
+                    camp = conn.execute(
+                        "SELECT gads_campaign_resource FROM campaigns WHERE id = ?",
+                        (assigned_campaign_id,)
+                    ).fetchone()
+                if camp:
+                    campaign_resource = camp["gads_campaign_resource"] or ""
+            from google_ads_extensions import remove_call_extension_from_campaign as _rcef
+            rm = _rcef(campaign_resource or prev_camp_asset, prev_camp_asset)
+            err = "" if rm["ok"] else "; ".join(rm.get("errors") or ["remove failed"])
+            _write_gads_status(number_id, "not_applicable", "", "", err)
+        else:
+            _write_gads_status(number_id, "not_applicable", "", "", "")
+        result["status"] = "not_applicable"
+        return result
+
+    from google_ads_extensions import push_call_extension_to_campaign, remove_call_extension_from_campaign
+
+    if should_remove:
+        # Fetch the campaign resource if we have a stored campaign_asset to remove
+        campaign_resource = ""
+        if prev_camp_asset:
+            # Extract campaign resource from stored campaign_asset_resource if possible,
+            # else fall back to looking up from the campaign record
+            assigned_campaign_id = row.get("assigned_campaign_id")
+            if assigned_campaign_id:
+                with _conn() as conn:
+                    camp = conn.execute(
+                        "SELECT gads_campaign_resource FROM campaigns WHERE id = ?",
+                        (assigned_campaign_id,)
+                    ).fetchone()
+                if camp:
+                    campaign_resource = camp["gads_campaign_resource"] or ""
+
+        if campaign_resource or prev_camp_asset:
+            # Use prev_camp_asset as fallback for customer_id extraction
+            # (campaign_asset resource "customers/N/campaignAssets/..." embeds the ID)
+            rm = remove_call_extension_from_campaign(
+                campaign_resource or prev_camp_asset,
+                prev_camp_asset,
+            )
+            if rm["ok"]:
+                result["status"] = "removed"
+                _write_gads_status(number_id, "removed", "", "", "")
+                logger.info("[callrail_admin] _push_to_gads: removed call extension for number %d", number_id)
+            else:
+                err = "; ".join(rm.get("errors") or ["remove failed"])
+                result.update({"status": "failed", "error": err})
+                _write_gads_status(number_id, "failed", "", "", err)
+        else:
+            # Nothing stored — nothing to remove
+            result["status"] = "removed"
+            _write_gads_status(number_id, "removed", "", "", "")
+        return result
+
+    # should_push — look up campaign
+    assigned_campaign_id = row.get("assigned_campaign_id")
+    if not assigned_campaign_id:
+        msg = "No campaign assigned — cannot push call extension"
+        result.update({"status": "pending", "error": msg})
+        _write_gads_status(number_id, "pending", "", "", msg)
+        return result
+
+    with _conn() as conn:
+        camp = conn.execute(
+            "SELECT id, campaign_name, gads_campaign_resource FROM campaigns WHERE id = ?",
+            (assigned_campaign_id,)
+        ).fetchone()
+
+    if not camp:
+        msg = f"Campaign id={assigned_campaign_id} not found in DB"
+        result.update({"status": "pending", "error": msg})
+        _write_gads_status(number_id, "pending", "", "", msg)
+        return result
+
+    campaign_resource = camp["gads_campaign_resource"] or ""
+    if not campaign_resource:
+        msg = f"Campaign '{camp['campaign_name']}' not yet launched on Google Ads — no campaign resource"
+        result.update({"status": "pending", "error": msg})
+        _write_gads_status(number_id, "pending", "", "", msg)
+        logger.info("[callrail_admin] _push_to_gads pending: %s", msg)
+        return result
+
+    # Remove any other numbers on same campaign first (handles campaign re-assignment)
+    # Then push this number
+    _write_gads_status(number_id, "pending", "", "", "")
+    push = push_call_extension_to_campaign(
+        campaign_resource=campaign_resource,
+        phone_number_e164=phone,
+        friendly_name=f"CallRail {phone}",
+    )
+
+    if push["ok"]:
+        result.update({
+            "status": "pushed",
+            "asset_resource":          push["asset_resource"],
+            "campaign_asset_resource": push["campaign_asset_resource"],
+        })
+        _write_gads_status(
+            number_id, "pushed",
+            push["asset_resource"],
+            push["campaign_asset_resource"],
+            "",
+        )
+        # Demote any other DB rows that were displaced (pushed same campaign, different number)
+        if push.get("removed_old"):
+            _demote_displaced_numbers(number_id, assigned_campaign_id, push["removed_old"])
+
+        logger.info("[callrail_admin] _push_to_gads pushed for number %d: %s",
+                    number_id, push["campaign_asset_resource"])
+    else:
+        err = "; ".join(push.get("errors") or ["push failed"])
+        result.update({"status": "failed", "error": err})
+        _write_gads_status(number_id, "failed", "", "", err)
+        logger.error("[callrail_admin] _push_to_gads failed for number %d: %s", number_id, err)
+
+    return result
+
+
+def _write_gads_status(
+    number_id: int,
+    status: str,
+    asset_resource: str,
+    campaign_asset_resource: str,
+    error: str,
+) -> None:
+    """Write GAds push status columns back to the callrail_numbers row."""
+    now = _now_iso()
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE callrail_numbers SET
+                gads_push_status             = ?,
+                gads_call_asset_resource     = ?,
+                gads_campaign_asset_resource = ?,
+                gads_push_error              = ?,
+                gads_push_attempted_at       = ?
+            WHERE id = ?
+        """, (status, asset_resource, campaign_asset_resource, error, now, number_id))
+
+
+def _demote_displaced_numbers(
+    winner_id: int,
+    campaign_id: int,
+    removed_campaign_asset_resources: list[str],
+) -> None:
+    """
+    When we removed existing CampaignAssets to make room for the new number,
+    mark any DB rows that referenced those resources as 'removed' so they
+    don't show stale 'pushed' status.
+    """
+    if not removed_campaign_asset_resources:
+        return
+    with _conn() as conn:
+        for resource in removed_campaign_asset_resources:
+            conn.execute("""
+                UPDATE callrail_numbers
+                SET gads_push_status = 'removed',
+                    gads_push_error  = 'displaced by number_id=' || ?,
+                    gads_campaign_asset_resource = ''
+                WHERE id != ?
+                  AND assigned_campaign_id = ?
+                  AND gads_campaign_asset_resource = ?
+                  AND gads_push_status = 'pushed'
+            """, (winner_id, winner_id, campaign_id, resource))
+
+
+def retry_gads_push(number_id: int) -> dict:
+    """
+    Re-attempt the Google Ads call extension push for a number.
+    Does NOT touch CallRail or the DB assignment — only re-pushes
+    based on current DB state.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM callrail_numbers WHERE id = ?", (number_id,)
+        ).fetchone()
+    if not row:
+        raise ValueError(f"callrail_numbers id={number_id} not found")
+    return _push_to_gads(number_id)

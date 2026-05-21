@@ -1046,6 +1046,20 @@ def admin_callrail_set_status(number_id: int, body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/callrail/numbers/{number_id}/retry-gads", dependencies=[Depends(_require_admin)])
+def admin_callrail_retry_gads(number_id: int):
+    """Retry the Google Ads call extension push for a number in failed/pending state."""
+    try:
+        from callrail_admin import retry_gads_push
+        result = retry_gads_push(number_id)
+        return {"status": "ok", "gads_push": result}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"CallRail retry-gads {number_id} failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/admin/callrail/reconcile", dependencies=[Depends(_require_admin)])
 def admin_callrail_reconcile():
     """Drift report: compare local callrail_numbers DB against live CallRail API."""
