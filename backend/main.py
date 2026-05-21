@@ -974,6 +974,102 @@ def admin_callrail_sync():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/admin/callrail/numbers", dependencies=[Depends(_require_admin)])
+def admin_callrail_list_numbers():
+    """All tracking numbers with 30-day call counts and campaign assignment names."""
+    try:
+        from callrail_admin import list_numbers_with_stats
+        return {"status": "ok", "numbers": list_numbers_with_stats()}
+    except Exception as e:
+        logger.error(f"CallRail list_numbers failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/callrail/numbers/{number_id}", dependencies=[Depends(_require_admin)])
+def admin_callrail_get_number(number_id: int):
+    """Single tracking number detail for the assignment modal."""
+    try:
+        from callrail_admin import get_number_detail
+        row = get_number_detail(number_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Tracking number id={number_id} not found")
+        return {"status": "ok", "number": row}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"CallRail get_number {number_id} failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/callrail/numbers/{number_id}/assign", dependencies=[Depends(_require_admin)])
+def admin_callrail_assign_number(number_id: int, body: dict):
+    """
+    Assign / update a tracking number.
+    Validates, pushes destination_number + whisper to CallRail, then writes DB.
+    """
+    # HIPAA guard — recording must not be toggled via this endpoint
+    if body.get("recording_enabled") not in (None, 0, False):
+        raise HTTPException(status_code=400, detail="Recording can only be enabled after signing the HIPAA BAA.")
+    if not get_settings().callrail_api_key:
+        raise HTTPException(status_code=503, detail="CALLRAIL_API_KEY not configured in .env")
+    try:
+        from callrail_admin import assign_number
+        updated = assign_number(number_id, body)
+        return {"status": "ok", "number": updated}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logger.error(f"CallRail assign_number {number_id} failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/callrail/numbers/{number_id}/status", dependencies=[Depends(_require_admin)])
+def admin_callrail_set_status(number_id: int, body: dict):
+    """Pause or activate a tracking number (updates DB + CallRail)."""
+    new_status = body.get("status", "")
+    if new_status not in ("active", "paused"):
+        raise HTTPException(status_code=422, detail="status must be 'active' or 'paused'")
+    if not get_settings().callrail_api_key:
+        raise HTTPException(status_code=503, detail="CALLRAIL_API_KEY not configured in .env")
+    try:
+        from callrail_admin import set_number_status
+        updated = set_number_status(number_id, new_status)
+        return {"status": "ok", "number": updated}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logger.error(f"CallRail set_status {number_id} failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/callrail/reconcile", dependencies=[Depends(_require_admin)])
+def admin_callrail_reconcile():
+    """Drift report: compare local callrail_numbers DB against live CallRail API."""
+    if not get_settings().callrail_api_key:
+        raise HTTPException(status_code=503, detail="CALLRAIL_API_KEY not configured in .env")
+    try:
+        from callrail_admin import reconcile_with_callrail
+        return {"status": "ok", **reconcile_with_callrail()}
+    except Exception as e:
+        logger.error(f"CallRail reconcile failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/callrail/campaigns-for-assignment", dependencies=[Depends(_require_admin)])
+def admin_callrail_campaigns_for_assignment():
+    """Slim campaign list for the tracking number assignment modal dropdown."""
+    try:
+        from callrail_admin import list_campaigns_for_assignment
+        return {"status": "ok", "campaigns": list_campaigns_for_assignment()}
+    except Exception as e:
+        logger.error(f"CallRail campaigns_for_assignment failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/sync", dependencies=[Depends(_require_admin)])
 def admin_sync():
     result = sync_from_firestore()

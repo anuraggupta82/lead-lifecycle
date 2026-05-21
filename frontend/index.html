@@ -17193,6 +17193,470 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, onMove, o
   );
 }
 
+// ── Tracking Numbers Tab (CallRail PR 2) ──────────────────────────────────────
+
+function AssignmentModal({ number, campaigns, onClose, onSaved }) {
+  const [assignmentType, setAssignmentType] = React.useState(number.assignment_type || 'unassigned');
+  const [assignedCampaignId, setAssignedCampaignId] = React.useState(number.assigned_campaign_id ? String(number.assigned_campaign_id) : '');
+  const [extId, setExtId] = React.useState(number.assigned_call_extension_id || '');
+  const [staticLabel, setStaticLabel] = React.useState(number.static_source_label || '');
+  const [forwardTo, setForwardTo] = React.useState(number.forward_to || '');
+  const [whisper, setWhisper] = React.useState(number.whisper_message || '');
+  const [saving, setSaving] = React.useState(false);
+  const [err, setErr] = React.useState('');
+  const [forwardErr, setForwardErr] = React.useState('');
+
+  const e164Re = /^\+1\d{10}$/;
+  const wordCount = whisper.trim() ? whisper.trim().split(/\s+/).length : 0;
+
+  function validateForward(val) {
+    if (!e164Re.test(val)) {
+      setForwardErr('Must be E.164 format: +1XXXXXXXXXX');
+    } else {
+      setForwardErr('');
+    }
+  }
+
+  async function handleSave() {
+    if (forwardErr || !e164Re.test(forwardTo)) { setForwardErr('Must be E.164 format: +1XXXXXXXXXX'); return; }
+    if (assignmentType === 'gads_campaign' && !assignedCampaignId) { setErr('Select a campaign'); return; }
+    if (assignmentType === 'static_source' && !staticLabel.trim()) { setErr('Enter a source label'); return; }
+    setSaving(true); setErr('');
+    try {
+      await api(`/api/admin/callrail/numbers/${number.id}/assign`, {
+        method: 'POST',
+        body: JSON.stringify({
+          assignment_type: assignmentType,
+          assigned_campaign_id: assignmentType === 'gads_campaign' ? parseInt(assignedCampaignId) : null,
+          assigned_call_extension_id: assignmentType === 'gads_call_extension' ? extId : '',
+          static_source_label: assignmentType === 'static_source' ? staticLabel : '',
+          forward_to: forwardTo,
+          whisper_message: whisper,
+        }),
+      });
+      onSaved();
+    } catch(e) {
+      setErr(e.detail || e.message || 'Save failed');
+    } finally { setSaving(false); }
+  }
+
+  const typeOptions = [
+    { value: 'unassigned',          label: '— Unassigned',               desc: 'Not yet assigned to any source' },
+    { value: 'gads_campaign',       label: '🎯 Google Ads Campaign',      desc: 'Dedicated number for a specific campaign' },
+    { value: 'gads_call_extension', label: '📣 Google Ads Call Extension', desc: 'Used as a call extension resource (PR 3)' },
+    { value: 'static_source',       label: '🏢 Static Source',            desc: 'GMB, organic, direct mail, etc.' },
+    { value: 'pool',                label: '🔄 DNI Pool',                 desc: 'Dynamic number insertion rotation (PR 6)' },
+  ];
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:9000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{background:'var(--card)',borderRadius:10,padding:24,width:520,maxHeight:'90vh',overflowY:'auto',boxShadow:'0 8px 32px rgba(0,0,0,0.3)'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:700,color:'var(--text)'}}>Edit Tracking Number</div>
+            <div style={{fontSize:13,color:'var(--text-muted)',fontFamily:'monospace',marginTop:2}}>{number.phone_number}</div>
+          </div>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:20,cursor:'pointer',color:'var(--text-muted)'}}>✕</button>
+        </div>
+
+        {/* Assignment type */}
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:1,marginBottom:8}}>Assign To</div>
+          {typeOptions.map(opt => (
+            <label key={opt.value} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'8px 10px',borderRadius:6,cursor:'pointer',
+              background: assignmentType === opt.value ? 'var(--teal)15' : 'transparent',
+              border: `1px solid ${assignmentType === opt.value ? 'var(--teal)' : 'var(--border)'}`,
+              marginBottom:6}}>
+              <input type="radio" name="assignType" value={opt.value} checked={assignmentType === opt.value}
+                onChange={() => setAssignmentType(opt.value)} style={{marginTop:3}} />
+              <div>
+                <div style={{fontSize:13,fontWeight:600,color:'var(--text)'}}>{opt.label}</div>
+                <div style={{fontSize:11,color:'var(--text-muted)'}}>{opt.desc}</div>
+              </div>
+            </label>
+          ))}
+        </div>
+
+        {/* Conditional sub-fields */}
+        {assignmentType === 'gads_campaign' && (
+          <div style={{marginBottom:14}}>
+            <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Campaign</label>
+            <select value={assignedCampaignId} onChange={e => setAssignedCampaignId(e.target.value)}
+              style={{width:'100%',padding:'7px 10px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13}}>
+              <option value="">— Select campaign —</option>
+              {campaigns.map(c => (
+                <option key={c.id} value={String(c.id)}>{c.campaign_name} [{c.status}]</option>
+              ))}
+            </select>
+          </div>
+        )}
+        {assignmentType === 'gads_call_extension' && (
+          <div style={{marginBottom:14}}>
+            <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Call Extension Resource ID <span style={{fontWeight:400}}>(stored for PR 3)</span></label>
+            <input value={extId} onChange={e => setExtId(e.target.value)} placeholder="customers/xxx/callExtensions/yyy"
+              style={{width:'100%',padding:'7px 10px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13,boxSizing:'border-box'}} />
+          </div>
+        )}
+        {assignmentType === 'static_source' && (
+          <div style={{marginBottom:14}}>
+            <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Source Label</label>
+            <input value={staticLabel} onChange={e => setStaticLabel(e.target.value)} placeholder="GMB / organic / direct_mail_jan2026"
+              style={{width:'100%',padding:'7px 10px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13,boxSizing:'border-box'}} />
+          </div>
+        )}
+
+        {/* Forwarding */}
+        <div style={{borderTop:'1px solid var(--border)',paddingTop:14,marginBottom:14}}>
+          <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>Forward To <span style={{fontWeight:400,color:'var(--text-muted)'}}>(E.164: +1XXXXXXXXXX)</span></label>
+          <input value={forwardTo} onChange={e => { setForwardTo(e.target.value); validateForward(e.target.value); }}
+            onBlur={e => validateForward(e.target.value)} placeholder="+15083184477"
+            style={{width:'100%',padding:'7px 10px',border:`1px solid ${forwardErr ? '#ef4444' : 'var(--border)'}`,borderRadius:6,
+              background:'var(--card)',color:'var(--text)',fontSize:13,boxSizing:'border-box'}} />
+          {forwardErr && <div style={{color:'#ef4444',fontSize:11,marginTop:4}}>{forwardErr}</div>}
+        </div>
+
+        <div style={{marginBottom:16}}>
+          <label style={{fontSize:12,fontWeight:600,color:'var(--text-muted)',display:'block',marginBottom:6}}>
+            Whisper Message <span style={{fontWeight:400}}>({wordCount}/25 words)</span>
+          </label>
+          <textarea value={whisper} onChange={e => setWhisper(e.target.value)} rows={2}
+            placeholder='Lead from Google Ads — Implant Search'
+            style={{width:'100%',padding:'7px 10px',border:`1px solid ${wordCount > 25 ? '#f59e0b' : 'var(--border)'}`,
+              borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13,resize:'vertical',boxSizing:'border-box'}} />
+          {wordCount > 25 && <div style={{color:'#f59e0b',fontSize:11,marginTop:4}}>⚠ Over 25 words — CallRail may truncate when played</div>}
+        </div>
+
+        {err && <div style={{color:'#ef4444',fontSize:12,marginBottom:10,padding:'8px 10px',background:'#ef444415',borderRadius:6}}>{err}</div>}
+
+        <div style={{display:'flex',justifyContent:'flex-end',gap:10}}>
+          <button onClick={onClose} style={{padding:'8px 18px',border:'1px solid var(--border)',borderRadius:6,background:'transparent',color:'var(--text)',cursor:'pointer',fontSize:13}}>Cancel</button>
+          <button onClick={handleSave} disabled={saving || !!forwardErr}
+            style={{padding:'8px 18px',border:'none',borderRadius:6,background:'var(--teal)',color:'#fff',cursor:saving ? 'default' : 'pointer',fontSize:13,opacity: saving ? 0.7 : 1}}>
+            {saving ? 'Saving…' : '✓ Save & Push'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReconcileDetailModal({ report, onClose }) {
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:9001,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{background:'var(--card)',borderRadius:10,padding:24,width:620,maxHeight:'85vh',overflowY:'auto',boxShadow:'0 8px 32px rgba(0,0,0,0.3)'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+          <div style={{fontSize:18,fontWeight:700,color:'var(--text)'}}>Reconcile Report</div>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:20,cursor:'pointer',color:'var(--text-muted)'}}>✕</button>
+        </div>
+
+        {report.clean && (
+          <div style={{textAlign:'center',padding:'32px 0',color:'#22c55e',fontSize:15}}>✓ DB and CallRail are in sync</div>
+        )}
+
+        {report.missing_in_callrail?.length > 0 && (
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:12,fontWeight:700,color:'#ef4444',textTransform:'uppercase',letterSpacing:1,marginBottom:8}}>
+              In DB but missing from CallRail ({report.missing_in_callrail.length})
+            </div>
+            <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:8}}>These numbers exist in our DB but are gone from CallRail. Run Sync to mark them released.</div>
+            {report.missing_in_callrail.map(r => (
+              <div key={r.tracker_id} style={{padding:'6px 10px',background:'#ef444410',borderRadius:6,marginBottom:4,fontSize:12,fontFamily:'monospace'}}>
+                {r.phone_number} — {r.friendly_name} <span style={{color:'var(--text-muted)'}}>({r.tracker_id})</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {report.missing_in_db?.length > 0 && (
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:12,fontWeight:700,color:'#f59e0b',textTransform:'uppercase',letterSpacing:1,marginBottom:8}}>
+              In CallRail but missing from DB ({report.missing_in_db.length})
+            </div>
+            <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:8}}>These numbers exist in CallRail but haven't been synced yet. Click Sync from CallRail to import.</div>
+            {report.missing_in_db.map(r => (
+              <div key={r.tracker_id} style={{padding:'6px 10px',background:'#f59e0b10',borderRadius:6,marginBottom:4,fontSize:12,fontFamily:'monospace'}}>
+                {r.phone_number} — {r.friendly_name} <span style={{color:'var(--text-muted)'}}>({r.tracker_id})</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {report.field_drift?.length > 0 && (
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:12,fontWeight:700,color:'#8b5cf6',textTransform:'uppercase',letterSpacing:1,marginBottom:8}}>
+              Field Drift ({report.field_drift.length})
+              {report.field_drift.some(d => d.field === 'recording_enabled' && d.callrail_value === 1) && (
+                <span style={{marginLeft:8,color:'#ef4444'}}>⚠ HIPAA ALERT: Recording ON</span>
+              )}
+            </div>
+            {report.field_drift.map((d, i) => (
+              <div key={i} style={{padding:'6px 10px',background: d.field === 'recording_enabled' && d.callrail_value === 1 ? '#ef444420' : '#8b5cf610',
+                borderRadius:6,marginBottom:4,fontSize:12}}>
+                <span style={{fontFamily:'monospace'}}>{d.phone_number}</span> — <strong>{d.field}</strong>:
+                DB=<code>{String(d.db_value)}</code> vs CallRail=<code>{String(d.callrail_value)}</code>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{textAlign:'right',marginTop:8}}>
+          <button onClick={onClose} style={{padding:'8px 18px',border:'1px solid var(--border)',borderRadius:6,background:'transparent',color:'var(--text)',cursor:'pointer',fontSize:13}}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NumbersTable({ numbers, onEdit, onToggleStatus }) {
+  function assignPill(n) {
+    const styles = {
+      unassigned:          { bg:'#6b728020', color:'#6b7280', label:'Unassigned' },
+      gads_campaign:       { bg:'#0891b220', color:'#0891b2', label: n.assigned_campaign_name || 'Campaign' },
+      gads_call_extension: { bg:'#7c3aed20', color:'#7c3aed', label:'Call Extension' },
+      static_source:       { bg:'#d9770620', color:'#d97706', label: n.static_source_label || 'Static Source' },
+      pool:                { bg:'#2563eb20', color:'#2563eb', label:'DNI Pool' },
+    };
+    const s = styles[n.assignment_type] || styles.unassigned;
+    return <span style={{padding:'2px 8px',borderRadius:10,fontSize:11,fontWeight:600,background:s.bg,color:s.color}}>{s.label}</span>;
+  }
+
+  function statusDot(status) {
+    const c = status === 'active' ? '#22c55e' : status === 'paused' ? '#6b7280' : '#ef4444';
+    const label = status === 'active' ? 'Active' : status === 'paused' ? 'Paused' : 'Released';
+    return <span style={{display:'inline-flex',alignItems:'center',gap:5,fontSize:12}}>
+      <span style={{width:7,height:7,borderRadius:'50%',background:c,display:'inline-block'}}></span>{label}
+    </span>;
+  }
+
+  if (!numbers.length) {
+    return <div style={{textAlign:'center',padding:'48px 0',color:'var(--text-muted)'}}>
+      No tracking numbers yet. Click <strong>Sync from CallRail</strong> to import.
+    </div>;
+  }
+
+  return (
+    <div style={{overflowX:'auto'}}>
+      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+        <thead>
+          <tr style={{borderBottom:'2px solid var(--border)'}}>
+            {['Tracking Number','Friendly Name','Assigned To','Forward To','Calls 30d','Status','Actions'].map(h => (
+              <th key={h} style={{textAlign:'left',padding:'8px 12px',fontSize:11,fontWeight:700,color:'var(--text-muted)',textTransform:'uppercase',letterSpacing:0.5,whiteSpace:'nowrap'}}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {numbers.map(n => (
+            <tr key={n.id} style={{borderBottom:'1px solid var(--border)',opacity: n.status === 'released' ? 0.5 : 1}}>
+              <td style={{padding:'10px 12px',fontFamily:'monospace',fontSize:13,whiteSpace:'nowrap'}}>{n.phone_number}</td>
+              <td style={{padding:'10px 12px',color:'var(--text)',maxWidth:180}}>
+                <div style={{fontWeight:600}}>{n.friendly_name || <span style={{color:'var(--text-muted)'}}>—</span>}</div>
+              </td>
+              <td style={{padding:'10px 12px'}}>{assignPill(n)}</td>
+              <td style={{padding:'10px 12px',fontFamily:'monospace',fontSize:12,color:'var(--text-muted)'}}>{n.forward_to || '—'}</td>
+              <td style={{padding:'10px 12px',textAlign:'center',fontWeight:600,color: n.calls_30d > 0 ? 'var(--teal)' : 'var(--text-muted)'}}>{n.calls_30d ?? 0}</td>
+              <td style={{padding:'10px 12px'}}>{statusDot(n.status)}</td>
+              <td style={{padding:'10px 12px',whiteSpace:'nowrap'}}>
+                <button onClick={() => onEdit(n)}
+                  style={{padding:'4px 10px',border:'1px solid var(--border)',borderRadius:5,background:'transparent',color:'var(--text)',cursor:'pointer',fontSize:12,marginRight:6}}>
+                  Edit
+                </button>
+                {n.status !== 'released' && (
+                  <button onClick={() => onToggleStatus(n)}
+                    style={{padding:'4px 10px',border:`1px solid ${n.status === 'active' ? '#f59e0b' : '#22c55e'}`,borderRadius:5,
+                      background:'transparent',color: n.status === 'active' ? '#f59e0b' : '#22c55e',cursor:'pointer',fontSize:12}}>
+                    {n.status === 'active' ? 'Pause' : 'Activate'}
+                  </button>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TrackingNumbersTab() {
+  const [numbers, setNumbers] = React.useState([]);
+  const [campaigns, setCampaigns] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [syncing, setSyncing] = React.useState(false);
+  const [reconciling, setReconciling] = React.useState(false);
+  const [modalNumber, setModalNumber] = React.useState(null);
+  const [reconcileReport, setReconcileReport] = React.useState(null);
+  const [showReconcile, setShowReconcile] = React.useState(false);
+  const [filterText, setFilterText] = React.useState('');
+  const [filterStatus, setFilterStatus] = React.useState('all');
+  const [toastMsg, setToastMsg] = React.useState('');
+
+  function toast(msg, durationMs) {
+    setToastMsg(msg);
+    // Longer timeout for HIPAA warnings so operator can read them
+    const ms = durationMs || (msg.includes('recording') || msg.includes('⚠') ? 7000 : 3500);
+    setTimeout(() => setToastMsg(''), ms);
+  }
+
+  async function loadNumbers() {
+    try {
+      const d = await api('/api/admin/callrail/numbers');
+      setNumbers(d.numbers || []);
+    } catch(e) {
+      toast('Failed to load numbers: ' + (e.detail || e.message));
+    }
+  }
+
+  async function loadCampaigns() {
+    try {
+      const d = await api('/api/admin/callrail/campaigns-for-assignment');
+      setCampaigns(d.campaigns || []);
+    } catch(_) {}
+  }
+
+  React.useEffect(() => {
+    Promise.all([loadNumbers(), loadCampaigns()]).finally(() => setLoading(false));
+  }, []);
+
+  async function handleSync() {
+    setSyncing(true);
+    try {
+      const d = await api('/api/admin/callrail/sync', { method: 'POST' });
+      const r = d.result || {};
+      toast(`Sync done — ${r.inserted || 0} new, ${r.updated || 0} updated${r.recording_warnings?.length ? ' ⚠ recording ON!' : ''}`);
+      await loadNumbers();
+    } catch(e) {
+      toast('Sync failed: ' + (e.detail || e.message));
+    } finally { setSyncing(false); }
+  }
+
+  async function handleReconcile() {
+    setReconciling(true);
+    try {
+      const d = await api('/api/admin/callrail/reconcile');
+      setReconcileReport(d);
+      setShowReconcile(true);
+    } catch(e) {
+      toast('Reconcile failed: ' + (e.detail || e.message));
+    } finally { setReconciling(false); }
+  }
+
+  async function handleToggleStatus(n) {
+    const newStatus = n.status === 'active' ? 'paused' : 'active';
+    try {
+      await api(`/api/admin/callrail/numbers/${n.id}/status`, {
+        method: 'POST',
+        body: JSON.stringify({ status: newStatus }),
+      });
+      toast(`${n.phone_number} ${newStatus === 'active' ? 'activated' : 'paused'}`);
+      await loadNumbers();
+    } catch(e) {
+      toast('Status update failed: ' + (e.detail || e.message));
+    }
+  }
+
+  // Derived: drift badge count
+  const driftCount = reconcileReport
+    ? (reconcileReport.missing_in_callrail?.length || 0) + (reconcileReport.missing_in_db?.length || 0) + (reconcileReport.field_drift?.length || 0)
+    : 0;
+  const hasHipaaAlert = reconcileReport?.field_drift?.some(d => d.field === 'recording_enabled' && d.callrail_value === 1);
+
+  // Filtered numbers
+  const filtered = numbers.filter(n => {
+    if (filterStatus !== 'all' && n.status !== filterStatus) return false;
+    if (filterText) {
+      const q = filterText.toLowerCase();
+      return (n.phone_number || '').includes(q) || (n.friendly_name || '').toLowerCase().includes(q) ||
+        (n.static_source_label || '').toLowerCase().includes(q) || (n.assigned_campaign_name || '').toLowerCase().includes(q);
+    }
+    return true;
+  });
+
+  return (
+    <div style={{padding:'24px 28px',maxWidth:1100}}>
+      {/* Toast */}
+      {toastMsg && (
+        <div style={{position:'fixed',bottom:24,right:24,background:'#1e293b',color:'#fff',padding:'10px 18px',borderRadius:8,fontSize:13,zIndex:9999,boxShadow:'0 4px 16px rgba(0,0,0,0.3)'}}>
+          {toastMsg}
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:20,flexWrap:'wrap',gap:10}}>
+        <div>
+          <h2 style={{margin:0,fontSize:20,fontWeight:700,color:'var(--text)'}}>📞 Tracking Numbers</h2>
+          <div style={{fontSize:12,color:'var(--text-muted)',marginTop:3}}>
+            {numbers.length} number{numbers.length !== 1 ? 's' : ''} · HIPAA Path B (recording disabled)
+          </div>
+        </div>
+        <div style={{display:'flex',gap:8}}>
+          <button onClick={handleReconcile} disabled={reconciling}
+            style={{padding:'7px 14px',border:'1px solid var(--border)',borderRadius:6,background:'transparent',
+              color:'var(--text)',cursor:reconciling ? 'default' : 'pointer',fontSize:13,position:'relative'}}>
+            {reconciling ? 'Checking…' : '🔍 Reconcile'}
+            {driftCount > 0 && <span style={{position:'absolute',top:-6,right:-6,background:'#ef4444',color:'#fff',borderRadius:10,fontSize:10,padding:'1px 5px',fontWeight:700}}>{driftCount}</span>}
+          </button>
+          <button onClick={handleSync} disabled={syncing}
+            style={{padding:'7px 16px',border:'none',borderRadius:6,background:'var(--teal)',
+              color:'#fff',cursor:syncing ? 'default' : 'pointer',fontSize:13,fontWeight:600,opacity:syncing ? 0.7 : 1}}>
+            {syncing ? '↻ Syncing…' : '↻ Sync from CallRail'}
+          </button>
+        </div>
+      </div>
+
+      {/* Drift / HIPAA banner */}
+      {reconcileReport && !reconcileReport.clean && (
+        <div onClick={() => setShowReconcile(true)} style={{
+          background: hasHipaaAlert ? '#ef444415' : '#f59e0b15',
+          border: `1px solid ${hasHipaaAlert ? '#ef4444' : '#f59e0b'}`,
+          borderRadius:8, padding:'10px 16px', marginBottom:16, cursor:'pointer',
+          display:'flex', alignItems:'center', justifyContent:'space-between',
+        }}>
+          <span style={{fontSize:13,color: hasHipaaAlert ? '#ef4444' : '#d97706',fontWeight:600}}>
+            {hasHipaaAlert ? '⚠ HIPAA ALERT: Recording is ON in CallRail — disable immediately!' :
+              `⚠ ${driftCount} drift item${driftCount !== 1 ? 's' : ''} detected`}
+          </span>
+          <span style={{fontSize:12,color:'var(--text-muted)'}}>View details →</span>
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{display:'flex',gap:10,marginBottom:16,flexWrap:'wrap'}}>
+        <input value={filterText} onChange={e => setFilterText(e.target.value)} placeholder="Search number, name, source…"
+          style={{padding:'7px 12px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13,width:240}} />
+        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
+          style={{padding:'7px 10px',border:'1px solid var(--border)',borderRadius:6,background:'var(--card)',color:'var(--text)',fontSize:13}}>
+          <option value="all">All statuses</option>
+          <option value="active">Active</option>
+          <option value="paused">Paused</option>
+          <option value="released">Released</option>
+        </select>
+      </div>
+
+      {/* Table */}
+      {loading
+        ? <div style={{textAlign:'center',padding:'40px 0',color:'var(--text-muted)'}}>Loading…</div>
+        : <NumbersTable numbers={filtered} onEdit={n => setModalNumber(n)} onToggleStatus={handleToggleStatus} />
+      }
+
+      {/* Modals */}
+      {modalNumber && (
+        <AssignmentModal
+          number={modalNumber}
+          campaigns={campaigns}
+          onClose={() => setModalNumber(null)}
+          onSaved={async () => { setModalNumber(null); toast('Saved and pushed to CallRail'); await loadNumbers(); }}
+        />
+      )}
+      {showReconcile && reconcileReport && (
+        <ReconcileDetailModal report={reconcileReport} onClose={() => setShowReconcile(false)} />
+      )}
+    </div>
+  );
+}
+
+// ── End Tracking Numbers Tab ──────────────────────────────────────────────────
+
 function AiOptimizerTab() {
   const [running, setRunning] = React.useState(false);
   const [lastRun, setLastRun] = React.useState('');
@@ -18712,6 +19176,7 @@ function App() {
         <button className={'tab' + (tab === 'reports' ? ' active' : '')} onClick={() => setTab('reports')}>Reports & Campaigns</button>
         <button className={'tab' + (tab === 'workflows' ? ' active' : '')} onClick={() => setTab('workflows')}>Workflows</button>
         <button className={'tab' + (tab === 'calls' ? ' active' : '')} onClick={() => setTab('calls')}>📋 Call Analysis</button>
+        <button className={'tab' + (tab === 'tracking_numbers' ? ' active' : '')} onClick={() => setTab('tracking_numbers')}>📞 Tracking #s</button>
         <button className={'tab' + (tab === 'ai_optimizer' ? ' active' : '')} onClick={() => setTab('ai_optimizer')}>🤖 AI Optimizer</button>
         <button className={'tab' + (tab === 'admin' ? ' active' : '')} onClick={() => setTab('admin')}>Admin</button>
       </div>
@@ -18740,6 +19205,7 @@ function App() {
             {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} ga4Days={ga4Days} ga4Loading={ga4Loading} onGa4DaysChange={(d) => { setGa4Days(d); loadGa4(d); }} />}
             {tab === 'workflows' && <WorkflowsSection />}
             {tab === 'calls' && <CallAnalysisView />}
+            {tab === 'tracking_numbers' && <TrackingNumbersTab />}
             {tab === 'ai_optimizer' && <AiOptimizerTab onTabSwitch={setTab} />}
             {tab === 'admin' && (
               <AdminTab
