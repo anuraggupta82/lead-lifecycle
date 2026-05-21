@@ -1205,7 +1205,7 @@ def _get_campaign_settings(client, customer_id: str, days: int = 30) -> dict:
 
             campaign_settings[rn] = {
                 "campaign_name": row.campaign.name,
-                "campaign_status": str(row.campaign.status).replace("CampaignStatus.", ""),
+                "campaign_status": str(row.campaign.status.name),  # "ENABLED" or "PAUSED" — use .name, not str() which returns the integer
                 "bidding_strategy_type": strategy_type,
                 "target_cpa_usd": round(target_cpa / 1_000_000, 2) if target_cpa else None,
                 "target_roas": round(target_roas, 3) if target_roas else None,
