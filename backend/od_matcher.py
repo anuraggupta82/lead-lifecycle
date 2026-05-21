@@ -894,10 +894,12 @@ def run_full_od_sync() -> dict:
     match_result = match_leads_to_od()
     stage_result = sync_treatment_stages()
     direct_result = sync_scheduler_direct_leads(lookback_days=30)
+    callrail_result = enrich_callrail_calls_with_od(limit=500)
     return {
         "match": match_result,
         "treatment_stages": stage_result,
         "scheduler_leads": direct_result,
+        "callrail_od_enrich": callrail_result,
     }
 
 
@@ -1432,21 +1434,27 @@ def _names_match(caller_id_name: str, od_first: str, od_last: str) -> bool:
 def _classify_od_status(pat_info: dict | None, call_time=None,
                          check_recent_visit: bool = False, od_conn=None) -> str:
     """
-    Classify caller as: new_patient | existing_active | existing_inactive | unknown
+    Classify caller's OD relationship. Return values:
+
+      no_match          — phone not found in OD at all (true new patient inquiry)
+      new_patient       — in OD (PatStatus=0) but all appointments were booked AFTER
+                          this call (record created in response to the call), or
+                          in OD with PatStatus=0 but no appointments ever.
+      existing_active   — PatStatus=0, has at least one appointment entry ≤ call_time
+      existing_inactive — PatStatus=2 (Inactive) or 3 (Archived)
+      unknown           — OD record found but PatStatus not in 0/2/3 (NonPatient,
+                          Deceased, Prospective — shouldn't block lead creation)
 
     Core rule: if the patient's earliest appointment entry in OD is AFTER the call
     time, the record was created in response to this call → new_patient, regardless
     of PatStatus. SecDateEntry on the patient table is unreliable (can reflect system
     defaults); SecDateTEntry on the appointment table is the authoritative timestamp.
 
-    PatStatus=0 with earliest_apt_entry <= call_time → existing_active
-    PatStatus=0 with earliest_apt_entry > call_time  → new_patient
-    PatStatus=0 with no appointments at all          → new_patient (never been seen)
-    PatStatus=2 (Inactive) or 3 (Archived)           → existing_inactive
-    No OD match                                      → new_patient
+    GUARD logic in process_webhook: skips lead creation only for
+    existing_active | existing_inactive. All other statuses → create lead.
     """
     if pat_info is None:
-        return "new_patient"
+        return "no_match"
     ps = pat_info.get("pat_status", -1)
     if ps == 0:
         earliest = pat_info.get("earliest_apt_entry")
@@ -1593,6 +1601,100 @@ def match_mango_calls_to_od_patients(limit: int = 500) -> dict:
         "errors": errors,
         "skipped": skipped,
     }
+
+
+# ── CallRail OD enrichment ────────────────────────────────────────────────────
+
+def enrich_callrail_calls_with_od(limit: int = 500) -> dict:
+    """
+    Two-pass enrichment for callrail_calls rows missing od_patient_num/status.
+
+    Pass 1 (no OD round-trip):
+      Copy od_patient_num + od_patient_status from the linked lead row via
+      database.backfill_callrail_od_from_leads().  Fast — pure SQLite.
+
+    Pass 2 (OD phone lookup):
+      For rows that still have no od_patient_num after Pass 1, do a live
+      phone lookup against OpenDental using _get_od_patient_info_by_phone +
+      _classify_od_status.  Updates callrail_calls via
+      database.update_callrail_call_od_match().
+
+    Returns counts dict suitable for logging / API response.
+    """
+    from database import (
+        backfill_callrail_od_from_leads,
+        get_callrail_calls_needing_od_enrich,
+        update_callrail_call_od_match,
+    )
+
+    result = {
+        "scanned": 0,
+        "filled_from_lead": 0,
+        "filled_from_od": 0,
+        "skipped_no_phone": 0,
+        "errors": 0,
+        "od_unavailable": False,
+    }
+
+    # ── Pass 1: backfill from linked leads (SQLite only) ─────────────────────
+    try:
+        p1 = backfill_callrail_od_from_leads()
+        result["filled_from_lead"] = p1.get("updated", 0)
+        logger.info(f"[callrail_od_enrich] Pass 1 done: {result['filled_from_lead']} rows filled from leads")
+    except Exception as e:
+        logger.error(f"[callrail_od_enrich] Pass 1 (backfill) failed: {e}")
+        result["errors"] += 1
+
+    # ── Pass 2: OD phone lookup for remaining unenriched rows ─────────────────
+    calls = get_callrail_calls_needing_od_enrich(limit=limit)
+    result["scanned"] = len(calls)
+
+    if not calls:
+        logger.info("[callrail_od_enrich] Pass 2: nothing to enrich")
+        return result
+
+    od_conn = _get_db()
+    if od_conn is None:
+        logger.warning("[callrail_od_enrich] Pass 2: OpenDental unavailable — skipping phone lookup")
+        result["od_unavailable"] = True
+        return result
+
+    try:
+        for row in calls:
+            row_id       = row["id"]
+            caller_phone = (row.get("caller_number") or "").strip()
+            called_at    = row.get("called_at") or ""
+
+            # Normalize to 10-digit for OD query
+            digits = "".join(c for c in caller_phone if c.isdigit())
+            phone_10 = digits[-10:] if len(digits) >= 10 else digits
+
+            if not phone_10 or len(phone_10) < 7:
+                result["skipped_no_phone"] += 1
+                continue
+
+            try:
+                pat_info = _get_od_patient_info_by_phone(od_conn, phone_10)
+                status   = _classify_od_status(pat_info, call_time=called_at)
+                pat_num  = pat_info["pat_num"] if pat_info else ""
+                update_callrail_call_od_match(row_id, pat_num, status)
+                result["filled_from_od"] += 1
+                logger.debug(
+                    f"[callrail_od_enrich] row {row_id} phone={phone_10} "
+                    f"pat_num={pat_num} status={status}"
+                )
+            except Exception as e:
+                logger.error(f"[callrail_od_enrich] row {row_id} error: {e}")
+                result["errors"] += 1
+    finally:
+        od_conn.close()
+
+    logger.info(
+        f"[callrail_od_enrich] Pass 2 done: scanned={result['scanned']} "
+        f"filled={result['filled_from_od']} skipped={result['skipped_no_phone']} "
+        f"errors={result['errors']}"
+    )
+    return result
 
 
 if __name__ == "__main__":

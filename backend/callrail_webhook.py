@@ -182,6 +182,102 @@ def _find_mango_match(conn, caller_e164: str, called_at_iso: str) -> str:
         return ""
 
 
+def _existing_patient_guard_enabled() -> bool:
+    """
+    Read DB setting 'callrail_existing_patient_guard'. Default ON.
+    '1'/'true'/'on' → True; '0'/'false'/'off' → False.
+    """
+    try:
+        from database import get_setting
+        raw = (get_setting("callrail_existing_patient_guard", "1") or "1").strip().lower()
+        return raw in ("1", "true", "on", "yes")
+    except Exception:
+        return True  # fail-safe: keep guard ON
+
+
+def _check_existing_od_patient(caller_e164: str, called_at_iso: str) -> dict:
+    """
+    Look up the caller in OpenDental.
+
+    Returns:
+      {
+        "looked_up":  bool,   # False if OD unavailable or phone blank
+        "pat_num":    str,    # "" if no match
+        "status":     str,    # 'new_patient'|'existing_active'|'existing_inactive'|'unknown'|''
+        "first_name": str,
+        "last_name":  str,
+      }
+
+    On OD unavailability (office network down), returns looked_up=False so the
+    webhook falls through to lead creation rather than dropping the call silently.
+    """
+    out = {"looked_up": False, "pat_num": "", "status": "",
+           "first_name": "", "last_name": ""}
+    if not caller_e164:
+        return out
+    try:
+        from od_matcher import _get_db, _get_od_patient_info_by_phone, \
+                              _classify_od_status, _normalize_phone
+        phone_10 = _normalize_phone(caller_e164)
+        if not phone_10 or len(phone_10) < 10:
+            return out
+        od_conn = _get_db()
+        if od_conn is None:
+            logger.warning("[callrail_webhook] OD unavailable — skipping existing-patient guard")
+            return out
+        try:
+            pat_info = _get_od_patient_info_by_phone(od_conn, phone_10)
+            status   = _classify_od_status(pat_info, call_time=called_at_iso)
+            out.update({
+                "looked_up": True,
+                "pat_num":    (pat_info or {}).get("pat_num", "") or "",
+                "status":     status,
+                "first_name": (pat_info or {}).get("first_name", "") or "",
+                "last_name":  (pat_info or {}).get("last_name", "") or "",
+            })
+        finally:
+            try:
+                od_conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("[callrail_webhook] OD patient lookup failed (non-fatal): %s", e)
+    return out
+
+
+def _enrich_new_lead_with_od(lead_id: str, od_lookup: dict) -> None:
+    """
+    For a brand-new CallRail lead where OD lookup already ran,
+    stamp od_patient_num + od_relationship inline.
+    Only writes when pat_num is present and status == 'new_patient'.
+    Avoids a one-night lag before the nightly OD matcher runs.
+    """
+    pat_num = od_lookup.get("pat_num") or ""
+    status  = od_lookup.get("status") or ""
+    if not pat_num or status != "new_patient":
+        return
+    try:
+        from database import _conn, add_lead_event
+        now = _now_iso()
+        with _conn() as conn:
+            conn.execute(
+                "UPDATE leads SET od_patient_num=?, od_matched_at=?, updated_at=? WHERE id=?",
+                (pat_num, now, now, lead_id),
+            )
+        add_lead_event(
+            lead_id, "od_matched",
+            detail=json.dumps({
+                "pat_num": pat_num,
+                "match_method": "callrail_inline",
+                "od_status": status,
+            }),
+            source="callrail_webhook",
+        )
+        logger.info("[callrail_webhook] inline OD-match lead %s → PatNum %s", lead_id, pat_num)
+    except Exception as e:
+        logger.warning("[callrail_webhook] inline OD enrich failed (non-fatal): %s", e)
+
+
 def _upsert_callrail_call(
     conn,
     callrail_call_id: str,
@@ -194,6 +290,8 @@ def _upsert_callrail_call(
     raw_payload: str,
     event_type: str,
     lead_match_method: str = "",
+    od_patient_num: str = "",
+    od_patient_status: str = "",
 ) -> tuple:
     """
     Idempotent upsert of a callrail_calls row.
@@ -253,6 +351,8 @@ def _upsert_callrail_call(
                 mango_call_id      = CASE WHEN ? != '' THEN ? ELSE mango_call_id END,
                 lead_id            = CASE WHEN ? IS NOT NULL THEN ? ELSE lead_id END,
                 lead_match_method  = CASE WHEN ? != '' THEN ? ELSE lead_match_method END,
+                od_patient_num     = CASE WHEN ? != '' THEN ? ELSE od_patient_num END,
+                od_patient_status  = CASE WHEN ? != '' THEN ? ELSE od_patient_status END,
                 event_type         = ?,
                 webhook_received_at = ?,
                 raw_payload        = ?
@@ -277,6 +377,8 @@ def _upsert_callrail_call(
             final_mango_id, final_mango_id,
             final_lead_id, final_lead_id,
             lead_match_method, lead_match_method,
+            od_patient_num, od_patient_num,
+            od_patient_status, od_patient_status,
             event_type,
             now,
             raw_payload,
@@ -290,16 +392,16 @@ def _upsert_callrail_call(
                 caller_number, caller_name, caller_city, caller_state,
                 called_at, duration_seconds, direction, answered, voicemail, first_call,
                 source, campaign, keyword, gclid, landing_page, recording_url,
-                mango_call_id, lead_id, od_patient_num,
+                mango_call_id, lead_id, od_patient_num, od_patient_status,
                 event_type, webhook_received_at, lead_match_method,
                 ingested_at, raw_payload
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             callrail_call_id, tracking_number_id,
             caller_e164, name, city, state,
             called_at, duration, direction, answered, voicemail, first_call,
             source, campaign, keyword, gclid, landing, recording_url,
-            mango_uuid, lead_id, "",
+            mango_uuid, lead_id, od_patient_num, od_patient_status,
             event_type, now, lead_match_method,
             now, raw_payload,
         ))
@@ -492,6 +594,7 @@ def process_webhook(payload: dict, raw_body: bytes) -> dict:
         lead_id = None
         action  = "ingested_no_lead"
         lead_match_method = "none"
+        od_lookup = {"looked_up": False, "pat_num": "", "status": ""}
 
         if caller_e164:
             from database import get_lead_by_phone
@@ -513,11 +616,34 @@ def process_webhook(payload: dict, raw_body: bytes) -> dict:
                     (call.get("answered") or call.get("voicemail"))
                 )
                 if should_create:
-                    lead_id = _create_lead_from_call(call, caller_e164, campaign_id_resolved)
-                    action  = "created"
-                    lead_match_method = "created"
+                    # ── PR 5: existing-patient guard ─────────────────────────
+                    if _existing_patient_guard_enabled():
+                        od_lookup = _check_existing_od_patient(
+                            caller_e164, call.get("start_time", "")
+                        )
+
+                    if (od_lookup["looked_up"]
+                            and od_lookup["pat_num"]
+                            and od_lookup["status"] in ("existing_active", "existing_inactive")):
+                        # Service call from existing OD patient — skip lead creation
+                        action = "skipped_existing_patient"
+                        lead_match_method = "od_existing_patient"
+                        logger.info(
+                            "[callrail_webhook] skip lead creation — caller %s is existing OD "
+                            "patient (PatNum=%s, status=%s)",
+                            caller_e164, od_lookup["pat_num"], od_lookup["status"],
+                        )
+                    else:
+                        lead_id = _create_lead_from_call(call, caller_e164, campaign_id_resolved)
+                        action  = "created"
+                        lead_match_method = "created"
+                        # Inline OD enrichment — don't wait for nightly cron
+                        if od_lookup["looked_up"]:
+                            _enrich_new_lead_with_od(lead_id, od_lookup)
 
         result["lead_id"] = lead_id
+        result["od_patient_num"]    = od_lookup.get("pat_num", "")
+        result["od_patient_status"] = od_lookup.get("status", "")
 
         # ── 8. Upsert call row ───────────────────────────────────────────────
         with _conn() as conn:
@@ -533,6 +659,8 @@ def process_webhook(payload: dict, raw_body: bytes) -> dict:
                 raw_payload=json.dumps(payload),
                 event_type=event_type,
                 lead_match_method=lead_match_method,
+                od_patient_num=od_lookup.get("pat_num", ""),
+                od_patient_status=od_lookup.get("status", ""),
             )
 
         result["was_new_call_row"] = is_new

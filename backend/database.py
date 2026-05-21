@@ -1591,7 +1591,7 @@ def _migrate(conn):
     mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
     mango_patient_cols = [
         ("od_patient_num",    "TEXT DEFAULT ''"),   # OD PatNum matched by phone
-        ("od_patient_status", "TEXT DEFAULT ''"),   # new_patient|existing_active|existing_inactive|unknown
+        ("od_patient_status", "TEXT DEFAULT ''"),   # no_match|new_patient|existing_active|existing_inactive|unknown
         ("od_patient_name",   "TEXT DEFAULT ''"),   # First + Last from OD (not from Mango caller_id_name)
         ("od_matched_at",     "TEXT DEFAULT ''"),   # ISO timestamp of last OD match attempt
     ]
@@ -2706,6 +2706,26 @@ GROUP BY a.campaign_id, c.campaign_name;
                 conn.execute(f"ALTER TABLE callrail_calls ADD COLUMN {_col} {_defn}")
             except Exception:
                 pass  # already exists on concurrent startup
+
+    # ── CallRail PR 5 — OD patient guard columns on callrail_calls ─────────────
+    _cr5_calls_cols = {
+        "od_patient_status": "TEXT DEFAULT ''",  # 'no_match'|'new_patient'|'existing_active'|'existing_inactive'|'unknown'|''
+    }
+    # Re-use _existing_cc_cols (already fetched above; re-fetch in case of schema race)
+    _existing_cc_cols2 = {row[1] for row in conn.execute("PRAGMA table_info(callrail_calls)").fetchall()}
+    for _col, _defn in _cr5_calls_cols.items():
+        if _col not in _existing_cc_cols2:
+            try:
+                conn.execute(f"ALTER TABLE callrail_calls ADD COLUMN {_col} {_defn}")
+            except Exception:
+                pass
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_callrail_calls_od_status "
+            "ON callrail_calls(od_patient_status)"
+        )
+    except Exception:
+        pass
 
 
 def _seed_call_grading_criteria(conn):
@@ -7429,6 +7449,82 @@ def update_mango_call_od_income(
              float(od_patient_production or 0.0),
              now, now, uuid),
         )
+
+
+# ─── CallRail PR 5 helpers ────────────────────────────────────────────────────
+
+def get_callrail_calls_needing_od_enrich(limit: int = 200) -> list:
+    """
+    Return callrail_calls rows where od_patient_num and od_patient_status are
+    both empty AND caller_number is known. Used by the nightly enrich pass and
+    the admin endpoint. Ordered newest-first.
+    """
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT id, callrail_call_id, caller_number, called_at, lead_id, od_patient_num
+            FROM callrail_calls
+            WHERE caller_number != ''
+              AND od_patient_num = ''
+              AND (od_patient_status = '' OR od_patient_status IS NULL)
+            ORDER BY called_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_callrail_call_od_match(call_row_id: int, pat_num: str, status: str) -> None:
+    """Stamp od_patient_num + od_patient_status on a single callrail_calls row."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE callrail_calls SET od_patient_num=?, od_patient_status=? WHERE id=?",
+            (pat_num or "", status or "", call_row_id),
+        )
+
+
+def backfill_callrail_od_from_leads() -> dict:
+    """
+    Pass 1 of OD enrichment — no OD round-trip needed.
+
+    For callrail_calls rows where od_patient_num='' AND lead_id IS NOT NULL,
+    copy the lead's od_patient_num across and map od_relationship to
+    od_patient_status.
+
+    od_relationship → od_patient_status mapping:
+      'active_patient'     → 'existing_active'
+      'reactivation'       → 'existing_inactive'
+      'implant_prospect'   → 'existing_active'
+      'new_patient'/'cold' → 'new_patient'
+      anything else        → ''   (leave blank so Pass 2 can try OD)
+
+    Returns {"scanned": int, "updated": int}.
+    """
+    _rel_to_status = {
+        "active_patient":   "existing_active",
+        "reactivation":     "existing_inactive",
+        "implant_prospect": "existing_active",
+        "new_patient":      "new_patient",
+        "cold":             "new_patient",
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    scanned = updated = 0
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT cc.id, l.od_patient_num, l.od_relationship
+            FROM callrail_calls cc
+            JOIN leads l ON l.id = cc.lead_id
+            WHERE cc.od_patient_num = ''
+              AND cc.lead_id IS NOT NULL
+              AND l.od_patient_num != ''
+        """).fetchall()
+        scanned = len(rows)
+        for r in rows:
+            status = _rel_to_status.get(r["od_relationship"] or "", "")
+            conn.execute(
+                "UPDATE callrail_calls SET od_patient_num=?, od_patient_status=? WHERE id=?",
+                (r["od_patient_num"], status, r["id"]),
+            )
+            updated += 1
+    return {"scanned": scanned, "updated": updated}
 
 
 # ─── Call flags helpers ───────────────────────────────────────────────────────

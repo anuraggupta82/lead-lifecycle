@@ -1113,6 +1113,54 @@ def admin_callrail_recent_calls(limit: int = Query(20, ge=1, le=200)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/callrail/enrich-calls", dependencies=[Depends(_require_admin)])
+def admin_callrail_enrich_calls(limit: int = Query(500, ge=1, le=5000)):
+    """
+    Run OD enrichment for callrail_calls rows missing od_patient_num / od_patient_status.
+
+    Pass 1: copy from linked lead (SQLite only — no OD round-trip).
+    Pass 2: live OD phone lookup for any rows still unenriched.
+
+    Safe to call at any time; idempotent.  Also runs automatically during the
+    nightly OD sync (run_full_od_sync).
+    """
+    try:
+        from od_matcher import enrich_callrail_calls_with_od
+        result = enrich_callrail_calls_with_od(limit=limit)
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.error(f"callrail enrich-calls failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/callrail/guard-status", dependencies=[Depends(_require_admin)])
+def admin_callrail_guard_get():
+    """Return the current state of the existing-patient guard toggle."""
+    try:
+        from callrail_webhook import _existing_patient_guard_enabled
+        return {"status": "ok", "guard_enabled": _existing_patient_guard_enabled()}
+    except Exception as e:
+        logger.error(f"callrail guard-status GET failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/callrail/guard-status", dependencies=[Depends(_require_admin)])
+def admin_callrail_guard_set(body: dict):
+    """
+    Enable or disable the existing-patient guard at runtime.
+    Body: {"enabled": true | false}
+    """
+    try:
+        from database import save_setting
+        enabled = bool(body.get("enabled", True))
+        save_setting("callrail_existing_patient_guard", "true" if enabled else "false")
+        logger.info(f"[callrail] existing-patient guard set to {enabled}")
+        return {"status": "ok", "guard_enabled": enabled}
+    except Exception as e:
+        logger.error(f"callrail guard-status POST failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/sync", dependencies=[Depends(_require_admin)])
 def admin_sync():
     result = sync_from_firestore()
