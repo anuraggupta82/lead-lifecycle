@@ -307,6 +307,7 @@
     .kc-notes { background: #fef3c7; color: #92400e; }
     .kc-appt { background: #d1fae5; color: #065f46; }
     .kc-kw { background: #ede9fe; color: #7c3aed; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+    .kc-selfbooked { background: #a7f3d0; color: #047857; }
     .kc-followup-pill { display: inline-flex; align-items: center; gap: 4px; background: #fef3c7;
                         color: #92400e; padding: 1px 6px; border-radius: 4px; font-size: 9px; font-weight: 600; }
     .kanban-empty { font-size: 10px; color: var(--text-muted); font-style: italic;
@@ -1398,6 +1399,14 @@ function KanbanCard({ lead, isSelected, onClick, onStageChange }) {
       {lead.appointment_date && (
         <div className="kc-row">
           <span className="kc-badge kc-appt">📅 {fmtDate(lead.appointment_date)}</span>
+          {lead.self_booked == 1 && (
+            <span className="kc-badge kc-selfbooked" title="Patient self-scheduled online via visitgdc.com" style={{marginLeft:'4px'}}>✓ Self-Booked</span>
+          )}
+        </div>
+      )}
+      {!lead.appointment_date && lead.self_booked == 1 && (
+        <div className="kc-row">
+          <span className="kc-badge kc-selfbooked" title="Patient self-scheduled online via visitgdc.com">✓ Self-Booked</span>
         </div>
       )}
       {kw && <div className="kc-row"><span className="kc-badge kc-kw" title={kw}>🔑 {kw}</span></div>}

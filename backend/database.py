@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS leads (
     tx_accepted_at  TEXT DEFAULT '',
     tx_completed_at TEXT DEFAULT '',
     cold_at         TEXT DEFAULT '',
+    self_booked INTEGER DEFAULT 0,        -- 1 if patient self-scheduled via visitgdc.com with GAds attribution + always-rule campaign
     tags        TEXT DEFAULT '[]',
     updated_at  TEXT NOT NULL
 );
@@ -2356,6 +2357,10 @@ GROUP BY a.campaign_id, c.campaign_name;
     if "ga4_client_id" not in leads_img_cols:
         conn.execute("ALTER TABLE leads ADD COLUMN ga4_client_id TEXT DEFAULT ''")
 
+    # ── PR 4: self_booked flag — set when scheduler lead has GAds attribution + always-rule campaign ──
+    if "self_booked" not in leads_img_cols:
+        conn.execute("ALTER TABLE leads ADD COLUMN self_booked INTEGER DEFAULT 0")
+
     # ── Image Attachments: image_attachment on workflow_steps ─────────────────
     ws_cols = {row[1] for row in conn.execute("PRAGMA table_info(workflow_steps)").fetchall()}
     if "image_attachment" not in ws_cols:
@@ -2964,6 +2969,10 @@ def upsert_lead(data: dict) -> dict:
                 if data.get(col) not in (None, ""):
                     fields.append(f"{col}=?")
                     values.append(data[col])
+            # PR 4: self_booked is a sticky upgrade — only set to 1, never overwrite back to 0
+            if data.get("self_booked") == 1 or data.get("self_booked") is True:
+                fields.append("self_booked=?")
+                values.append(1)
             if phone_raw:
                 fields += ["phone_hash=?"]
                 values += [_hash_phone(phone_raw) if phone_raw else ""]
@@ -2982,8 +2991,8 @@ def upsert_lead(data: dict) -> dict:
                     utm_campaign, utm_term, utm_content, landing_url,
                     smile_image_url, smile_blob_name, smile_composite_blob_name,
                     notes, tags, ga4_client_id,
-                    appointment_date, appointment_status, od_patient_num)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    appointment_date, appointment_status, od_patient_num, self_booked)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
                 data.get("source") or "unknown", data.get("stage", "new"),
@@ -3004,6 +3013,7 @@ def upsert_lead(data: dict) -> dict:
                 data.get("appointment_date", ""),
                 data.get("appointment_status", ""),
                 data.get("od_patient_num", "") or "",
+                1 if data.get("self_booked") else 0,
             ))
             # Auto-note: inline into same connection so no nested-transaction risk
             try:

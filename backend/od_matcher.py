@@ -811,6 +811,29 @@ def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
                 # ── Parse ATTR: attribution from OD appointment Note ──────────
                 attr = _parse_attr_marker(note_text)
 
+                # ── PR 4: Self-Booked flag ────────────────────────────────────
+                # If the lead has GAds attribution AND the matched campaign in
+                # the pipeline DB has auto_enter_pipeline_rule='always', mark
+                # self_booked=1. Indicates the patient self-scheduled online
+                # (positive signal vs. calling in).
+                self_booked = 0
+                utm_campaign_attr = (attr.get("utm_campaign") or "").strip()
+                if utm_campaign_attr:
+                    try:
+                        from contextlib import closing
+                        from database import _conn as _local_conn
+                        with closing(_local_conn()) as _lc:
+                            _row = _lc.execute(
+                                "SELECT auto_enter_pipeline_rule FROM campaigns "
+                                "WHERE LOWER(campaign_name)=LOWER(?) LIMIT 1",
+                                (utm_campaign_attr,)
+                            ).fetchone()
+                        if _row and (_row[0] == 'always'):
+                            self_booked = 1
+                    except Exception as _sb_e:
+                        logger.debug(f"[sched_leads] self_booked lookup failed for "
+                                     f"utm_campaign={utm_campaign_attr!r}: {_sb_e}")
+
                 # ── Derive appointment type from Note (first non-ATTR line) ───
                 apt_type = ""
                 for line in note_text.splitlines():
@@ -856,6 +879,7 @@ def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
                     "appointment_date":   apt_datetime_str[:10] if apt_datetime_str else "",
                     "appointment_status": "scheduled",
                     "od_patient_num":     pat_num,
+                    "self_booked":        self_booked,
                 }
 
                 upsert_lead(lead_data)
@@ -867,12 +891,14 @@ def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
                               "appointment_type": apt_type,
                               "apt_datetime": apt_datetime_str,
                               "has_attribution": bool(attr.get("gclid") or attr.get("utm_campaign")),
+                              "self_booked": bool(self_booked),
                           }))
 
                 logger.info(
                     f"[sched_leads] Created lead {new_id[:8]} for {email or phone} "
                     f"AptNum={apt_num} apt_type={apt_type!r} "
-                    f"gclid={'yes' if attr.get('gclid') else 'no'}"
+                    f"gclid={'yes' if attr.get('gclid') else 'no'} "
+                    f"self_booked={self_booked}"
                 )
                 created += 1
 
