@@ -145,7 +145,8 @@ def push_ad_schedule(client, customer_id: str, campaign_resource: str,
         client:            GoogleAdsClient
         customer_id:       str digits-only
         campaign_resource: campaigns/XXXXXXX resource name
-        schedule:          list of {day, start_hour, end_hour}
+        schedule:          list of {day, start_hour, end_hour, bid_modifier?}
+                           bid_modifier: float 0.1–10.0 (default 1.0 = no change)
         replace:           if True, remove all existing schedule criteria first
 
     Returns: {"ok": bool, "pushed": int, "removed": int, "error": str|None}
@@ -199,6 +200,10 @@ def push_ad_schedule(client, customer_id: str, campaign_resource: str,
         c.ad_schedule.start_minute = client.enums.MinuteOfHourEnum.ZERO
         c.ad_schedule.end_hour     = end_h
         c.ad_schedule.end_minute   = client.enums.MinuteOfHourEnum.ZERO
+        # bid_modifier: 1.0 = no change, 0.5 = -50%, 1.2 = +20%
+        bid_mod = slot.get("bid_modifier")
+        if bid_mod is not None:
+            c.bid_modifier = max(0.1, min(10.0, float(bid_mod)))
         ops.append(op)
 
     if not ops:

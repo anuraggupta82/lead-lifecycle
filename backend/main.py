@@ -8886,6 +8886,149 @@ def admin_set_campaign_schedule(campaign_id: str, body: SetScheduleRequest):
         raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
 
 
+# ─── GET current ad schedule (with bid modifiers) ────────────────────────────
+
+@app.get("/api/admin/campaigns/{campaign_id}/ad-schedule",
+         dependencies=[Depends(_require_admin)])
+def admin_get_campaign_schedule(campaign_id: str):
+    """
+    Return the current ad schedule criteria for a campaign, including bid modifiers.
+    Reads live from Google Ads API.
+    Returns: {slots: [{day, start_hour, end_hour, bid_modifier}]}
+    """
+    from google_ads_create import _build_client
+    from database import get_campaign_by_id
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    camp_resource = camp.get("gads_campaign_resource") or ""
+    if not camp_resource:
+        raise HTTPException(status_code=400, detail="Campaign not linked to Google Ads")
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+
+    try:
+        client = _build_client()
+        ga_service = client.get_service("GoogleAdsService")
+        query = f"""
+            SELECT
+              campaign_criterion.ad_schedule.day_of_week,
+              campaign_criterion.ad_schedule.start_hour,
+              campaign_criterion.ad_schedule.end_hour,
+              campaign_criterion.bid_modifier
+            FROM campaign_criterion
+            WHERE campaign.resource_name = '{camp_resource}'
+            AND campaign_criterion.type = AD_SCHEDULE
+            ORDER BY campaign_criterion.ad_schedule.day_of_week,
+                     campaign_criterion.ad_schedule.start_hour
+        """
+        rows = list(ga_service.search(customer_id=customer_id, query=query))
+        slots = []
+        for r in rows:
+            s = r.campaign_criterion.ad_schedule
+            bm = r.campaign_criterion.bid_modifier
+            slots.append({
+                "day": s.day_of_week.name,          # e.g. "MONDAY"
+                "start_hour": s.start_hour,
+                "end_hour": s.end_hour,
+                "bid_modifier": round(bm, 4) if bm else 1.0,
+            })
+        return {"slots": slots, "campaign_id": campaign_id, "campaign_resource": camp_resource}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+# ─── POST ad schedule with bid modifiers (structured) ────────────────────────
+
+class ScheduleSlot(BaseModel):
+    day: str           # MONDAY, TUESDAY, etc.
+    start_hour: int    # 0–23
+    end_hour: int      # 1–24
+    bid_modifier: float = 1.0  # 0.1–10.0
+
+class SetScheduleSlotsRequest(BaseModel):
+    campaign_resource: str
+    slots: list[ScheduleSlot]
+
+@app.post("/api/admin/campaigns/{campaign_id}/set-schedule-slots",
+          dependencies=[Depends(_require_admin)])
+def admin_set_campaign_schedule_slots(campaign_id: str, body: SetScheduleSlotsRequest):
+    """
+    Replace the ad schedule on a campaign using structured slot data including bid modifiers.
+    Use this instead of set-schedule when you need per-slot bid modifiers.
+    """
+    import datetime as _dt
+    from google_ads_create import push_ad_schedule, _build_client
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import log_admin_manual_action, update_gads_action_result, set_audit_approval
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    if not body.campaign_resource:
+        raise HTTPException(status_code=422, detail="campaign_resource is required")
+    if not body.slots:
+        raise HTTPException(status_code=422, detail="slots list is required and cannot be empty")
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+
+    slots_dicts = [
+        {
+            "day": s.day.upper(),
+            "start_hour": s.start_hour,
+            "end_hour": s.end_hour,
+            "bid_modifier": max(0.1, min(10.0, s.bid_modifier)),
+        }
+        for s in body.slots
+    ]
+    days_summary = ", ".join(sorted(set(s["day"] for s in slots_dicts)))
+
+    action_id = None
+    try:
+        action_id = log_admin_manual_action(
+            operation="set_ad_schedule",
+            entity_type="campaign",
+            entity_id=body.campaign_resource,
+            entity_name=campaign_id,
+            before={"slots": []},
+            after={"slots": slots_dicts, "days": days_summary,
+                   "campaign_resource": body.campaign_resource},
+            reason=f"Set ad schedule with bid modifiers: {days_summary}",
+        )
+
+        client = _build_client()
+        result = push_ad_schedule(client, customer_id, body.campaign_resource, slots_dicts, replace=True)
+        if not result["ok"]:
+            if action_id:
+                update_gads_action_result(action_id, executed=True,
+                                          execution_result="error", error_detail=result["error"])
+            raise HTTPException(status_code=502, detail=f"Google Ads error: {result['error']}")
+
+        if action_id:
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, "admin")
+
+        return {
+            "ok": True,
+            "pushed": result.get("pushed", 0),
+            "removed": result.get("removed", 0),
+            "slots": slots_dicts,
+            "days_summary": days_summary,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        if action_id:
+            update_gads_action_result(action_id, executed=True,
+                                      execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
 # ─── Google Ads extended reporting ───────────────────────────────────────────
 
 @app.get("/api/admin/gads/ad-groups", dependencies=[Depends(_require_admin)])

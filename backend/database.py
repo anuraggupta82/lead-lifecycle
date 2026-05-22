@@ -5944,12 +5944,15 @@ def update_gads_action_result(
 ) -> None:
     """Update an audit log row after the Google Ads API call returns."""
     now = _now()
+    # api_executed=1 when executed=True (actual API call was made);
+    # only set to 0 if explicitly not executed (pending/rejected paths).
+    api_executed_val = 1 if executed else 0
     with _conn() as conn:
         conn.execute("""
             UPDATE gads_audit_log
-               SET executed=?, execution_result=?, error_detail=?, updated_at=?
+               SET executed=?, execution_result=?, error_detail=?, api_executed=?, updated_at=?
              WHERE action_id=?
-        """, (1 if executed else 0, execution_result, error_detail, now, action_id))
+        """, (1 if executed else 0, execution_result, error_detail, api_executed_val, now, action_id))
 
 
 def set_audit_approval(action_id: str, approver: str) -> None:

@@ -6206,6 +6206,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [geoEditDraft, setGeoEditDraft]       = useState('');   // geo_json string being edited
   const [geoSaving, setGeoSaving]             = useState(false);
 
+  // Ad schedule editor (Performance tab)
+  const [schedEditOpen, setSchedEditOpen]     = useState(false);
+  const [schedSlots, setSchedSlots]           = useState([]);    // [{day,start_hour,end_hour,bid_modifier}]
+  const [schedLoading, setSchedLoading]       = useState(false);
+  const [schedSaving, setSchedSaving]         = useState(false);
+  const [schedMsg, setSchedMsg]               = useState('');
+
   // AI Refine box (Performance tab)
   const [aiRefineInput, setAiRefineInput]     = useState('');
   const [aiRefineLoading, setAiRefineLoading] = useState(false);
@@ -6570,6 +6577,47 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
       alert('Location update failed: ' + (e?.detail || e?.message || 'Unknown error'));
     } finally {
       setGeoSaving(false);
+    }
+  }
+
+  // Load current ad schedule from Google Ads
+  async function loadSchedule(campId) {
+    setSchedLoading(true);
+    setSchedMsg('');
+    try {
+      const res = await api(`/api/admin/campaigns/${campId}/ad-schedule`);
+      setSchedSlots(res.slots || []);
+    } catch(e) {
+      setSchedMsg('Failed to load schedule: ' + (e?.detail || e?.message || 'error'));
+    } finally {
+      setSchedLoading(false);
+    }
+  }
+
+  // Save ad schedule (with bid modifiers) to Google Ads
+  async function saveSchedule(campId) {
+    const cd = campDetail;
+    const campResource = cd?.campaign?.gads_campaign_resource;
+    if (!campResource) { alert('No campaign resource found'); return; }
+    if (!schedSlots.length) { alert('Add at least one schedule slot before saving'); return; }
+    setSchedSaving(true);
+    setSchedMsg('');
+    try {
+      const res = await api(`/api/admin/campaigns/${campId}/set-schedule-slots`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({campaign_resource: campResource, slots: schedSlots}),
+      });
+      setSchedMsg(`✅ Schedule saved — ${res.pushed} slot(s) pushed, ${res.removed} removed`);
+      setTimeout(() => {
+        setSchedEditOpen(false);
+        setSchedMsg('');
+        openCampaignDetail(campId, campDetailDays);
+      }, 1800);
+    } catch(e) {
+      setSchedMsg('Save failed: ' + (e?.detail || e?.message || 'Unknown error'));
+    } finally {
+      setSchedSaving(false);
     }
   }
 
@@ -10622,6 +10670,80 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                             color:'#fff',border:'none',borderRadius:5,cursor:'pointer',
                                             opacity:geoSaving?0.6:1}}>
                                           {geoSaving ? 'Saving…' : '💾 Save to Google Ads'}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+
+                              {/* ── Ad Schedule editor ── */}
+                              {cd.campaign.gads_campaign_resource && (
+                                <div style={{marginBottom:12}}>
+                                  {!schedEditOpen ? (
+                                    <div style={{display:'flex',alignItems:'center',gap:6,
+                                      background:'#f9fafb',border:'1px solid var(--border)',
+                                      borderRadius:6,padding:'7px 10px'}}>
+                                      <span style={{fontSize:11,color:'var(--text-muted)',flexShrink:0}}>🕐 Schedule:</span>
+                                      <span style={{fontSize:12,flex:1,color:'var(--text)'}}>
+                                        {cd.campaign.ad_schedule
+                                          ? cd.campaign.ad_schedule
+                                          : <span style={{color:'#9ca3af'}}>24/7 (no schedule set)</span>}
+                                      </span>
+                                      <button
+                                        title="Edit ad schedule and bid modifiers"
+                                        onClick={async ()=>{
+                                          setSchedEditOpen(true);
+                                          setSchedSlots([]);
+                                          await loadSchedule(cd.campaign.campaign_id);
+                                        }}
+                                        style={{fontSize:12,background:'none',border:'none',
+                                          cursor:'pointer',color:'var(--teal)',padding:'0 4px',lineHeight:1}}>
+                                        ✏️ Edit
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <div style={{background:'#fff',border:'1px solid var(--teal)',
+                                      borderRadius:7,padding:'10px 12px'}}>
+                                      <div style={{display:'flex',justifyContent:'space-between',
+                                        alignItems:'center',marginBottom:8}}>
+                                        <span style={{fontSize:12,fontWeight:600,color:'var(--teal)'}}>
+                                          🕐 Edit Ad Schedule
+                                        </span>
+                                        <button onClick={()=>{setSchedEditOpen(false);setSchedMsg('');}}
+                                          style={{fontSize:11,background:'none',border:'none',
+                                            cursor:'pointer',color:'var(--text-muted)'}}>✕ Cancel</button>
+                                      </div>
+                                      {schedLoading ? (
+                                        <div style={{fontSize:11,color:'var(--text-muted)',padding:'8px 0'}}>
+                                          Loading current schedule from Google Ads…
+                                        </div>
+                                      ) : (
+                                        <AdScheduleEditor
+                                          slots={schedSlots}
+                                          onChange={setSchedSlots}
+                                        />
+                                      )}
+                                      {schedMsg && (
+                                        <div style={{marginTop:8,fontSize:11,padding:'5px 8px',borderRadius:5,
+                                          background: schedMsg.startsWith('✅') ? '#f0fdf4' : '#fef2f2',
+                                          color: schedMsg.startsWith('✅') ? '#166534' : '#dc2626',
+                                          border: `1px solid ${schedMsg.startsWith('✅') ? '#bbf7d0' : '#fca5a5'}`}}>
+                                          {schedMsg}
+                                        </div>
+                                      )}
+                                      <div style={{display:'flex',gap:8,marginTop:10,justifyContent:'flex-end'}}>
+                                        <button onClick={()=>{setSchedEditOpen(false);setSchedMsg('');}}
+                                          style={{fontSize:11,padding:'4px 12px',background:'#f3f4f6',
+                                            color:'var(--text)',border:'none',borderRadius:5,cursor:'pointer'}}>
+                                          Cancel
+                                        </button>
+                                        <button disabled={schedSaving||schedLoading}
+                                          onClick={()=>saveSchedule(cd.campaign.campaign_id)}
+                                          style={{fontSize:11,padding:'4px 14px',background:'var(--teal)',
+                                            color:'#fff',border:'none',borderRadius:5,cursor:'pointer',
+                                            opacity:(schedSaving||schedLoading)?0.6:1}}>
+                                          {schedSaving ? 'Saving…' : '💾 Save to Google Ads'}
                                         </button>
                                       </div>
                                     </div>
@@ -15277,6 +15399,97 @@ function _ohSerialize(dayMap) {
     }
   });
   return parts.join(', ');
+}
+
+// ── Ad Schedule Editor ────────────────────────────────────────────────────────
+// Lets users define per-slot day/hour ranges with optional bid modifiers.
+// Used in the Performance tab alongside the geo editor.
+
+const _SCHED_DAYS = ['MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY','SUNDAY'];
+const _SCHED_DAY_SHORT = {MONDAY:'Mon',TUESDAY:'Tue',WEDNESDAY:'Wed',THURSDAY:'Thu',FRIDAY:'Fri',SATURDAY:'Sat',SUNDAY:'Sun'};
+const _SCHED_HOURS = Array.from({length:25}, (_,i) => i); // 0–24
+
+function _schedFmtHour(h) {
+  if (h === 0)  return '12am';
+  if (h === 12) return '12pm';
+  if (h === 24) return 'midnight';
+  return h < 12 ? `${h}am` : `${h-12}pm`;
+}
+
+function _schedBmLabel(bm) {
+  if (!bm || bm === 1) return 'no change';
+  const pct = Math.round((bm - 1) * 100);
+  return pct > 0 ? `+${pct}%` : `${pct}%`;
+}
+
+function _schedBmColor(bm) {
+  if (!bm || bm === 1) return 'var(--text-muted)';
+  return bm > 1 ? '#059669' : '#dc2626';
+}
+
+function AdScheduleEditor({slots, onChange}) {
+  const selStyle = {fontSize:11,padding:'2px 4px',border:'1px solid var(--border)',
+    borderRadius:3,background:'var(--bg)',color:'var(--text)'};
+  const bmStyle  = {fontSize:11,padding:'2px 4px',border:'1px solid var(--border)',
+    borderRadius:3,background:'var(--bg)',color:'var(--text)',width:60};
+
+  function updateSlot(idx, field, val) {
+    const next = slots.map((s,i) => i===idx ? {...s, [field]: val} : s);
+    onChange(next);
+  }
+
+  function addSlot() {
+    onChange([...slots, {day:'MONDAY', start_hour:8, end_hour:18, bid_modifier:1.0}]);
+  }
+
+  function removeSlot(idx) {
+    onChange(slots.filter((_,i) => i !== idx));
+  }
+
+  return (
+    <div>
+      {slots.length === 0 && (
+        <div style={{fontSize:11,color:'var(--text-muted)',fontStyle:'italic',marginBottom:6}}>
+          No schedule set — campaign runs 24/7
+        </div>
+      )}
+      {slots.map((slot, idx) => (
+        <div key={idx} style={{display:'flex',alignItems:'center',gap:6,marginBottom:4,flexWrap:'wrap'}}>
+          <select value={slot.day} onChange={e=>updateSlot(idx,'day',e.target.value)} style={{...selStyle,width:74}}>
+            {_SCHED_DAYS.map(d => <option key={d} value={d}>{_SCHED_DAY_SHORT[d]}</option>)}
+          </select>
+          <select value={slot.start_hour} onChange={e=>updateSlot(idx,'start_hour',+e.target.value)} style={{...selStyle,width:62}}>
+            {_SCHED_HOURS.slice(0,24).map(h=><option key={h} value={h}>{_schedFmtHour(h)}</option>)}
+          </select>
+          <span style={{fontSize:10,color:'var(--text-muted)'}}>–</span>
+          <select value={slot.end_hour} onChange={e=>updateSlot(idx,'end_hour',+e.target.value)} style={{...selStyle,width:72}}>
+            {_SCHED_HOURS.slice(1).map(h=><option key={h} value={h}>{_schedFmtHour(h)}</option>)}
+          </select>
+          <span style={{fontSize:10,color:'var(--text-muted)',flexShrink:0}}>bid</span>
+          <input
+            type="number" min="0.1" max="10" step="0.05"
+            value={slot.bid_modifier ?? 1.0}
+            onChange={e=>updateSlot(idx,'bid_modifier',parseFloat(e.target.value)||1.0)}
+            style={bmStyle}
+          />
+          <span style={{fontSize:10,fontWeight:600,color:_schedBmColor(slot.bid_modifier),minWidth:44}}>
+            {_schedBmLabel(slot.bid_modifier)}
+          </span>
+          <button onClick={()=>removeSlot(idx)}
+            style={{fontSize:11,background:'none',border:'none',cursor:'pointer',
+              color:'#dc2626',padding:'0 2px',lineHeight:1}}>✕</button>
+        </div>
+      ))}
+      <button onClick={addSlot}
+        style={{fontSize:11,marginTop:4,padding:'3px 10px',background:'var(--bg-alt,#f9fafb)',
+          border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',color:'var(--text)'}}>
+        + Add slot
+      </button>
+      <div style={{marginTop:6,fontSize:9,color:'var(--text-muted)'}}>
+        Bid modifier: 1.0 = no change · 0.6 = −40% · 1.1 = +10%
+      </div>
+    </div>
+  );
 }
 
 function OfficeHoursEditor({value, onChange}) {
