@@ -17197,10 +17197,14 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, onMove, o
 
 function AssignmentModal({ number, campaigns, onClose, onSaved }) {
   const [assignmentType, setAssignmentType] = React.useState(number.assignment_type || 'unassigned');
-  const [assignedCampaignId, setAssignedCampaignId] = React.useState(number.assigned_campaign_id ? String(number.assigned_campaign_id) : '');
+  // Multi-campaign: set of selected campaign IDs (strings)
+  const [selectedCampaignIds, setSelectedCampaignIds] = React.useState(
+    () => number.assigned_campaign_id ? new Set([String(number.assigned_campaign_id)]) : new Set()
+  );
   const [forwardTo, setForwardTo] = React.useState(number.forward_to || '');
   const [whisper, setWhisper] = React.useState(number.whisper_message || '');
   const [saving, setSaving] = React.useState(false);
+  const [saveProgress, setSaveProgress] = React.useState('');
   const [err, setErr] = React.useState('');
   const [forwardErr, setForwardErr] = React.useState('');
 
@@ -17215,41 +17219,91 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
     }
   }
 
+  function toggleCampaign(idStr) {
+    setSelectedCampaignIds(prev => {
+      const next = new Set(prev);
+      if (next.has(idStr)) { next.delete(idStr); } else { next.add(idStr); }
+      return next;
+    });
+  }
+
+  function selectAllCampaigns() {
+    setSelectedCampaignIds(new Set(campaigns.map(c => String(c.id))));
+  }
+
+  function clearAllCampaigns() {
+    setSelectedCampaignIds(new Set());
+  }
+
   async function handleSave() {
     if (forwardErr || !e164Re.test(forwardTo)) { setForwardErr('Must be E.164 format: +1XXXXXXXXXX'); return; }
-    if (assignmentType === 'gads_campaign' && !assignedCampaignId) { setErr('Select a campaign'); return; }
-    setSaving(true); setErr('');
-    try {
-      const res = await api(`/api/admin/callrail/numbers/${number.id}/assign`, {
-        method: 'POST',
-        body: JSON.stringify({
-          assignment_type: assignmentType,
-          assigned_campaign_id: assignmentType === 'gads_campaign' ? parseInt(assignedCampaignId) : null,
-          assigned_call_extension_id: '',
-          static_source_label: '',
-          forward_to: forwardTo,
-          whisper_message: whisper,
-        }),
-      });
-      // Surface GAds push warnings without blocking close
-      const gp = res?.number?.gads_push || {};
-      if (gp.status === 'failed') {
-        setErr(`Saved to CallRail ✓ — but Google Ads push failed: ${gp.error}. Use Retry GAds from the table row.`);
-        onSaved();  // reload table so badge shows
-      } else if (gp.status === 'pending') {
-        setErr(`Saved ✓ — Google Ads push deferred: ${gp.error}.`);
+    if (assignmentType === 'gads_campaign' && selectedCampaignIds.size === 0) { setErr('Select at least one campaign'); return; }
+    setSaving(true); setErr(''); setSaveProgress('');
+
+    if (assignmentType !== 'gads_campaign') {
+      // Single call for non-campaign types
+      try {
+        await api(`/api/admin/callrail/numbers/${number.id}/assign`, {
+          method: 'POST',
+          body: JSON.stringify({
+            assignment_type: assignmentType,
+            assigned_campaign_id: null,
+            assigned_call_extension_id: '',
+            static_source_label: '',
+            forward_to: forwardTo,
+            whisper_message: whisper,
+          }),
+        });
         onSaved();
-      } else {
-        onSaved();
+      } catch(e) {
+        setErr(e.detail || e.message || 'Save failed');
+      } finally { setSaving(false); setSaveProgress(''); }
+      return;
+    }
+
+    // Multi-campaign: push to each selected campaign in sequence
+    const ids = Array.from(selectedCampaignIds);
+    let failed = []; let gadsWarnings = [];
+    for (let i = 0; i < ids.length; i++) {
+      const campId = ids[i];
+      const camp = campaigns.find(c => String(c.id) === campId);
+      setSaveProgress(`Pushing ${i + 1}/${ids.length}: ${camp?.campaign_name || campId}…`);
+      try {
+        const res = await api(`/api/admin/callrail/numbers/${number.id}/assign`, {
+          method: 'POST',
+          body: JSON.stringify({
+            assignment_type: 'gads_campaign',
+            assigned_campaign_id: parseInt(campId),
+            assigned_call_extension_id: '',
+            static_source_label: '',
+            forward_to: forwardTo,
+            whisper_message: whisper,
+          }),
+        });
+        const gp = res?.number?.gads_push || {};
+        if (gp.status === 'failed') gadsWarnings.push(`${camp?.campaign_name}: GAds push failed${gp.error ? ' — ' + gp.error : ''}`);
+        else if (gp.status === 'pending') gadsWarnings.push(`${camp?.campaign_name}: GAds push pending${gp.error ? ' — ' + gp.error : ''}`);
+      } catch(e) {
+        failed.push(`${camp?.campaign_name || campId}: ${e.detail || e.message || 'error'}`);
       }
-    } catch(e) {
-      setErr(e.detail || e.message || 'Save failed');
-    } finally { setSaving(false); }
+    }
+
+    setSaving(false); setSaveProgress('');
+    if (failed.length > 0) {
+      // Keep modal open so user can see which campaigns failed and retry
+      setErr(`${failed.length} campaign(s) failed:\n${failed.join('\n')}`);
+      if (failed.length < ids.length) onSaved(); // partial success — refresh table
+    } else if (gadsWarnings.length > 0) {
+      setErr(`Saved to CallRail ✓ — GAds warnings:\n${gadsWarnings.join('\n')}`);
+      onSaved();
+    } else {
+      onSaved();
+    }
   }
 
   const typeOptions = [
     { value: 'unassigned',    label: '— Unassigned',          desc: 'Not yet assigned to a campaign' },
-    { value: 'gads_campaign', label: '🎯 Google Ads Campaign', desc: 'Dedicated tracking number + call extension for this campaign' },
+    { value: 'gads_campaign', label: '🎯 Google Ads Campaign', desc: 'Push call extension to one or more campaigns' },
   ];
 
   const LBL = {fontSize:12,fontWeight:700,color:'#111827',display:'block',marginBottom:6,textTransform:'uppercase',letterSpacing:0.6};
@@ -17286,16 +17340,40 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
           ))}
         </div>
 
-        {/* Conditional sub-fields */}
+        {/* Multi-campaign checkboxes */}
         {assignmentType === 'gads_campaign' && (
           <div style={{marginBottom:16}}>
-            <label style={LBL}>Campaign</label>
-            <select value={assignedCampaignId} onChange={e => setAssignedCampaignId(e.target.value)} style={INPUT}>
-              <option value="">— Select campaign —</option>
-              {campaigns.map(c => (
-                <option key={c.id} value={String(c.id)}>{c.campaign_name} [{c.status}]</option>
-              ))}
-            </select>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+              <label style={LBL}>Campaigns ({selectedCampaignIds.size} selected)</label>
+              <div style={{display:'flex',gap:8}}>
+                <button onClick={selectAllCampaigns} style={{fontSize:12,color:'#0d9488',background:'none',border:'none',cursor:'pointer',padding:'2px 6px',borderRadius:4,fontWeight:600}}>All</button>
+                <button onClick={clearAllCampaigns} style={{fontSize:12,color:'#6b7280',background:'none',border:'none',cursor:'pointer',padding:'2px 6px',borderRadius:4,fontWeight:600}}>None</button>
+              </div>
+            </div>
+            <div style={{border:'1px solid #d1d5db',borderRadius:7,overflow:'hidden',maxHeight:220,overflowY:'auto'}}>
+              {campaigns.map((c, i) => {
+                const idStr = String(c.id);
+                const checked = selectedCampaignIds.has(idStr);
+                const isActive = c.status === 'ENABLED';
+                return (
+                  <label key={c.id} style={{display:'flex',alignItems:'center',gap:10,padding:'9px 12px',cursor:'pointer',
+                    background: checked ? 'rgba(13,148,136,0.08)' : (i % 2 === 0 ? '#f9fafb' : '#fff'),
+                    borderBottom: i < campaigns.length - 1 ? '1px solid #e5e7eb' : 'none',
+                  }}>
+                    <input type="checkbox" checked={checked} onChange={() => toggleCampaign(idStr)}
+                      style={{width:15,height:15,accentColor:'#0d9488',flexShrink:0}} />
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:13,fontWeight:600,color:'#111827',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{c.campaign_name}</div>
+                    </div>
+                    <span style={{fontSize:11,fontWeight:600,padding:'2px 7px',borderRadius:10,flexShrink:0,
+                      background: isActive ? 'rgba(16,185,129,0.12)' : 'rgba(107,114,128,0.12)',
+                      color: isActive ? '#059669' : '#6b7280'}}>
+                      {c.status}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
           </div>
         )}
         {/* Forwarding */}
@@ -17317,13 +17395,14 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
           {wordCount > 25 && <div style={{color:'#f59e0b',fontSize:12,marginTop:5}}>⚠ Over 25 words — CallRail may truncate when played</div>}
         </div>
 
-        {err && <div style={{color:'#ef4444',fontSize:13,marginBottom:12,padding:'10px 12px',background:'rgba(239,68,68,0.1)',borderRadius:6,border:'1px solid #ef4444'}}>{err}</div>}
+        {err && <div style={{color:'#ef4444',fontSize:13,marginBottom:12,padding:'10px 12px',background:'rgba(239,68,68,0.1)',borderRadius:6,border:'1px solid #ef4444',whiteSpace:'pre-line'}}>{err}</div>}
+        {saveProgress && <div style={{color:'#0d9488',fontSize:13,marginBottom:12,padding:'8px 12px',background:'rgba(13,148,136,0.08)',borderRadius:6}}>{saveProgress}</div>}
 
         <div style={{display:'flex',justifyContent:'flex-end',gap:10,borderTop:'1px solid #e5e7eb',paddingTop:16}}>
-          <button onClick={onClose} style={{padding:'9px 20px',border:'1px solid #d1d5db',borderRadius:7,background:'#f9fafb',color:'#374151',cursor:'pointer',fontSize:14,fontWeight:500}}>Cancel</button>
+          <button onClick={onClose} disabled={saving} style={{padding:'9px 20px',border:'1px solid #d1d5db',borderRadius:7,background:'#f9fafb',color:'#374151',cursor:saving ? 'default' : 'pointer',fontSize:14,fontWeight:500,opacity:saving ? 0.5 : 1}}>Cancel</button>
           <button onClick={handleSave} disabled={saving || !!forwardErr}
             style={{padding:'9px 20px',border:'none',borderRadius:7,background:'#0d9488',color:'#fff',cursor:saving ? 'default' : 'pointer',fontSize:14,fontWeight:600,opacity: saving ? 0.7 : 1}}>
-            {saving ? 'Saving…' : '✓ Save & Push'}
+            {saving ? (saveProgress ? '⏳ Pushing…' : 'Saving…') : `✓ Save & Push${assignmentType === 'gads_campaign' && selectedCampaignIds.size > 1 ? ` (${selectedCampaignIds.size})` : ''}`}
           </button>
         </div>
       </div>
