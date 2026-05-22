@@ -2998,12 +2998,40 @@ def update_stage(lead_id: str, new_stage: str, source: str = "system", detail: s
     return get_lead(lead_id)
 
 
-def get_all_leads(stage: str = None, limit: int = 200) -> list:
+def get_all_leads(stage: str = None, limit: int = 200, gads_only: bool = False) -> list:
+    """Return leads from the pipeline DB.
+
+    gads_only=True filters to leads with a Google Ads attribution signal:
+      - gclid present (click-through)
+      - campaign_id present (GAds campaign tag)
+      - utm_source starts with 'google' or contains 'cpc'
+      - notes mention 'Google Ads' or 'gclid' (CallRail fallback when cookie expired)
+      - source='manual' (dentist-entered leads always shown)
+    All other callers (od_matcher, mango_service, etc.) must NOT pass gads_only=True.
+    """
+    _GADS_FILTER = """(
+        COALESCE(gclid, '') != ''
+        OR COALESCE(campaign_id, '') != ''
+        OR COALESCE(utm_source, '') LIKE 'google%'
+        OR COALESCE(utm_source, '') LIKE '%cpc%'
+        OR COALESCE(notes, '') LIKE '%Google Ads%'
+        OR COALESCE(notes, '') LIKE '%gclid%'
+        OR source = 'manual'
+    )"""
     with _conn() as conn:
+        conditions = []
+        params: list = []
         if stage:
-            rows = conn.execute("SELECT * FROM leads WHERE stage=? ORDER BY updated_at DESC LIMIT ?", (stage, limit)).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM leads ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+            conditions.append("stage = ?")
+            params.append(stage)
+        if gads_only:
+            conditions.append(_GADS_FILTER)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"SELECT * FROM leads {where} ORDER BY updated_at DESC LIMIT ?",
+            params,
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -3429,14 +3457,25 @@ def unsubscribe(lead_id: str, channel: str, reason: str = ""):
 
 # ─── Pipeline stats ──────────────────────────────────────────────────────────
 
-def get_pipeline_stats() -> dict:
+def get_pipeline_stats(gads_only: bool = False) -> dict:
+    _GADS_FILTER = """(
+        COALESCE(gclid, '') != ''
+        OR COALESCE(campaign_id, '') != ''
+        OR COALESCE(utm_source, '') LIKE 'google%'
+        OR COALESCE(utm_source, '') LIKE '%cpc%'
+        OR COALESCE(notes, '') LIKE '%Google Ads%'
+        OR COALESCE(notes, '') LIKE '%gclid%'
+        OR source = 'manual'
+    )"""
+    _where = f"WHERE {_GADS_FILTER}" if gads_only else ""
+    _and   = f"AND {_GADS_FILTER}"  if gads_only else ""
     with _conn() as conn:
-        rows = conn.execute("SELECT stage, COUNT(*) as count FROM leads GROUP BY stage").fetchall()
+        rows = conn.execute(f"SELECT stage, COUNT(*) as count FROM leads {_where} GROUP BY stage").fetchall()
         counts = {r["stage"]: r["count"] for r in rows}
-        total = conn.execute("SELECT COUNT(*) FROM leads WHERE stage != 'cold'").fetchone()[0]
-        total_all = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
-        revenue = conn.execute("SELECT SUM(attributed_production) FROM leads").fetchone()[0] or 0.0
-        income = conn.execute("SELECT SUM(attributed_income) FROM leads").fetchone()[0] or 0.0
+        total = conn.execute(f"SELECT COUNT(*) FROM leads WHERE stage != 'cold' {_and}").fetchone()[0]
+        total_all = conn.execute(f"SELECT COUNT(*) FROM leads {_where}").fetchone()[0]
+        revenue = conn.execute(f"SELECT SUM(attributed_production) FROM leads {_where}").fetchone()[0] or 0.0
+        income = conn.execute(f"SELECT SUM(attributed_income) FROM leads {_where}").fetchone()[0] or 0.0
         pending_followups = conn.execute("SELECT COUNT(*) FROM follow_up_queue WHERE status='pending'").fetchone()[0]
         sent_today = conn.execute("""
             SELECT COUNT(*) FROM follow_up_queue
@@ -3448,14 +3487,14 @@ def get_pipeline_stats() -> dict:
         # no-shows, or leads with an active treatment plan value.
         # NOTE: The OR-chain is intentional — no_show is excluded from clause 1
         # by 'stage NOT IN' but re-included by clause 2. Keep the comment.
-        hot_leads_count = conn.execute("""
+        hot_leads_count = conn.execute(f"""
             SELECT COUNT(*) FROM leads WHERE (
                 (od_relationship IN ('implant_prospect','reactivation')
                  AND stage NOT IN ('treatment_completed','cold'))
                 OR (stage = 'no_show' AND no_show_count >= 1)
                 OR (treatment_plan_value > 0
                     AND stage NOT IN ('treatment_completed','cold'))
-            )
+            ) {_and}
         """).fetchone()[0]
 
         return {

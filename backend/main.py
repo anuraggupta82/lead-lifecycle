@@ -826,9 +826,13 @@ async def receive_event(payload: EventPayload):
 # ─── Pipeline API ─────────────────────────────────────────────────────────────
 
 @app.get("/api/pipeline")
-def get_pipeline(stage: Optional[str] = None, limit: int = 200):
-    """Return all leads with their current stage — feeds the dashboard."""
-    leads = get_all_leads(stage=stage, limit=limit)
+def get_pipeline(stage: Optional[str] = None, limit: int = 200, show_all: bool = False):
+    """Return all leads with their current stage — feeds the dashboard.
+
+    Default: gads_only=True (only Google Ads attributed leads shown).
+    Pass show_all=true to bypass the filter and see every lead.
+    """
+    leads = get_all_leads(stage=stage, limit=limit, gads_only=not show_all)
 
     # Enrich each lead with last event
     result = []
@@ -971,8 +975,10 @@ def delete_smile_image(lead_id: str):
 # ─── Admin endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/admin/stats", dependencies=[Depends(_require_admin)])
-def admin_stats():
-    return get_pipeline_stats()
+def admin_stats(show_all: bool = False):
+    """Pipeline KPI stats. Default: gads_only (matches /api/pipeline/enriched default).
+    Pass show_all=true to get unfiltered counts (must match pipeline fetch)."""
+    return get_pipeline_stats(gads_only=not show_all)
 
 
 @app.get("/api/admin/queue", dependencies=[Depends(_require_admin)])
@@ -10439,13 +10445,33 @@ def admin_trigger_pipeline(request: Request):
 # ─── Pipeline with enrichment ────────────────────────────────────────────────
 
 @app.get("/api/pipeline/enriched")
-def get_pipeline_enriched(stage: Optional[str] = None, campaign: Optional[str] = None, limit: int = 500):
-    """Return all leads enriched with notes count, for Kanban board."""
+def get_pipeline_enriched(
+    stage: Optional[str] = None,
+    campaign: Optional[str] = None,
+    limit: int = 500,
+    show_all: bool = False,
+):
+    """Return all leads enriched with notes count, for Kanban board.
+
+    Default: gads_only filter applied (only Google Ads attributed leads).
+    Pass show_all=true to bypass the filter and see every lead.
+    """
+    _GADS_FILTER = """(
+        COALESCE(l.gclid, '') != ''
+        OR COALESCE(l.campaign_id, '') != ''
+        OR COALESCE(l.utm_source, '') LIKE 'google%'
+        OR COALESCE(l.utm_source, '') LIKE '%cpc%'
+        OR COALESCE(l.notes, '') LIKE '%Google Ads%'
+        OR COALESCE(l.notes, '') LIKE '%gclid%'
+        OR l.source = 'manual'
+    )"""
     from database import _conn
     with _conn() as conn:
         query = "SELECT l.*, (SELECT COUNT(*) FROM lead_notes n WHERE n.lead_id = l.id) as notes_count FROM leads l"
         params = []
         conditions = []
+        if not show_all:
+            conditions.append(_GADS_FILTER)
         if stage:
             conditions.append("l.stage = ?")
             params.append(stage)

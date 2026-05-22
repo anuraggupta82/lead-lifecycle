@@ -1460,7 +1460,7 @@ function KanbanColumn({ stage, label, leads, color, selectedId, onCardClick, onD
   );
 }
 
-function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh }) {
+function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [sourceFilter, setSourceFilter] = useState('all');
   const [showCold, setShowCold] = useState(false);
@@ -1573,6 +1573,24 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
           <input type="checkbox" checked={showCold} onChange={e => setShowCold(e.target.checked)} />
           Cold
         </label>
+        {/* PR 0 — GAds-only source filter toggle */}
+        <button
+          title={showAllSources ? 'Showing all sources — click to show GAds leads only' : 'Showing GAds leads only — click to show all sources'}
+          onClick={() => onToggleShowAll && onToggleShowAll(!showAllSources)}
+          style={{
+            fontSize: 11,
+            padding: '4px 10px',
+            borderRadius: 6,
+            border: '1px solid ' + (showAllSources ? 'var(--border)' : 'var(--teal)'),
+            background: showAllSources ? 'var(--surface)' : 'var(--teal)',
+            color: showAllSources ? 'var(--text-muted)' : '#fff',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            fontWeight: showAllSources ? 400 : 600,
+          }}
+        >
+          {showAllSources ? '👁 All Sources' : '📱 GAds Only'}
+        </button>
         <button className="btn btn-teal btn-sm" onClick={() => { setNewLead({...EMPTY_LEAD}); setAddLeadError(''); setShowAddLead(true); }}
           style={{marginLeft:'auto', fontSize:11, padding:'4px 14px', whiteSpace:'nowrap'}}>
           + Add Lead
@@ -1826,7 +1844,7 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
 // ── PipelineTab — thin wrapper around KanbanBoard ──────────────────────────
 
 // PipelineTab is a thin wrapper — all logic lives in KanbanBoard above
-function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh }) {
+function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll }) {
   return (
     <KanbanBoard
       pipeline={pipeline}
@@ -1835,6 +1853,8 @@ function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       onCardClick={onCardClick}
       onStageChange={onStageChange}
       onRefresh={onRefresh}
+      showAllSources={showAllSources}
+      onToggleShowAll={onToggleShowAll}
     />
   );
 }
@@ -19387,6 +19407,8 @@ function App() {
   const [tab, setTab] = useState('dashboard');  // Dashboard is now the landing tab
   const [pipeline, setPipeline] = useState([]);
   const [stats, setStats] = useState(null);
+  // PR 0 — GAds-only pipeline filter (default ON; toggle to see all sources)
+  const [showAllSources, setShowAllSources] = useState(false);
   const [campaignStats, setCampaignStats] = useState([]);
   const [keywordStats, setKeywordStats] = useState([]);
   const [ga4Data, setGa4Data]   = useState(null);
@@ -19413,6 +19435,9 @@ function App() {
       window.removeEventListener('inbox-unread-changed', loadData);
     };
   }, []);
+
+  // Re-fetch pipeline when the GAds-only filter toggles
+  useEffect(() => { loadData(); }, [showAllSources]);
 
   // Update browser tab title
   useEffect(() => {
@@ -19442,11 +19467,14 @@ function App() {
     } finally { setGa4Loading(false); }
   }
 
-  async function loadData() {
+  async function loadData(overrideShowAll) {
+    // overrideShowAll lets the toggle call loadData(true/false) before state settles
+    const _showAll = overrideShowAll !== undefined ? overrideShowAll : showAllSources;
+    const _qs = _showAll ? '?show_all=true' : '';
     try {
       const [p, s, c, g] = await Promise.all([
-        api('/api/pipeline/enriched'),
-        api('/api/admin/stats'),
+        api('/api/pipeline/enriched' + _qs),
+        api('/api/admin/stats' + _qs),
         api('/api/admin/campaigns'),
         api(`/api/admin/ga4?days=${ga4Days}`).catch(() => null),
       ]);
@@ -19625,7 +19653,8 @@ function App() {
             {tab === 'pipeline' && (
               <React.Fragment>
                 <PipelineTab pipeline={pipeline} stats={stats} selectedId={selectedId}
-                  onCardClick={setSelectedId} onStageChange={handleStageChange} onRefresh={loadData} />
+                  onCardClick={setSelectedId} onStageChange={handleStageChange} onRefresh={loadData}
+                  showAllSources={showAllSources} onToggleShowAll={(val) => setShowAllSources(val)} />
                 {selectedId && (
                   <DetailPanel lead={pipeline.find(l => l.id === selectedId)} onClose={() => setSelectedId(null)}
                     onStageChange={handleStageChange} onRefresh={loadData}
