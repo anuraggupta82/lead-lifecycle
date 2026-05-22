@@ -1460,11 +1460,80 @@ function KanbanColumn({ stage, label, leads, color, selectedId, onCardClick, onD
   );
 }
 
-function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll }) {
+function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll, campaigns }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [sourceFilter, setSourceFilter] = useState('all');
   const [showCold, setShowCold] = useState(false);
   const [followupOnly, setFollowupOnly] = useState(false);
+  // PR 3 — per-campaign chip filter (client-side; full pipeline still fetched)
+  const PIPELINE_FILTER_LS_KEY = 'nxtsmile_pipeline_campaign_filter';
+  const [selectedCampaigns, setSelectedCampaigns] = useState(() => {
+    try {
+      const raw = localStorage.getItem(PIPELINE_FILTER_LS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed.map(String);
+      }
+    } catch(_) {}
+    return [];
+  });
+  const [savingDefault, setSavingDefault] = useState(false);
+  const [savedDefaultCampaigns, setSavedDefaultCampaigns] = useState([]);
+
+  // Persist current chip selection to localStorage on every change
+  useEffect(() => {
+    try { localStorage.setItem(PIPELINE_FILTER_LS_KEY, JSON.stringify(selectedCampaigns)); } catch(_) {}
+  }, [selectedCampaigns]);
+
+  // On mount: load saved default from server; if localStorage had nothing, adopt the default
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const d = await api('/api/admin/pipeline-default-campaigns');
+        if (cancelled) return;
+        const names = Array.isArray(d?.campaigns) ? d.campaigns.map(String) : [];
+        setSavedDefaultCampaigns(names);
+        try {
+          const lsRaw = localStorage.getItem(PIPELINE_FILTER_LS_KEY);
+          if (!lsRaw && names.length > 0) setSelectedCampaigns(names);
+        } catch(_) {}
+      } catch(_) {
+        // non-fatal — server may be unreachable briefly
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  function toggleCampaign(name) {
+    setSelectedCampaigns(prev =>
+      prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]
+    );
+  }
+
+  function clearCampaignChips() {
+    setSelectedCampaigns([]);
+  }
+
+  async function saveDefaultView() {
+    setSavingDefault(true);
+    try {
+      const res = await api('/api/admin/pipeline-default-campaigns', {
+        method: 'POST',
+        body: JSON.stringify({ campaigns: selectedCampaigns }),
+      });
+      setSavedDefaultCampaigns(Array.isArray(res?.campaigns) ? res.campaigns : selectedCampaigns);
+    } catch(e) {
+      console.error('Save default view failed', e);
+    } finally {
+      setSavingDefault(false);
+    }
+  }
+
+  function resetToDefault() {
+    setSelectedCampaigns(savedDefaultCampaigns.slice());
+  }
+
   const boardRef = useRef(null);
   // Manual lead creation
   const EMPTY_LEAD = {first_name:'',last_name:'',email:'',phone:'',source:'manual',notes:''};
@@ -1492,10 +1561,17 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
   }
 
   const filtered = useMemo(() => {
+    const campaignSet = selectedCampaigns.length > 0 ? new Set(selectedCampaigns) : null;
     return pipeline.filter(l => {
       if (!showCold && l.stage === 'cold') return false;
       if (sourceFilter !== 'all' && l.source !== sourceFilter) return false;
       if (followupOnly && !isStaffFollowUp(l)) return false;
+      if (campaignSet) {
+        const cn = (l.campaign_name || '').trim();
+        // Manual leads (no campaign_name) always pass through — they come from
+        // the PR 0 fallback (source='manual') and are not campaign-attributed.
+        if (cn && !campaignSet.has(cn)) return false;
+      }
       if (searchTerm) {
         const term = searchTerm.toLowerCase();
         const name = ((l.first_name || '') + ' ' + (l.last_name || '')).trim().toLowerCase();
@@ -1505,7 +1581,7 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       }
       return true;
     });
-  }, [pipeline, searchTerm, sourceFilter, showCold, followupOnly]);
+  }, [pipeline, searchTerm, sourceFilter, showCold, followupOnly, selectedCampaigns]);
 
   const byStage = useMemo(() => {
     const map = {};
@@ -1522,6 +1598,33 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
     const set = new Set(pipeline.filter(l => l.source).map(l => l.source));
     return ['all', ...Array.from(set).sort()];
   }, [pipeline]);
+
+  // PR 3 — campaign chip names: prefer campaigns prop, fall back to pipeline data.
+  // Note: get_campaign_stats() rows use key 'campaign' (not 'campaign_name'), so
+  // we try both to be robust against either shape.
+  const campaignChipNames = useMemo(() => {
+    const set = new Set();
+    if (Array.isArray(campaigns)) {
+      campaigns.forEach(c => {
+        const n = (c?.campaign_name || c?.campaign || '').trim();
+        if (n) set.add(n);
+      });
+    }
+    pipeline.forEach(l => {
+      const n = (l?.campaign_name || '').trim();
+      if (n) set.add(n);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [campaigns, pipeline]);
+
+  // Whether current selection differs from saved default (drives Save/Reset visibility)
+  const isDirtyVsDefault = useMemo(() => {
+    const a = [...selectedCampaigns].sort();
+    const b = [...savedDefaultCampaigns].sort();
+    if (a.length !== b.length) return true;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return true;
+    return false;
+  }, [selectedCampaigns, savedDefaultCampaigns]);
 
   async function handleDrop(leadId, newStage) {
     try {
@@ -1596,6 +1699,85 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
           + Add Lead
         </button>
       </div>
+
+      {/* PR 3 — Campaign chip row (multi-select, client-side filter) */}
+      {campaignChipNames.length > 0 && (
+        <div style={{
+          display:'flex', flexWrap:'wrap', alignItems:'center', gap:6,
+          padding:'6px 10px', marginBottom:8,
+          background:'var(--surface)', border:'1px solid var(--border)',
+          borderRadius:6, fontSize:11,
+        }}>
+          <span style={{color:'var(--text-muted)', fontWeight:600, marginRight:4}}>Campaigns:</span>
+          <button
+            onClick={clearCampaignChips}
+            title="Show all campaigns"
+            style={{
+              fontSize:11, padding:'3px 9px', borderRadius:12,
+              border:'1px solid ' + (selectedCampaigns.length === 0 ? 'var(--teal)' : 'var(--border)'),
+              background: selectedCampaigns.length === 0 ? 'var(--teal)' : 'transparent',
+              color: selectedCampaigns.length === 0 ? '#fff' : 'var(--text-muted)',
+              cursor:'pointer', whiteSpace:'nowrap',
+              fontWeight: selectedCampaigns.length === 0 ? 600 : 400,
+            }}
+          >
+            All
+          </button>
+          {campaignChipNames.map(name => {
+            const active = selectedCampaigns.includes(name);
+            return (
+              <button
+                key={name}
+                onClick={() => toggleCampaign(name)}
+                title={active ? 'Click to remove this campaign filter' : 'Click to filter to this campaign'}
+                style={{
+                  fontSize:11, padding:'3px 9px', borderRadius:12,
+                  border:'1px solid ' + (active ? 'var(--teal)' : 'var(--border)'),
+                  background: active ? 'var(--teal)' : 'transparent',
+                  color: active ? '#fff' : 'var(--text)',
+                  cursor:'pointer', whiteSpace:'nowrap',
+                  fontWeight: active ? 600 : 400,
+                  maxWidth:240, overflow:'hidden', textOverflow:'ellipsis',
+                }}
+              >
+                {name}
+              </button>
+            );
+          })}
+          <div style={{marginLeft:'auto', display:'flex', gap:6, alignItems:'center'}}>
+            {isDirtyVsDefault && savedDefaultCampaigns.length > 0 && (
+              <button
+                onClick={resetToDefault}
+                title="Reset chips to saved default"
+                style={{
+                  fontSize:11, padding:'3px 9px', borderRadius:6,
+                  border:'1px solid var(--border)', background:'transparent',
+                  color:'var(--text-muted)', cursor:'pointer', whiteSpace:'nowrap',
+                }}
+              >
+                ↺ Reset
+              </button>
+            )}
+            <button
+              onClick={saveDefaultView}
+              disabled={savingDefault || !isDirtyVsDefault}
+              title="Save current chip selection as default view"
+              style={{
+                fontSize:11, padding:'3px 9px', borderRadius:6,
+                border:'1px solid ' + (isDirtyVsDefault ? 'var(--teal)' : 'var(--border)'),
+                background: isDirtyVsDefault ? 'var(--teal)' : 'transparent',
+                color: isDirtyVsDefault ? '#fff' : 'var(--text-muted)',
+                cursor: (savingDefault || !isDirtyVsDefault) ? 'not-allowed' : 'pointer',
+                whiteSpace:'nowrap',
+                fontWeight: isDirtyVsDefault ? 600 : 400,
+                opacity: (savingDefault || !isDirtyVsDefault) ? 0.7 : 1,
+              }}
+            >
+              {savingDefault ? 'Saving…' : '💾 Save Default'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Add Lead Modal */}
       {showAddLead && (
@@ -1844,7 +2026,7 @@ function DashboardTab({ pipeline, stats, onTabSwitch }) {
 // ── PipelineTab — thin wrapper around KanbanBoard ──────────────────────────
 
 // PipelineTab is a thin wrapper — all logic lives in KanbanBoard above
-function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll }) {
+function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll, campaigns }) {
   return (
     <KanbanBoard
       pipeline={pipeline}
@@ -1855,6 +2037,7 @@ function PipelineTab({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       onRefresh={onRefresh}
       showAllSources={showAllSources}
       onToggleShowAll={onToggleShowAll}
+      campaigns={campaigns}
     />
   );
 }
@@ -19747,7 +19930,8 @@ function App() {
               <React.Fragment>
                 <PipelineTab pipeline={pipeline} stats={stats} selectedId={selectedId}
                   onCardClick={setSelectedId} onStageChange={handleStageChange} onRefresh={loadData}
-                  showAllSources={showAllSources} onToggleShowAll={(val) => setShowAllSources(val)} />
+                  showAllSources={showAllSources} onToggleShowAll={(val) => setShowAllSources(val)}
+                  campaigns={campaignStats} />
                 {selectedId && (
                   <DetailPanel lead={pipeline.find(l => l.id === selectedId)} onClose={() => setSelectedId(null)}
                     onStageChange={handleStageChange} onRefresh={loadData}

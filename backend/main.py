@@ -25,7 +25,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Header, Body, BackgroundTasks, UploadFile, File, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -10523,6 +10523,44 @@ def get_pipeline_enriched(
         rows = conn.execute(query, params).fetchall()
         leads = [dict(r) for r in rows]
     return {"leads": leads, "total": len(leads)}
+
+
+# ─── PR 3 — Pipeline default campaign filter ─────────────────────────────────
+
+@app.get("/api/admin/pipeline-default-campaigns", dependencies=[Depends(_require_admin)])
+def get_pipeline_default_campaigns():
+    """Return the saved default campaign-name filter for the Kanban pipeline view.
+
+    Stored in settings under key 'pipeline_default_campaigns' as a JSON array of
+    campaign_name strings. Empty list = no default (show all campaigns that pass
+    visibility rules).
+    """
+    import json as _json
+    raw = get_setting("pipeline_default_campaigns", "")
+    try:
+        names = _json.loads(raw) if raw else []
+        if not isinstance(names, list):
+            names = []
+        names = [str(n) for n in names if str(n).strip()]
+    except Exception:
+        names = []
+    return {"campaigns": names}
+
+
+class PipelineDefaultCampaignsRequest(BaseModel):
+    campaigns: List[str] = []
+
+
+@app.post("/api/admin/pipeline-default-campaigns", dependencies=[Depends(_require_admin)])
+def save_pipeline_default_campaigns(body: PipelineDefaultCampaignsRequest):
+    """Persist the user's default campaign chip selection for the Kanban pipeline.
+
+    Pass an empty list to clear the default (== show all campaigns).
+    """
+    import json as _json
+    cleaned = [str(c).strip() for c in (body.campaigns or []) if str(c).strip()]
+    save_setting("pipeline_default_campaigns", _json.dumps(cleaned))
+    return {"ok": True, "campaigns": cleaned}
 
 
 # ─── Scheduled Jobs Status ───────────────────────────────────────────────────

@@ -3080,23 +3080,50 @@ def update_stage(lead_id: str, new_stage: str, source: str = "system", detail: s
 
 def _pipeline_visibility_clause(lead_alias: str = "leads") -> str:
     """Return a SQL WHERE fragment (no leading WHERE keyword) that hides leads from
-    campaigns with auto_enter_pipeline_rule='never', while preserving all other leads.
+    campaigns with auto_enter_pipeline_rule='never', and enforces
+    'when_follow_up_flagged' via a correlated EXISTS on mango_calls.
 
-    Logic (PR 2):
+    Logic (PR 3 — extends PR 2):
       - Lead has a campaign_id that matches a campaigns row → honor that campaign's rule.
-        Only 'never' actively hides; all other rules (always / when_no_booking /
-        when_follow_up_flagged) show in the pipeline view.
+          * 'never'                                → hidden
+          * 'always' / 'when_no_booking' / NULL   → shown
+          * 'when_follow_up_flagged' (PR 3)        → shown ONLY IF:
+                (a) any associated mango_calls row has follow_up_needed=1, OR
+                (b) the lead has no *classified* calls yet (classified_at=''/NULL)
+                    → benefit of the doubt for unclassified leads.
       - Lead has no matching campaign row → fall back to the PR 0 heuristic:
         must have a GAds signal (gclid, utm_source, notes, source='manual').
 
-    Uses a LEFT JOIN on campaigns; callers must alias the leads table as `lead_alias`.
-    The JOIN and this clause are returned separately — see _pipeline_visibility_join().
+    Callers must:
+      - alias the leads table as `lead_alias` (e.g. 'l' or 'leads')
+      - include the campaigns LEFT JOIN via _pipeline_visibility_join()
+    The mango_calls lookup is inlined as correlated subqueries — no extra JOIN
+    is required of the caller (keeps all existing call sites unchanged).
     """
     L = lead_alias
     return f"""(
-        -- Campaign matched: show unless rule is 'never'
+        -- Campaign matched: show unless rule is 'never' (and follow-up rule satisfied)
         (c.campaign_id IS NOT NULL
-         AND COALESCE(c.auto_enter_pipeline_rule, 'always') != 'never')
+         AND COALESCE(c.auto_enter_pipeline_rule, 'always') != 'never'
+         AND (
+            -- 'always' / 'when_no_booking' / NULL → always passes this check
+            COALESCE(c.auto_enter_pipeline_rule, 'always') != 'when_follow_up_flagged'
+            OR
+            -- 'when_follow_up_flagged': pass if any call is flagged for follow-up
+            EXISTS (
+                SELECT 1 FROM mango_calls mc_fu
+                WHERE mc_fu.lead_id = {L}.id
+                  AND mc_fu.follow_up_needed = 1
+            )
+            OR
+            -- 'when_follow_up_flagged': pass if lead has no classified calls yet
+            NOT EXISTS (
+                SELECT 1 FROM mango_calls mc_any
+                WHERE mc_any.lead_id = {L}.id
+                  AND COALESCE(mc_any.classified_at, '') != ''
+            )
+         )
+        )
         OR
         -- No campaign match: legacy GAds heuristic (PR 0 fallback for orphan leads)
         (c.campaign_id IS NULL AND (
