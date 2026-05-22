@@ -7385,8 +7385,17 @@ def get_mango_calls(
     direction: str = "",
     status: str = "",
     days: int = 30,
-) -> list:
-    """Return mango_calls rows enriched with GAds campaign name, newest first."""
+    gads_only: bool = False,
+    patient_status: str = "",   # comma-separated: 'new_patient' | 'existing_active,existing_inactive'
+    converted: bool = False,
+) -> tuple:
+    """Return mango_calls rows enriched with GAds + CallRail data, newest first.
+
+    Stackable filters:
+      gads_only     — GAds call extension calls OR CallRail DNI google_ads calls with keyword
+      patient_status — comma-separated od_patient_status values (OR'd via IN)
+      converted     — booked_outcome='booked' OR ai_appointment_scheduled=1
+    """
     cutoff = (datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     ) - __import__("datetime").timedelta(days=days)).isoformat()
@@ -7398,6 +7407,24 @@ def get_mango_calls(
     if status:
         clauses.append("mc.status = ?")
         params.append(status)
+    if gads_only:
+        clauses.append("""(
+            (mc.gads_call_id IS NOT NULL AND mc.gads_call_id != '')
+            OR EXISTS (
+                SELECT 1 FROM callrail_calls cc2
+                WHERE cc2.mango_call_id = mc.uuid
+                  AND cc2.source = 'google_ads'
+                  AND COALESCE(cc2.keyword, '') != ''
+            )
+        )""")
+    if patient_status:
+        ps_values = [v.strip() for v in patient_status.split(",") if v.strip()]
+        if ps_values:
+            placeholders = ",".join("?" for _ in ps_values)
+            clauses.append(f"mc.od_patient_status IN ({placeholders})")
+            params.extend(ps_values)
+    if converted:
+        clauses.append("(mc.booked_outcome = 'booked' OR mc.ai_appointment_scheduled = 1)")
     where = " AND ".join(clauses)
     params.extend([limit, offset])
     with _conn() as conn:
@@ -7441,10 +7468,23 @@ def get_mango_calls(
                        COALESCE(
                            NULLIF(gcv.campaign_id, ''),
                            NULLIF(l.campaign_id, '')
-                       ) AS effective_campaign_id
+                       ) AS effective_campaign_id,
+                       -- CallRail DNI bridge: raw keyword captured at landing time
+                       cr.keyword  AS callrail_keyword,
+                       cr.gclid    AS callrail_gclid,
+                       cr.campaign AS callrail_campaign,
+                       cr.source   AS callrail_source
                 FROM mango_calls mc
                 LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
                 LEFT JOIN leads l ON l.id = mc.lead_id
+                -- CallRail: pick the best-matching row (prefer non-empty keyword, then newest)
+                LEFT JOIN callrail_calls cr ON cr.id = (
+                    SELECT cc.id FROM callrail_calls cc
+                    WHERE cc.mango_call_id = mc.uuid
+                    ORDER BY (CASE WHEN COALESCE(cc.keyword,'') != '' THEN 0 ELSE 1 END),
+                             cc.id DESC
+                    LIMIT 1
+                )
                 WHERE {where}
                 ORDER BY mc.started_at DESC LIMIT ? OFFSET ?""",
             params,
@@ -7640,25 +7680,36 @@ def get_missed_mango_calls_since(since_iso: str) -> list:
 
 
 def get_mango_calls_needing_od_match(limit: int = 500) -> list:
-    """Return inbound calls from Google Ads that haven't been matched against OpenDental yet.
+    """Return inbound calls from paid/tracked sources that haven't been OD-matched yet.
 
-    Restricted to calls with a gads_call_id (GAds call extension) OR a lead_id
-    (click/form lead that was linked to this call). We only phone-match patients
-    who came through ads — matching every Mango call would pull in existing patients
-    and inflate new-patient metrics.
+    Three eligibility paths (any one qualifies):
+      1. mc.gads_call_id IS NOT NULL  — Google Ads call extension
+      2. mc.lead_id IS NOT NULL       — known lead (form/click) linked to this call
+      3. EXISTS callrail row WHERE mango_call_id = mc.uuid AND source = 'google_ads'
+            — CallRail DNI captured a Google Ads visitor (no gads_call_id path)
+
+    We only phone-match patients who came through a paid/tracked source to avoid
+    pulling in organic/existing patients and inflating new-patient metrics.
+    Uses EXISTS (not LEFT JOIN) to avoid duplicate rows when multiple CallRail
+    events (call.created + call.completed) link to the same Mango call.
     """
     with _conn() as conn:
         rows = conn.execute(
-            """SELECT uuid, from_number, caller_id_name, started_at
-               FROM mango_calls
-               WHERE direction='inbound'
-                 AND (od_matched_at IS NULL OR od_matched_at = '')
-                 AND from_number IS NOT NULL AND from_number != ''
+            """SELECT mc.uuid, mc.from_number, mc.caller_id_name, mc.started_at
+               FROM mango_calls mc
+               WHERE mc.direction='inbound'
+                 AND (mc.od_matched_at IS NULL OR mc.od_matched_at = '')
+                 AND mc.from_number IS NOT NULL AND mc.from_number != ''
                  AND (
-                     (gads_call_id IS NOT NULL AND gads_call_id != '')
-                     OR lead_id IS NOT NULL
+                     (mc.gads_call_id IS NOT NULL AND mc.gads_call_id != '')
+                     OR mc.lead_id IS NOT NULL
+                     OR EXISTS (
+                         SELECT 1 FROM callrail_calls cc
+                         WHERE cc.mango_call_id = mc.uuid
+                           AND cc.source = 'google_ads'
+                     )
                  )
-               ORDER BY started_at DESC
+               ORDER BY mc.started_at DESC
                LIMIT ?""",
             (limit,),
         ).fetchall()

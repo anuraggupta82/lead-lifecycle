@@ -68,22 +68,36 @@ def attribute_calls_to_keywords(days: int = 30) -> dict:
     from database import _conn
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    counts = {"method_a": 0, "method_b": 0, "method_c": 0, "method_d": 0,
-              "skipped": 0, "errors": 0}
+    counts = {"method_a": 0, "method_a_prime": 0, "method_b": 0, "method_c": 0,
+              "method_d": 0, "skipped": 0, "errors": 0}
 
     try:
         with _conn() as conn:
-            # Fetch unattributed inbound calls in the window
+            # Fetch unattributed inbound calls in the window.
+            # CallRail bridge: correlated subquery picks the best callrail_calls row
+            # (prefers rows with a non-empty keyword, then newest) to avoid duplicates
+            # when multiple CallRail events (call.created + call.completed) link to
+            # the same Mango call.
             rows = conn.execute("""
                 SELECT
                   mc.uuid, mc.started_at, mc.lead_id, mc.gads_call_id,
                   l.gclid, l.keyword_text AS lead_keyword, l.search_term_type AS lead_match_type,
                   l.ad_group_name AS lead_ad_group, l.campaign_name AS lead_campaign_name,
                   l.campaign_id AS lead_campaign_id,
-                  gcv.campaign_id AS gcv_campaign_id, gcv.campaign_name AS gcv_campaign_name
+                  gcv.campaign_id AS gcv_campaign_id, gcv.campaign_name AS gcv_campaign_name,
+                  -- PR B: CallRail DNI bridge (exact search query captured at landing time)
+                  cr.keyword  AS cr_keyword,
+                  cr.source   AS cr_source
                 FROM mango_calls mc
-                LEFT JOIN leads l           ON l.id        = mc.lead_id
+                LEFT JOIN leads l            ON l.id        = mc.lead_id
                 LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+                LEFT JOIN callrail_calls cr  ON cr.id = (
+                    SELECT cc.id FROM callrail_calls cc
+                    WHERE cc.mango_call_id = mc.uuid
+                    ORDER BY (CASE WHEN COALESCE(cc.keyword,'') != '' THEN 0 ELSE 1 END),
+                             cc.id DESC
+                    LIMIT 1
+                )
                 WHERE mc.started_at >= ?
                   AND mc.direction = 'inbound'
                   AND (mc.attributed_keyword_method IS NULL OR mc.attributed_keyword_method = '')
@@ -107,9 +121,9 @@ def attribute_calls_to_keywords(days: int = 30) -> dict:
     total = sum(v for k, v in counts.items() if k != "errors")
     logger.info(
         f"Call attribution complete: "
-        f"A={counts['method_a']} B={counts['method_b']} "
-        f"C={counts['method_c']} D={counts['method_d']} "
-        f"skip={counts['skipped']} err={counts['errors']} / {total} processed"
+        f"A={counts['method_a']} A'={counts['method_a_prime']} "
+        f"B={counts['method_b']} C={counts['method_c']} "
+        f"D={counts['method_d']} skip={counts['skipped']} err={counts['errors']} / {total} processed"
     )
     return counts
 
@@ -133,6 +147,21 @@ def _attribute_one_call(conn, row: dict) -> str:
                            method="lead_gclid",
                            confidence=0.95)
         return "method_a"
+
+    # ── Method A-prime: CallRail DNI captured the exact search query ─────────
+    # Priority: between A (gclid-confirmed) and B (campaign+date inference).
+    # CallRail's keyword is the literal search query that landed the visitor, which
+    # is more accurate than inferring from gads_clicks but lacks a gclid-level link.
+    # Only fires for google_ads-sourced calls with a non-empty keyword.
+    if (row.get("cr_source") == "google_ads"
+            and (row.get("cr_keyword") or "").strip()):
+        _write_attribution(conn, uuid,
+                           keyword=row["cr_keyword"].strip(),
+                           match_type="",      # CallRail does not report match_type
+                           ad_group="",        # CallRail does not report ad_group
+                           method="callrail_dni",
+                           confidence=0.85)
+        return "method_a_prime"
 
     # ── Method B: lead exists but no gclid — find dominant keyword by campaign+date ──
     # Many leads only have campaign_name (not campaign_id). Try both.

@@ -9416,12 +9416,19 @@ def admin_get_calls(
     days: int = 30,
     limit: int = 100,
     offset: int = 0,
+    gads_only: bool = False,
+    patient_status: str = "",   # comma-separated: 'new_patient', 'existing_active', 'existing_inactive'
+    converted: bool = False,
 ):
-    """List Mango Voice calls. Filter by direction (inbound/outbound), status, days back."""
+    """List Mango Voice calls. Stackable filters: direction, status, gads_only,
+    patient_status (comma-sep od_patient_status values), converted, days-back."""
     from database import get_mango_calls, get_gads_call_view
     calls, total = get_mango_calls(
         limit=limit, offset=offset,
         direction=direction, status=status, days=days,
+        gads_only=gads_only,
+        patient_status=patient_status,
+        converted=converted,
     )
     # Also return gads call_view counts for summary
     gads_calls = get_gads_call_view(days=days)
@@ -9432,6 +9439,10 @@ def admin_get_calls(
         if c.get("gads_call_id"):
             conf = c.get("match_confidence", 0) or 0
             c["attribution_label"] = "Ad call ✓" if conf >= 0.90 else "Ad call (~)"
+        elif (c.get("callrail_source") == "google_ads"
+              and (c.get("callrail_keyword") or "").strip()):
+            # CallRail DNI captured a Google Ads visitor — no gads_call_id but keyword known
+            c["attribution_label"] = "Ad call (DNI)"
         elif c.get("lead_id"):
             c["attribution_label"] = "Known lead"
         else:
