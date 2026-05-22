@@ -6193,6 +6193,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [gadsUnlinkedLocal, setGadsUnlinkedLocal] = useState([]);   // local campaigns without a GAds link
   const [gadsLinkMap, setGadsLinkMap] = useState({});               // { [gadsCampaignId]: localCampaignId }
   const [campDetail, setCampDetail] = useState(null);
+  // PR 2 — inline pipeline rule editor: { [campaign_id]: 'saving'|'idle' }
+  const [pipelineRuleSaving, setPipelineRuleSaving] = useState({});
   const [campDetailLoading, setCampDetailLoading] = useState(false);
   const [campDetailOptimizerRecs, setCampDetailOptimizerRecs] = useState([]);
   const [campDetailRejectModal, setCampDetailRejectModal] = useState(null);      // {action_id, entity_name, operation}
@@ -6756,6 +6758,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [wizardWfId, setWizardWfId] = useState('');
   const [wizardSkipWorkflow, setWizardSkipWorkflow] = useState(false);
   const [wizardCopyFrom, setWizardCopyFrom] = useState(''); // campaign_id to copy settings from
+  const [wizardPipelineRule, setWizardPipelineRule] = useState('always'); // PR 2
   const [wizardStrategy, setWizardStrategy] = useState(null);
   const [wizardStrategyLoading, setWizardStrategyLoading] = useState(false);
   const [wizardRefineInput, setWizardRefineInput] = useState('');
@@ -6790,6 +6793,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
     setWizardWfId('');
     setWizardSkipWorkflow(false);
     setWizardCopyFrom('');
+    setWizardPipelineRule('always');
     setCampSaveMsg('');
     setWizardStepError('');
     try {
@@ -6806,6 +6810,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
     setWizardWfId('');
     setWizardSkipWorkflow(false);
     setWizardCopyFrom('');
+    setWizardPipelineRule('always');
     setCampSaveMsg('');
     setWizardStepError('');
     setWizardStrategy(null);
@@ -6842,6 +6847,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
         expected_cpl: parseFloat(newCamp.expected_cpl) || 0,
         workflow_id: wfIdVal,
         skip_workflow: wizardSkipWorkflow,
+        auto_enter_pipeline_rule: wizardPipelineRule,
+        pipeline_default_visibility: 'shown',
       };
       const createRes = await api('/api/admin/campaigns/create', { method: 'POST', body: JSON.stringify(savedCamp) });
       const createdCampId = createRes?.campaign?.campaign_id || null;
@@ -7388,6 +7395,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
             <tr>
               <th>Campaign</th>
               <th>Status</th>
+              <th style={{width:110}} title="When leads from this campaign enter the pipeline">Pipeline</th>
               <th style={{width:90}}>Type</th>
               <th style={{width:88}}>Start</th>
               <th style={{width:88}}>End</th>
@@ -7417,10 +7425,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
           </thead>
           <tbody>
             {unifiedLoading && (
-              <tr><td colSpan={14} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
+              <tr><td colSpan={15} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>Loading…</td></tr>
             )}
             {!unifiedLoading && unifiedCamps.length === 0 && (
-              <tr><td colSpan={14} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
+              <tr><td colSpan={15} style={{textAlign:'center',color:'var(--text-muted)',padding:20,fontStyle:'italic'}}>
                 No campaigns yet — click "+ New Campaign" or "⬇ Import from Google Ads".
               </td></tr>
             )}
@@ -7494,6 +7502,58 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                         {c.status}
                       </span>
                     </td>
+
+                    {/* PR 2 — Pipeline routing rule badge + inline editor */}
+                    {(() => {
+                      const rule = c.auto_enter_pipeline_rule || 'always';
+                      const saving = pipelineRuleSaving[c.campaign_id] === 'saving';
+                      const ruleColor = rule === 'never' ? '#dc2626'
+                        : (rule === 'when_no_booking' || rule === 'when_follow_up_flagged') ? '#d97706'
+                        : '#6b7280';
+                      const ruleLabel = rule === 'always' ? 'Always'
+                        : rule === 'when_no_booking' ? 'No-booking'
+                        : rule === 'when_follow_up_flagged' ? 'Flagged'
+                        : 'Never';
+                      return (
+                        <td>
+                          <select
+                            disabled={saving}
+                            value={rule}
+                            title="When leads from this campaign enter the pipeline"
+                            onChange={async (e) => {
+                              const newRule = e.target.value;
+                              setPipelineRuleSaving(p => ({...p, [c.campaign_id]: 'saving'}));
+                              try {
+                                await api(`/api/admin/campaigns/${c.campaign_id}`, {
+                                  method: 'PATCH',
+                                  body: JSON.stringify({ auto_enter_pipeline_rule: newRule }),
+                                });
+                                // Optimistically update the local unified camps list
+                                setUnifiedCamps(prev => prev.map(x =>
+                                  x.campaign_id === c.campaign_id
+                                    ? {...x, auto_enter_pipeline_rule: newRule}
+                                    : x
+                                ));
+                              } catch(_) { /* leave as-is on error */ }
+                              setPipelineRuleSaving(p => ({...p, [c.campaign_id]: 'idle'}));
+                            }}
+                            style={{
+                              fontSize: 10, fontWeight: 600, color: ruleColor,
+                              background: ruleColor + '12',
+                              border: `1px solid ${ruleColor}55`,
+                              borderRadius: 4, padding: '2px 4px',
+                              cursor: saving ? 'wait' : 'pointer',
+                              maxWidth: 100,
+                            }}
+                          >
+                            <option value="always">Always</option>
+                            <option value="when_no_booking">No-booking</option>
+                            <option value="when_follow_up_flagged">Flagged (AI)</option>
+                            <option value="never">Never</option>
+                          </select>
+                        </td>
+                      );
+                    })()}
 
                     <td style={{fontSize:10,color:'var(--text-muted)'}}>{(c.campaign_type||'—').replace('GOOGLE_ADS','G-Ads')}</td>
                     <td style={{fontSize:11}}>{c.start_date || '—'}</td>
@@ -7631,7 +7691,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                   {/* Strategy expansion row */}
                   {strategyOpen && parsedStrategy && (
                     <tr>
-                      <td colSpan={14} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
+                      <td colSpan={15} style={{padding:0,background:'#fafafa',borderTop:'none'}}>
                         <div style={{padding:'16px 18px',borderLeft:'3px solid var(--teal)'}}>
                           <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
                             <span style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>🧠 Opus Strategy</span>
@@ -11992,6 +12052,34 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                     🚫 No follow-up emails or SMS will be sent for leads from this campaign. Leads will still appear in the pipeline.
                   </div>
                 )}
+
+                {/* ── PR 2: Pipeline Routing ── */}
+                <div style={{marginTop:18,paddingTop:14,borderTop:'1px solid var(--border)'}}>
+                  <div style={{fontSize:12,fontWeight:700,color:'var(--text)',marginBottom:4}}>Pipeline Routing</div>
+                  <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+                    When should leads from this campaign enter the pipeline worklist?
+                  </div>
+                  {[
+                    { value:'always',                 label:'Always',                       desc:'Every inbound contact enters the pipeline. Best for implants, high-value services.' },
+                    { value:'when_no_booking',        label:'Only when no booking yet',     desc:'Skip leads who already booked themselves. Best for general dentistry campaigns.' },
+                    { value:'when_follow_up_flagged', label:'Only when follow-up flagged',  desc:'AI classifier decides (rolling out soon). Falls back to Always in the meantime.' },
+                    { value:'never',                  label:'Never — tracking only',        desc:'Leads are recorded for attribution but hidden from the pipeline board.' },
+                  ].map(opt => (
+                    <label key={opt.value} style={{display:'flex',gap:10,alignItems:'flex-start',marginBottom:8,cursor:'pointer',
+                      padding:'8px 10px',borderRadius:7,
+                      border:`1.5px solid ${wizardPipelineRule===opt.value ? 'var(--teal)' : 'var(--border)'}`,
+                      background: wizardPipelineRule===opt.value ? 'rgba(13,122,127,0.06)' : 'var(--surface)'}}>
+                      <input type="radio" name="pipeline_rule" value={opt.value}
+                        checked={wizardPipelineRule===opt.value}
+                        onChange={()=>setWizardPipelineRule(opt.value)}
+                        style={{marginTop:2,accentColor:'var(--teal)'}} />
+                      <div>
+                        <div style={{fontSize:12,fontWeight:600,color: wizardPipelineRule===opt.value ? 'var(--teal)' : 'var(--text)'}}>{opt.label}</div>
+                        <div style={{fontSize:10,color:'var(--text-muted)',marginTop:1,lineHeight:1.4}}>{opt.desc}</div>
+                      </div>
+                    </label>
+                  ))}
+                </div>
               </div>
             )}
 

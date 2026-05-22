@@ -2727,6 +2727,58 @@ GROUP BY a.campaign_id, c.campaign_name;
     except Exception:
         pass
 
+    # ── PR 2 — Pipeline routing rules per campaign ────────────────────────────
+    # Two columns added to campaigns:
+    #   auto_enter_pipeline_rule: 'always'|'when_no_booking'|'when_follow_up_flagged'|'never'
+    #   pipeline_default_visibility: 'shown'|'hidden'
+    _pr2_camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "auto_enter_pipeline_rule" not in _pr2_camp_cols:
+        try:
+            conn.execute(
+                "ALTER TABLE campaigns ADD COLUMN auto_enter_pipeline_rule TEXT NOT NULL DEFAULT 'always'"
+            )
+        except Exception:
+            pass
+    if "pipeline_default_visibility" not in _pr2_camp_cols:
+        try:
+            conn.execute(
+                "ALTER TABLE campaigns ADD COLUMN pipeline_default_visibility TEXT NOT NULL DEFAULT 'shown'"
+            )
+        except Exception:
+            pass
+
+    # Per-campaign defaults for existing campaigns (idempotent — only sets when still at default)
+    # Implant → always / shown (every contact needs follow-up)
+    conn.execute("""
+        UPDATE campaigns SET auto_enter_pipeline_rule='always', pipeline_default_visibility='shown'
+        WHERE (campaign_name LIKE '%implant%' OR campaign_name LIKE '%all-on%' OR campaign_name LIKE '%all on%')
+          AND auto_enter_pipeline_rule='always'
+    """)
+    # Emergency → always / shown
+    conn.execute("""
+        UPDATE campaigns SET auto_enter_pipeline_rule='always', pipeline_default_visibility='shown'
+        WHERE campaign_name LIKE '%emergency%'
+          AND auto_enter_pipeline_rule='always'
+    """)
+    # General dentistry → when_follow_up_flagged / shown
+    conn.execute("""
+        UPDATE campaigns SET auto_enter_pipeline_rule='when_follow_up_flagged', pipeline_default_visibility='shown'
+        WHERE campaign_name LIKE '%general dentistry%'
+          AND auto_enter_pipeline_rule='always'
+    """)
+    # Brand awareness → never / hidden
+    conn.execute("""
+        UPDATE campaigns SET auto_enter_pipeline_rule='never', pipeline_default_visibility='hidden'
+        WHERE campaign_name LIKE '%brand awareness%'
+          AND auto_enter_pipeline_rule='always'
+    """)
+    # Dentures → always / shown
+    conn.execute("""
+        UPDATE campaigns SET auto_enter_pipeline_rule='always', pipeline_default_visibility='shown'
+        WHERE campaign_name LIKE '%denture%'
+          AND auto_enter_pipeline_rule='always'
+    """)
+
 
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
@@ -2998,40 +3050,81 @@ def update_stage(lead_id: str, new_stage: str, source: str = "system", detail: s
     return get_lead(lead_id)
 
 
+def _pipeline_visibility_clause(lead_alias: str = "leads") -> str:
+    """Return a SQL WHERE fragment (no leading WHERE keyword) that hides leads from
+    campaigns with auto_enter_pipeline_rule='never', while preserving all other leads.
+
+    Logic (PR 2):
+      - Lead has a campaign_id that matches a campaigns row → honor that campaign's rule.
+        Only 'never' actively hides; all other rules (always / when_no_booking /
+        when_follow_up_flagged) show in the pipeline view.
+      - Lead has no matching campaign row → fall back to the PR 0 heuristic:
+        must have a GAds signal (gclid, utm_source, notes, source='manual').
+
+    Uses a LEFT JOIN on campaigns; callers must alias the leads table as `lead_alias`.
+    The JOIN and this clause are returned separately — see _pipeline_visibility_join().
+    """
+    L = lead_alias
+    return f"""(
+        -- Campaign matched: show unless rule is 'never'
+        (c.campaign_id IS NOT NULL
+         AND COALESCE(c.auto_enter_pipeline_rule, 'always') != 'never')
+        OR
+        -- No campaign match: legacy GAds heuristic (PR 0 fallback for orphan leads)
+        (c.campaign_id IS NULL AND (
+            COALESCE({L}.gclid, '') != ''
+            OR COALESCE({L}.campaign_id, '') != ''
+            OR COALESCE({L}.utm_source, '') LIKE 'google%'
+            OR COALESCE({L}.utm_source, '') LIKE '%cpc%'
+            OR COALESCE({L}.notes, '') LIKE '%Google Ads%'
+            OR COALESCE({L}.notes, '') LIKE '%gclid%'
+            OR {L}.source = 'manual'
+        ))
+    )"""
+
+
+def _pipeline_visibility_join(lead_alias: str = "leads") -> str:
+    """Return the LEFT JOIN clause that pairs leads with their campaign row."""
+    return f"LEFT JOIN campaigns c ON c.campaign_id = {lead_alias}.campaign_id"
+
+
 def get_all_leads(stage: str = None, limit: int = 200, gads_only: bool = False) -> list:
     """Return leads from the pipeline DB.
 
-    gads_only=True filters to leads with a Google Ads attribution signal:
-      - gclid present (click-through)
-      - campaign_id present (GAds campaign tag)
-      - utm_source starts with 'google' or contains 'cpc'
-      - notes mention 'Google Ads' or 'gclid' (CallRail fallback when cookie expired)
-      - source='manual' (dentist-entered leads always shown)
-    All other callers (od_matcher, mango_service, etc.) must NOT pass gads_only=True.
+    gads_only=True (PR 2): applies campaign-level pipeline visibility rules.
+      - Leads matched to a campaign with auto_enter_pipeline_rule='never' are hidden.
+      - Leads with no campaign match fall back to the PR 0 GAds heuristic.
+      - source='manual' always shown.
+    All other callers (od_matcher, mango_service, ai_optimizer, etc.) must NOT
+    pass gads_only=True — they need the full unfiltered lead set.
     """
-    _GADS_FILTER = """(
-        COALESCE(gclid, '') != ''
-        OR COALESCE(campaign_id, '') != ''
-        OR COALESCE(utm_source, '') LIKE 'google%'
-        OR COALESCE(utm_source, '') LIKE '%cpc%'
-        OR COALESCE(notes, '') LIKE '%Google Ads%'
-        OR COALESCE(notes, '') LIKE '%gclid%'
-        OR source = 'manual'
-    )"""
     with _conn() as conn:
-        conditions = []
-        params: list = []
-        if stage:
-            conditions.append("stage = ?")
-            params.append(stage)
         if gads_only:
-            conditions.append(_GADS_FILTER)
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        params.append(limit)
-        rows = conn.execute(
-            f"SELECT * FROM leads {where} ORDER BY updated_at DESC LIMIT ?",
-            params,
-        ).fetchall()
+            join = _pipeline_visibility_join("leads")
+            vis  = _pipeline_visibility_clause("leads")
+            conditions = [vis]
+            params: list = []
+            if stage:
+                conditions.append("leads.stage = ?")
+                params.append(stage)
+            where = "WHERE " + " AND ".join(conditions)
+            params.append(limit)
+            rows = conn.execute(
+                f"SELECT leads.* FROM leads {join} {where} ORDER BY leads.updated_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        else:
+            params = []
+            if stage:
+                rows = conn.execute(
+                    "SELECT * FROM leads WHERE stage=? ORDER BY updated_at DESC LIMIT ?",
+                    (stage, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM leads ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -3458,44 +3551,67 @@ def unsubscribe(lead_id: str, channel: str, reason: str = ""):
 # ─── Pipeline stats ──────────────────────────────────────────────────────────
 
 def get_pipeline_stats(gads_only: bool = False) -> dict:
-    _GADS_FILTER = """(
-        COALESCE(gclid, '') != ''
-        OR COALESCE(campaign_id, '') != ''
-        OR COALESCE(utm_source, '') LIKE 'google%'
-        OR COALESCE(utm_source, '') LIKE '%cpc%'
-        OR COALESCE(notes, '') LIKE '%Google Ads%'
-        OR COALESCE(notes, '') LIKE '%gclid%'
-        OR source = 'manual'
-    )"""
-    _where = f"WHERE {_GADS_FILTER}" if gads_only else ""
-    _and   = f"AND {_GADS_FILTER}"  if gads_only else ""
+    """Pipeline KPI counts.
+
+    gads_only=True (PR 2): applies campaign-level visibility rules via
+    _pipeline_visibility_clause() + LEFT JOIN campaigns. Matches what
+    get_all_leads(gads_only=True) and get_pipeline_enriched(show_all=False) return.
+    """
     with _conn() as conn:
-        rows = conn.execute(f"SELECT stage, COUNT(*) as count FROM leads {_where} GROUP BY stage").fetchall()
-        counts = {r["stage"]: r["count"] for r in rows}
-        total = conn.execute(f"SELECT COUNT(*) FROM leads WHERE stage != 'cold' {_and}").fetchone()[0]
-        total_all = conn.execute(f"SELECT COUNT(*) FROM leads {_where}").fetchone()[0]
-        revenue = conn.execute(f"SELECT SUM(attributed_production) FROM leads {_where}").fetchone()[0] or 0.0
-        income = conn.execute(f"SELECT SUM(attributed_income) FROM leads {_where}").fetchone()[0] or 0.0
-        pending_followups = conn.execute("SELECT COUNT(*) FROM follow_up_queue WHERE status='pending'").fetchone()[0]
+        if gads_only:
+            _join = _pipeline_visibility_join("leads")
+            _vis  = _pipeline_visibility_clause("leads")
+            rows = conn.execute(
+                f"SELECT leads.stage, COUNT(*) as count FROM leads {_join} WHERE {_vis} GROUP BY leads.stage"
+            ).fetchall()
+            counts = {r["stage"]: r["count"] for r in rows}
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM leads {_join} WHERE leads.stage != 'cold' AND {_vis}"
+            ).fetchone()[0]
+            total_all = conn.execute(
+                f"SELECT COUNT(*) FROM leads {_join} WHERE {_vis}"
+            ).fetchone()[0]
+            revenue = conn.execute(
+                f"SELECT SUM(leads.attributed_production) FROM leads {_join} WHERE {_vis}"
+            ).fetchone()[0] or 0.0
+            income = conn.execute(
+                f"SELECT SUM(leads.attributed_income) FROM leads {_join} WHERE {_vis}"
+            ).fetchone()[0] or 0.0
+            hot_leads_count = conn.execute(f"""
+                SELECT COUNT(*) FROM leads {_join} WHERE {_vis} AND (
+                    (leads.od_relationship IN ('implant_prospect','reactivation')
+                     AND leads.stage NOT IN ('treatment_completed','cold'))
+                    OR (leads.stage = 'no_show' AND leads.no_show_count >= 1)
+                    OR (leads.treatment_plan_value > 0
+                        AND leads.stage NOT IN ('treatment_completed','cold'))
+                )
+            """).fetchone()[0]
+        else:
+            rows = conn.execute("SELECT stage, COUNT(*) as count FROM leads GROUP BY stage").fetchall()
+            counts = {r["stage"]: r["count"] for r in rows}
+            total = conn.execute("SELECT COUNT(*) FROM leads WHERE stage != 'cold'").fetchone()[0]
+            total_all = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+            revenue = conn.execute("SELECT SUM(attributed_production) FROM leads").fetchone()[0] or 0.0
+            income = conn.execute("SELECT SUM(attributed_income) FROM leads").fetchone()[0] or 0.0
+            hot_leads_count = conn.execute("""
+                SELECT COUNT(*) FROM leads WHERE (
+                    (od_relationship IN ('implant_prospect','reactivation')
+                     AND stage NOT IN ('treatment_completed','cold'))
+                    OR (stage = 'no_show' AND no_show_count >= 1)
+                    OR (treatment_plan_value > 0
+                        AND stage NOT IN ('treatment_completed','cold'))
+                )
+            """).fetchone()[0]
+
+        pending_followups = conn.execute(
+            "SELECT COUNT(*) FROM follow_up_queue WHERE status='pending'"
+        ).fetchone()[0]
         sent_today = conn.execute("""
             SELECT COUNT(*) FROM follow_up_queue
             WHERE status='sent' AND sent_at >= date('now')
         """).fetchone()[0]
-        no_show_count = counts.get("no_show", 0)
+        no_show_count  = counts.get("no_show", 0)
         scheduled_count = counts.get("scheduled", 0)
-        # Hot leads: implant prospects / reactivations not yet completed,
-        # no-shows, or leads with an active treatment plan value.
-        # NOTE: The OR-chain is intentional — no_show is excluded from clause 1
-        # by 'stage NOT IN' but re-included by clause 2. Keep the comment.
-        hot_leads_count = conn.execute(f"""
-            SELECT COUNT(*) FROM leads WHERE (
-                (od_relationship IN ('implant_prospect','reactivation')
-                 AND stage NOT IN ('treatment_completed','cold'))
-                OR (stage = 'no_show' AND no_show_count >= 1)
-                OR (treatment_plan_value > 0
-                    AND stage NOT IN ('treatment_completed','cold'))
-            ) {_and}
-        """).fetchone()[0]
 
         return {
             "total_leads": total,
@@ -4265,6 +4381,16 @@ def create_campaign(data: dict) -> dict:
     gads_resource = data.get("gads_campaign_resource") or None
     gads_numeric  = data.get("gads_campaign_numeric_id") or None
 
+    # PR 2 — pipeline routing fields (validate allowed values)
+    _VALID_RULES = {"always", "when_no_booking", "when_follow_up_flagged", "never"}
+    _VALID_VIS   = {"shown", "hidden"}
+    pipeline_rule = data.get("auto_enter_pipeline_rule") or "always"
+    if pipeline_rule not in _VALID_RULES:
+        pipeline_rule = "always"
+    pipeline_vis = data.get("pipeline_default_visibility") or "shown"
+    if pipeline_vis not in _VALID_VIS:
+        pipeline_vis = "shown"
+
     with _conn() as conn:
         conn.execute("""
             INSERT INTO campaigns
@@ -4273,8 +4399,9 @@ def create_campaign(data: dict) -> dict:
                  monthly_budget, expected_cpl, start_date, end_date,
                  landing_page, notes, workflow_id, skip_workflow,
                  gads_campaign_resource, gads_campaign_numeric_id,
+                 auto_enter_pipeline_rule, pipeline_default_visibility,
                  created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             campaign_id,
             data["campaign_name"],
@@ -4294,6 +4421,8 @@ def create_campaign(data: dict) -> dict:
             1 if data.get("skip_workflow") else 0,
             gads_resource,
             gads_numeric,
+            pipeline_rule,
+            pipeline_vis,
             now, now,
         ))
         row = conn.execute(
@@ -4314,6 +4443,8 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
         "target_audience", "expected_cpl", "geographic_targeting",
         "launch_date", "call_extension_phone", "skip_workflow", "sitelinks",
         "booking_link",
+        # PR 2 — pipeline routing
+        "auto_enter_pipeline_rule", "pipeline_default_visibility",
     }
     safe = {k: v for k, v in fields.items() if k in ALLOWED}
     if not safe:

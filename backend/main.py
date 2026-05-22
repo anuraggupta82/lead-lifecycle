@@ -37,6 +37,7 @@ from config import get_settings, Settings
 from database import (
     init_db, upsert_lead, get_lead, get_lead_by_email, update_stage,
     get_all_leads, get_events, get_pipeline_stats, enqueue_follow_ups,
+    _pipeline_visibility_join, _pipeline_visibility_clause,
     add_event, unsubscribe, get_follow_up_queue, get_due_follow_ups,
     add_note, get_notes, delete_note, force_stage,
     get_campaign_stats, get_google_ads_campaigns, get_distinct_sources, get_keyword_stats,
@@ -4442,6 +4443,9 @@ class CampaignCreateRequest(BaseModel):
     notes: Optional[str] = ""
     workflow_id: Optional[int] = None      # Attached follow-up workflow (NULL = use default)
     skip_workflow: bool = False            # If True, no follow-up emails/SMS for leads from this campaign
+    # PR 2 — pipeline routing fields
+    auto_enter_pipeline_rule: Optional[str] = "always"
+    pipeline_default_visibility: Optional[str] = "shown"
 
     @validator("campaign_name")
     def name_not_empty(cls, v):
@@ -4609,6 +4613,10 @@ def admin_campaigns_unified(days: int = 30, include_inactive: bool = False):
             "budget_summary": budget_summary}
 
 
+_VALID_PIPELINE_RULES = {"always", "when_no_booking", "when_follow_up_flagged", "never"}
+_VALID_PIPELINE_VISIBILITY = {"shown", "hidden"}
+
+
 class CampaignUpdateFieldsRequest(BaseModel):
     campaign_name: str | None = None
     service_focus: str | None = None
@@ -4625,6 +4633,21 @@ class CampaignUpdateFieldsRequest(BaseModel):
     launch_date: str | None = None
     call_extension_phone: str | None = None
     booking_link: str | None = None
+    # PR 2 — pipeline routing fields
+    auto_enter_pipeline_rule: str | None = None
+    pipeline_default_visibility: str | None = None
+
+    @validator("auto_enter_pipeline_rule")
+    def validate_pipeline_rule(cls, v):
+        if v is not None and v not in _VALID_PIPELINE_RULES:
+            raise ValueError(f"auto_enter_pipeline_rule must be one of {_VALID_PIPELINE_RULES}")
+        return v
+
+    @validator("pipeline_default_visibility")
+    def validate_pipeline_visibility(cls, v):
+        if v is not None and v not in _VALID_PIPELINE_VISIBILITY:
+            raise ValueError(f"pipeline_default_visibility must be one of {_VALID_PIPELINE_VISIBILITY}")
+        return v
 
     @validator("geographic_targeting")
     def validate_geographic_targeting(cls, v):
@@ -10453,25 +10476,18 @@ def get_pipeline_enriched(
 ):
     """Return all leads enriched with notes count, for Kanban board.
 
-    Default: gads_only filter applied (only Google Ads attributed leads).
-    Pass show_all=true to bypass the filter and see every lead.
+    Default (show_all=False): applies PR 2 campaign-level visibility rules.
+      Leads from campaigns with auto_enter_pipeline_rule='never' are hidden.
+      Leads with no campaign match fall back to PR 0 GAds heuristic.
+    Pass show_all=true to bypass all filters.
     """
-    _GADS_FILTER = """(
-        COALESCE(l.gclid, '') != ''
-        OR COALESCE(l.campaign_id, '') != ''
-        OR COALESCE(l.utm_source, '') LIKE 'google%'
-        OR COALESCE(l.utm_source, '') LIKE '%cpc%'
-        OR COALESCE(l.notes, '') LIKE '%Google Ads%'
-        OR COALESCE(l.notes, '') LIKE '%gclid%'
-        OR l.source = 'manual'
-    )"""
     from database import _conn
     with _conn() as conn:
-        query = "SELECT l.*, (SELECT COUNT(*) FROM lead_notes n WHERE n.lead_id = l.id) as notes_count FROM leads l"
-        params = []
         conditions = []
+        params = []
         if not show_all:
-            conditions.append(_GADS_FILTER)
+            # PR 2: campaign-level visibility via LEFT JOIN campaigns c
+            conditions.append(_pipeline_visibility_clause("l"))
         if stage:
             conditions.append("l.stage = ?")
             params.append(stage)
@@ -10480,10 +10496,14 @@ def get_pipeline_enriched(
                 "(l.campaign_name = ? OR l.utm_campaign = ? OR (l.campaign_name = '' AND l.utm_campaign = '' AND l.source = ?))"
             )
             params.extend([campaign, campaign, campaign])
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY l.updated_at DESC LIMIT ?"
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         params.append(limit)
+        # Include LEFT JOIN when filtering so _pipeline_visibility_clause alias 'c' resolves
+        join = _pipeline_visibility_join("l") if not show_all else ""
+        query = (
+            f"SELECT l.*, (SELECT COUNT(*) FROM lead_notes n WHERE n.lead_id = l.id) as notes_count "
+            f"FROM leads l {join} {where} ORDER BY l.updated_at DESC LIMIT ?"
+        )
         rows = conn.execute(query, params).fetchall()
         leads = [dict(r) for r in rows]
     return {"leads": leads, "total": len(leads)}
