@@ -21,12 +21,14 @@ if BACKEND_DIR not in sys.path:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stub return values for all 7 underlying sync functions
+# Stub return values for all 9 underlying sync functions (updated for PR 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 FIRESTORE_STUB     = {"synced": 5, "unsub_applied": 2}
 GADS_STUB          = {"resolved": 12, "unmatched": 3}
 OD_MATCH_STUB      = {"matched": 10, "stages_updated": 4}
+CALL_INTEL_STUB    = {"processed": 5, "errors": 0, "skipped": 1}   # PR 1 — new
+REFRESH_INCOME_STUB = {"calls_updated": 3, "calls_refreshed": 3, "total_income_synced": 1200.0}
 OD_PAYMENTS_STUB   = {"total_paid_365d": 4820, "patients_synced": 14}
 CALL_KW_STUB       = {"attributed": 19, "total": 22, "below_threshold": 3}
 CALL_PROD_STUB     = {"rows_written": 7}
@@ -34,12 +36,14 @@ CONVERSIONS_STUB   = {"uploaded": 4}
 
 
 def _make_all_stubs():
-    """Return a dict of all 7 module-level mock patches."""
+    """Return a dict of all 9 module-level mock patches (PR 1 adds call_intelligence)."""
     return {
         "firestore_sync.sync_from_firestore":             MagicMock(return_value={"synced": 5}),
         "firestore_sync.sync_unsubscribes_from_firestore": MagicMock(return_value={"applied": 2}),
         "google_ads_sync.sync_gclids_to_keywords":        MagicMock(return_value=GADS_STUB),
         "od_matcher.run_full_od_sync":                    MagicMock(return_value=OD_MATCH_STUB),
+        "call_intelligence.run_call_intelligence":        MagicMock(return_value=CALL_INTEL_STUB),
+        "od_payment_sync.refresh_call_od_income":         MagicMock(return_value=REFRESH_INCOME_STUB),
         "od_payment_sync.sync_od_payments":               MagicMock(return_value=OD_PAYMENTS_STUB),
         "call_keyword_attribution.attribute_calls_to_keywords": MagicMock(return_value=CALL_KW_STUB),
         "call_production_log.link_calls_to_keyword_production": MagicMock(return_value=CALL_PROD_STUB),
@@ -65,11 +69,11 @@ def _reset_progress():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 1 — Happy path: all 7 steps succeed
+# Test 1 — Happy path: all 9 steps succeed (updated for PR 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_happy_path_all_steps_ok():
-    """All 7 sync functions succeed → progress shows 7 ok steps, pct=100, running=False."""
+    """All 9 sync functions succeed → progress shows 9 ok steps, pct=100, running=False."""
     _reset_progress()
 
     stubs = _make_all_stubs()
@@ -78,6 +82,7 @@ def test_happy_path_all_steps_ok():
         "firestore_sync":           _module_stub("firestore_sync",   stubs),
         "google_ads_sync":          _module_stub("google_ads_sync",  stubs),
         "od_matcher":               _module_stub("od_matcher",       stubs),
+        "call_intelligence":        _module_stub("call_intelligence", stubs),
         "od_payment_sync":          _module_stub("od_payment_sync",  stubs),
         "call_keyword_attribution": _module_stub("call_keyword_attribution", stubs),
         "call_production_log":      _module_stub("call_production_log",      stubs),
@@ -90,9 +95,9 @@ def test_happy_path_all_steps_ok():
     assert result.get("running") is False,       "running must be False when done"
     assert result.get("pct") == 100,             "pct must be 100 when all steps finish"
     step_results = result.get("step_results", [])
-    assert len(step_results) == 7,               "must record exactly 7 step results"
+    assert len(step_results) == 9,               "must record exactly 9 step results"
     ok_steps = [s for s in step_results if s.get("status") == "ok"]
-    assert len(ok_steps) == 7,                   "all 7 steps must be ok"
+    assert len(ok_steps) == 9,                   "all 9 steps must be ok"
     # Verify summaries are not empty
     for s in step_results:
         assert s.get("summary"), f"Step '{s['step']}' must have a summary"
@@ -103,7 +108,7 @@ def test_happy_path_all_steps_ok():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_single_step_failure_chain_continues():
-    """Step 3 (OD Match) raises → steps 4–7 still run; step 3 marked error."""
+    """Step 3 (OD Match) raises → steps 4–9 still run; step 3 marked error."""
     _reset_progress()
 
     stubs = _make_all_stubs()
@@ -115,6 +120,7 @@ def test_single_step_failure_chain_continues():
         "firestore_sync":           _module_stub("firestore_sync",   stubs),
         "google_ads_sync":          _module_stub("google_ads_sync",  stubs),
         "od_matcher":               od_stub,
+        "call_intelligence":        _module_stub("call_intelligence", stubs),
         "od_payment_sync":          _module_stub("od_payment_sync",  stubs),
         "call_keyword_attribution": _module_stub("call_keyword_attribution", stubs),
         "call_production_log":      _module_stub("call_production_log",      stubs),
@@ -125,21 +131,22 @@ def test_single_step_failure_chain_continues():
         result = uos.run_unified_od_sync(trigger="test")
 
     step_results = result.get("step_results", [])
-    assert len(step_results) == 7, "all 7 steps must be recorded even when one fails"
+    assert len(step_results) == 9, "all 9 steps must be recorded even when one fails"
 
     step3 = next((s for s in step_results if s["step"] == "OpenDental Patient Match"), None)
     assert step3 is not None,               "step 3 result must be present"
     assert step3["status"] == "error",      "step 3 must be marked error"
     assert "OD unreachable" in step3.get("error", ""), "error message must be captured"
 
-    # Steps 4–7 must have run (status ok or error, but present and not missing)
+    # Steps 4–9 must have run (status ok or error, but present and not missing)
     later_names = {
+        "Call Intelligence", "Refresh Call Income",
         "OpenDental Payments", "Call → Keyword", "Call Production Log", "Conversion Upload"
     }
     recorded_names = {s["step"] for s in step_results}
     assert later_names.issubset(recorded_names), "downstream steps must still be recorded"
 
-    # In our test, steps 4–7 get stubs so they should be ok
+    # In our test, steps 4–9 get stubs so they should be ok
     for s in step_results:
         if s["step"] in later_names:
             assert s["status"] == "ok", f"Downstream step '{s['step']}' should be ok"

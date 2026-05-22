@@ -1305,6 +1305,22 @@ def admin_refresh_call_income(days: int = 90):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/calls/classify", dependencies=[Depends(_require_admin)])
+def admin_classify_calls():
+    """
+    PR 1: Run Gemini Call Intelligence on up to 100 GAds-attributed
+    mango_calls that have a completed transcript but no classification yet.
+    Idempotent — already-classified calls are skipped automatically.
+    """
+    try:
+        from call_intelligence import run_call_intelligence
+        result = run_call_intelligence(limit=100)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        logger.error(f"Call classification failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/backfill-booked-outcome", dependencies=[Depends(_require_admin)])
 def admin_backfill_booked_outcome():
     """

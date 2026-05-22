@@ -1,5 +1,5 @@
 """
-unified_od_sync.py — Canonical 8-step Google Ads income attribution chain.
+unified_od_sync.py — Canonical 9-step Google Ads income attribution chain.
 
 Runs all steps in order, wrapping each in try/except so a single failure
 never blocks downstream steps. Progress is written to a module-level dict
@@ -9,12 +9,13 @@ Canonical step order (non-negotiable — wrong order = wrong attribution):
   1. Firestore Sync         — new leads must exist before anything attributes them
   2. Google Ads gclid→kw    — stamps campaign/ad_group/keyword before OD match
   3. OD Patient Match       — sets od_patient_num before payment pull
-  4. Refresh Call Income    — re-pulls OD paid amounts for new-patient calls (PR 4)
+  4. Call Intelligence      — classifies GAds-attributed calls with Gemini (PR 1)
+  5. Refresh Call Income    — re-pulls OD paid amounts for new-patient calls (PR 4)
                              Must run BEFORE OD Payments so fresh data is available.
-  5. OD Payments            — paid amounts before call production dedup
-  6. Call → Keyword         — needs gads_clicks table (step 2) and OD match (step 3)
-  7. Call Production Log    — needs call attribution (step 6) + OD match (step 3)
-  8. Conversion Upload      — needs everything above to be fresh
+  6. OD Payments            — paid amounts before call production dedup
+  7. Call → Keyword         — needs gads_clicks table (step 2) and OD match (step 3)
+  8. Call Production Log    — needs call attribution (step 7) + OD match (step 3)
+  9. Conversion Upload      — needs everything above to be fresh
 """
 import logging
 import threading
@@ -31,7 +32,8 @@ UNIFIED_SYNC_STEPS = [
     ("Firestore Sync",           "Pulling new leads from web forms…"),
     ("Google Ads Resolver",      "Resolving gclids to campaign/ad group/keyword…"),
     ("OpenDental Patient Match", "Matching leads to OD patients + treatment stages…"),
-    ("Refresh Call Income",      "Re-pulling OD paid amounts for new-patient calls…"),   # PR 4 — index 3
+    ("Call Intelligence",        "Classifying GAds-attributed calls with Gemini…"),      # PR 1 — index 3
+    ("Refresh Call Income",      "Re-pulling OD paid amounts for new-patient calls…"),   # PR 4 — index 4
     ("OpenDental Payments",      "Pulling paid amounts from OD (365d + LTV)…"),
     ("Call → Keyword",           "Attributing phone calls to paid clicks…"),
     ("Call Production Log",      "Writing call-path keyword production…"),
@@ -138,6 +140,17 @@ def _summarize_od_match(r) -> str:
             matched = (r or {}).get("new_matches", 0)
             updated = (r or {}).get("updated", 0)
         return f"{matched} leads matched, {updated} stages updated"
+    except Exception:
+        return "completed"
+
+
+def _summarize_call_intel(r) -> str:
+    """r is the return value of run_call_intelligence (PR 1)."""
+    try:
+        proc = (r or {}).get("processed", 0)
+        skip = (r or {}).get("skipped", 0)
+        err  = (r or {}).get("errors", 0)
+        return f"{proc} classified, {skip} skipped, {err} errors"
     except Exception:
         return "completed"
 
@@ -308,42 +321,51 @@ def run_unified_od_sync(trigger: str = "manual") -> dict:
 
         _run_step(2, _do_od_match, _summarize_od_match)
 
-        # ── Step 4: Refresh Call OD Income (PR 4) ────────────────────────────
-        # Must run BEFORE OD Payments (step 5) so fresh mango_calls.od_patient_income
-        # is available and any new KPL rows from step 7 get correct paid amounts.
+        # ── Step 4: Gemini Call Intelligence (PR 1) ───────────────────────────
+        # Runs after OD patient match so future enrichments can use od_patient_num.
+        # Must run BEFORE Call → Keyword (step 7) so later PRs can gate on follow_up_needed.
+        def _do_call_intel():
+            from call_intelligence import run_call_intelligence
+            return run_call_intelligence(limit=100)
+
+        _run_step(3, _do_call_intel, _summarize_call_intel)
+
+        # ── Step 5: Refresh Call OD Income (PR 4) ────────────────────────────
+        # Must run BEFORE OD Payments (step 6) so fresh mango_calls.od_patient_income
+        # is available and any new KPL rows from step 8 get correct paid amounts.
         def _do_refresh_call_income():
             from od_payment_sync import refresh_call_od_income
             return refresh_call_od_income(days=90)
 
-        _run_step(3, _do_refresh_call_income, _summarize_refresh_call_income)
+        _run_step(4, _do_refresh_call_income, _summarize_refresh_call_income)
 
-        # ── Step 5: OD Payment Pull (PR 2) ────────────────────────────────────
+        # ── Step 6: OD Payment Pull (PR 2) ────────────────────────────────────
         def _do_od_payments():
             from od_payment_sync import sync_od_payments
             return sync_od_payments(days_back=7)
 
-        _run_step(4, _do_od_payments, _summarize_od_payments)
+        _run_step(5, _do_od_payments, _summarize_od_payments)
 
-        # ── Step 6: Call → Keyword Attribution ───────────────────────────────
+        # ── Step 7: Call → Keyword Attribution ───────────────────────────────
         def _do_call_kw():
             from call_keyword_attribution import attribute_calls_to_keywords
             return attribute_calls_to_keywords(days=7)
 
-        _run_step(5, _do_call_kw, _summarize_call_kw)
+        _run_step(6, _do_call_kw, _summarize_call_kw)
 
-        # ── Step 7: Call Production Log ───────────────────────────────────────
+        # ── Step 8: Call Production Log ───────────────────────────────────────
         def _do_call_production():
             from call_production_log import link_calls_to_keyword_production
             return link_calls_to_keyword_production(days=7)
 
-        _run_step(6, _do_call_production, _summarize_call_production)
+        _run_step(7, _do_call_production, _summarize_call_production)
 
-        # ── Step 8: Conversion Upload to Google Ads ───────────────────────────
+        # ── Step 9: Conversion Upload to Google Ads ───────────────────────────
         def _do_conversions():
             from google_ads_conversions import upload_offline_conversions
             return upload_offline_conversions()
 
-        _run_step(7, _do_conversions, _summarize_conversions)
+        _run_step(8, _do_conversions, _summarize_conversions)
 
     finally:
         # Always mark done and persist, even if something panicked above

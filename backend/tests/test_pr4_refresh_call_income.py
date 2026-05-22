@@ -437,21 +437,26 @@ def test_od_unavailable_returns_skipped():
     assert result.get("reason") == "od_unavailable"
 
 
-# ─── Test 6: Unified sync chain has 8 steps ──────────────────────────────────
+# ─── Test 6: Unified sync chain has 9 steps (updated for PR 1) ───────────────
 
 def test_unified_sync_has_8_steps():
     """
-    UNIFIED_SYNC_STEPS must have exactly 8 entries after PR 4,
-    and step index 3 (0-indexed) must be 'Refresh Call Income'.
+    UNIFIED_SYNC_STEPS must have exactly 9 entries after PR 1 (Call Intelligence added),
+    step index 3 must be 'Call Intelligence', and index 4 must be 'Refresh Call Income'.
+    (Test name kept as-is for backward compat with CI tooling.)
     """
     from unified_od_sync import UNIFIED_SYNC_STEPS
 
-    assert len(UNIFIED_SYNC_STEPS) == 8, \
-        f"Expected 8 steps after PR 4 but got {len(UNIFIED_SYNC_STEPS)}: {[s[0] for s in UNIFIED_SYNC_STEPS]}"
+    assert len(UNIFIED_SYNC_STEPS) == 9, \
+        f"Expected 9 steps after PR 1 but got {len(UNIFIED_SYNC_STEPS)}: {[s[0] for s in UNIFIED_SYNC_STEPS]}"
 
     step_4_label = UNIFIED_SYNC_STEPS[3][0]
-    assert step_4_label == "Refresh Call Income", \
-        f"Expected step 4 (index 3) to be 'Refresh Call Income' but got '{step_4_label}'"
+    assert step_4_label == "Call Intelligence", \
+        f"Expected step 4 (index 3) to be 'Call Intelligence' but got '{step_4_label}'"
+
+    step_5_label = UNIFIED_SYNC_STEPS[4][0]
+    assert step_5_label == "Refresh Call Income", \
+        f"Expected step 5 (index 4) to be 'Refresh Call Income' but got '{step_5_label}'"
 
 
 # ─── Test 7: get_unified_campaigns reflects KPL booked_override paid amounts ──

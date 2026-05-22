@@ -1639,6 +1639,34 @@ def _migrate(conn):
             except Exception:
                 pass
 
+    # ── Mango calls — Gemini Call Intelligence (PR 1, May 2026) ──────────────
+    # Single Gemini Vertex call returns 7 signals; staff use follow_up_needed
+    # in the pipeline. Backfill-safe: defaults all empty/false so existing
+    # rows look "unclassified" until the nightly job picks them up.
+    mango_cols = {row[1] for row in conn.execute("PRAGMA table_info(mango_calls)").fetchall()}
+    _mango_intel_cols = [
+        ("follow_up_needed",   "INTEGER DEFAULT 0"),    # 0|1 (SQLite bool)
+        ("follow_up_reason",   "TEXT DEFAULT ''"),      # short staff-facing why
+        ("classified_at",      "TEXT DEFAULT ''"),      # ISO timestamp; '' = not yet
+        ("classifier_version", "TEXT DEFAULT ''"),      # e.g. 'v1'
+        ("sentiment",          "TEXT DEFAULT ''"),      # 'positive'|'neutral'|'negative'
+        ("sentiment_score",    "REAL DEFAULT NULL"),    # 0.0–1.0; NULL = not yet
+        ("outcome",            "TEXT DEFAULT ''"),      # one of 7 enum values
+        ("keywords",           "TEXT DEFAULT '[]'"),    # JSON array string
+    ]
+    for col_name, col_type in _mango_intel_cols:
+        if col_name not in mango_cols:
+            try:
+                conn.execute(f"ALTER TABLE mango_calls ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mango_calls_classified_at ON mango_calls(classified_at DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mango_calls_needs_intel "
+        "ON mango_calls(transcription_status, classified_at) "
+        "WHERE classified_at = ''"
+    )
+
     # ── call_flags — auto-generated flags for missed/short Google Ads calls ──
     conn.execute("""
         CREATE TABLE IF NOT EXISTS call_flags (
@@ -8399,6 +8427,79 @@ def get_calls_needing_processing(
             (min_seconds, max_attempts, cutoff, batch_size)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_calls_for_intelligence(limit: int = 100) -> list:
+    """
+    Return GAds-attributed mango_calls that have a completed transcript
+    but have NOT been classified by Gemini Call Intelligence yet.
+
+    Scope (PR 1): GAds-attributed only — either gads_call_id is set
+    (direct call-from-ad) OR lead_id is set (form → call lead).
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT uuid, call_transcript, call_summary, lead_id,
+                      gads_call_id, direction, caller_id_name
+               FROM mango_calls
+               WHERE transcription_status = 'done'
+                 AND (classified_at IS NULL OR classified_at = '')
+                 AND (
+                       (gads_call_id IS NOT NULL AND gads_call_id != '')
+                       OR (lead_id IS NOT NULL AND lead_id != '')
+                     )
+               ORDER BY started_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_call_intelligence(uuid: str, data: dict) -> None:
+    """
+    Persist Gemini Call Intelligence output for a single call.
+
+    `data` must contain all 7 signal keys:
+      follow_up_needed (bool), follow_up_reason (str),
+      classified_at (ISO str), classifier_version (str),
+      sentiment (str), sentiment_score (float),
+      outcome (str), keywords (list[str])
+    Missing keys are coerced to safe defaults; this never raises on bad input.
+    """
+    import json as _json
+    fu_needed = 1 if bool(data.get("follow_up_needed")) else 0
+    fu_reason = str(data.get("follow_up_reason") or "")[:500]
+    classified_at = str(data.get("classified_at") or "")
+    classifier_version = str(data.get("classifier_version") or "v1")
+    sentiment = str(data.get("sentiment") or "")
+    score = data.get("sentiment_score")
+    try:
+        sentiment_score = float(score) if score is not None else None
+    except (TypeError, ValueError):
+        sentiment_score = None
+    outcome = str(data.get("outcome") or "other")
+    kws = data.get("keywords") or []
+    if not isinstance(kws, list):
+        kws = []
+    keywords_json = _json.dumps([str(k)[:60] for k in kws[:5]])
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE mango_calls SET
+                 follow_up_needed=?,
+                 follow_up_reason=?,
+                 classified_at=?,
+                 classifier_version=?,
+                 sentiment=?,
+                 sentiment_score=?,
+                 outcome=?,
+                 keywords=?,
+                 updated_at=?
+               WHERE uuid=?""",
+            (fu_needed, fu_reason, classified_at, classifier_version,
+             sentiment, sentiment_score, outcome, keywords_json, now, uuid),
+        )
 
 
 def mark_call_action_completed(uuid: str, by_email: str = "") -> None:
