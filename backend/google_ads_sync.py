@@ -241,6 +241,131 @@ def _fetch_all_keyword_perf(client, customer_id: str, days: int = 30) -> list:
     return results
 
 
+def _fetch_account_intelligence(client, customer_id: str) -> dict:
+    """
+    Fetch account-level health signals from Google Ads API and persist to gads_account_stats.
+
+    Three independent passes — each wrapped in its own try/except so a failure in one
+    doesn't blank the others:
+
+    Pass 1 — customer.optimization_score (no date segment, single row)
+    Pass 2 — top/abs-top impression share via `customer` + `segments.date`
+              + invalid clicks aggregated from `campaign` level (invalid_clicks is NOT
+              available on the `customer` resource in v24 — must use campaign aggregate)
+              Both impression-share metrics are impression-weighted (not a daily mean)
+              to match how Google calculates account-level IS.
+    Pass 3 — Search Partners spend share via `segments.ad_network_type` on `campaign`.
+              Uses proto enum .name per project convention (str() returns integer).
+              search_partners_pct is None when total_cost=0 (no sync data yet) so the
+              optimizer can distinguish "disabled" (0.0) from "not synced yet" (None).
+
+    Returns a dict ready for save_gads_account_stats().
+    """
+    from database import save_gads_account_stats
+
+    service = client.get_service("GoogleAdsService")
+    result: dict = {}
+
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=30)
+
+    # Pass 1: customer-level optimization_score (no date segment needed)
+    try:
+        cust_query = "SELECT customer.optimization_score FROM customer"
+        for row in service.search(customer_id=customer_id, query=cust_query):
+            result["optimization_score"] = float(row.customer.optimization_score or 0.0)
+        logger.info(f"Account optimization_score: {result.get('optimization_score')}")
+    except Exception as e:
+        logger.warning(f"_fetch_account_intelligence pass 1 (opt_score) failed: {e}")
+
+    # Pass 2a: Top / abs-top impression share from customer resource (date-segmented).
+    # Weighted by daily impressions — NOT a simple daily mean — to faithfully represent
+    # the 30-day account-level IS (a day with 1k imps at 20% outweighs a day with 10 imps at 90%).
+    try:
+        is_query = f"""
+            SELECT
+                metrics.impressions,
+                metrics.search_top_impression_share,
+                metrics.search_absolute_top_impression_share
+            FROM customer
+            WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+        """
+        imp_total = 0
+        top_is_weighted = 0.0
+        abs_top_weighted = 0.0
+        for row in service.search(customer_id=customer_id, query=is_query):
+            imps = int(row.metrics.impressions or 0)
+            top_is_weighted += float(row.metrics.search_top_impression_share or 0.0) * imps
+            abs_top_weighted += float(row.metrics.search_absolute_top_impression_share or 0.0) * imps
+            imp_total += imps
+        result["top_impression_pct"] = round(top_is_weighted / imp_total, 4) if imp_total else 0.0
+        result["abs_top_impression_pct"] = round(abs_top_weighted / imp_total, 4) if imp_total else 0.0
+        logger.info(f"Account top_IS: {result.get('top_impression_pct'):.1%}, "
+                    f"abs_top_IS: {result.get('abs_top_impression_pct'):.1%}")
+    except Exception as e:
+        logger.warning(f"_fetch_account_intelligence pass 2a (impression share) failed: {e}")
+
+    # Pass 2b: Invalid clicks — aggregated from campaign level (NOT available on customer resource in v24).
+    # invalid_click_rate computed from totals (click-weighted) rather than averaging daily rates.
+    try:
+        inv_query = f"""
+            SELECT
+                metrics.invalid_clicks,
+                metrics.clicks
+            FROM campaign
+            WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+        """
+        inv_click_total = 0
+        click_total = 0
+        for row in service.search(customer_id=customer_id, query=inv_query):
+            inv_click_total += int(row.metrics.invalid_clicks or 0)
+            click_total += int(row.metrics.clicks or 0)
+        result["invalid_clicks"] = inv_click_total
+        result["invalid_click_rate"] = round(inv_click_total / click_total, 4) if click_total else 0.0
+        logger.info(f"Account invalid_clicks: {inv_click_total}, rate: {result.get('invalid_click_rate'):.2%}")
+    except Exception as e:
+        logger.warning(f"_fetch_account_intelligence pass 2b (invalid clicks) failed: {e}")
+
+    # Pass 3: Search Partners spend share (campaign-level, segmented by network type).
+    # Uses .name on proto enum per project convention — str() returns the integer value.
+    # search_partners_pct = None when total_cost=0 (no spend data) so the optimizer can
+    # distinguish "Search Partners genuinely disabled (0.0)" from "not yet synced (None)".
+    try:
+        network_query = f"""
+            SELECT
+                segments.ad_network_type,
+                metrics.cost_micros
+            FROM campaign
+            WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+        """
+        search_cost = 0
+        partners_cost = 0
+        for row in service.search(customer_id=customer_id, query=network_query):
+            net = row.segments.ad_network_type.name  # "SEARCH_PARTNERS", "GOOGLE_SEARCH", etc.
+            cost = int(row.metrics.cost_micros or 0)
+            if net == "SEARCH_PARTNERS":
+                partners_cost += cost
+            elif net in ("GOOGLE_SEARCH", "SEARCH"):
+                search_cost += cost
+        total_cost = search_cost + partners_cost
+        if total_cost > 0:
+            result["search_partners_pct"] = round(partners_cost / total_cost, 4)
+        else:
+            result["search_partners_pct"] = None  # not synced / no spend data yet
+        logger.info(f"Search Partners spend share: {result.get('search_partners_pct')}")
+    except Exception as e:
+        logger.warning(f"_fetch_account_intelligence pass 3 (search partners) failed: {e}")
+
+    if result:
+        try:
+            save_gads_account_stats(result)
+            logger.info("Account intelligence saved to gads_account_stats")
+        except Exception as e:
+            logger.warning(f"save_gads_account_stats failed: {e}")
+
+    return result
+
+
 def _fetch_campaign_daily_stats(client, customer_id: str, days: int = 30) -> int:
     """
     Query ad_group resource segmented by date for impressions/clicks/cost/conversions.
@@ -303,6 +428,73 @@ def _fetch_campaign_daily_stats(client, customer_id: str, days: int = 30) -> int
     if rows:
         count = save_gads_daily_stats(rows)
         logger.info(f"Upserted {count} rows into gads_daily_stats")
+        return count
+    return 0
+
+
+def _fetch_campaign_phone_stats(client, customer_id: str, days: int = 30) -> int:
+    """
+    Fetch Google Ads native phone-call metrics per campaign per day.
+    These come from call extensions and call-only ads, NOT from CallRail.
+
+    Fields fetched:
+      - metrics.phone_calls        — calls initiated via Google Ads call extensions
+      - metrics.phone_impressions  — impressions of call extensions (shows)
+      - metrics.phone_through_rate — phone_calls / phone_impressions
+
+    Note: phone_through_rate is derived (phone_calls / phone_impressions) so we
+    compute it here rather than trusting the API value which may differ from the
+    per-row detail. The API value is included as-is for reference.
+
+    Upserts into gads_campaign_phone_stats via save_gads_campaign_phone_stats().
+    Returns count of rows upserted.
+    """
+    from database import save_gads_campaign_phone_stats
+
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    query = f"""
+        SELECT
+            campaign.id,
+            campaign.name,
+            segments.date,
+            metrics.phone_calls,
+            metrics.phone_impressions,
+            metrics.phone_through_rate
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+          AND metrics.phone_impressions > 0
+    """
+
+    rows = []
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            campaign_id = str(row.campaign.id) if row.campaign.id else ""
+            if not campaign_id:
+                continue
+            phone_calls = int(row.metrics.phone_calls or 0)
+            phone_impressions = int(row.metrics.phone_impressions or 0)
+            # Compute phone_through_rate from raw counts (more accurate than API value)
+            ptr = round(phone_calls / phone_impressions, 4) if phone_impressions > 0 else 0.0
+            rows.append({
+                "campaign_id": campaign_id,
+                "campaign_name": row.campaign.name or "",
+                "date": row.segments.date,
+                "phone_calls": phone_calls,
+                "phone_impressions": phone_impressions,
+                "phone_through_rate": ptr,
+            })
+        logger.info(f"Campaign phone stats: {len(rows)} rows fetched")
+    except Exception as e:
+        logger.warning(f"_fetch_campaign_phone_stats failed: {e}")
+        return 0
+
+    if rows:
+        count = save_gads_campaign_phone_stats(rows)
+        logger.info(f"Upserted {count} rows into gads_campaign_phone_stats")
         return count
     return 0
 
@@ -622,6 +814,24 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         logger.warning(f"Daily ad-group stats fetch failed (non-fatal): {e}")
         daily_rows = 0
 
+    # Pass 7a: Phone stats (call extensions / call-only ads) per campaign per day
+    logger.info("Fetching campaign phone stats (call extensions)...")
+    try:
+        phone_rows = _fetch_campaign_phone_stats(client, customer_id, days=30)
+        logger.info(f"Phone stats: {phone_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Phone stats fetch failed (non-fatal): {e}")
+        phone_rows = 0
+
+    # Pass 7b: Account-level intelligence (optimization_score, invalid clicks, top IS, partners)
+    logger.info("Fetching account-level intelligence...")
+    try:
+        account_intel = _fetch_account_intelligence(client, customer_id)
+        logger.info(f"Account intelligence fetched: {list(account_intel.keys())}")
+    except Exception as e:
+        logger.warning(f"Account intelligence fetch failed (non-fatal): {e}")
+        account_intel = {}
+
     # Pass 7: Ad creative metadata + daily metrics
     logger.info("Fetching ad creative metadata and daily metrics...")
     ad_rows = 0
@@ -651,6 +861,8 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         "daily_stats_rows": daily_rows,
         "ad_creatives_synced": ad_rows,
         "ad_metric_rows": ad_metric_rows,
+        "account_intel_fetched": bool(account_intel),
+        "phone_stats_rows": phone_rows,
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result

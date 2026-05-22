@@ -13242,6 +13242,40 @@ def admin_get_account_budget():
         "budget_constrained": constrained == "true",
     }
 
+@app.get("/api/admin/account-intelligence", dependencies=[Depends(_require_admin)])
+def admin_get_account_intelligence():
+    """
+    Return the latest account-level intelligence snapshot (PR-D).
+    Fetched during gads-sync and cached in gads_account_stats.
+    Fields: optimization_score (0-1), optimization_score_tier (good/warning/critical/unknown),
+            invalid_clicks, invalid_click_rate, top_impression_pct, abs_top_impression_pct,
+            search_partners_pct (None if not synced, 0.0 if disabled), synced_at.
+    """
+    from database import get_gads_account_stats
+    data = get_gads_account_stats()
+    if not data:
+        # Not yet synced — return a structured placeholder so the UI can show a prompt
+        return {
+            "status": "not_synced",
+            "optimization_score_tier": "unknown",
+            "message": "Run gads-sync to populate account intelligence.",
+        }
+    return data
+
+
+@app.get("/api/admin/campaign-phone-stats", dependencies=[Depends(_require_admin)])
+def admin_get_campaign_phone_stats(days: int = 30, campaign_id: Optional[str] = None):
+    """
+    Return aggregated Google Ads native phone call metrics per campaign (PR-F).
+    Source: gads_campaign_phone_stats (populated during gads-sync).
+    Metrics come from call extensions / call-only ads, NOT from CallRail.
+    Fields: campaign_id, campaign_name, phone_calls, phone_impressions, phone_through_rate.
+    Returns empty list if not yet synced.
+    """
+    from database import get_campaign_phone_stats
+    return {"phone_stats": get_campaign_phone_stats(days=days, campaign_id=campaign_id)}
+
+
 @app.post("/api/admin/account-budget", dependencies=[Depends(_require_admin)])
 def admin_save_account_budget(body: AccountBudgetRequest):
     from database import save_setting, get_setting

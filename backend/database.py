@@ -1966,6 +1966,37 @@ GROUP BY a.campaign_id, c.campaign_name;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_daily_date ON gads_daily_stats(date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_daily_campaign ON gads_daily_stats(campaign_id, date)")
 
+    # ── Account-level intelligence snapshot (single-row, always overwritten) ──
+    # search_partners_pct is nullable: NULL = "not yet synced"; 0.0 = "synced, partners disabled"
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_account_stats (
+            id                     INTEGER PRIMARY KEY DEFAULT 1,
+            optimization_score     REAL DEFAULT 0.0,
+            invalid_clicks         INTEGER DEFAULT 0,
+            invalid_click_rate     REAL DEFAULT 0.0,
+            top_impression_pct     REAL DEFAULT 0.0,
+            abs_top_impression_pct REAL DEFAULT 0.0,
+            search_partners_pct    REAL,
+            synced_at              TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    # ── Campaign phone stats (call extensions / call-only ads, campaign+date grained) ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_campaign_phone_stats (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id        TEXT NOT NULL DEFAULT '',
+            campaign_name      TEXT DEFAULT '',
+            date               TEXT NOT NULL,
+            phone_calls        INTEGER DEFAULT 0,
+            phone_impressions  INTEGER DEFAULT 0,
+            phone_through_rate REAL DEFAULT 0.0,
+            synced_at          TEXT NOT NULL DEFAULT '',
+            UNIQUE (campaign_id, date)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_phone_stats_campaign ON gads_campaign_phone_stats(campaign_id, date)")
+
     # ── Phase 1: Campaign management — audit log + guardrails + optimizer runs ──
     conn.execute("""
         CREATE TABLE IF NOT EXISTS gads_optimizer_runs (
@@ -5795,6 +5826,172 @@ def save_gads_daily_stats(rows: list) -> int:
                 now,
             ))
     return len(rows)
+
+
+def optimization_score_tier(score: float) -> str:
+    """
+    Classify Google Ads optimization_score into a display tier.
+    Single source of truth — used by the REST endpoint and MCP tool.
+      >= 0.80  → 'good'
+      >= 0.60  → 'warning'
+      >  0.00  → 'critical'
+      == 0.00  → 'unknown' (not yet synced or Google hasn't assigned a score)
+    """
+    if score >= 0.80:
+        return "good"
+    elif score >= 0.60:
+        return "warning"
+    elif score > 0:
+        return "critical"
+    return "unknown"
+
+
+def save_gads_account_stats(data: dict) -> None:
+    """
+    Upsert the single-row account-level intelligence snapshot.
+    data keys: optimization_score, invalid_clicks, invalid_click_rate,
+                top_impression_pct, abs_top_impression_pct, search_partners_pct
+    search_partners_pct may be None (not yet synced) vs 0.0 (partners disabled).
+    Always replaces row id=1.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    # search_partners_pct is intentionally nullable — None means "not yet synced"
+    sp_val = data.get("search_partners_pct")
+    sp_stored = float(sp_val) if sp_val is not None else None
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO gads_account_stats
+                (id, optimization_score, invalid_clicks, invalid_click_rate,
+                 top_impression_pct, abs_top_impression_pct, search_partners_pct, synced_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                optimization_score     = excluded.optimization_score,
+                invalid_clicks         = excluded.invalid_clicks,
+                invalid_click_rate     = excluded.invalid_click_rate,
+                top_impression_pct     = excluded.top_impression_pct,
+                abs_top_impression_pct = excluded.abs_top_impression_pct,
+                search_partners_pct    = excluded.search_partners_pct,
+                synced_at              = excluded.synced_at
+        """, (
+            float(data.get("optimization_score", 0.0)),
+            int(data.get("invalid_clicks", 0)),
+            float(data.get("invalid_click_rate", 0.0)),
+            float(data.get("top_impression_pct", 0.0)),
+            float(data.get("abs_top_impression_pct", 0.0)),
+            sp_stored,
+            now,
+        ))
+
+
+def get_gads_account_stats() -> dict:
+    """
+    Return the latest account-level intelligence snapshot with an optimization_score_tier.
+    Returns {} if not yet synced.
+    search_partners_pct is None when never synced; 0.0 when synced but partners disabled.
+    """
+    with _conn() as conn:
+        row = conn.execute("""
+            SELECT optimization_score, invalid_clicks, invalid_click_rate,
+                   top_impression_pct, abs_top_impression_pct, search_partners_pct, synced_at
+            FROM gads_account_stats WHERE id = 1
+        """).fetchone()
+    if row is None:
+        return {}
+    score = row[0] or 0.0
+    return {
+        "optimization_score": score,
+        "invalid_clicks": row[1],
+        "invalid_click_rate": row[2],
+        "top_impression_pct": row[3],
+        "abs_top_impression_pct": row[4],
+        "search_partners_pct": row[5],  # may be None
+        "synced_at": row[6],
+        "optimization_score_tier": optimization_score_tier(score),
+    }
+
+
+def save_gads_campaign_phone_stats(rows: list) -> int:
+    """
+    Upsert a list of campaign-level phone call stats.
+    Each row must have: campaign_id, campaign_name, date,
+                         phone_calls, phone_impressions, phone_through_rate.
+    Returns number of rows processed.
+    """
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        for row in rows:
+            conn.execute("""
+                INSERT INTO gads_campaign_phone_stats
+                    (campaign_id, campaign_name, date,
+                     phone_calls, phone_impressions, phone_through_rate, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, date) DO UPDATE SET
+                    campaign_name      = excluded.campaign_name,
+                    phone_calls        = excluded.phone_calls,
+                    phone_impressions  = excluded.phone_impressions,
+                    phone_through_rate = excluded.phone_through_rate,
+                    synced_at          = excluded.synced_at
+            """, (
+                row["campaign_id"],
+                row.get("campaign_name", ""),
+                row["date"],
+                int(row.get("phone_calls", 0)),
+                int(row.get("phone_impressions", 0)),
+                float(row.get("phone_through_rate", 0.0)),
+                now,
+            ))
+    return len(rows)
+
+
+def get_campaign_phone_stats(days: int = 30, campaign_id: Optional[str] = None) -> list:
+    """
+    Return aggregated phone call stats per campaign for the last N days.
+    Optionally filter by campaign_id.
+    Returns list of dicts: campaign_id, campaign_name, phone_calls,
+                            phone_impressions, phone_through_rate.
+    phone_through_rate is recomputed from totals (weighted, not averaged).
+    """
+    days = max(min(int(days), 90), 1)
+    modifier = f"-{days} days"
+    with _conn() as conn:
+        if campaign_id:
+            rows = conn.execute("""
+                SELECT
+                    campaign_id,
+                    MAX(campaign_name) AS campaign_name,
+                    SUM(phone_calls) AS phone_calls,
+                    SUM(phone_impressions) AS phone_impressions
+                FROM gads_campaign_phone_stats
+                WHERE date >= date('now', 'localtime', ?)
+                  AND campaign_id = ?
+                GROUP BY campaign_id
+            """, (modifier, campaign_id)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT
+                    campaign_id,
+                    MAX(campaign_name) AS campaign_name,
+                    SUM(phone_calls) AS phone_calls,
+                    SUM(phone_impressions) AS phone_impressions
+                FROM gads_campaign_phone_stats
+                WHERE date >= date('now', 'localtime', ?)
+                GROUP BY campaign_id
+            """, (modifier,)).fetchall()
+    result = []
+    for r in rows:
+        ph_calls = int(r["phone_calls"] or 0)
+        ph_imps = int(r["phone_impressions"] or 0)
+        result.append({
+            "campaign_id": r["campaign_id"],
+            "campaign_name": r["campaign_name"],
+            "phone_calls": ph_calls,
+            "phone_impressions": ph_imps,
+            # Recompute weighted PTR from totals
+            "phone_through_rate": round(ph_calls / ph_imps, 4) if ph_imps > 0 else 0.0,
+        })
+    return result
 
 
 def get_daily_stats(days: int = 30, campaign_id: Optional[str] = None) -> list:

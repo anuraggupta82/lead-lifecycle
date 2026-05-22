@@ -1155,6 +1155,36 @@ def _get_keyword_performance(client, customer_id: str, days: int = 30) -> list:
     return results
 
 
+def _get_campaign_phone_stats(days: int = 30) -> dict:
+    """
+    Return Google Ads native phone call metrics per campaign for the last N days.
+    Keyed by campaign_id (string).
+    Source: gads_campaign_phone_stats table, populated during gads-sync.
+    Returns {} gracefully if table not yet synced.
+    """
+    try:
+        from database import get_campaign_phone_stats
+        rows = get_campaign_phone_stats(days=days)
+        return {r["campaign_id"]: r for r in rows}
+    except Exception as e:
+        logger.warning(f"_get_campaign_phone_stats failed: {e}")
+        return {}
+
+
+def _get_account_intelligence() -> dict:
+    """
+    Pull the latest account-level intelligence snapshot from the DB.
+    This was fetched during the last gads-sync and cached in gads_account_stats.
+    Returns {} gracefully if not yet synced.
+    """
+    try:
+        from database import get_gads_account_stats
+        return get_gads_account_stats()
+    except Exception as e:
+        logger.warning(f"_get_account_intelligence failed: {e}")
+        return {}
+
+
 def _get_campaign_settings(client, customer_id: str, days: int = 30) -> dict:
     """
     Pull campaign-level settings and impression share metrics for each active campaign.
@@ -2512,7 +2542,9 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              # Budget constraint: True = no budget increases allowed
                              budget_constrained: bool = False,
                              # Existing campaign assets: callouts, snippets, sitelinks already live
-                             existing_campaign_assets: dict | None = None) -> list:
+                             existing_campaign_assets: dict | None = None,
+                             # PR-F: Google Ads native phone call stats (phone_calls, phone_through_rate)
+                             phone_stats: dict | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -2617,6 +2649,21 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "ctr_pct":              round(_camp_clicks / _camp_impr * 100, 2) if _camp_impr > 0 else None,
             "roas":                 round(_camp_prod / _camp_spend, 2) if _camp_spend > 0 and _camp_prod > 0 else None,
         }
+        # PR-F: Inject Google Ads native phone call metrics (from call extensions / call-only ads).
+        # Keys are always set so the prompt receives consistent context regardless of whether
+        # phone_stats is populated: None = "no data for this campaign" vs 0 = "confirmed zero".
+        _camp_ph: dict | None = None
+        if phone_stats and campaign_resource:
+            _cid_from_resource = campaign_resource.split("/")[-1]
+            _camp_ph = phone_stats.get(_cid_from_resource)
+        if _camp_ph:
+            campaign_stats["gads_phone_calls_30d"] = _camp_ph.get("phone_calls", 0)
+            campaign_stats["gads_phone_impressions_30d"] = _camp_ph.get("phone_impressions", 0)
+            campaign_stats["gads_phone_through_rate"] = _camp_ph.get("phone_through_rate", 0.0)
+        else:
+            campaign_stats["gads_phone_calls_30d"] = None
+            campaign_stats["gads_phone_impressions_30d"] = None
+            campaign_stats["gads_phone_through_rate"] = None
         # ─────────────────────────────────────────────────────────────────────────────
 
         context = {
@@ -3271,7 +3318,26 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
      solely on this signal.
 
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
-ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + _build_institutional_memory_note(campaign) + feedback_block + _build_mcp_decisions_note(campaign)
+ad_performance — never invent a resource name to satisfy an LQI flag.
+
+GOOGLE ADS NATIVE PHONE METRICS (PR-F):
+The campaign_stats dict may contain three Google Ads native phone call fields:
+  - gads_phone_calls_30d: calls initiated via call extensions / call-only ads (NOT CallRail)
+  - gads_phone_impressions_30d: number of times call extensions were shown
+  - gads_phone_through_rate: phone_calls / phone_impressions (call extension click-through rate)
+
+These are null if no call extension impressions occurred in the last 30 days (call assets not active
+or Google hasn't returned data yet). Do NOT flag null as a problem.
+
+HOW TO USE:
+1. If gads_phone_through_rate is non-null AND < 0.01 (below 1%): the call asset is showing but
+   rarely converting to calls. Emit claude_advisory suggesting ad copy review for the call asset
+   or verifying the phone number is correct.
+2. If gads_phone_calls_30d > 0 AND the campaign's calls_30d (CallRail) is MUCH higher:
+   The gap is normal — CallRail tracks ALL calls (organic + paid), GAds phone metrics track only
+   calls from call extension clicks. Do not flag this as a discrepancy.
+3. If gads_phone_calls_30d > 0: cite it as corroborating evidence when recommending call asset
+   optimization (e.g., ad schedule, call-only ad testing).""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + _build_institutional_memory_note(campaign) + feedback_block + _build_mcp_decisions_note(campaign)
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -3996,6 +4062,10 @@ def _call_claude_account_level(
     # Raw campaign_settings dict (resource_name-keyed) from _get_campaign_settings()
     # Used to enrich camp_perf with search_budget_lost_is, roas, bidding_strategy_type
     campaign_settings_raw: dict | None = None,
+    # Account-level intelligence snapshot from gads_account_stats
+    # Keys: optimization_score, invalid_clicks, invalid_click_rate, top_impression_pct,
+    #       abs_top_impression_pct, search_partners_pct, synced_at
+    account_intelligence: dict | None = None,
 ) -> list:
     """
     Account-level Claude pass: runs once after all per-campaign passes.
@@ -4254,6 +4324,8 @@ def _call_claude_account_level(
             "cannibalization_signals": cannibalization_signals,
             # Which campaigns are currently ACTIVE (used to validate cross-campaign negative safety)
             "active_campaign_names": sorted(_active_campaign_names),
+            # PR-D: Account-level intelligence (optimization_score, invalid clicks, top IS, partners)
+            "account_intelligence": account_intelligence or {},
         }
 
         # Account-level: use aggregate summary, no specific camp_settings
@@ -4538,7 +4610,37 @@ USE THESE TO IDENTIFY BROAD-MATCH NEGATIVE KEYWORDS:
 - Prefer bigrams over unigrams when the bigram captures the intent more precisely.
 - Highly service-relevant tokens (implant, invisalign, crown, emergency, etc.) are pre-filtered — do not appear in ngram signals.
 - Generate add_negative_keyword with match_type "broad" for the strongest candidates (top 3–5 by waste).
-- The "reason" field should cite: total_waste, distinct_terms, and a sample of example_terms.""" + _build_institutional_memory_note("") + _build_mcp_decisions_note(None)
+- The "reason" field should cite: total_waste, distinct_terms, and a sample of example_terms.
+
+ACCOUNT HEALTH INTELLIGENCE (PR-D):
+The "account_intelligence" field contains account-level signals from the last sync:
+  - optimization_score (0.0–1.0): Google's account-wide optimization score. Below 0.60 = red flag.
+  - invalid_clicks / invalid_click_rate: bot/fraud clicks. Rate > 5% warrants IP exclusion review.
+  - top_impression_pct: fraction of searches where ads showed anywhere in top positions.
+  - abs_top_impression_pct: fraction of searches where ads showed as the #1 result.
+  - search_partners_pct: fraction of spend going to Search Partners network (non-Google search).
+
+RULES FOR ACCOUNT HEALTH RECS:
+1. OPTIMIZATION SCORE:
+   - If optimization_score > 0 AND optimization_score < 0.60: emit claude_advisory noting the score
+     and suggesting a review of Google's recommended optimizations in the UI.
+   - If optimization_score >= 0.80: mention it as a positive signal in any advisory.
+   - Do NOT blindly accept all Google recommendations — this optimizer may deliberately reject some.
+2. INVALID CLICKS:
+   - If invalid_click_rate > 0.05 (5%): emit claude_advisory citing the rate and recommending
+     IP exclusion review on the highest-spend ENABLED campaign (identify it from campaign_performance).
+     Do not hardcode a campaign name — use actual spend data to identify the correct campaign.
+   - If invalid_clicks > 200 in 30d: flag for investigation regardless of rate.
+3. SEARCH PARTNERS:
+   - If search_partners_pct is null: not yet synced — do NOT flag.
+   - If search_partners_pct == 0.0: Search Partners is disabled — note as a deliberate setting (good).
+   - If search_partners_pct > 0.15 (>15% of spend on Search Partners): emit claude_advisory.
+     Search Partners quality varies and dental practices often see lower intent there.
+     Suggest disabling Search Partners if conversion rate is not validated for this account.
+4. TOP / ABS-TOP IMPRESSION SHARE:
+   - If abs_top_impression_pct < 0.10 (less than 10% of searches show our ad #1): advisory noting
+     competitive positioning is weak at the top slot; bid intelligence may be needed.
+   - These are impression-weighted 30-day account averages — per-campaign IS is in campaign_performance.""" + _build_institutional_memory_note("") + _build_mcp_decisions_note(None)
 
         msg = client.messages.create(
             model="claude-sonnet-4-5",
@@ -8682,6 +8784,8 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             budget_constrained=_budget_constrained,
             # Existing campaign assets (callouts, snippets, sitelinks)
             existing_campaign_assets=camp_existing_assets,
+            # PR-F: Google Ads native phone call stats
+            phone_stats=_phone_stats,
         )
         if not structured:
             continue
@@ -9006,6 +9110,17 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         if bud is not None:
             _acct_budget_by_campaign[cn] = float(bud or 0.0)
 
+    # PR-F: Fetch Google Ads native phone call stats (call extensions / call-only ads)
+    _phone_stats = _get_campaign_phone_stats(days=30)
+    if _phone_stats:
+        logger.info(f"Phone stats loaded for {len(_phone_stats)} campaigns")
+
+    # PR-D: Fetch account-level intelligence snapshot for account-level Claude
+    _account_intel = _get_account_intelligence()
+    if _account_intel:
+        logger.info(f"Account intelligence loaded: opt_score={_account_intel.get('optimization_score')}, "
+                    f"invalid_click_rate={_account_intel.get('invalid_click_rate')}")
+
     acct_structured = _call_claude_account_level(
         all_keyword_perf=keyword_perf,
         all_search_terms=search_terms,
@@ -9024,6 +9139,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         budget_by_campaign=_acct_budget_by_campaign if _budget_constrained else None,
         campaign_lifecycle_map=_rule_lifecycle_by_camp,
         campaign_settings_raw=campaign_settings,
+        account_intelligence=_account_intel,
     )
 
     logger.info(f"Account-level recommendations: {len(acct_structured)}")
