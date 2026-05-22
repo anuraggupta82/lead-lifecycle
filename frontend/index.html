@@ -17197,10 +17197,10 @@ function OptimizerSection({ title, recs, loading, onApprove, onIgnore, onMove, o
 
 function AssignmentModal({ number, campaigns, onClose, onSaved }) {
   const [assignmentType, setAssignmentType] = React.useState(number.assignment_type || 'unassigned');
-  // Multi-campaign: set of selected campaign IDs (strings)
-  const [selectedCampaignIds, setSelectedCampaignIds] = React.useState(
-    () => number.assigned_campaign_id ? new Set([String(number.assigned_campaign_id)]) : new Set()
-  );
+  // Multi-campaign: always start empty — DB only stores last pushed campaign_id,
+  // so pre-selecting it would be misleading when number was pushed to multiple campaigns.
+  const [selectedCampaignIds, setSelectedCampaignIds] = React.useState(() => new Set());
+  const [staticLabel, setStaticLabel] = React.useState(number.static_source_label || '');
   const [forwardTo, setForwardTo] = React.useState(number.forward_to || '');
   const [whisper, setWhisper] = React.useState(number.whisper_message || '');
   const [saving, setSaving] = React.useState(false);
@@ -17238,6 +17238,7 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
   async function handleSave() {
     if (forwardErr || !e164Re.test(forwardTo)) { setForwardErr('Must be E.164 format: +1XXXXXXXXXX'); return; }
     if (assignmentType === 'gads_campaign' && selectedCampaignIds.size === 0) { setErr('Select at least one campaign'); return; }
+    if (assignmentType === 'static_source' && !staticLabel.trim()) { setErr('Enter a website label (e.g. graftondentalcare.com)'); return; }
     setSaving(true); setErr(''); setSaveProgress('');
 
     if (assignmentType !== 'gads_campaign') {
@@ -17249,7 +17250,7 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
             assignment_type: assignmentType,
             assigned_campaign_id: null,
             assigned_call_extension_id: '',
-            static_source_label: '',
+            static_source_label: staticLabel.trim(),
             forward_to: forwardTo,
             whisper_message: whisper,
           }),
@@ -17304,6 +17305,7 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
   const typeOptions = [
     { value: 'unassigned',    label: '— Unassigned',          desc: 'Not yet assigned to a campaign' },
     { value: 'gads_campaign', label: '🎯 Google Ads Campaign', desc: 'Push call extension to one or more campaigns' },
+    { value: 'static_source', label: '🌐 Website (DNI Pool)',  desc: 'Assign to a website for dynamic number insertion' },
   ];
 
   const LBL = {fontSize:12,fontWeight:700,color:'#111827',display:'block',marginBottom:6,textTransform:'uppercase',letterSpacing:0.6};
@@ -17340,16 +17342,28 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
           ))}
         </div>
 
+        {/* Website label input */}
+        {assignmentType === 'static_source' && (
+          <div style={{marginBottom:16}}>
+            <label style={LBL}>Website Label</label>
+            <input value={staticLabel} onChange={e => setStaticLabel(e.target.value)}
+              placeholder="graftondentalcare.com"
+              style={INPUT} />
+            <div style={{fontSize:11,color:'#6b7280',marginTop:5}}>Enter the site this number is displayed on (used for reporting labels).</div>
+          </div>
+        )}
+
         {/* Multi-campaign checkboxes */}
         {assignmentType === 'gads_campaign' && (
           <div style={{marginBottom:16}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
               <label style={LBL}>Campaigns ({selectedCampaignIds.size} selected)</label>
               <div style={{display:'flex',gap:8}}>
                 <button onClick={selectAllCampaigns} style={{fontSize:12,color:'#0d9488',background:'none',border:'none',cursor:'pointer',padding:'2px 6px',borderRadius:4,fontWeight:600}}>All</button>
                 <button onClick={clearAllCampaigns} style={{fontSize:12,color:'#6b7280',background:'none',border:'none',cursor:'pointer',padding:'2px 6px',borderRadius:4,fontWeight:600}}>None</button>
               </div>
             </div>
+            <div style={{fontSize:11,color:'#6b7280',marginBottom:6}}>Select campaigns to push this call extension to. Always select all active campaigns — this number may already be live on campaigns not shown as checked.</div>
             <div style={{border:'1px solid #d1d5db',borderRadius:7,overflow:'hidden',maxHeight:220,overflowY:'auto'}}>
               {campaigns.map((c, i) => {
                 const idStr = String(c.id);
@@ -17478,96 +17492,121 @@ function ReconcileDetailModal({ report, onClose }) {
   );
 }
 
-function NumbersTable({ numbers, onEdit, onToggleStatus, onRetryGads }) {
-  function assignPill(n) {
-    const styles = {
-      unassigned:          { bg:'#6b728020', color:'#6b7280', label:'Unassigned' },
-      gads_campaign:       { bg:'#0891b220', color:'#0891b2', label: n.assigned_campaign_name || 'Campaign' },
-      gads_call_extension: { bg:'#7c3aed20', color:'#7c3aed', label:'Call Extension' },
-      static_source:       { bg:'#d9770620', color:'#d97706', label: n.static_source_label || 'Static Source' },
-      pool:                { bg:'#2563eb20', color:'#2563eb', label:'DNI Pool' },
-    };
-    const s = styles[n.assignment_type] || styles.unassigned;
-    return <span style={{padding:'2px 8px',borderRadius:10,fontSize:11,fontWeight:600,background:s.bg,color:s.color}}>{s.label}</span>;
-  }
+// ── Tracking Numbers — grouped card layout ────────────────────────────────
+const GADS_CALL_EXT_NUMBER = '+15083215428';
 
+function NumbersGrouped({ numbers, onEdit, onToggleStatus }) {
   function statusDot(status) {
-    const c = status === 'active' ? '#22c55e' : status === 'paused' ? '#6b7280' : '#ef4444';
+    const c = status === 'active' ? '#22c55e' : status === 'paused' ? '#f59e0b' : '#ef4444';
     const label = status === 'active' ? 'Active' : status === 'paused' ? 'Paused' : 'Released';
-    return <span style={{display:'inline-flex',alignItems:'center',gap:5,fontSize:12}}>
-      <span style={{width:7,height:7,borderRadius:'50%',background:c,display:'inline-block'}}></span>{label}
+    return <span style={{display:'inline-flex',alignItems:'center',gap:5,fontSize:12,color:'#374151'}}>
+      <span style={{width:7,height:7,borderRadius:'50%',background:c,flexShrink:0}}></span>{label}
     </span>;
   }
 
-  function gadsBadge(n, onRetry) {
-    const s = n.gads_push_status;
-    if (!s || s === 'not_applicable') return <span style={{color:'#d1d5db',fontSize:11}}>—</span>;
-    const cfg = {
-      pushed:  { bg:'#dcfce7', color:'#16a34a', label:'Live' },
-      pending: { bg:'#f3f4f6', color:'#6b7280', label:'Pending' },
-      failed:  { bg:'#fee2e2', color:'#dc2626', label:'Failed' },
-      removed: { bg:'#f3f4f6', color:'#9ca3af', label:'Removed' },
-    }[s] || { bg:'#f3f4f6', color:'#6b7280', label: s };
+  const CARD = {border:'1px solid #e5e7eb',borderRadius:8,padding:'14px 18px',background:'#fff',marginBottom:8,display:'flex',alignItems:'center',gap:16,flexWrap:'wrap'};
+  const NUM  = {fontFamily:'monospace',fontSize:14,fontWeight:700,color:'#111827',whiteSpace:'nowrap'};
+  const ARR  = {fontSize:13,color:'#9ca3af',flexShrink:0};
+  const FWD  = {fontFamily:'monospace',fontSize:13,color:'#6b7280',whiteSpace:'nowrap'};
+  const CALLS= {fontSize:12,color:'#6b7280',whiteSpace:'nowrap'};
+  const SECTION_HDR = {fontSize:11,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:0.8,marginBottom:10,marginTop:0};
+
+  // Partition numbers
+  const gadsExt    = numbers.find(n => n.phone_number === GADS_CALL_EXT_NUMBER);
+  const websiteDNI = numbers.filter(n => n.phone_number !== GADS_CALL_EXT_NUMBER && n.assignment_type === 'static_source');
+  const reserve    = numbers.filter(n => n.phone_number !== GADS_CALL_EXT_NUMBER && n.assignment_type !== 'static_source');
+
+  function editBtn(n) {
     return (
-      <span style={{display:'inline-flex',alignItems:'center',gap:4}}>
-        <span title={n.gads_push_error || s}
-          style={{padding:'2px 7px',borderRadius:8,fontSize:10,fontWeight:600,background:cfg.bg,color:cfg.color}}>
-          {cfg.label}
-        </span>
-        {s === 'failed' && (
-          <button onClick={() => onRetry(n.id)} title="Retry GAds push"
-            style={{padding:'1px 6px',fontSize:10,border:'1px solid #dc2626',borderRadius:4,
-              background:'transparent',color:'#dc2626',cursor:'pointer'}}>↺</button>
+      <div style={{marginLeft:'auto',display:'flex',gap:6,flexShrink:0}}>
+        <button onClick={() => onEdit(n)}
+          style={{padding:'4px 12px',border:'1px solid #d1d5db',borderRadius:5,background:'#f9fafb',color:'#374151',cursor:'pointer',fontSize:12}}>
+          Edit
+        </button>
+        {n.status !== 'released' && (
+          <button onClick={() => onToggleStatus(n)}
+            style={{padding:'4px 10px',border:`1px solid ${n.status === 'active' ? '#f59e0b' : '#22c55e'}`,borderRadius:5,
+              background:'transparent',color: n.status === 'active' ? '#f59e0b' : '#22c55e',cursor:'pointer',fontSize:12}}>
+            {n.status === 'active' ? 'Pause' : 'Activate'}
+          </button>
         )}
-      </span>
+      </div>
     );
   }
 
-  if (!numbers.length) {
-    return <div style={{textAlign:'center',padding:'48px 0',color:'#6b7280'}}>
-      No tracking numbers yet. Click <strong>Sync from CallRail</strong> to import.
-    </div>;
-  }
-
   return (
-    <div style={{overflowX:'auto'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead>
-          <tr style={{borderBottom:'2px solid #e5e7eb'}}>
-            {['Tracking Number','Friendly Name','Assigned To','Forward To','Calls 30d','Status','GAds','Actions'].map(h => (
-              <th key={h} style={{textAlign:'left',padding:'8px 12px',fontSize:11,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:0.5,whiteSpace:'nowrap'}}>{h}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {numbers.map(n => (
-            <tr key={n.id} style={{borderBottom:'1px solid #e5e7eb',opacity: n.status === 'released' ? 0.5 : 1}}>
-              <td style={{padding:'10px 12px',fontFamily:'monospace',fontSize:13,whiteSpace:'nowrap'}}>{n.phone_number}</td>
-              <td style={{padding:'10px 12px',color:'#111827',maxWidth:180}}>
-                <div style={{fontWeight:600}}>{n.friendly_name || <span style={{color:'#9ca3af'}}>—</span>}</div>
-              </td>
-              <td style={{padding:'10px 12px'}}>{assignPill(n)}</td>
-              <td style={{padding:'10px 12px',fontFamily:'monospace',fontSize:12,color:'#6b7280'}}>{n.forward_to || '—'}</td>
-              <td style={{padding:'10px 12px',textAlign:'center',fontWeight:600,color: n.calls_30d > 0 ? '#0d7a7f' : '#6b7280'}}>{n.calls_30d ?? 0}</td>
-              <td style={{padding:'10px 12px'}}>{statusDot(n.status)}</td>
-              <td style={{padding:'10px 12px',whiteSpace:'nowrap'}}>{gadsBadge(n, onRetryGads)}</td>
-              <td style={{padding:'10px 12px',whiteSpace:'nowrap'}}>
-                <button onClick={() => onEdit(n)}
-                  style={{padding:'4px 10px',border:'1px solid #d1d5db',borderRadius:5,background:'#f9fafb',color:'#374151',cursor:'pointer',fontSize:12,marginRight:6}}>
-                  Edit
-                </button>
-                {n.status !== 'released' && (
-                  <button onClick={() => onToggleStatus(n)}
-                    style={{padding:'4px 10px',border:`1px solid ${n.status === 'active' ? '#f59e0b' : '#22c55e'}`,borderRadius:5,
-                      background:'transparent',color: n.status === 'active' ? '#f59e0b' : '#22c55e',cursor:'pointer',fontSize:12}}>
-                    {n.status === 'active' ? 'Pause' : 'Activate'}
-                  </button>
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div>
+      {/* ── Section 1: Google Ads Call Extension ── */}
+      <p style={SECTION_HDR}>📞 Google Ads Call Extension</p>
+      {gadsExt ? (
+        <div style={{...CARD,borderColor:'#bfdbfe',background:'#eff6ff'}}>
+          <span style={NUM}>{gadsExt.phone_number}</span>
+          <span style={ARR}>→</span>
+          <span style={FWD}>{gadsExt.forward_to || '+15083184477'}</span>
+          <span style={{padding:'2px 8px',borderRadius:10,fontSize:11,fontWeight:600,background:'#dbeafe',color:'#1d4ed8'}}>All Campaigns</span>
+          <span style={CALLS}>{gadsExt.calls_30d ?? 0} calls / 30d</span>
+          {statusDot(gadsExt.status)}
+          {editBtn(gadsExt)}
+        </div>
+      ) : (
+        <div style={{...CARD,background:'#f9fafb'}}>
+          <span style={NUM}>{GADS_CALL_EXT_NUMBER}</span>
+          <span style={ARR}>→</span>
+          <span style={FWD}>+15083184477</span>
+          <span style={{padding:'2px 8px',borderRadius:10,fontSize:11,fontWeight:600,background:'#dbeafe',color:'#1d4ed8'}}>All Campaigns · via CallRail</span>
+          <span style={{fontSize:12,color:'#9ca3af'}}>Not yet synced</span>
+        </div>
+      )}
+      <div style={{fontSize:11,color:'#9ca3af',marginBottom:24,marginTop:4}}>
+        Static number used across all Google Ads call extensions. Google sends caller data to CallRail via Call Details Forwarding.
+      </div>
+
+      {/* ── Section 2: Website DNI Numbers ── */}
+      <p style={SECTION_HDR}>🌐 Website DNI Numbers</p>
+      {websiteDNI.length === 0 ? (
+        <div style={{fontSize:13,color:'#9ca3af',marginBottom:24,padding:'12px 0'}}>
+          No website numbers assigned yet. Edit a number and select "Website (DNI Pool)" to assign it.
+        </div>
+      ) : (
+        websiteDNI.map(n => (
+          <div key={n.id} style={{...CARD,borderColor:'#d1fae5',background:'#f0fdf4'}}>
+            <span style={NUM}>{n.phone_number}</span>
+            <span style={ARR}>→</span>
+            <span style={FWD}>{n.forward_to || '—'}</span>
+            <span style={{padding:'2px 10px',borderRadius:10,fontSize:12,fontWeight:600,background:'#dcfce7',color:'#15803d'}}>
+              {n.static_source_label || 'Website'}
+            </span>
+            <span style={CALLS}>{n.calls_30d ?? 0} calls / 30d</span>
+            {statusDot(n.status)}
+            {editBtn(n)}
+          </div>
+        ))
+      )}
+      <div style={{fontSize:11,color:'#9ca3af',marginBottom:24,marginTop: websiteDNI.length ? 4 : 0}}>
+        Numbers displayed on websites via swap.js DNI. Caller data captured with gclid for conversion attribution.
+      </div>
+
+      {/* ── Section 3: Reserve / Unassigned ── */}
+      <p style={SECTION_HDR}>📋 Reserve Numbers</p>
+      {reserve.length === 0 ? (
+        <div style={{fontSize:13,color:'#9ca3af',padding:'12px 0'}}>No reserve numbers.</div>
+      ) : (
+        reserve.map(n => (
+          <div key={n.id} style={{...CARD, opacity: n.status === 'released' ? 0.5 : 1}}>
+            <span style={NUM}>{n.phone_number}</span>
+            <span style={ARR}>→</span>
+            <span style={FWD}>{n.forward_to || '—'}</span>
+            <span style={{fontSize:13,color:'#6b7280',flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+              {n.friendly_name || <span style={{color:'#d1d5db'}}>Unnamed</span>}
+            </span>
+            {statusDot(n.status)}
+            {editBtn(n)}
+          </div>
+        ))
+      )}
+      <div style={{fontSize:11,color:'#9ca3af',marginTop:4}}>
+        Available for GBP, Facebook Ads, or future campaigns. Assign via Edit when ready.
+      </div>
     </div>
   );
 }
@@ -17665,8 +17704,7 @@ function TrackingNumbersTab() {
   const [modalNumber, setModalNumber] = React.useState(null);
   const [reconcileReport, setReconcileReport] = React.useState(null);
   const [showReconcile, setShowReconcile] = React.useState(false);
-  const [filterText, setFilterText] = React.useState('');
-  const [filterStatus, setFilterStatus] = React.useState('all');
+  // filters removed — replaced with grouped card layout
   const [toastMsg, setToastMsg] = React.useState('');
   const [recentCalls, setRecentCalls] = React.useState([]);
   const [recentCallsLoading, setRecentCallsLoading] = React.useState(false);
@@ -17760,16 +17798,7 @@ function TrackingNumbersTab() {
     : 0;
   const hasHipaaAlert = reconcileReport?.field_drift?.some(d => d.field === 'recording_enabled' && d.callrail_value === 1);
 
-  // Filtered numbers
-  const filtered = numbers.filter(n => {
-    if (filterStatus !== 'all' && n.status !== filterStatus) return false;
-    if (filterText) {
-      const q = filterText.toLowerCase();
-      return (n.phone_number || '').includes(q) || (n.friendly_name || '').toLowerCase().includes(q) ||
-        (n.static_source_label || '').toLowerCase().includes(q) || (n.assigned_campaign_name || '').toLowerCase().includes(q);
-    }
-    return true;
-  });
+  // No filter needed — grouped layout handles display
 
   return (
     <div style={{padding:'24px 28px',maxWidth:1100}}>
@@ -17819,23 +17848,10 @@ function TrackingNumbersTab() {
         </div>
       )}
 
-      {/* Filters */}
-      <div style={{display:'flex',gap:10,marginBottom:16,flexWrap:'wrap'}}>
-        <input value={filterText} onChange={e => setFilterText(e.target.value)} placeholder="Search number, name, source…"
-          style={{padding:'7px 12px',border:'1px solid #d1d5db',borderRadius:6,background:'#ffffff',color:'#111827',fontSize:13,width:240}} />
-        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
-          style={{padding:'7px 10px',border:'1px solid #d1d5db',borderRadius:6,background:'#ffffff',color:'#111827',fontSize:13}}>
-          <option value="all">All statuses</option>
-          <option value="active">Active</option>
-          <option value="paused">Paused</option>
-          <option value="released">Released</option>
-        </select>
-      </div>
-
-      {/* Table */}
+      {/* Grouped cards */}
       {loading
         ? <div style={{textAlign:'center',padding:'40px 0',color:'var(--text-muted)'}}>Loading…</div>
-        : <NumbersTable numbers={filtered} onEdit={n => setModalNumber(n)} onToggleStatus={handleToggleStatus} onRetryGads={handleRetryGads} />
+        : <NumbersGrouped numbers={numbers} onEdit={n => setModalNumber(n)} onToggleStatus={handleToggleStatus} />
       }
 
       {/* PR 4: Recent Calls */}
