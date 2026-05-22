@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS leads (
     tx_completed_at TEXT DEFAULT '',
     cold_at         TEXT DEFAULT '',
     self_booked INTEGER DEFAULT 0,        -- 1 if patient self-scheduled via visitgdc.com with GAds attribution + always-rule campaign
+    existing_patient INTEGER DEFAULT 0,   -- PR 5: 1 if matched OD patient has ≥1 prior completed appt (not a net-new acquisition)
     tags        TEXT DEFAULT '[]',
     updated_at  TEXT NOT NULL
 );
@@ -2361,6 +2362,10 @@ GROUP BY a.campaign_id, c.campaign_name;
     if "self_booked" not in leads_img_cols:
         conn.execute("ALTER TABLE leads ADD COLUMN self_booked INTEGER DEFAULT 0")
 
+    # ── PR 5: existing_patient flag — set when matched OD patient has ≥1 prior completed appt ──
+    if "existing_patient" not in leads_img_cols:
+        conn.execute("ALTER TABLE leads ADD COLUMN existing_patient INTEGER DEFAULT 0")
+
     # ── Image Attachments: image_attachment on workflow_steps ─────────────────
     ws_cols = {row[1] for row in conn.execute("PRAGMA table_info(workflow_steps)").fetchall()}
     if "image_attachment" not in ws_cols:
@@ -2973,6 +2978,10 @@ def upsert_lead(data: dict) -> dict:
             if data.get("self_booked") == 1 or data.get("self_booked") is True:
                 fields.append("self_booked=?")
                 values.append(1)
+            # PR 5: existing_patient is a sticky upgrade — only set to 1, never overwrite back to 0
+            if data.get("existing_patient") == 1 or data.get("existing_patient") is True:
+                fields.append("existing_patient=?")
+                values.append(1)
             if phone_raw:
                 fields += ["phone_hash=?"]
                 values += [_hash_phone(phone_raw) if phone_raw else ""]
@@ -2991,8 +3000,9 @@ def upsert_lead(data: dict) -> dict:
                     utm_campaign, utm_term, utm_content, landing_url,
                     smile_image_url, smile_blob_name, smile_composite_blob_name,
                     notes, tags, ga4_client_id,
-                    appointment_date, appointment_status, od_patient_num, self_booked)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    appointment_date, appointment_status, od_patient_num, self_booked,
+                    existing_patient)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
                 data.get("source") or "unknown", data.get("stage", "new"),
@@ -3014,6 +3024,7 @@ def upsert_lead(data: dict) -> dict:
                 data.get("appointment_status", ""),
                 data.get("od_patient_num", "") or "",
                 1 if data.get("self_booked") else 0,
+                1 if data.get("existing_patient") else 0,
             ))
             # Auto-note: inline into same connection so no nested-transaction risk
             try:
@@ -3092,6 +3103,9 @@ def _pipeline_visibility_clause(lead_alias: str = "leads") -> str:
     """Return a SQL WHERE fragment (no leading WHERE keyword) that hides leads from
     campaigns with auto_enter_pipeline_rule='never', and enforces
     'when_follow_up_flagged' via a correlated EXISTS on mango_calls.
+    PR 5 also hides any lead with existing_patient=1 (matched OD patient with prior
+    completed appointments) — those are not net-new acquisitions and would only
+    crowd the worklist.
 
     Logic (PR 3 — extends PR 2):
       - Lead has a campaign_id that matches a campaigns row → honor that campaign's rule.
@@ -3112,6 +3126,11 @@ def _pipeline_visibility_clause(lead_alias: str = "leads") -> str:
     """
     L = lead_alias
     return f"""(
+        -- PR 5: hide existing-patient leads from the pipeline regardless of campaign rule.
+        -- They stay in DB + feed the optimizer noise signal, but never crowd the worklist.
+        (COALESCE({L}.existing_patient, 0) = 0)
+      AND
+      (
         -- Campaign matched: show unless rule is 'never' (and follow-up rule satisfied)
         (c.campaign_id IS NOT NULL
          AND COALESCE(c.auto_enter_pipeline_rule, 'always') != 'never'
@@ -3145,6 +3164,7 @@ def _pipeline_visibility_clause(lead_alias: str = "leads") -> str:
             OR COALESCE({L}.notes, '') LIKE '%gclid%'
             OR {L}.source = 'manual'
         ))
+      )
     )"""
 
 

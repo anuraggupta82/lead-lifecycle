@@ -918,6 +918,98 @@ def _hour_in_any_dow_range(hour: int, open_hours: dict) -> bool:
     return any(_hour_in_dow_range(hour, r) for r in open_hours.values())
 
 
+# ─── Existing-patient call noise (PR 5) ──────────────────────────────────────
+def collect_existing_patient_calls(conn, days: int = 30) -> dict:
+    """
+    Per-campaign count of GAds calls where the caller is already an active or
+    inactive OD patient. These calls are not new-patient acquisitions — they're
+    existing patients reaching the office through the ad number. High volume on
+    a campaign is a signal that the search terms / match types may be attracting
+    the current patient base rather than net-new prospects.
+
+    Returns:
+      {
+        "by_campaign": {
+            "<campaign_name>": {
+                "existing_calls": int,   # od_patient_status in existing_active|existing_inactive
+                "total_calls":    int,   # all GAds-attributed mango_calls in window
+                "existing_pct":   float, # existing_calls / total_calls (0–1)
+                "top_terms":      [str], # up to 3 search terms / keywords that produced these calls
+            }, ...
+        },
+        "totals": {
+            "existing_calls": int,
+            "total_calls":    int,
+        }
+      }
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    agg_sql = """
+      SELECT
+        COALESCE(NULLIF(l.utm_campaign,''),'(unattributed)') AS campaign,
+        COUNT(*)                                               AS total_calls,
+        SUM(CASE WHEN mc.od_patient_status IN ('existing_active','existing_inactive')
+                 THEN 1 ELSE 0 END)                           AS existing_calls
+      FROM mango_calls mc
+      LEFT JOIN leads l ON l.id = mc.lead_id
+      WHERE mc.started_at >= ?
+        AND (mc.gads_call_id IS NOT NULL AND mc.gads_call_id != '')
+      GROUP BY campaign
+    """
+    by_camp: dict = {}
+    tot_existing = 0
+    tot_all = 0
+    try:
+        for r in conn.execute(agg_sql, (cutoff,)):
+            total = int(r["total_calls"] or 0)
+            existing = int(r["existing_calls"] or 0)
+            if total == 0:
+                continue
+            tot_all += total
+            tot_existing += existing
+            by_camp[r["campaign"]] = {
+                "existing_calls": existing,
+                "total_calls":    total,
+                "existing_pct":   round(existing / total, 3) if total else 0.0,
+                "top_terms":      [],
+            }
+    except Exception as e:
+        logger.debug(f"LQI existing_patient_calls agg failed: {e}")
+        return {"by_campaign": {}, "totals": {"existing_calls": 0, "total_calls": 0}}
+
+    # Top keywords producing existing-patient calls per campaign
+    try:
+        term_sql = """
+          SELECT
+            COALESCE(NULLIF(l.utm_campaign,''),'(unattributed)') AS campaign,
+            COALESCE(NULLIF(l.keyword_text,''), NULLIF(l.utm_term,''), '(unknown)') AS term,
+            COUNT(*) AS n
+          FROM mango_calls mc
+          LEFT JOIN leads l ON l.id = mc.lead_id
+          WHERE mc.started_at >= ?
+            AND mc.od_patient_status IN ('existing_active','existing_inactive')
+          GROUP BY campaign, term
+          ORDER BY n DESC
+        """
+        per_camp_terms: dict = {}
+        for r in conn.execute(term_sql, (cutoff,)):
+            per_camp_terms.setdefault(r["campaign"], []).append(r["term"])
+        for camp, terms in per_camp_terms.items():
+            if camp in by_camp:
+                by_camp[camp]["top_terms"] = terms[:3]
+    except Exception as e:
+        logger.debug(f"LQI existing_patient_calls top_terms failed (non-fatal): {e}")
+
+    return {
+        "by_campaign": by_camp,
+        "totals": {
+            "existing_calls": tot_existing,
+            "total_calls":    tot_all,
+        },
+    }
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def collect_all(days: int = 30) -> dict:
     """
@@ -946,13 +1038,14 @@ def collect_all(days: int = 30) -> dict:
         }
     }
     collectors = [
-        ("sources",      collect_source_quality),
-        ("calls",        collect_short_calls),
-        ("search_terms", collect_bad_search_terms),
-        ("schedule",     collect_schedule_waste),
-        ("cold_leads",   collect_cold_lead_causes),
-        ("no_shows",     collect_no_show_patterns),
-        ("geo",          collect_geo_signals),
+        ("sources",                collect_source_quality),
+        ("calls",                  collect_short_calls),
+        ("search_terms",           collect_bad_search_terms),
+        ("schedule",               collect_schedule_waste),
+        ("cold_leads",             collect_cold_lead_causes),
+        ("no_shows",               collect_no_show_patterns),
+        ("geo",                    collect_geo_signals),
+        ("existing_patient_calls", collect_existing_patient_calls),  # PR 5
     ]
 
     try:

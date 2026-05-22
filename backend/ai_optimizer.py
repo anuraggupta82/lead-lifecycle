@@ -2461,14 +2461,23 @@ def _build_lqi_campaign_slice(campaign: str, lqi: dict) -> dict:
             lqi_camp_geo = payload
             break
 
+    # PR 5: per-campaign existing-patient call noise
+    lqi_camp_existing_calls: dict = {}
+    ep_by_camp = (lqi.get("existing_patient_calls") or {}).get("by_campaign", {})
+    for cname, payload in ep_by_camp.items():
+        if cname.strip().lower() == camp_l:
+            lqi_camp_existing_calls = payload
+            break
+
     return {
-        "sources":          lqi.get("sources", {}),
-        "calls":            lqi_camp_calls,
-        "bad_search_terms": lqi_camp_bad_terms,
-        "schedule":         lqi.get("schedule", {}),
-        "cold_leads":       lqi.get("cold_leads", {}),
-        "no_shows":         lqi.get("no_shows", {}),
-        "geo":              lqi_camp_geo,
+        "sources":                lqi.get("sources", {}),
+        "calls":                  lqi_camp_calls,
+        "bad_search_terms":       lqi_camp_bad_terms,
+        "schedule":               lqi.get("schedule", {}),
+        "cold_leads":             lqi.get("cold_leads", {}),
+        "no_shows":               lqi.get("no_shows", {}),
+        "geo":                    lqi_camp_geo,
+        "existing_patient_calls": lqi_camp_existing_calls,  # PR 5
     }
 
 
@@ -3247,6 +3256,20 @@ The "lqi" field in the data contains six sub-fields. Use them as follows:
    - Always cite specific band CVR numbers from the rollup in your geo_rationale
    - MINIMUM DATA FLOOR: do not recommend update_geo_targeting unless at least one location has ≥ 30 clicks
 
+8. lqi.existing_patient_calls — EXISTING-PATIENT CALL NOISE (PR 5):
+   Structure: {existing_calls, total_calls, existing_pct, top_terms[]}
+   These are calls where the caller was already an active or inactive OD patient
+   when they dialed the ad number — i.e. NOT a net-new patient acquisition.
+   - If existing_pct >= 0.30 AND total_calls >= 5: return a claude_advisory
+     stating "Existing-patient call noise: N of M calls were from existing patients
+     last 30d (P%). These are not new-patient acquisitions — the ad spend for these
+     calls is effectively serving existing patients. Review whether search terms /
+     match types are attracting current patients."
+   - If top_terms contains obvious branded/existing-patient patterns, propose
+     add_negative_keyword for them (requires operator approval via the approval flow).
+   - This is informational pressure only — do not pause keywords or reduce bids
+     solely on this signal.
+
 LQI is signal, not gospel. Cross-check each LQI-driven rec against keyword_performance and
 ad_performance — never invent a resource name to satisfy an LQI flag.""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + _build_institutional_memory_note(campaign) + feedback_block + _build_mcp_decisions_note(campaign)
 
@@ -3798,13 +3821,25 @@ def _build_lqi_account_summary(lqi: dict) -> dict:
         "by_campaign":      calls_lqi.get("by_campaign", {}),
         "shortest_overall": (calls_lqi.get("shortest_overall") or [])[:10],
     }
+    # PR 5: existing-patient call noise — only surface campaigns above the noise threshold
+    epc = lqi.get("existing_patient_calls") or {}
+    existing_patient_calls_account = {
+        "totals": epc.get("totals", {}),
+        "by_campaign": {
+            c: payload
+            for c, payload in (epc.get("by_campaign") or {}).items()
+            if (payload.get("existing_pct") or 0) >= 0.30
+            and (payload.get("total_calls") or 0) >= 5
+        },
+    }
     return {
-        "source_scoreboard": source_scoreboard,
-        "schedule_summary":  schedule_summary,
-        "bad_search_terms":  bad_terms_account,
-        "calls":             calls_account,
-        "cold_leads":        lqi.get("cold_leads", {}),
-        "no_shows":          lqi.get("no_shows", {}),
+        "source_scoreboard":      source_scoreboard,
+        "schedule_summary":       schedule_summary,
+        "bad_search_terms":       bad_terms_account,
+        "calls":                  calls_account,
+        "cold_leads":             lqi.get("cold_leads", {}),
+        "no_shows":               lqi.get("no_shows", {}),
+        "existing_patient_calls": existing_patient_calls_account,  # PR 5
     }
 
 
@@ -4402,6 +4437,20 @@ The "lqi" field in the account data contains pre-computed quality signals across
    - lqi.no_shows.lead_age_at_booking_days has no_show_median and showed_median (days between lead creation and booking).
    - If no_show_median > 14 days, flag the long booking lag as a likely no-show driver.
    - lqi.no_shows.reminders.no_show_no_reminders_pct: if > 0.50, flag as critical — no-shows not receiving reminders.
+
+7. EXISTING-PATIENT CALL NOISE — CROSS-CAMPAIGN (lqi.existing_patient_calls):
+   - lqi.existing_patient_calls.by_campaign maps campaign_name to
+     {existing_calls, total_calls, existing_pct, top_terms[]}.
+   - Only campaigns with existing_pct ≥ 0.30 AND total_calls ≥ 5 are included (pre-filtered).
+   - For each such campaign, generate a claude_advisory:
+     "Campaign [name] had N/M calls from existing patients last 30d (P%).
+      These are not new-patient acquisitions. Top terms surfacing existing
+      patients: [top_terms]. Consider whether search terms or match types
+      are attracting the current patient base; potential negatives listed."
+   - If top_terms contains obvious patterns (branded terms, doctor name, practice name),
+     propose add_negative_keyword operations targeting the offending campaign.
+   - This signal is informational and noise-routing only. Negatives are
+     suggestions for operator review — never auto-applied.
 
 ACCOUNT-LEVEL LIFECYCLE AWARENESS (MANDATORY):
 Each campaign in "campaign_performance" has three lifecycle fields:

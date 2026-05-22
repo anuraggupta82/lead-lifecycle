@@ -235,15 +235,23 @@ def match_leads_to_od() -> dict:
                 apt_info   = _get_appointment_info(conn, pat_num)
                 od_rel     = _compute_od_relationship(tp_status, apt_info)
 
+                # PR 5: "existing patient" = has ≥1 completed (AptStatus=2) appointment in OD.
+                # has_showed is set by _get_appointment_info when any AptStatus=2 row exists.
+                # Sticky-upgrade: CASE WHEN prevents overwriting 1→0 on subsequent runs.
+                existing_patient = 1 if apt_info.get("has_showed") else 0
+
                 # Update lead in SQLite
                 lconn = _get_sqlite()
                 now = datetime.now(timezone.utc).isoformat()
                 lconn.execute("""
                     UPDATE leads
                     SET od_patient_num=?, od_matched_at=?, attributed_production=?,
-                        od_relationship=?, updated_at=?
+                        od_relationship=?,
+                        existing_patient = CASE WHEN ? = 1 THEN 1 ELSE existing_patient END,
+                        updated_at=?
                     WHERE id=?
-                """, (pat_num, now, production["total"], od_rel, now, lead["id"]))
+                """, (pat_num, now, production["total"], od_rel,
+                      existing_patient, now, lead["id"]))
                 lconn.commit()
                 lconn.close()
 
@@ -844,6 +852,21 @@ def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
 
                 apt_datetime_str = str(apt_dt) if apt_dt else ""
 
+                # ── PR 5: existing_patient detection ──────────────────────────
+                # A patient is "existing" if they have ≥1 completed appointment (AptStatus=2)
+                # already in OD. The appointment we're processing here is the NEW one the
+                # scheduler just booked (AptStatus=1 Scheduled), so has_showed only catches
+                # prior visits. Existing-patient leads stay in DB but are hidden from the
+                # default pipeline view via _pipeline_visibility_clause().
+                existing_patient = 0
+                try:
+                    _apt_info = _get_appointment_info(od_conn, pat_num)
+                    if _apt_info.get("has_showed"):
+                        existing_patient = 1
+                except Exception as _ep_err:
+                    logger.debug(f"[sched_leads] existing_patient check failed for "
+                                 f"PatNum={pat_num}: {_ep_err}")
+
                 # ── Build lead payload ────────────────────────────────────────
                 new_id = str(uuid.uuid4())
                 created_at = datetime.now(timezone.utc).isoformat()
@@ -880,6 +903,7 @@ def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
                     "appointment_status": "scheduled",
                     "od_patient_num":     pat_num,
                     "self_booked":        self_booked,
+                    "existing_patient":   existing_patient,
                 }
 
                 upsert_lead(lead_data)
@@ -892,13 +916,14 @@ def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
                               "apt_datetime": apt_datetime_str,
                               "has_attribution": bool(attr.get("gclid") or attr.get("utm_campaign")),
                               "self_booked": bool(self_booked),
+                              "existing_patient": bool(existing_patient),
                           }))
 
                 logger.info(
                     f"[sched_leads] Created lead {new_id[:8]} for {email or phone} "
                     f"AptNum={apt_num} apt_type={apt_type!r} "
                     f"gclid={'yes' if attr.get('gclid') else 'no'} "
-                    f"self_booked={self_booked}"
+                    f"self_booked={self_booked} existing_patient={existing_patient}"
                 )
                 created += 1
 
