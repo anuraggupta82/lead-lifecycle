@@ -42,6 +42,11 @@ def _build_client():
     })
 
 
+def _micros_to_usd(val):
+    """Convert micros (int) to dollars. None-safe — treats 0 as valid (not None)."""
+    return round(val / 1_000_000.0, 4) if val is not None else None
+
+
 def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
     """
     Query click_view for the last N days.
@@ -549,10 +554,6 @@ def _fetch_keyword_bid_estimates(client, customer_id: str) -> int:
           AND ad_group.status = 'ENABLED'
     """
 
-    def _micros_to_usd(val):
-        """Convert micros (int) to dollars. None-safe — treats 0 as valid (not None)."""
-        return round(val / 1_000_000.0, 4) if val is not None else None
-
     rows = []
     try:
         response = service.search(customer_id=customer_id, query=query)
@@ -669,9 +670,9 @@ def _fetch_geo_performance(client, customer_id: str, days: int = 30) -> int:
             SELECT
                 campaign.id,
                 campaign.name,
+                campaign.status,
                 geographic_view.resource_name,
                 geographic_view.location_type,
-                geographic_view.country_criterion_id,
                 metrics.impressions,
                 metrics.clicks,
                 metrics.cost_micros,
