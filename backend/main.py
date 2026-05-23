@@ -8174,6 +8174,375 @@ def admin_add_negative_keyword(campaign_id: str, body: NegativeKeywordRequest):
         raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
 
 
+class PauseKeywordRequest(BaseModel):
+    keyword_text: str
+    ad_group_name: str = ""
+    match_type: str = "EXACT"   # EXACT | PHRASE | BROAD
+    reason: str = ""
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/pause-keyword",
+          dependencies=[Depends(_require_admin)])
+def admin_pause_keyword(campaign_id: str, body: PauseKeywordRequest):
+    """
+    Pause a keyword by text (and optional ad group name) in a campaign.
+    Looks up the keyword resource_name via Google Ads API, then calls
+    _execute_single_pause(). Logs to gads_audit_log.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from ai_optimizer import _build_client, _execute_single_pause
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    keyword_text = (body.keyword_text or "").strip()
+    if not keyword_text:
+        raise HTTPException(status_code=422, detail="keyword_text is required")
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id
+    client = _build_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    # Build query — optionally filter by ad group name
+    ag_filter = ""
+    if body.ad_group_name:
+        safe_ag = body.ad_group_name.replace("'", "\\'")
+        ag_filter = f" AND ad_group.name = '{safe_ag}'"
+
+    safe_kw = keyword_text.replace("'", "\\'")
+    query = f"""
+        SELECT
+            ad_group_criterion.resource_name,
+            ad_group_criterion.keyword.text,
+            ad_group_criterion.keyword.match_type,
+            ad_group_criterion.status,
+            ad_group.name,
+            campaign.resource_name
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.status = 'ENABLED'
+          AND ad_group_criterion.keyword.text = '{safe_kw}'
+          AND campaign.resource_name = '{gads_resource}'
+          {ag_filter}
+        LIMIT 5
+    """
+
+    rows = list(ga_service.search(customer_id=customer_id, query=query))
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Keyword '{keyword_text}' not found (ENABLED) in campaign. "
+                   f"It may already be paused or the ad_group_name doesn't match."
+        )
+
+    # If multiple rows (same keyword in multiple ad groups), take first
+    row = rows[0]
+    kw_resource = row.ad_group_criterion.resource_name
+    ag_name = row.ad_group.name
+
+    action_id = log_admin_manual_action(
+        operation="pause_keyword",
+        entity_type="keyword",
+        entity_id=kw_resource,
+        entity_name=keyword_text,
+        before={"status": "ENABLED"},
+        after={"status": "PAUSED"},
+        reason=body.reason or "manual_pause_via_mcp",
+    )
+
+    try:
+        _execute_single_pause(client, customer_id, resource_name=kw_resource)
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        logger.info(f"MCP pause_keyword: '{keyword_text}' in '{ag_name}' ({action_id[:8]})")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "pause_keyword",
+            "keyword_text": keyword_text,
+            "ad_group_name": ag_name,
+            "resource_name": kw_resource,
+        }
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+class AdjustBidRequest(BaseModel):
+    keyword_text: str
+    new_bid_usd: float
+    ad_group_name: str = ""
+    reason: str = ""
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/adjust-bid",
+          dependencies=[Depends(_require_admin)])
+def admin_adjust_bid(campaign_id: str, body: AdjustBidRequest):
+    """
+    Adjust the CPC bid for a keyword in a campaign.
+    Looks up the keyword resource_name via Google Ads API, then calls
+    _execute_bid_change(). Logs to gads_audit_log.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from ai_optimizer import _build_client, _execute_bid_change
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    keyword_text = (body.keyword_text or "").strip()
+    if not keyword_text:
+        raise HTTPException(status_code=422, detail="keyword_text is required")
+
+    if body.new_bid_usd <= 0:
+        raise HTTPException(status_code=422, detail="new_bid_usd must be > 0")
+
+    new_bid_micros = int(round(body.new_bid_usd * 1_000_000))
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id
+    client = _build_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    ag_filter = ""
+    if body.ad_group_name:
+        safe_ag = body.ad_group_name.replace("'", "\\'")
+        ag_filter = f" AND ad_group.name = '{safe_ag}'"
+
+    safe_kw = keyword_text.replace("'", "\\'")
+    query = f"""
+        SELECT
+            ad_group_criterion.resource_name,
+            ad_group_criterion.keyword.text,
+            ad_group_criterion.keyword.match_type,
+            ad_group_criterion.status,
+            ad_group_criterion.effective_cpc_bid_micros,
+            ad_group.name,
+            campaign.resource_name
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.status = 'ENABLED'
+          AND ad_group_criterion.keyword.text = '{safe_kw}'
+          AND campaign.resource_name = '{gads_resource}'
+          {ag_filter}
+        LIMIT 5
+    """
+
+    rows = list(ga_service.search(customer_id=customer_id, query=query))
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Keyword '{keyword_text}' not found (ENABLED) in campaign."
+        )
+
+    row = rows[0]
+    kw_resource = row.ad_group_criterion.resource_name
+    ag_name = row.ad_group.name
+    old_bid_micros = row.ad_group_criterion.effective_cpc_bid_micros or 0
+
+    operation = "increase_bid" if new_bid_micros > old_bid_micros else "decrease_bid"
+
+    action_id = log_admin_manual_action(
+        operation=operation,
+        entity_type="keyword",
+        entity_id=kw_resource,
+        entity_name=keyword_text,
+        before={"cpc_bid_micros": old_bid_micros,
+                "cpc_bid_usd": round(old_bid_micros / 1_000_000, 4)},
+        after={"cpc_bid_micros": new_bid_micros,
+               "cpc_bid_usd": body.new_bid_usd,
+               "new_bid_micros": new_bid_micros},
+        reason=body.reason or "manual_bid_via_mcp",
+    )
+
+    try:
+        _execute_bid_change(client, customer_id,
+                            resource_name=kw_resource,
+                            new_bid_micros=new_bid_micros)
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        logger.info(f"MCP adjust_bid: '{keyword_text}' → ${body.new_bid_usd:.2f} "
+                    f"in '{ag_name}' ({action_id[:8]})")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": operation,
+            "keyword_text": keyword_text,
+            "ad_group_name": ag_name,
+            "old_bid_usd": round(old_bid_micros / 1_000_000, 4),
+            "new_bid_usd": body.new_bid_usd,
+            "resource_name": kw_resource,
+        }
+    except ValueError as e:
+        update_gads_action_result(action_id, executed=False,
+                                  execution_result=f"rejected: {str(e)[:200]}")
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+class DeviceBidModifierRequest(BaseModel):
+    device: str          # MOBILE | DESKTOP | TABLET
+    modifier: float      # e.g. -0.5 means -50%, 0.3 means +30%, -1.0 means fully excluded
+    reason: str = ""
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/device-bid-modifier",
+          dependencies=[Depends(_require_admin)])
+def admin_set_device_bid_modifier(campaign_id: str, body: DeviceBidModifierRequest):
+    """
+    Set a device-level bid modifier on a campaign using CampaignCriterionService.
+    modifier=-0.5 → -50%, modifier=0.3 → +30%, modifier=-1.0 → fully excluded.
+    Valid range: -1.0 to +9.0 (Google Ads limit). MOBILE cannot be excluded (-1.0).
+    Logs to gads_audit_log.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from ai_optimizer import _build_client
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    device_str = (body.device or "").upper().strip()
+    if device_str not in ("MOBILE", "DESKTOP", "TABLET"):
+        raise HTTPException(status_code=422, detail="device must be MOBILE, DESKTOP, or TABLET")
+
+    modifier = body.modifier
+    if modifier < -1.0 or modifier > 9.0:
+        raise HTTPException(status_code=422, detail="modifier must be between -1.0 and 9.0")
+    if device_str == "MOBILE" and modifier == -1.0:
+        raise HTTPException(status_code=422, detail="MOBILE cannot be fully excluded (modifier=-1.0)")
+
+    # bid_modifier field = 1 + modifier (e.g. -50% → 0.5, +30% → 1.3, -1.0 → 0.0)
+    bid_modifier_value = round(1.0 + modifier, 6)
+
+    settings = get_settings()
+    customer_id = settings.google_ads_customer_id
+    client = _build_client()
+
+    # Device enum — use integer value directly (proto-plus v24 pattern)
+    device_int_map = {
+        "MOBILE":  client.enums.DeviceEnum.MOBILE.value,
+        "DESKTOP": client.enums.DeviceEnum.DESKTOP.value,
+        "TABLET":  client.enums.DeviceEnum.TABLET.value,
+    }
+    device_int = device_int_map[device_str]
+
+    # Look up the existing device criterion resource name (Google Ads creates these automatically
+    # for all campaigns — we always UPDATE rather than CREATE)
+    ga_service = client.get_service("GoogleAdsService")
+    q = f"""
+        SELECT campaign_criterion.resource_name, campaign_criterion.bid_modifier
+        FROM campaign_criterion
+        WHERE campaign_criterion.campaign = '{gads_resource}'
+          AND campaign_criterion.type = 'DEVICE'
+          AND campaign_criterion.device.type = '{device_str}'
+    """
+    try:
+        rows = list(ga_service.search(customer_id=customer_id, query=q))
+    except Exception as eq:
+        raise HTTPException(status_code=500, detail=f"Google Ads lookup failed: {eq}")
+
+    from google.protobuf import field_mask_pb2 as _fm
+    cc_service = client.get_service("CampaignCriterionService")
+
+    action_id = log_admin_manual_action(
+        operation="set_device_bid_modifier",
+        entity_type="campaign",
+        entity_id=gads_resource,
+        entity_name=camp.get("campaign_name", ""),
+        before={"bid_modifier": rows[0].campaign_criterion.bid_modifier if rows else None},
+        after={"device": device_str, "modifier": modifier,
+               "bid_modifier_value": bid_modifier_value},
+        reason=body.reason or "manual_device_modifier_via_mcp",
+    )
+
+    try:
+        if rows:
+            # UPDATE existing criterion (the normal path — Google auto-creates device criteria)
+            existing_rn = rows[0].campaign_criterion.resource_name
+            op = client.get_type("CampaignCriterionOperation")
+            op.update.resource_name = existing_rn
+            op.update.bid_modifier = bid_modifier_value
+            client.copy_from(op.update_mask, _fm.FieldMask(paths=["bid_modifier"]))
+            result = cc_service.mutate_campaign_criteria(
+                customer_id=customer_id,
+                operations=[op],
+            )
+            resource_name = result.results[0].resource_name if result.results else existing_rn
+            op_type = "update"
+        else:
+            # CREATE (rare: campaign was just created and criteria don't exist yet)
+            op = client.get_type("CampaignCriterionOperation")
+            op.create.campaign = gads_resource
+            op.create.device.type_ = client.enums.DeviceEnum(device_int)
+            op.create.bid_modifier = bid_modifier_value
+            result = cc_service.mutate_campaign_criteria(
+                customer_id=customer_id,
+                operations=[op],
+            )
+            resource_name = result.results[0].resource_name if result.results else ""
+            op_type = "create"
+
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        logger.info(f"MCP device_modifier ({op_type}): {device_str} {modifier:+.0%} on "
+                    f"'{camp.get('campaign_name')}' ({action_id[:8]})")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "set_device_bid_modifier",
+            "campaign_name": camp.get("campaign_name"),
+            "device": device_str,
+            "modifier": modifier,
+            "modifier_pct": f"{modifier:+.0%}",
+            "bid_modifier_value": bid_modifier_value,
+            "resource_name": resource_name,
+            "op_type": op_type,
+        }
+    except Exception as e:
+        err_str = str(e)
+        logger.error(f"device_modifier failed ({device_str}, {op_type}): {err_str}")
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=err_str)
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {err_str}")
+
+
 @app.get("/api/admin/gads/negatives/campaign/{campaign_id}",
          dependencies=[Depends(_require_admin)])
 def admin_list_campaign_negatives(campaign_id: str):
