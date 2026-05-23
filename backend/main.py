@@ -13276,6 +13276,110 @@ def admin_get_campaign_phone_stats(days: int = 30, campaign_id: Optional[str] = 
     return {"phone_stats": get_campaign_phone_stats(days=days, campaign_id=campaign_id)}
 
 
+@app.get("/api/admin/conversion-action-breakdown", dependencies=[Depends(_require_admin)])
+def admin_get_conversion_action_breakdown(campaign_id: Optional[str] = None, days: int = 30):
+    """
+    PR-B: Return conversions segmented by conversion action name per campaign.
+    Shows what TYPE of conversion is firing (Appointment Booked, Phone Call, Form Submit, etc.)
+    Source: gads_conversion_actions (populated during gads-sync Pass 8a).
+    """
+    from database import get_conversion_action_breakdown
+    rows = get_conversion_action_breakdown(campaign_id=campaign_id, days=days)
+    return {"conversion_action_breakdown": rows, "total_rows": len(rows)}
+
+
+@app.get("/api/admin/keyword-click-share", dependencies=[Depends(_require_admin)])
+def admin_get_keyword_click_share(campaign_name: Optional[str] = None):
+    """
+    PR-B: Return keyword click share + historical QS trends.
+    Fields: search_click_share, historical_qs_avg/min/max, component QS scores.
+    Source: gads_keyword_click_share (populated during gads-sync Pass 8b).
+    """
+    from database import get_keyword_click_share
+    rows = get_keyword_click_share(campaign_name=campaign_name)
+    low_cs = [r for r in rows if r.get("search_click_share") is not None and r["search_click_share"] < 0.30]
+    return {
+        "keyword_click_share": rows,
+        "summary": {
+            "total_keywords": len(rows),
+            "low_click_share_count": len(low_cs),
+        },
+    }
+
+
+@app.get("/api/admin/geo-performance", dependencies=[Depends(_require_admin)])
+def admin_get_geo_performance(campaign_id: Optional[str] = None, days: int = 30, min_clicks: int = 1):
+    """
+    PR-E: Return geographic performance breakdown by city/region/country.
+    Source: gads_geo_performance (populated during gads-sync Pass 8d).
+    Returns impressions, clicks, cost, conversions, CTR, avg CPC, cost/conv per location.
+    Ordered by cost DESC so highest-spend locations are first.
+    Pass campaign_id to filter to a single campaign; omit for account-level view.
+    Pass min_clicks to filter out low-traffic locations (default: >= 1 click).
+    """
+    from database import get_geo_performance
+    rows = get_geo_performance(campaign_id=campaign_id, days=days, min_clicks=min_clicks)
+    high_cost_no_conv = [r for r in rows if r.get("cost", 0) > 10 and r.get("conversions", 0) == 0]
+    total_cost = sum(r.get("cost", 0) for r in rows)
+    return {
+        "geo_performance": rows,
+        "summary": {
+            "total_locations": len(rows),
+            "total_cost": round(total_cost, 2),
+            "high_cost_no_conversion_locations": len(high_cost_no_conv),
+        },
+    }
+
+
+@app.get("/api/admin/device-performance", dependencies=[Depends(_require_admin)])
+def admin_get_device_performance(campaign_id: Optional[str] = None, days: int = 30):
+    """
+    PR-C: Return device performance breakdown (MOBILE / DESKTOP / TABLET).
+    Source: gads_device_performance (populated during gads-sync Pass 8c).
+    Aggregates impressions, clicks, cost, conversions, CTR, avg CPC, cost/conv by device.
+    Pass campaign_id to filter to a single campaign; omit for account-level view.
+    """
+    from database import get_device_performance
+    rows = get_device_performance(campaign_id=campaign_id, days=days)
+    mobile = next((r for r in rows if r.get("device") == "MOBILE"), None)
+    desktop = next((r for r in rows if r.get("device") == "DESKTOP"), None)
+    return {
+        "device_performance": rows,
+        "summary": {
+            "total_rows": len(rows),
+            "mobile_cost": round(mobile["cost"], 2) if mobile else None,
+            "desktop_cost": round(desktop["cost"], 2) if desktop else None,
+            "mobile_ctr": mobile.get("ctr") if mobile else None,
+            "desktop_ctr": desktop.get("ctr") if desktop else None,
+        },
+    }
+
+
+@app.get("/api/admin/keyword-bid-estimates", dependencies=[Depends(_require_admin)])
+def admin_get_keyword_bid_estimates(campaign_name: Optional[str] = None):
+    """
+    Return keyword bid estimates + serving status (PR-A).
+    Source: gads_keyword_bid_estimates (populated during gads-sync Pass 7c).
+    Fields: keyword_text, match_type, ad_group_name, campaign_name,
+            first_page_cpc, top_of_page_cpc, first_position_cpc,
+            effective_cpc_bid, system_serving_status, primary_status,
+            quality_score, under_bid, gap_to_first_page, gap_to_top_of_page.
+    Returns empty list if not yet synced (run gads-sync first).
+    """
+    from database import get_keyword_bid_estimates
+    rows = get_keyword_bid_estimates(campaign_name=campaign_name)
+    under_bid = [r for r in rows if r.get("under_bid")]
+    rarely_served = [r for r in rows if r.get("system_serving_status") == "RARELY_SERVED"]
+    return {
+        "keyword_bid_estimates": rows,
+        "summary": {
+            "total_keywords": len(rows),
+            "under_bid_count": len(under_bid),
+            "rarely_served_count": len(rarely_served),
+        },
+    }
+
+
 @app.post("/api/admin/account-budget", dependencies=[Depends(_require_admin)])
 def admin_save_account_budget(body: AccountBudgetRequest):
     from database import save_setting, get_setting

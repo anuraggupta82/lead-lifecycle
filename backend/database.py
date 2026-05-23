@@ -245,6 +245,112 @@ CREATE TABLE IF NOT EXISTS gads_keywords_cache (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_cache_key
     ON gads_keywords_cache(keyword_text, match_type, ad_group_name, campaign_name, days);
 
+-- PR-A: Keyword bid estimates + serving status (point-in-time, refreshed each sync)
+-- system_serving_status actual v24 values: RARELY_SERVED / SERVED / LOW_SEARCH_VOLUME /
+--   BELOW_FIRST_PAGE_BID / LOW_QUALITY_SCORE / UNSPECIFIED / UNKNOWN
+CREATE TABLE IF NOT EXISTS gads_keyword_bid_estimates (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword_text                TEXT NOT NULL DEFAULT '',
+    match_type                  TEXT DEFAULT '',
+    ad_group_name               TEXT DEFAULT '',
+    ad_group_id                 TEXT DEFAULT '',
+    campaign_name               TEXT DEFAULT '',
+    campaign_id                 TEXT DEFAULT '',
+    criterion_status            TEXT DEFAULT '',   -- ENABLED / PAUSED / REMOVED
+    system_serving_status       TEXT DEFAULT '',   -- RARELY_SERVED / SERVED / LOW_SEARCH_VOLUME / BELOW_FIRST_PAGE_BID / LOW_QUALITY_SCORE
+    primary_status              TEXT DEFAULT '',   -- ELIGIBLE / PAUSED / REMOVED / etc.
+    effective_cpc_bid           REAL,              -- current actual bid (dollars)
+    effective_cpc_bid_micros    INTEGER,           -- current actual bid (micros) — use for increase_bid/decrease_bid ops
+    quality_score               INTEGER,           -- 1-10; NULL = no QS data yet (new keyword)
+    first_page_cpc              REAL,              -- min bid to appear on page 1 (dollars)
+    first_page_cpc_micros       INTEGER,           -- min bid to appear on page 1 (micros)
+    top_of_page_cpc             REAL,              -- min bid for top 3 positions (dollars)
+    top_of_page_cpc_micros      INTEGER,           -- min bid for top 3 positions (micros)
+    first_position_cpc          REAL,              -- min bid for position 1 (dollars)
+    first_position_cpc_micros   INTEGER,           -- min bid for position 1 (micros)
+    est_add_clicks_first_pos    INTEGER DEFAULT 0, -- estimated incremental clicks at first_position_cpc
+    synced_at                   TEXT NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_bid_est_key
+    ON gads_keyword_bid_estimates(keyword_text, match_type, ad_group_name, campaign_name);
+
+-- PR-B: Conversion action segmentation (what type of conversion per campaign per day)
+CREATE TABLE IF NOT EXISTS gads_conversion_actions (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id                 TEXT NOT NULL DEFAULT '',
+    campaign_name               TEXT DEFAULT '',
+    date                        TEXT NOT NULL,
+    conversion_action_name      TEXT NOT NULL DEFAULT '',
+    conversion_action_category  TEXT DEFAULT '',
+    conversions                 REAL DEFAULT 0.0,
+    conversions_value           REAL DEFAULT 0.0,
+    all_conversions             REAL DEFAULT 0.0,
+    synced_at                   TEXT NOT NULL DEFAULT '',
+    UNIQUE (campaign_id, date, conversion_action_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gads_conv_actions_campaign
+    ON gads_conversion_actions(campaign_id, date);
+
+-- PR-B: Keyword click share + historical Quality Score trends
+CREATE TABLE IF NOT EXISTS gads_keyword_click_share (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword_text                TEXT NOT NULL DEFAULT '',
+    match_type                  TEXT DEFAULT '',
+    ad_group_name               TEXT DEFAULT '',
+    campaign_name               TEXT DEFAULT '',
+    search_click_share          REAL,              -- fraction 0.0–1.0; NULL = not enough data
+    historical_qs_avg           REAL,              -- avg QS over lookback window (1–10)
+    historical_qs_min           INTEGER,           -- lowest QS seen in window
+    historical_qs_max           INTEGER,           -- highest QS seen in window
+    creative_quality_score      TEXT DEFAULT '',   -- BELOW_AVERAGE / AVERAGE / ABOVE_AVERAGE
+    landing_page_quality_score  TEXT DEFAULT '',
+    search_predicted_ctr        TEXT DEFAULT '',
+    synced_at                   TEXT NOT NULL DEFAULT '',
+    UNIQUE (keyword_text, match_type, ad_group_name, campaign_name)
+);
+
+-- PR-E: Geographic performance — click/cost/conversion breakdown by location per campaign
+CREATE TABLE IF NOT EXISTS gads_geo_performance (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     TEXT NOT NULL DEFAULT '',
+    campaign_name   TEXT NOT NULL DEFAULT '',
+    location_type   TEXT NOT NULL DEFAULT '',   -- CITY / METRO / REGION / COUNTRY
+    location_name   TEXT NOT NULL DEFAULT '',   -- e.g. "Grafton, MA", "Worcester County, MA"
+    criterion_id    TEXT NOT NULL DEFAULT '',   -- Google geo target constant ID
+    impressions     INTEGER DEFAULT 0,
+    clicks          INTEGER DEFAULT 0,
+    cost            REAL DEFAULT 0.0,
+    conversions     REAL DEFAULT 0.0,
+    ctr             REAL DEFAULT 0.0,
+    avg_cpc         REAL DEFAULT 0.0,
+    cost_per_conv   REAL DEFAULT 0.0,
+    days            INTEGER DEFAULT 30,
+    synced_at       TEXT NOT NULL DEFAULT '',
+    UNIQUE (campaign_id, criterion_id, days)
+);
+CREATE INDEX IF NOT EXISTS idx_gads_geo_camp ON gads_geo_performance(campaign_id, location_type);
+
+-- PR-C: Device segmentation — performance breakdown by device type per campaign
+CREATE TABLE IF NOT EXISTS gads_device_performance (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     TEXT NOT NULL DEFAULT '',
+    campaign_name   TEXT NOT NULL DEFAULT '',
+    device          TEXT NOT NULL DEFAULT '',   -- MOBILE / DESKTOP / TABLET / CONNECTED_TV / UNKNOWN
+    date            TEXT NOT NULL DEFAULT '',   -- YYYY-MM-DD (daily row) or 'SUMMARY' for rollup
+    impressions     INTEGER DEFAULT 0,
+    clicks          INTEGER DEFAULT 0,
+    cost            REAL DEFAULT 0.0,
+    conversions     REAL DEFAULT 0.0,
+    ctr             REAL DEFAULT 0.0,
+    avg_cpc         REAL DEFAULT 0.0,
+    cost_per_conv   REAL DEFAULT 0.0,
+    synced_at       TEXT NOT NULL DEFAULT '',
+    UNIQUE (campaign_id, device, date)
+);
+CREATE INDEX IF NOT EXISTS idx_gads_device_camp ON gads_device_performance(campaign_id, device);
+
 CREATE TABLE IF NOT EXISTS gads_search_terms_cache (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     search_term     TEXT NOT NULL,
@@ -1996,6 +2102,124 @@ GROUP BY a.campaign_id, c.campaign_name;
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_phone_stats_campaign ON gads_campaign_phone_stats(campaign_id, date)")
+
+    # ── PR-A: Keyword bid estimates + serving status (point-in-time, refreshed each sync) ──
+    # Stores both dollar and micros values — micros used for increase_bid/decrease_bid operations.
+    # quality_score NULL = no data yet (new kw); 1–10 = actual QS.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_keyword_bid_estimates (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword_text                TEXT NOT NULL DEFAULT '',
+            match_type                  TEXT DEFAULT '',
+            ad_group_name               TEXT DEFAULT '',
+            ad_group_id                 TEXT DEFAULT '',
+            campaign_name               TEXT DEFAULT '',
+            campaign_id                 TEXT DEFAULT '',
+            criterion_status            TEXT DEFAULT '',
+            system_serving_status       TEXT DEFAULT '',
+            primary_status              TEXT DEFAULT '',
+            effective_cpc_bid           REAL,
+            effective_cpc_bid_micros    INTEGER,
+            quality_score               INTEGER,
+            first_page_cpc              REAL,
+            first_page_cpc_micros       INTEGER,
+            top_of_page_cpc             REAL,
+            top_of_page_cpc_micros      INTEGER,
+            first_position_cpc          REAL,
+            first_position_cpc_micros   INTEGER,
+            est_add_clicks_first_pos    INTEGER DEFAULT 0,
+            synced_at                   TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_gads_kw_bid_est_key
+            ON gads_keyword_bid_estimates(keyword_text, match_type, ad_group_name, campaign_name)
+    """)
+
+    # ── PR-B: Conversion action segmentation ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_conversion_actions (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id                 TEXT NOT NULL DEFAULT '',
+            campaign_name               TEXT DEFAULT '',
+            date                        TEXT NOT NULL,
+            conversion_action_name      TEXT NOT NULL DEFAULT '',
+            conversion_action_category  TEXT DEFAULT '',
+            conversions                 REAL DEFAULT 0.0,
+            conversions_value           REAL DEFAULT 0.0,
+            all_conversions             REAL DEFAULT 0.0,
+            synced_at                   TEXT NOT NULL DEFAULT '',
+            UNIQUE (campaign_id, date, conversion_action_name)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_gads_conv_actions_campaign
+            ON gads_conversion_actions(campaign_id, date)
+    """)
+
+    # ── PR-E: Geographic performance ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_geo_performance (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id     TEXT NOT NULL DEFAULT '',
+            campaign_name   TEXT NOT NULL DEFAULT '',
+            location_type   TEXT NOT NULL DEFAULT '',
+            location_name   TEXT NOT NULL DEFAULT '',
+            criterion_id    TEXT NOT NULL DEFAULT '',
+            impressions     INTEGER DEFAULT 0,
+            clicks          INTEGER DEFAULT 0,
+            cost            REAL DEFAULT 0.0,
+            conversions     REAL DEFAULT 0.0,
+            ctr             REAL DEFAULT 0.0,
+            avg_cpc         REAL DEFAULT 0.0,
+            cost_per_conv   REAL DEFAULT 0.0,
+            days            INTEGER DEFAULT 30,
+            synced_at       TEXT NOT NULL DEFAULT '',
+            UNIQUE (campaign_id, criterion_id, days)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_geo_camp ON gads_geo_performance(campaign_id, location_type)")
+
+    # ── PR-C: Device segmentation ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_device_performance (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id     TEXT NOT NULL DEFAULT '',
+            campaign_name   TEXT NOT NULL DEFAULT '',
+            device          TEXT NOT NULL DEFAULT '',
+            date            TEXT NOT NULL DEFAULT '',
+            impressions     INTEGER DEFAULT 0,
+            clicks          INTEGER DEFAULT 0,
+            cost            REAL DEFAULT 0.0,
+            conversions     REAL DEFAULT 0.0,
+            ctr             REAL DEFAULT 0.0,
+            avg_cpc         REAL DEFAULT 0.0,
+            cost_per_conv   REAL DEFAULT 0.0,
+            synced_at       TEXT NOT NULL DEFAULT '',
+            UNIQUE (campaign_id, device, date)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gads_device_camp ON gads_device_performance(campaign_id, device)")
+
+    # ── PR-B: Keyword click share + historical QS ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gads_keyword_click_share (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword_text                TEXT NOT NULL DEFAULT '',
+            match_type                  TEXT DEFAULT '',
+            ad_group_name               TEXT DEFAULT '',
+            campaign_name               TEXT DEFAULT '',
+            search_click_share          REAL,
+            historical_qs_avg           REAL,
+            historical_qs_min           INTEGER,
+            historical_qs_max           INTEGER,
+            creative_quality_score      TEXT DEFAULT '',
+            landing_page_quality_score  TEXT DEFAULT '',
+            search_predicted_ctr        TEXT DEFAULT '',
+            synced_at                   TEXT NOT NULL DEFAULT '',
+            UNIQUE (keyword_text, match_type, ad_group_name, campaign_name)
+        )
+    """)
 
     # ── Phase 1: Campaign management — audit log + guardrails + optimizer runs ──
     conn.execute("""
@@ -5992,6 +6216,424 @@ def get_campaign_phone_stats(days: int = 30, campaign_id: Optional[str] = None) 
             "phone_through_rate": round(ph_calls / ph_imps, 4) if ph_imps > 0 else 0.0,
         })
     return result
+
+
+def save_gads_keyword_bid_estimates(rows: list) -> int:
+    """
+    PR-A: Upsert keyword bid estimates + serving status.
+    Rows keyed by (keyword_text, match_type, ad_group_name, campaign_name).
+    Stores both dollar (REAL) and micros (INTEGER) values.
+    Overwrites all fields on conflict — these are point-in-time estimates.
+    Returns count of rows upserted.
+    """
+    now = _now()
+    count = 0
+    with _conn() as conn:
+        for row in rows:
+            conn.execute("""
+                INSERT INTO gads_keyword_bid_estimates
+                    (keyword_text, match_type, ad_group_name, ad_group_id,
+                     campaign_name, campaign_id,
+                     criterion_status, system_serving_status, primary_status,
+                     effective_cpc_bid, effective_cpc_bid_micros,
+                     quality_score,
+                     first_page_cpc, first_page_cpc_micros,
+                     top_of_page_cpc, top_of_page_cpc_micros,
+                     first_position_cpc, first_position_cpc_micros,
+                     est_add_clicks_first_pos, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(keyword_text, match_type, ad_group_name, campaign_name) DO UPDATE SET
+                    ad_group_id=excluded.ad_group_id,
+                    campaign_id=excluded.campaign_id,
+                    criterion_status=excluded.criterion_status,
+                    system_serving_status=excluded.system_serving_status,
+                    primary_status=excluded.primary_status,
+                    effective_cpc_bid=excluded.effective_cpc_bid,
+                    effective_cpc_bid_micros=excluded.effective_cpc_bid_micros,
+                    quality_score=excluded.quality_score,
+                    first_page_cpc=excluded.first_page_cpc,
+                    first_page_cpc_micros=excluded.first_page_cpc_micros,
+                    top_of_page_cpc=excluded.top_of_page_cpc,
+                    top_of_page_cpc_micros=excluded.top_of_page_cpc_micros,
+                    first_position_cpc=excluded.first_position_cpc,
+                    first_position_cpc_micros=excluded.first_position_cpc_micros,
+                    est_add_clicks_first_pos=excluded.est_add_clicks_first_pos,
+                    synced_at=excluded.synced_at
+            """, (
+                row.get("keyword_text", ""),
+                row.get("match_type", ""),
+                row.get("ad_group_name", ""),
+                row.get("ad_group_id", ""),
+                row.get("campaign_name", ""),
+                row.get("campaign_id", ""),
+                row.get("criterion_status", ""),
+                row.get("system_serving_status", ""),
+                row.get("primary_status", ""),
+                row.get("effective_cpc_bid"),
+                row.get("effective_cpc_bid_micros"),
+                row.get("quality_score"),       # None = no QS data yet
+                row.get("first_page_cpc"),
+                row.get("first_page_cpc_micros"),
+                row.get("top_of_page_cpc"),
+                row.get("top_of_page_cpc_micros"),
+                row.get("first_position_cpc"),
+                row.get("first_position_cpc_micros"),
+                row.get("est_add_clicks_first_pos", 0),
+                now,
+            ))
+            count += 1
+    return count
+
+
+def get_keyword_bid_estimates(campaign_name: Optional[str] = None) -> list:
+    """
+    PR-A: Return keyword bid estimates + serving status.
+    Optionally filter by campaign_name.
+    Returns list of dicts with all bid estimate fields + computed flags.
+
+    Computed fields:
+      - under_bid: True when effective_cpc_bid < first_page_cpc (not reaching page 1)
+      - gap_to_first_page: dollars to reach page 1 (positive = under-bid; negative = already above)
+      - gap_to_top_of_page: dollars to reach top 3 positions
+
+    Micros fields (first_page_cpc_micros, top_of_page_cpc_micros, etc.) are included
+    so the AI optimizer can pass them directly to increase_bid/decrease_bid operations.
+    """
+    with _conn() as conn:
+        query = """
+            SELECT
+                keyword_text, match_type, ad_group_name, campaign_name,
+                criterion_status, system_serving_status, primary_status,
+                effective_cpc_bid, effective_cpc_bid_micros,
+                quality_score,
+                first_page_cpc, first_page_cpc_micros,
+                top_of_page_cpc, top_of_page_cpc_micros,
+                first_position_cpc, first_position_cpc_micros,
+                est_add_clicks_first_pos, synced_at
+            FROM gads_keyword_bid_estimates
+        """
+        params: list = []
+        if campaign_name:
+            query += " WHERE LOWER(campaign_name) = LOWER(?)"
+            params.append(campaign_name)
+        query += " ORDER BY campaign_name, ad_group_name, keyword_text"
+        rows = conn.execute(query, params).fetchall()
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        eff = d.get("effective_cpc_bid")
+        fp = d.get("first_page_cpc")
+        top = d.get("top_of_page_cpc")
+        # under_bid: keyword is bidding below the page-1 threshold.
+        # Guard eff > 0: portfolio bidding strategies (MAXIMIZE_CONVERSIONS, TARGET_CPA)
+        # return effective_cpc_bid_micros=0, which would always trigger under_bid falsely.
+        d["under_bid"] = (eff is not None and eff > 0 and fp is not None and eff < fp)
+        # gap values: positive = needs increase; negative = already above threshold
+        d["gap_to_first_page"] = round(fp - eff, 4) if (eff is not None and fp is not None) else None
+        d["gap_to_top_of_page"] = round(top - eff, 4) if (eff is not None and top is not None) else None
+        result.append(d)
+    return result
+
+
+def save_gads_conversion_actions(rows: list) -> int:
+    """
+    PR-B: Upsert conversion action segmentation rows.
+    Keyed by (campaign_id, date, conversion_action_name).
+    Returns count of rows upserted.
+    """
+    now = _now()
+    count = 0
+    with _conn() as conn:
+        for row in rows:
+            conn.execute("""
+                INSERT INTO gads_conversion_actions
+                    (campaign_id, campaign_name, date, conversion_action_name,
+                     conversion_action_category, conversions, conversions_value,
+                     all_conversions, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(campaign_id, date, conversion_action_name) DO UPDATE SET
+                    campaign_name=excluded.campaign_name,
+                    conversion_action_category=excluded.conversion_action_category,
+                    conversions=excluded.conversions,
+                    conversions_value=excluded.conversions_value,
+                    all_conversions=excluded.all_conversions,
+                    synced_at=excluded.synced_at
+            """, (
+                row.get("campaign_id", ""),
+                row.get("campaign_name", ""),
+                row.get("date", ""),
+                row.get("conversion_action_name", ""),
+                row.get("conversion_action_category", ""),
+                row.get("conversions", 0.0),
+                row.get("conversions_value", 0.0),
+                row.get("all_conversions", 0.0),
+                now,
+            ))
+            count += 1
+    return count
+
+
+def get_conversion_action_breakdown(campaign_id: Optional[str] = None, days: int = 30) -> list:
+    """
+    PR-B: Return conversions broken down by action name per campaign.
+    Aggregates over the lookback window. Useful for seeing what conversion types
+    are firing (Appointment Booked vs Phone Call vs Form Submit).
+    """
+    days = max(min(int(days), 90), 1)
+    modifier = f"-{days} days"
+    with _conn() as conn:
+        query = """
+            SELECT
+                campaign_id,
+                MAX(campaign_name) AS campaign_name,
+                conversion_action_name,
+                MAX(conversion_action_category) AS conversion_action_category,
+                SUM(conversions) AS conversions,
+                SUM(conversions_value) AS conversions_value,
+                SUM(all_conversions) AS all_conversions
+            FROM gads_conversion_actions
+            WHERE date >= date('now', 'localtime', ?)
+        """
+        params: list = [modifier]
+        if campaign_id:
+            query += " AND campaign_id = ?"
+            params.append(campaign_id)
+        query += " GROUP BY campaign_id, conversion_action_name ORDER BY campaign_id, conversions DESC"
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_gads_keyword_click_share(rows: list) -> int:
+    """
+    PR-B: Upsert keyword click share + historical QS.
+    Keyed by (keyword_text, match_type, ad_group_name, campaign_name).
+    Returns count of rows upserted.
+    """
+    now = _now()
+    count = 0
+    with _conn() as conn:
+        for row in rows:
+            conn.execute("""
+                INSERT INTO gads_keyword_click_share
+                    (keyword_text, match_type, ad_group_name, campaign_name,
+                     search_click_share, historical_qs_avg, historical_qs_min, historical_qs_max,
+                     creative_quality_score, landing_page_quality_score, search_predicted_ctr,
+                     synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(keyword_text, match_type, ad_group_name, campaign_name) DO UPDATE SET
+                    search_click_share=excluded.search_click_share,
+                    historical_qs_avg=excluded.historical_qs_avg,
+                    historical_qs_min=excluded.historical_qs_min,
+                    historical_qs_max=excluded.historical_qs_max,
+                    creative_quality_score=excluded.creative_quality_score,
+                    landing_page_quality_score=excluded.landing_page_quality_score,
+                    search_predicted_ctr=excluded.search_predicted_ctr,
+                    synced_at=excluded.synced_at
+            """, (
+                row.get("keyword_text", ""),
+                row.get("match_type", ""),
+                row.get("ad_group_name", ""),
+                row.get("campaign_name", ""),
+                row.get("search_click_share"),
+                row.get("historical_qs_avg"),
+                row.get("historical_qs_min"),
+                row.get("historical_qs_max"),
+                row.get("creative_quality_score", ""),
+                row.get("landing_page_quality_score", ""),
+                row.get("search_predicted_ctr", ""),
+                now,
+            ))
+            count += 1
+    return count
+
+
+def get_keyword_click_share(campaign_name: Optional[str] = None) -> list:
+    """
+    PR-B: Return keyword click share + historical QS data.
+    Optionally filter by campaign_name.
+    """
+    with _conn() as conn:
+        query = """
+            SELECT keyword_text, match_type, ad_group_name, campaign_name,
+                   search_click_share, historical_qs_avg, historical_qs_min, historical_qs_max,
+                   creative_quality_score, landing_page_quality_score, search_predicted_ctr, synced_at
+            FROM gads_keyword_click_share
+        """
+        params: list = []
+        if campaign_name:
+            query += " WHERE LOWER(campaign_name) = LOWER(?)"
+            params.append(campaign_name)
+        query += " ORDER BY campaign_name, ad_group_name, keyword_text"
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_gads_geo_performance(rows: list, days: int = 30) -> int:
+    """
+    PR-E: Upsert geographic performance rows.
+    Keyed by (campaign_id, criterion_id, days).
+    Returns count of rows upserted.
+    """
+    now = _now()
+    count = 0
+    with _conn() as conn:
+        for row in rows:
+            cost = row.get("cost", 0.0) or 0.0
+            clicks = row.get("clicks", 0) or 0
+            impressions = row.get("impressions", 0) or 0
+            conversions = row.get("conversions", 0.0) or 0.0
+            ctr = clicks / impressions if impressions > 0 else 0.0
+            avg_cpc = cost / clicks if clicks > 0 else 0.0
+            cost_per_conv = cost / conversions if conversions > 0 else 0.0
+            conn.execute("""
+                INSERT INTO gads_geo_performance
+                    (campaign_id, campaign_name, location_type, location_name, criterion_id,
+                     impressions, clicks, cost, conversions,
+                     ctr, avg_cpc, cost_per_conv, days, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(campaign_id, criterion_id, days) DO UPDATE SET
+                    campaign_name=excluded.campaign_name,
+                    location_type=excluded.location_type,
+                    location_name=excluded.location_name,
+                    impressions=excluded.impressions,
+                    clicks=excluded.clicks,
+                    cost=excluded.cost,
+                    conversions=excluded.conversions,
+                    ctr=excluded.ctr,
+                    avg_cpc=excluded.avg_cpc,
+                    cost_per_conv=excluded.cost_per_conv,
+                    synced_at=excluded.synced_at
+            """, (
+                row.get("campaign_id", ""),
+                row.get("campaign_name", ""),
+                row.get("location_type", ""),
+                row.get("location_name", ""),
+                row.get("criterion_id", ""),
+                impressions, clicks, cost, conversions,
+                round(ctr, 6), round(avg_cpc, 4), round(cost_per_conv, 4),
+                days, now,
+            ))
+            count += 1
+    return count
+
+
+def get_geo_performance(campaign_id: Optional[str] = None, days: int = 30,
+                        min_clicks: int = 1) -> list:
+    """
+    PR-E: Return geographic performance breakdown.
+    Optionally filter by campaign_id; filter out locations with < min_clicks.
+    Returns list of dicts ordered by cost DESC so highest-spend locations are first.
+    """
+    with _conn() as conn:
+        params: list = [days, min_clicks]
+        if campaign_id:
+            params.insert(0, campaign_id)
+            rows = conn.execute("""
+                SELECT campaign_id, campaign_name, location_type, location_name, criterion_id,
+                       impressions, clicks, cost, conversions, ctr, avg_cpc, cost_per_conv, synced_at
+                FROM gads_geo_performance
+                WHERE campaign_id = ? AND days = ? AND clicks >= ?
+                ORDER BY cost DESC
+            """, params).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT campaign_id, campaign_name, location_type, location_name, criterion_id,
+                       impressions, clicks, cost, conversions, ctr, avg_cpc, cost_per_conv, synced_at
+                FROM gads_geo_performance
+                WHERE days = ? AND clicks >= ?
+                ORDER BY campaign_name, cost DESC
+            """, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_gads_device_performance(rows: list) -> int:
+    """
+    PR-C: Upsert device performance rows.
+    Keyed by (campaign_id, device, date).
+    Returns count of rows upserted.
+    """
+    now = _now()
+    count = 0
+    with _conn() as conn:
+        for row in rows:
+            cost = row.get("cost", 0.0) or 0.0
+            clicks = row.get("clicks", 0) or 0
+            impressions = row.get("impressions", 0) or 0
+            conversions = row.get("conversions", 0.0) or 0.0
+            ctr = row.get("ctr") or (clicks / impressions if impressions > 0 else 0.0)
+            avg_cpc = row.get("avg_cpc") or (cost / clicks if clicks > 0 else 0.0)
+            cost_per_conv = row.get("cost_per_conv") or (cost / conversions if conversions > 0 else 0.0)
+            conn.execute("""
+                INSERT INTO gads_device_performance
+                    (campaign_id, campaign_name, device, date,
+                     impressions, clicks, cost, conversions,
+                     ctr, avg_cpc, cost_per_conv, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(campaign_id, device, date) DO UPDATE SET
+                    campaign_name=excluded.campaign_name,
+                    impressions=excluded.impressions,
+                    clicks=excluded.clicks,
+                    cost=excluded.cost,
+                    conversions=excluded.conversions,
+                    ctr=excluded.ctr,
+                    avg_cpc=excluded.avg_cpc,
+                    cost_per_conv=excluded.cost_per_conv,
+                    synced_at=excluded.synced_at
+            """, (
+                row.get("campaign_id", ""),
+                row.get("campaign_name", ""),
+                row.get("device", ""),
+                row.get("date", "SUMMARY"),
+                impressions, clicks, cost, conversions,
+                round(ctr, 6), round(avg_cpc, 4), round(cost_per_conv, 4),
+                now,
+            ))
+            count += 1
+    return count
+
+
+def get_device_performance(campaign_id: Optional[str] = None, days: int = 30) -> list:
+    """
+    PR-C: Return device performance breakdown.
+    Optionally filter by campaign_id; summarize by device across the date window.
+    Returns list of dicts ordered by campaign_name, device.
+    """
+    with _conn() as conn:
+        if campaign_id:
+            rows = conn.execute("""
+                SELECT campaign_id, campaign_name, device,
+                       SUM(impressions) AS impressions,
+                       SUM(clicks)      AS clicks,
+                       SUM(cost)        AS cost,
+                       SUM(conversions) AS conversions,
+                       CASE WHEN SUM(impressions)>0 THEN ROUND(1.0*SUM(clicks)/SUM(impressions),6) ELSE 0.0 END AS ctr,
+                       CASE WHEN SUM(clicks)>0 THEN ROUND(SUM(cost)/SUM(clicks),4) ELSE 0.0 END AS avg_cpc,
+                       CASE WHEN SUM(conversions)>0 THEN ROUND(SUM(cost)/SUM(conversions),4) ELSE 0.0 END AS cost_per_conv,
+                       MAX(synced_at) AS synced_at
+                FROM gads_device_performance
+                WHERE campaign_id = ?
+                  AND date >= DATE('now', ?)
+                GROUP BY campaign_id, campaign_name, device
+                ORDER BY device
+            """, (campaign_id, f"-{days} days")).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT campaign_id, campaign_name, device,
+                       SUM(impressions) AS impressions,
+                       SUM(clicks)      AS clicks,
+                       SUM(cost)        AS cost,
+                       SUM(conversions) AS conversions,
+                       CASE WHEN SUM(impressions)>0 THEN ROUND(1.0*SUM(clicks)/SUM(impressions),6) ELSE 0.0 END AS ctr,
+                       CASE WHEN SUM(clicks)>0 THEN ROUND(SUM(cost)/SUM(clicks),4) ELSE 0.0 END AS avg_cpc,
+                       CASE WHEN SUM(conversions)>0 THEN ROUND(SUM(cost)/SUM(conversions),4) ELSE 0.0 END AS cost_per_conv,
+                       MAX(synced_at) AS synced_at
+                FROM gads_device_performance
+                WHERE date >= DATE('now', ?)
+                GROUP BY campaign_id, campaign_name, device
+                ORDER BY campaign_name, device
+            """, (f"-{days} days",)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_daily_stats(days: int = 30, campaign_id: Optional[str] = None) -> list:

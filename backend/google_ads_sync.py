@@ -21,6 +21,9 @@ from database import (
     save_gads_geo_cache, save_gads_schedule_cache,
     save_gads_daily_stats, save_gads_ads, save_gads_ad_metrics,
     upsert_gads_call_view, upsert_gads_clicks, upsert_call_search_terms,
+    save_gads_keyword_bid_estimates,
+    save_gads_conversion_actions, save_gads_keyword_click_share,
+    save_gads_device_performance, save_gads_geo_performance,
 )
 
 logger = logging.getLogger(__name__)
@@ -499,6 +502,513 @@ def _fetch_campaign_phone_stats(client, customer_id: str, days: int = 30) -> int
     return 0
 
 
+def _fetch_keyword_bid_estimates(client, customer_id: str) -> int:
+    """
+    PR-A: Fetch keyword-level bid estimates and serving status from Google Ads API.
+
+    Fields fetched per keyword (ad_group_criterion resource — no date segment):
+      - position_estimates.first_page_cpc_micros       — min CPC to reach page 1
+      - position_estimates.top_of_page_cpc_micros      — min CPC to reach top 3
+      - position_estimates.first_position_cpc_micros   — min CPC to reach #1
+      - position_estimates.estimated_add_clicks_at_first_position_cpc
+      - system_serving_status                          — ELIGIBLE / RARELY_SERVED / etc.
+      - primary_status                                 — ELIGIBLE / PAUSED / REMOVED / etc.
+      - effective_cpc_bid_micros                       — actual bid currently applied
+      - quality_info.quality_score                     — 1–10
+
+    Strategy: fetch from ad_group_criterion (no date segment) to get latest estimates.
+    These are point-in-time estimates — re-fetched on every sync.
+
+    Upserts into gads_keyword_bid_estimates via save_gads_keyword_bid_estimates().
+    Returns count of rows upserted.
+    """
+    service = client.get_service("GoogleAdsService")
+
+    query = """
+        SELECT
+            ad_group_criterion.keyword.text,
+            ad_group_criterion.keyword.match_type,
+            ad_group_criterion.status,
+            ad_group_criterion.system_serving_status,
+            ad_group_criterion.primary_status,
+            ad_group_criterion.effective_cpc_bid_micros,
+            ad_group_criterion.quality_info.quality_score,
+            ad_group_criterion.position_estimates.first_page_cpc_micros,
+            ad_group_criterion.position_estimates.top_of_page_cpc_micros,
+            ad_group_criterion.position_estimates.first_position_cpc_micros,
+            ad_group_criterion.position_estimates.estimated_add_clicks_at_first_position_cpc,
+            ad_group.name,
+            ad_group.id,
+            campaign.name,
+            campaign.id,
+            campaign.status
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.status != 'REMOVED'
+          AND campaign.status = 'ENABLED'
+          AND ad_group.status = 'ENABLED'
+    """
+
+    def _micros_to_usd(val):
+        """Convert micros (int) to dollars. None-safe — treats 0 as valid (not None)."""
+        return round(val / 1_000_000.0, 4) if val is not None else None
+
+    rows = []
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            kw = row.ad_group_criterion
+            keyword_text = kw.keyword.text
+            if not keyword_text:
+                continue
+
+            pe = kw.position_estimates
+            # quality_score=0 means "no data yet" (new keyword); store None to distinguish from genuinely low QS
+            qs_raw = kw.quality_info.quality_score
+            qs = qs_raw if qs_raw > 0 else None
+
+            rows.append({
+                "keyword_text": keyword_text,
+                "match_type": kw.keyword.match_type.name,
+                "ad_group_name": row.ad_group.name or "",
+                "ad_group_id": str(row.ad_group.id) if row.ad_group.id else "",
+                "campaign_name": row.campaign.name or "",
+                "campaign_id": str(row.campaign.id) if row.campaign.id else "",
+                "criterion_status": kw.status.name,
+                "system_serving_status": kw.system_serving_status.name,
+                "primary_status": kw.primary_status.name,
+                # Store raw micros (int) AND dollar values for prompt/reporting use
+                "effective_cpc_bid": _micros_to_usd(kw.effective_cpc_bid_micros),
+                "effective_cpc_bid_micros": int(kw.effective_cpc_bid_micros) if kw.effective_cpc_bid_micros is not None else None,
+                "quality_score": qs,
+                "first_page_cpc": _micros_to_usd(pe.first_page_cpc_micros),
+                "first_page_cpc_micros": int(pe.first_page_cpc_micros) if pe.first_page_cpc_micros else None,
+                "top_of_page_cpc": _micros_to_usd(pe.top_of_page_cpc_micros),
+                "top_of_page_cpc_micros": int(pe.top_of_page_cpc_micros) if pe.top_of_page_cpc_micros else None,
+                "first_position_cpc": _micros_to_usd(pe.first_position_cpc_micros),
+                "first_position_cpc_micros": int(pe.first_position_cpc_micros) if pe.first_position_cpc_micros else None,
+                "est_add_clicks_first_pos": pe.estimated_add_clicks_at_first_position_cpc or 0,
+            })
+
+        logger.info(f"Keyword bid estimates: {len(rows)} rows fetched")
+    except Exception as e:
+        logger.warning(f"_fetch_keyword_bid_estimates failed: {e}")
+        return 0
+
+    if rows:
+        count = save_gads_keyword_bid_estimates(rows)
+        logger.info(f"Upserted {count} rows into gads_keyword_bid_estimates")
+        return count
+    return 0
+
+
+def _fetch_geo_target_names(client, customer_id: str, criterion_ids: list) -> dict:
+    """
+    PR-E helper: Look up human-readable names for a list of geo criterion IDs.
+    Uses the geo_target_constant resource which is accessible from any customer.
+    Returns dict: criterion_id → "Name, Country" (e.g. "Grafton, US")
+    Falls back to empty dict on any error (geo name enrichment is best-effort).
+    """
+    if not criterion_ids:
+        return {}
+    service = client.get_service("GoogleAdsService")
+    name_map: dict = {}
+    try:
+        # geo_target_constant is a global resource — no customer scope needed for read
+        # Query in batches of 50 to stay within request limits
+        unique_ids = list(set(str(cid) for cid in criterion_ids if cid))
+        for i in range(0, len(unique_ids), 50):
+            batch = unique_ids[i:i + 50]
+            id_list = ", ".join(f"'{cid}'" for cid in batch)
+            q = f"""
+                SELECT geo_target_constant.id, geo_target_constant.name,
+                       geo_target_constant.country_code, geo_target_constant.target_type
+                FROM geo_target_constant
+                WHERE geo_target_constant.id IN ({id_list})
+            """
+            for row in service.search(customer_id=customer_id, query=q):
+                cid = str(row.geo_target_constant.id)
+                name = row.geo_target_constant.name or ""
+                country = row.geo_target_constant.country_code or ""
+                ttype = row.geo_target_constant.target_type or ""
+                name_map[cid] = f"{name}, {country}" if country else name
+    except Exception as e:
+        logger.warning(f"_fetch_geo_target_names failed (non-fatal): {e}")
+    return name_map
+
+
+def _fetch_geo_performance(client, customer_id: str, days: int = 30) -> int:
+    """
+    PR-E: Fetch geographic performance breakdown per campaign.
+    Uses 'geographic_view' resource (v24).
+
+    Key v24 schema facts:
+      - geographic_view.resource_name encodes location criterion:
+          customers/{cid}/geographicViews/{country_criterion_id}~{location_criterion_id}
+        Parse the location criterion_id from the part after '~'.
+        If no '~', the whole numeric suffix is the criterion_id (country-level).
+      - geographic_view.location_type returns LOCATION_OF_PRESENCE or AREA_OF_INTEREST
+        (NOT city/region granularity — that comes from geo_target_constant.target_type).
+      - segments.geo_target does NOT exist in v24 — use geographic_view.resource_name.
+      - Include impressions > 0 (not just clicks > 0) to capture high-impression / zero-click
+        waste locations (candidates for negative geo targeting).
+
+    After fetching performance rows, does a secondary lookup of geo_target_constant
+    to resolve criterion_ids to human-readable "City, Country" names.
+
+    Returns count of rows upserted.
+    """
+    from database import save_gads_geo_performance as _save
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    rows = []
+    try:
+        query = f"""
+            SELECT
+                campaign.id,
+                campaign.name,
+                geographic_view.resource_name,
+                geographic_view.location_type,
+                geographic_view.country_criterion_id,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.ctr,
+                metrics.average_cpc
+            FROM geographic_view
+            WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+              AND campaign.status = 'ENABLED'
+              AND metrics.impressions > 0
+        """
+        for row in service.search(customer_id=customer_id, query=query):
+            cost = _micros_to_usd(row.metrics.cost_micros) or 0.0
+            clicks = int(row.metrics.clicks or 0)
+            impressions = int(row.metrics.impressions or 0)
+            conversions = float(row.metrics.conversions or 0.0)
+
+            # Parse location criterion_id from resource_name:
+            # Format: customers/{cid}/geographicViews/{country_id}~{location_id}
+            # or just: customers/{cid}/geographicViews/{country_id} for country-level rows
+            resource_name = row.geographic_view.resource_name or ""
+            view_suffix = resource_name.split("/geographicViews/")[-1] if "/geographicViews/" in resource_name else ""
+            if "~" in view_suffix:
+                criterion_id = view_suffix.split("~")[-1]
+            else:
+                criterion_id = view_suffix  # country-level row
+
+            # location_type: LOCATION_OF_PRESENCE (physical location) or AREA_OF_INTEREST (search interest)
+            loc_type = row.geographic_view.location_type.name if row.geographic_view.location_type else "UNKNOWN"
+
+            rows.append({
+                "campaign_id": str(row.campaign.id),
+                "campaign_name": row.campaign.name or "",
+                "location_type": loc_type,
+                "location_name": criterion_id,  # resolved to human name after batch lookup
+                "criterion_id": criterion_id,
+                "impressions": impressions,
+                "clicks": clicks,
+                "cost": cost,
+                "conversions": conversions,
+                "ctr": float(row.metrics.ctr or 0.0),
+                "avg_cpc": _micros_to_usd(int(row.metrics.average_cpc or 0)) or 0.0,
+                "cost_per_conv": round(cost / conversions, 4) if conversions > 0 else 0.0,
+            })
+        logger.info(f"Geo performance: {len(rows)} rows fetched")
+    except Exception as e:
+        logger.warning(f"_fetch_geo_performance failed: {e}")
+        return 0
+
+    if not rows:
+        return 0
+
+    # Enrich location_name: resolve criterion_ids to human-readable "City, Country"
+    all_criterion_ids = [r["criterion_id"] for r in rows if r["criterion_id"]]
+    name_map = _fetch_geo_target_names(client, customer_id, all_criterion_ids)
+    for r in rows:
+        cid = r["criterion_id"]
+        if cid and cid in name_map:
+            r["location_name"] = name_map[cid]
+        else:
+            r["location_name"] = f"geo:{cid}" if cid else "Unknown"
+
+    count = _save(rows, days=days)
+    logger.info(f"Upserted {count} rows into gads_geo_performance")
+    return count
+
+
+def _fetch_device_performance(client, customer_id: str, days: int = 30) -> int:
+    """
+    PR-C: Fetch device-segmented performance (MOBILE / DESKTOP / TABLET / CONNECTED_TV).
+    Uses 'campaign' resource with segments.device — valid without incompatibility issues.
+    Stores one row per (campaign_id, device, date) so trends can be tracked.
+    Returns count of rows upserted.
+    """
+    from database import save_gads_device_performance as _save
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    rows = []
+    try:
+        query = f"""
+            SELECT
+                campaign.id,
+                campaign.name,
+                segments.device,
+                segments.date,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.ctr,
+                metrics.average_cpc
+            FROM campaign
+            WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+              AND campaign.status = 'ENABLED'
+              AND metrics.impressions > 0
+        """
+        for row in service.search(customer_id=customer_id, query=query):
+            cost = _micros_to_usd(row.metrics.cost_micros) or 0.0
+            clicks = int(row.metrics.clicks or 0)
+            impressions = int(row.metrics.impressions or 0)
+            conversions = float(row.metrics.conversions or 0.0)
+            rows.append({
+                "campaign_id": str(row.campaign.id),
+                "campaign_name": row.campaign.name or "",
+                # Always call .name — don't guard on truthiness since UNSPECIFIED=0 is falsy
+                "device": row.segments.device.name,
+                "date": str(row.segments.date) if row.segments.date else "",
+                "impressions": impressions,
+                "clicks": clicks,
+                "cost": cost,
+                "conversions": conversions,
+                "ctr": float(row.metrics.ctr or 0.0),
+                "avg_cpc": _micros_to_usd(int(row.metrics.average_cpc or 0)) or 0.0,
+                "cost_per_conv": round(cost / conversions, 4) if conversions > 0 else 0.0,
+            })
+        logger.info(f"Device performance: {len(rows)} rows fetched")
+    except Exception as e:
+        logger.warning(f"_fetch_device_performance failed: {e}")
+        return 0
+
+    if rows:
+        count = _save(rows)
+        logger.info(f"Upserted {count} rows into gads_device_performance")
+        return count
+    return 0
+
+
+def _fetch_conversion_actions(client, customer_id: str, days: int = 30) -> int:
+    """
+    PR-B Pass 1: Fetch conversions segmented by conversion_action_name per campaign per day.
+
+    Uses campaign resource with segments.conversion_action_name and segments.date.
+    This breaks down what TYPE of conversion is happening (e.g. "Appointment Booked",
+    "Phone Call", "Form Submit") vs the aggregate conversions count.
+
+    Upserts into gads_conversion_actions via save_gads_conversion_actions().
+    Returns count of rows upserted.
+    """
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    query = f"""
+        SELECT
+            campaign.id,
+            campaign.name,
+            segments.date,
+            segments.conversion_action_name,
+            segments.conversion_action_category,
+            metrics.conversions,
+            metrics.conversions_value,
+            metrics.all_conversions
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+          AND metrics.all_conversions > 0
+    """
+
+    rows = []
+    try:
+        response = service.search(customer_id=customer_id, query=query)
+        for row in response:
+            campaign_id = str(row.campaign.id) if row.campaign.id else ""
+            if not campaign_id:
+                continue
+            rows.append({
+                "campaign_id": campaign_id,
+                "campaign_name": row.campaign.name or "",
+                "date": row.segments.date,
+                "conversion_action_name": row.segments.conversion_action_name or "",
+                "conversion_action_category": row.segments.conversion_action_category.name if row.segments.conversion_action_category else "",
+                "conversions": float(row.metrics.conversions or 0),
+                "conversions_value": float(row.metrics.conversions_value or 0),
+                "all_conversions": float(row.metrics.all_conversions or 0),
+            })
+        logger.info(f"Conversion action segments: {len(rows)} rows fetched")
+    except Exception as e:
+        logger.warning(f"_fetch_conversion_actions failed: {e}")
+        return 0
+
+    if rows:
+        count = save_gads_conversion_actions(rows)
+        logger.info(f"Upserted {count} rows into gads_conversion_actions")
+        return count
+    return 0
+
+
+def _fetch_keyword_click_share(client, customer_id: str, days: int = 30) -> int:
+    """
+    PR-B Pass 2: Fetch click share (ad group level) + historical Quality Score per keyword.
+
+    search_click_share: metrics.search_click_share is available on the 'ad_group' resource
+    (NOT keyword_view — same segment incompatibility as impression share metrics).
+    We pull it at ad group granularity, then map to all keywords in that ad group.
+
+    historical_quality_score / historical_creative_quality_score /
+    historical_landing_page_quality_score / historical_search_predicted_ctr:
+    Available on keyword_view WITH segments.date — lets us see QS trends over time.
+    Component scores are tracked by date so we use the most recent day's values.
+
+    Two sub-passes:
+      a) ad_group resource without date: click share at ad group level → mapped to keywords
+      b) keyword_view with date: historical QS per keyword per day
+
+    Upserts into gads_keyword_click_share via save_gads_keyword_click_share().
+    Returns count of rows upserted.
+    """
+    from database import save_gads_keyword_click_share as _save
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    # qs_map_labels: 0=no data, 1=unknown (treat as empty), 2=BELOW_AVERAGE, 3=AVERAGE, 4=ABOVE_AVERAGE
+    qs_map_labels = {0: "", 1: "", 2: "BELOW_AVERAGE", 3: "AVERAGE", 4: "ABOVE_AVERAGE"}
+
+    # Pass 2a: Click share at ad group level (metrics.search_click_share valid on ad_group resource)
+    # Result: ad_group_id → click_share so we can map to all keywords in that ad group.
+    ag_click_share_map: dict = {}  # ad_group_id → float or None
+    ag_info_map: dict = {}         # ad_group_id → {ad_group_name, campaign_name}
+    try:
+        query_cs = """
+            SELECT
+                ad_group.id,
+                ad_group.name,
+                campaign.name,
+                metrics.search_click_share
+            FROM ad_group
+            WHERE campaign.status = 'ENABLED'
+              AND ad_group.status = 'ENABLED'
+        """
+        for row in service.search(customer_id=customer_id, query=query_cs):
+            ag_id = str(row.ad_group.id)
+            cs = row.metrics.search_click_share
+            ag_click_share_map[ag_id] = float(cs) if cs else None
+            ag_info_map[ag_id] = {
+                "ad_group_name": row.ad_group.name or "",
+                "campaign_name": row.campaign.name or "",
+            }
+        logger.info(f"Click share fetched for {len(ag_click_share_map)} ad groups")
+    except Exception as e:
+        logger.warning(f"_fetch_keyword_click_share pass 2a (ad_group click share) failed: {e}")
+
+    # Pass 2b: Historical QS per keyword per day (with date segment)
+    # Track latest_date per key so component scores use the most recent day, not iteration order.
+    hist_qs_map: dict = {}  # key: (keyword_text, match_type, ag_name, camp_name) → agg dict
+    kw_ag_id_map: dict = {}  # key → ad_group_id (for mapping click share)
+    try:
+        query_hqs = f"""
+            SELECT
+                ad_group_criterion.keyword.text,
+                ad_group_criterion.keyword.match_type,
+                ad_group.id,
+                ad_group.name,
+                campaign.name,
+                segments.date,
+                metrics.historical_quality_score,
+                metrics.historical_creative_quality_score,
+                metrics.historical_landing_page_quality_score,
+                metrics.historical_search_predicted_ctr
+            FROM keyword_view
+            WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+              AND campaign.status = 'ENABLED'
+              AND ad_group.status = 'ENABLED'
+              AND ad_group_criterion.status != 'REMOVED'
+        """
+        for row in service.search(customer_id=customer_id, query=query_hqs):
+            kw_text = row.ad_group_criterion.keyword.text
+            if not kw_text:
+                continue
+            ag_id = str(row.ad_group.id)
+            key = (kw_text, row.ad_group_criterion.keyword.match_type.name,
+                   row.ad_group.name or "", row.campaign.name or "")
+            kw_ag_id_map[key] = ag_id
+            row_date = str(row.segments.date) if row.segments.date else ""
+            qs = int(row.metrics.historical_quality_score or 0)
+            if key not in hist_qs_map:
+                hist_qs_map[key] = {
+                    "qs_sum": 0, "qs_count": 0,
+                    "qs_min": None, "qs_max": None,
+                    "latest_date": "",
+                    "creative_qs_latest": "",
+                    "landing_page_qs_latest": "",
+                    "search_predicted_ctr_latest": "",
+                }
+            if qs > 0:
+                agg = hist_qs_map[key]
+                agg["qs_sum"] += qs
+                agg["qs_count"] += 1
+                agg["qs_min"] = min(agg["qs_min"], qs) if agg["qs_min"] is not None else qs
+                agg["qs_max"] = max(agg["qs_max"], qs) if agg["qs_max"] is not None else qs
+                # Only update component scores if this row is more recent than what we have
+                if row_date >= agg["latest_date"]:
+                    agg["latest_date"] = row_date
+                    cqs = int(row.metrics.historical_creative_quality_score or 0)
+                    lpqs = int(row.metrics.historical_landing_page_quality_score or 0)
+                    spctr = int(row.metrics.historical_search_predicted_ctr or 0)
+                    if cqs: agg["creative_qs_latest"] = qs_map_labels.get(cqs, "")
+                    if lpqs: agg["landing_page_qs_latest"] = qs_map_labels.get(lpqs, "")
+                    if spctr: agg["search_predicted_ctr_latest"] = qs_map_labels.get(spctr, "")
+        logger.info(f"Historical QS aggregated for {len(hist_qs_map)} keywords")
+    except Exception as e:
+        logger.warning(f"_fetch_keyword_click_share pass 2b (hist QS) failed: {e}")
+
+    # Merge into rows for DB.
+    # Click share is at ad group level → look up by ad_group_id mapped from keywords.
+    # For keywords seen in hist_qs_map but not ag_click_share_map, click_share=None.
+    all_keys = set(kw_ag_id_map.keys()) | set(hist_qs_map.keys())
+    rows = []
+    for key in all_keys:
+        kw_text, match_type, ag_name, camp_name = key
+        agg = hist_qs_map.get(key, {})
+        qs_count = agg.get("qs_count", 0)
+        # Map click share via ad_group_id → ag_click_share_map
+        ag_id = kw_ag_id_map.get(key)
+        click_share = ag_click_share_map.get(ag_id) if ag_id else None
+        rows.append({
+            "keyword_text": kw_text,
+            "match_type": match_type,
+            "ad_group_name": ag_name,
+            "campaign_name": camp_name,
+            "search_click_share": click_share,
+            "historical_qs_avg": round(agg["qs_sum"] / qs_count, 2) if qs_count > 0 else None,
+            "historical_qs_min": agg.get("qs_min"),
+            "historical_qs_max": agg.get("qs_max"),
+            "creative_quality_score": agg.get("creative_qs_latest", ""),
+            "landing_page_quality_score": agg.get("landing_page_qs_latest", ""),
+            "search_predicted_ctr": agg.get("search_predicted_ctr_latest", ""),
+        })
+
+    if rows:
+        count = _save(rows)
+        logger.info(f"Upserted {count} rows into gads_keyword_click_share")
+        return count
+    return 0
+
+
 def _fetch_ad_creatives(client, customer_id: str) -> list:
     """
     Fetch ad creative metadata from ad_group_ad resource.
@@ -832,6 +1342,51 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         logger.warning(f"Account intelligence fetch failed (non-fatal): {e}")
         account_intel = {}
 
+    # Pass 7c: Keyword bid estimates (first_page_cpc, top_of_page_cpc, first_position_cpc, serving status)
+    logger.info("Fetching keyword bid estimates and serving status...")
+    try:
+        bid_estimate_rows = _fetch_keyword_bid_estimates(client, customer_id)
+        logger.info(f"Keyword bid estimates: {bid_estimate_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Keyword bid estimates fetch failed (non-fatal): {e}")
+        bid_estimate_rows = 0
+
+    # Pass 8a: Conversion action segmentation (what TYPE of conversion per campaign)
+    logger.info("Fetching conversion action segments...")
+    try:
+        conv_action_rows = _fetch_conversion_actions(client, customer_id, days=30)
+        logger.info(f"Conversion actions: {conv_action_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Conversion action fetch failed (non-fatal): {e}")
+        conv_action_rows = 0
+
+    # Pass 8b: Click share + historical QS per keyword
+    logger.info("Fetching keyword click share and historical QS...")
+    try:
+        click_share_rows = _fetch_keyword_click_share(client, customer_id, days=30)
+        logger.info(f"Keyword click share/hist QS: {click_share_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Keyword click share fetch failed (non-fatal): {e}")
+        click_share_rows = 0
+
+    # Pass 8c: Device segmentation (MOBILE / DESKTOP / TABLET performance breakdown)
+    logger.info("Fetching device performance breakdown...")
+    try:
+        device_perf_rows = _fetch_device_performance(client, customer_id, days=30)
+        logger.info(f"Device performance: {device_perf_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Device performance fetch failed (non-fatal): {e}")
+        device_perf_rows = 0
+
+    # Pass 8d: Geographic performance (city/region breakdown per campaign)
+    logger.info("Fetching geographic performance breakdown...")
+    try:
+        geo_perf_rows = _fetch_geo_performance(client, customer_id, days=30)
+        logger.info(f"Geo performance: {geo_perf_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Geo performance fetch failed (non-fatal): {e}")
+        geo_perf_rows = 0
+
     # Pass 7: Ad creative metadata + daily metrics
     logger.info("Fetching ad creative metadata and daily metrics...")
     ad_rows = 0
@@ -863,6 +1418,11 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         "ad_metric_rows": ad_metric_rows,
         "account_intel_fetched": bool(account_intel),
         "phone_stats_rows": phone_rows,
+        "keyword_bid_estimate_rows": bid_estimate_rows,
+        "conversion_action_rows": conv_action_rows,
+        "keyword_click_share_rows": click_share_rows,
+        "device_performance_rows": device_perf_rows,
+        "geo_performance_rows": geo_perf_rows,
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result

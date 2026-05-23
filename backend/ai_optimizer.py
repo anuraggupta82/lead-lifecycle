@@ -1185,6 +1185,74 @@ def _get_account_intelligence() -> dict:
         return {}
 
 
+def _get_conversion_action_breakdown(campaign_id: str | None = None, days: int = 30) -> list:
+    """
+    PR-B: Return conversion action breakdown (what types of conversions fired per campaign).
+    Source: gads_conversion_actions, populated by _fetch_conversion_actions() during sync.
+    """
+    try:
+        from database import get_conversion_action_breakdown
+        return get_conversion_action_breakdown(campaign_id=campaign_id, days=days)
+    except Exception as e:
+        logger.warning(f"_get_conversion_action_breakdown failed: {e}")
+        return []
+
+
+def _get_keyword_click_share(campaign_name: str | None = None) -> list:
+    """
+    PR-B: Return keyword click share + historical QS trends.
+    Source: gads_keyword_click_share, populated during sync.
+    """
+    try:
+        from database import get_keyword_click_share
+        return get_keyword_click_share(campaign_name=campaign_name)
+    except Exception as e:
+        logger.warning(f"_get_keyword_click_share failed: {e}")
+        return []
+
+
+def _get_device_performance(campaign_id: str | None = None, days: int = 30) -> list:
+    """
+    PR-C: Return device performance breakdown (MOBILE / DESKTOP / TABLET / CONNECTED_TV).
+    Source: gads_device_performance, populated by _fetch_device_performance() during sync.
+    Returns [] gracefully if table not yet populated.
+    """
+    try:
+        from database import get_device_performance
+        return get_device_performance(campaign_id=campaign_id, days=days)
+    except Exception as e:
+        logger.warning(f"_get_device_performance failed: {e}")
+        return []
+
+
+def _get_geo_performance(campaign_id: str | None = None, days: int = 30) -> list:
+    """
+    PR-E: Return geographic performance breakdown (city/region/country per campaign).
+    Source: gads_geo_performance, populated by _fetch_geo_performance() during sync.
+    Returns [] gracefully if table not yet populated.
+    """
+    try:
+        from database import get_geo_performance
+        return get_geo_performance(campaign_id=campaign_id, days=days, min_clicks=1)
+    except Exception as e:
+        logger.warning(f"_get_geo_performance failed: {e}")
+        return []
+
+
+def _get_keyword_bid_estimates(campaign_name: str | None = None) -> list:
+    """
+    PR-A: Return keyword bid estimates + serving status for a campaign.
+    Source: gads_keyword_bid_estimates, populated by _fetch_keyword_bid_estimates() during sync.
+    Returns [] gracefully if table not yet populated.
+    """
+    try:
+        from database import get_keyword_bid_estimates
+        return get_keyword_bid_estimates(campaign_name=campaign_name)
+    except Exception as e:
+        logger.warning(f"_get_keyword_bid_estimates failed: {e}")
+        return []
+
+
 def _get_campaign_settings(client, customer_id: str, days: int = 30) -> dict:
     """
     Pull campaign-level settings and impression share metrics for each active campaign.
@@ -2544,7 +2612,16 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
                              # Existing campaign assets: callouts, snippets, sitelinks already live
                              existing_campaign_assets: dict | None = None,
                              # PR-F: Google Ads native phone call stats (phone_calls, phone_through_rate)
-                             phone_stats: dict | None = None) -> list:
+                             phone_stats: dict | None = None,
+                             # PR-A: Keyword bid estimates + serving status
+                             keyword_bid_estimates: list | None = None,
+                             # PR-B: Conversion action breakdown + keyword click share/hist QS
+                             conversion_action_breakdown: list | None = None,
+                             keyword_click_share: list | None = None,
+                             # PR-C: Device segmentation (MOBILE / DESKTOP / TABLET)
+                             device_performance: list | None = None,
+                             # PR-E: Geographic performance (city/region breakdown)
+                             geo_performance: list | None = None) -> list:
     """
     Ask Claude (Opus) for structured, actionable recommendations for this campaign.
     Each recommendation is a dict with operation + exact parameters ready to execute via API.
@@ -2703,6 +2780,15 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
             "keyword_intent_signals": intent_signals or {},
             # Lifecycle: age + stage classification
             "lifecycle": lifecycle or {},
+            # PR-A: keyword bid estimates + serving status
+            "keyword_bid_estimates": (keyword_bid_estimates or [])[:80],
+            # PR-B: conversion action breakdown + keyword click share/hist QS
+            "conversion_action_breakdown": conversion_action_breakdown or [],
+            "keyword_click_share": (keyword_click_share or [])[:80],
+            # PR-C: device segmentation
+            "device_performance": device_performance or [],
+            # PR-E: geographic performance
+            "geo_performance": (geo_performance or [])[:50],  # cap at 50 locations per campaign
         }
 
         feedback_block = f"\n\nUSER FEEDBACK (incorporate this):\n{feedback}" if feedback else ""
@@ -3337,7 +3423,167 @@ HOW TO USE:
    The gap is normal — CallRail tracks ALL calls (organic + paid), GAds phone metrics track only
    calls from call extension clicks. Do not flag this as a discrepancy.
 3. If gads_phone_calls_30d > 0: cite it as corroborating evidence when recommending call asset
-   optimization (e.g., ad schedule, call-only ad testing).""" + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + _build_institutional_memory_note(campaign) + feedback_block + _build_mcp_decisions_note(campaign)
+   optimization (e.g., ad schedule, call-only ad testing)."""
+
+        # PR-A: Keyword bid estimates note
+        bid_est_note = ""
+        if keyword_bid_estimates:
+            _under_bid = [k for k in keyword_bid_estimates if k.get("under_bid")]
+            _rarely_served = [k for k in keyword_bid_estimates if k.get("system_serving_status") == "RARELY_SERVED"]
+            _below_fp_bid = [k for k in keyword_bid_estimates if k.get("system_serving_status") == "BELOW_FIRST_PAGE_BID"]
+            bid_est_note = f"""
+
+KEYWORD BID ESTIMATES & SERVING STATUS (PR-A):
+The context includes keyword_bid_estimates — point-in-time estimates from Google Ads API.
+
+Key fields per keyword:
+  - first_page_cpc / first_page_cpc_micros: min bid to appear on page 1 (dollars + micros)
+  - top_of_page_cpc / top_of_page_cpc_micros: min bid for top 3 positions (dollars + micros)
+  - first_position_cpc / first_position_cpc_micros: min bid for position #1 (dollars + micros)
+  - effective_cpc_bid / effective_cpc_bid_micros: current bid (dollars + micros)
+  - system_serving_status: SERVED | RARELY_SERVED | BELOW_FIRST_PAGE_BID | LOW_QUALITY_SCORE | LOW_SEARCH_VOLUME | UNSPECIFIED
+  - under_bid: True when effective_cpc_bid < first_page_cpc (keyword not reaching page 1)
+  - gap_to_first_page: dollars to reach page 1 (positive = under-bid, negative = already above)
+  - quality_score: 1–10 (None = no QS data yet for new keywords — do NOT treat 0/None as low QS)
+
+Summary for this campaign:
+  - Under-bid keywords (below first-page threshold): {len(_under_bid)}
+  - Keywords BELOW_FIRST_PAGE_BID (Google throttling — strongest under-bid signal): {len(_below_fp_bid)}
+  - Keywords RARELY_SERVED: {len(_rarely_served)}
+
+CRITICAL — UNITS FOR BID OPERATIONS:
+When emitting increase_bid or decrease_bid, new_bid_micros MUST be an integer in micros (millionths of a dollar).
+Use the *_micros fields directly — do NOT pass dollar values.
+Example: to bid $5.46 → new_bid_micros = 5460000
+Correct: new_bid_micros = int(first_page_cpc_micros * 1.05)
+Wrong:   new_bid_micros = first_page_cpc * 1.05  ← this is dollars, will be rejected
+
+HOW TO USE:
+1. BELOW_FIRST_PAGE_BID keywords: Google is refusing to serve this keyword because bid is below page-1 minimum.
+   ALWAYS emit increase_bid with new_bid_micros = int(first_page_cpc_micros * 1.10) for strategically important keywords.
+2. UNDER-BID keywords (under_bid=True): bid is below page-1 threshold but still serving somewhat.
+   Emit increase_bid with new_bid_micros = int(first_page_cpc_micros * 1.05) IF:
+   - gap_to_first_page <= 3.00 (reachable with a modest bump)
+   - AND keyword has impressions > 0 OR is strategically important (brand/emergency terms)
+3. RARELY_SERVED keywords: throttled — use quality_score to decide:
+   - quality_score is None or < 5: flag as ad copy / landing page issue (QS problem), not a bid increase
+   - quality_score >= 6 AND strategically important: emit increase_bid to first_page_cpc_micros * 1.05
+   - quality_score < 3 AND 0 conversions in 30d: consider pause_keyword
+4. LOW_QUALITY_SCORE status: this is Google's explicit signal that QS is the problem — emit claude_advisory
+   recommending ad copy / landing page improvements, NOT a bid increase.
+5. LOW_SEARCH_VOLUME: keyword has too little volume — do NOT bid up; flag as potential removal candidate.
+6. OVER-BID detection: If a keyword is in the campaign's top-5 spenders by cost_30d AND conversions = 0
+   in 30 days AND effective_cpc_bid > first_page_cpc * 3.0: emit decrease_bid to top_of_page_cpc_micros * 1.1.
+   (Note: bidding above first_position_cpc is NOT necessarily wasteful — second-price auction means
+   actual CPC is bounded by competition, not your bid. Focus on cost/conversion ratio instead.)
+7. Do NOT flag every under-bid keyword — focus on actionable gaps. Maximum 3 bid recommendations per run.
+8. Never recommend new_bid_micros > 20_000_000 ($20) without explicit high-value conversion history."""
+
+        # PR-B: Conversion action breakdown + click share note
+        conv_action_note = ""
+        if conversion_action_breakdown:
+            conv_action_note = """
+
+CONVERSION ACTION BREAKDOWN (PR-B):
+The context includes conversion_action_breakdown — Google Ads conversions segmented by action name.
+This shows WHAT TYPE of conversion is firing (e.g. "Appointment Booked", "Phone Call", "Form Submit").
+
+HOW TO USE:
+1. If all conversions are "Phone Call" but you have 0 "Appointment Booked" conversions: the campaign
+   is driving calls but they're not converting to booked appointments — flag as a call quality issue.
+2. If "all_conversions" is much higher than "conversions" for an action: this action uses data-driven
+   attribution which counts fractional credit. Focus on "conversions" for bidding decisions.
+3. If a high-value action ("Appointment Booked", "Treatment Accepted") has 0 conversions but
+   "Phone Call" has many: recommend reviewing call handling / scheduling process, not the ad spend."""
+
+        click_share_note = ""
+        if keyword_click_share:
+            _low_cs = [k for k in keyword_click_share if k.get("search_click_share") is not None and k["search_click_share"] < 0.30]
+            _qs_declined = [k for k in keyword_click_share if k.get("historical_qs_min") is not None and k.get("historical_qs_max") is not None and k["historical_qs_max"] - k["historical_qs_min"] >= 2]
+            click_share_note = f"""
+
+KEYWORD CLICK SHARE & HISTORICAL QS (PR-B):
+The context includes keyword_click_share with search_click_share and historical QS trends.
+
+Key fields:
+  - search_click_share: fraction of available clicks your ads received (0.0–1.0). <0.30 = low share.
+  - historical_qs_avg: average QS over the last 30 days (1–10)
+  - historical_qs_min / historical_qs_max: QS range — a wide range means QS is unstable
+  - creative_quality_score / landing_page_quality_score / search_predicted_ctr: component QS breakdown
+
+Summary:
+  - Keywords with low click share (<30%): {len(_low_cs)}
+  - Keywords with unstable QS (range ≥2 points): {len(_qs_declined)}
+
+HOW TO USE:
+1. Low search_click_share (<0.30) + under_bid=True: bid is the constraint — recommend increase_bid.
+2. Low search_click_share (<0.30) + under_bid=False + low QS: ad quality is the constraint — recommend ad copy review.
+3. landing_page_quality_score = BELOW_AVERAGE: landing page relevance problem — flag for LP review.
+4. QS declining (historical_qs_max - historical_qs_min >= 2): potential ad fatigue or competitive pressure — flag for creative refresh."""
+
+        device_perf_note = ""
+        if device_performance:
+            _mobile = next((d for d in device_performance if d.get("device") == "MOBILE"), None)
+            _desktop = next((d for d in device_performance if d.get("device") == "DESKTOP"), None)
+            _tablet = next((d for d in device_performance if d.get("device") == "TABLET"), None)
+            _high_cost_no_conv = [d for d in device_performance if d.get("cost", 0) > 10 and d.get("conversions", 0) == 0]
+            # Build device summary lines separately to avoid f-string conditional chain bug
+            _dev_lines = []
+            if _mobile:
+                _dev_lines.append(f"  - Mobile cost: ${_mobile['cost']:.2f}, conversions: {_mobile['conversions']}, CTR: {_mobile.get('ctr', 0):.2%}")
+            if _desktop:
+                _dev_lines.append(f"  - Desktop cost: ${_desktop['cost']:.2f}, conversions: {_desktop['conversions']}, CTR: {_desktop.get('ctr', 0):.2%}")
+            if _tablet:
+                _dev_lines.append(f"  - Tablet cost: ${_tablet['cost']:.2f}, conversions: {_tablet['conversions']}")
+            _dev_lines.append(f"  - Devices with >$10 spend and 0 conversions: {len(_high_cost_no_conv)}")
+            device_perf_note = f"""
+
+DEVICE PERFORMANCE BREAKDOWN (PR-C):
+The context includes device_performance — campaign spend/conversion data split by MOBILE, DESKTOP, TABLET.
+
+Summary:
+{chr(10).join(_dev_lines)}
+
+HOW TO USE:
+1. A device with >$10 cost and 0 conversions is a waste candidate — recommend noting this for a bid
+   modifier (e.g. -50% mobile if mobile has high spend and no conversions).
+2. A device with the highest conversion rate and below-average spend share is under-allocated.
+3. Do NOT recommend specific bid modifier percentages unless clearly warranted by data (cost > $20,
+   conversion gap > 2x between devices). Note: bid modifiers require a separate UI workflow.
+4. For dental practices, mobile usually has lower conversion rates (users don't book on phones);
+   this is expected — only flag if mobile cost > 60% of total with near-zero conversions."""
+
+        geo_perf_note = ""
+        if geo_performance:
+            _high_cost_no_conv = [g for g in geo_performance if g.get("cost", 0) > 10 and g.get("conversions", 0) == 0]
+            _top5 = sorted(geo_performance, key=lambda g: g.get("cost", 0), reverse=True)[:5]
+            # Build top-5 summary safely (location_name is now human-readable "City, Country")
+            _top5_summary = [
+                f"{g.get('location_name', 'Unknown')} (${round(g.get('cost', 0), 2)}, {g.get('conversions', 0)} conv)"
+                for g in _top5
+            ]
+            geo_perf_note = f"""
+
+GEOGRAPHIC PERFORMANCE BREAKDOWN (PR-E):
+The context includes geo_performance — click/cost/conversion data broken down by location.
+location_name is a human-readable "City, Country" (e.g. "Grafton, US", "Worcester, US").
+location_type is LOCATION_OF_PRESENCE (physical location) or AREA_OF_INTEREST (interest-based).
+
+Top 5 locations by cost: {_top5_summary}
+Locations with >$10 spend and 0 conversions: {len(_high_cost_no_conv)}
+
+HOW TO USE:
+1. A location with >$10 cost and 0 conversions that appears to be outside the Grafton/central MA
+   service area: flag as advisory for geo targeting review ("consider excluding [location]").
+2. A location with high conversions and low cost relative to other locations: note as opportunity.
+3. LOCATION_OF_PRESENCE = user is physically in that location.
+   AREA_OF_INTEREST = user searched for that location (e.g. "dentist in Worcester" from Boston).
+   Both matter but AREA_OF_INTEREST rows may explain out-of-area spend.
+4. Do NOT recommend specific geo targeting API changes — that uses a separate geo UI workflow.
+   Flag locations for manual review only.
+5. criterion_id is the Google geo criterion ID; use it for context only, not API calls."""
+
+        prompt = prompt + rsa_note + geo_note + ad_perf_note + ag_perf_note + page_intel_note + campaign_brief_note + competitor_intel_note + planned_build_note + budget_feasibility_note + intent_signals_note + lifecycle_note + budget_constrained_note + skag_note + assets_note + bid_est_note + conv_action_note + click_share_note + device_perf_note + geo_perf_note + _build_institutional_memory_note(campaign) + feedback_block + _build_mcp_decisions_note(campaign)
 
         msg = client.messages.create(
             model="claude-opus-4-5",
@@ -8786,6 +9032,15 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
             existing_campaign_assets=camp_existing_assets,
             # PR-F: Google Ads native phone call stats
             phone_stats=_phone_stats,
+            # PR-A: keyword bid estimates filtered to this campaign (pre-bucketed for O(1) lookup)
+            keyword_bid_estimates=_kw_bid_by_camp.get(camp_name.lower(), []),
+            # PR-B: conversion action breakdown + keyword click share/hist QS
+            conversion_action_breakdown=_conv_actions_by_camp_id.get(_camp_id_for_lifecycle, []),
+            keyword_click_share=_kw_cs_by_camp.get(camp_name.lower(), []),
+            # PR-C: device segmentation filtered to this campaign (pre-bucketed by campaign_id)
+            device_performance=_device_perf_by_camp_id.get(_camp_id_for_lifecycle, []),
+            # PR-E: geographic performance filtered to this campaign (pre-bucketed by campaign_id)
+            geo_performance=_geo_perf_by_camp_id.get(_camp_id_for_lifecycle, []),
         )
         if not structured:
             continue
@@ -9114,6 +9369,52 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     _phone_stats = _get_campaign_phone_stats(days=30)
     if _phone_stats:
         logger.info(f"Phone stats loaded for {len(_phone_stats)} campaigns")
+
+    # PR-B: Fetch conversion action breakdown (all campaigns combined; filter per-campaign in loop)
+    _conversion_actions_all = _get_conversion_action_breakdown(days=30)
+    if _conversion_actions_all:
+        logger.info(f"Conversion action breakdown loaded: {len(_conversion_actions_all)} rows")
+    # Pre-bucket by campaign_id
+    _conv_actions_by_camp_id: dict = {}
+    for _ca in _conversion_actions_all:
+        _conv_actions_by_camp_id.setdefault(_ca.get("campaign_id", ""), []).append(_ca)
+
+    # PR-B: Fetch keyword click share + historical QS (all keywords; filter per-campaign in loop)
+    _keyword_click_share_all = _get_keyword_click_share()
+    if _keyword_click_share_all:
+        logger.info(f"Keyword click share/hist QS loaded: {len(_keyword_click_share_all)} keywords")
+    # Pre-bucket by campaign name (lowercase)
+    _kw_cs_by_camp: dict = {}
+    for _kcs in _keyword_click_share_all:
+        _kw_cs_by_camp.setdefault(_kcs.get("campaign_name", "").lower(), []).append(_kcs)
+
+    # PR-C: Fetch device performance breakdown (all campaigns; filter per-campaign in loop)
+    _device_perf_all = _get_device_performance(days=30)
+    if _device_perf_all:
+        logger.info(f"Device performance loaded: {len(_device_perf_all)} rows")
+    # Pre-bucket by campaign_id for O(1) per-campaign lookup
+    _device_perf_by_camp_id: dict = {}
+    for _dp in _device_perf_all:
+        _device_perf_by_camp_id.setdefault(_dp.get("campaign_id", ""), []).append(_dp)
+
+    # PR-E: Fetch geographic performance breakdown (all campaigns; filter per-campaign in loop)
+    _geo_perf_all = _get_geo_performance(days=30)
+    if _geo_perf_all:
+        logger.info(f"Geo performance loaded: {len(_geo_perf_all)} locations")
+    # Pre-bucket by campaign_id for O(1) per-campaign lookup
+    _geo_perf_by_camp_id: dict = {}
+    for _gp in _geo_perf_all:
+        _geo_perf_by_camp_id.setdefault(_gp.get("campaign_id", ""), []).append(_gp)
+
+    # PR-A: Fetch keyword bid estimates + serving status (point-in-time from last gads-sync)
+    _keyword_bid_estimates_all = _get_keyword_bid_estimates()
+    if _keyword_bid_estimates_all:
+        logger.info(f"Keyword bid estimates loaded: {len(_keyword_bid_estimates_all)} keywords, "
+                    f"{sum(1 for k in _keyword_bid_estimates_all if k.get('under_bid'))} under-bid")
+    # Pre-bucket by campaign name (lowercase) to avoid O(n*m) scan per campaign in the loop
+    _kw_bid_by_camp: dict = {}
+    for _k in _keyword_bid_estimates_all:
+        _kw_bid_by_camp.setdefault(_k.get("campaign_name", "").lower(), []).append(_k)
 
     # PR-D: Fetch account-level intelligence snapshot for account-level Claude
     _account_intel = _get_account_intelligence()
