@@ -19,9 +19,10 @@ from database import _conn
 logger = logging.getLogger(__name__)
 
 _E164_RE = re.compile(r"^\+1\d{10}$")
-# UI exposes only "unassigned" + "gads_campaign" today.
-# "gads_call_extension", "static_source", "pool" are reserved for PRs 3/6 — kept for forward compatibility.
-_VALID_ASSIGNMENT_TYPES = {"unassigned", "gads_campaign", "gads_call_extension", "static_source", "pool"}
+# UI exposes "unassigned", "gads_campaign", "static_source", "gbp" today.
+# "gads_call_extension", "pool" are reserved for future PRs — kept for forward compatibility.
+# "gbp" = static number placed on Google Business Profile listing (no GAds push).
+_VALID_ASSIGNMENT_TYPES = {"unassigned", "gads_campaign", "gads_call_extension", "static_source", "pool", "gbp"}
 
 # CallRail status vocab → our DB vocab and back
 _CR_STATUS_TO_DB = {"active": "active", "disabled": "paused", "paused": "paused"}

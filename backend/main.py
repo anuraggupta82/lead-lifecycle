@@ -2011,6 +2011,23 @@ async def gads_approve_action(action_id: str, request: Request):
             ag_resource   = after.get("ad_group_resource", "")
             path1         = (after.get("path1", "") or "")[:15]
             path2         = (after.get("path2", "") or "")[:15]
+            # Re-check campaigns.landing_page in case it changed after the rec was staged.
+            # This ensures the ad always uses the current landing page at approval time.
+            try:
+                from database import get_campaign_by_name as _gcbn_lp_approval
+                _camp_name_lp = (row.get("campaign_name") or "").strip()
+                if _camp_name_lp:
+                    _camp_row_lp = _gcbn_lp_approval(_camp_name_lp)
+                    _lp_override = ((_camp_row_lp or {}).get("landing_page") or "").strip()
+                    if _lp_override and _lp_override.lower().startswith(("http://", "https://")):
+                        if _lp_override != final_url:
+                            logger.info(
+                                f"replace_ad approval [{_camp_name_lp}]: overriding final_url "
+                                f"{final_url!r} → {_lp_override!r} (from campaigns.landing_page)"
+                            )
+                            final_url = _lp_override
+            except Exception as _lp_err:
+                logger.warning(f"replace_ad approval: landing_page lookup failed: {_lp_err}")
             if not old_rn or not new_h or not new_d or not final_url:
                 raise HTTPException(
                     status_code=422,

@@ -17892,9 +17892,10 @@ function AssignmentModal({ number, campaigns, onClose, onSaved }) {
   }
 
   const typeOptions = [
-    { value: 'unassigned',    label: '— Unassigned',          desc: 'Not yet assigned to a campaign' },
-    { value: 'gads_campaign', label: '🎯 Google Ads Campaign', desc: 'Push call extension to one or more campaigns' },
-    { value: 'static_source', label: '🌐 Website (DNI Pool)',  desc: 'Assign to a website for dynamic number insertion' },
+    { value: 'unassigned',    label: '— Unassigned',               desc: 'Not yet assigned to a campaign' },
+    { value: 'gads_campaign', label: '🎯 Google Ads Campaign',      desc: 'Push call extension to one or more campaigns' },
+    { value: 'static_source', label: '🌐 Website (DNI Pool)',       desc: 'Assign to a website for dynamic number insertion' },
+    { value: 'gbp',           label: '📍 Google Business Profile',  desc: 'Static number placed on Google Business Profile listing' },
   ];
 
   const LBL = {fontSize:12,fontWeight:700,color:'#111827',display:'block',marginBottom:6,textTransform:'uppercase',letterSpacing:0.6};
@@ -18102,8 +18103,9 @@ function NumbersGrouped({ numbers, onEdit, onToggleStatus }) {
 
   // Partition numbers
   const gadsExt    = numbers.find(n => n.phone_number === GADS_CALL_EXT_NUMBER);
+  const gbp        = numbers.filter(n => n.phone_number !== GADS_CALL_EXT_NUMBER && n.assignment_type === 'gbp');
   const websiteDNI = numbers.filter(n => n.phone_number !== GADS_CALL_EXT_NUMBER && n.assignment_type === 'static_source');
-  const reserve    = numbers.filter(n => n.phone_number !== GADS_CALL_EXT_NUMBER && n.assignment_type !== 'static_source');
+  const reserve    = numbers.filter(n => n.phone_number !== GADS_CALL_EXT_NUMBER && n.assignment_type !== 'static_source' && n.assignment_type !== 'gbp');
 
   function editBtn(n) {
     return (
@@ -18150,7 +18152,32 @@ function NumbersGrouped({ numbers, onEdit, onToggleStatus }) {
         Static number used across all Google Ads call extensions. Google sends caller data to CallRail via Call Details Forwarding.
       </div>
 
-      {/* ── Section 2: Website DNI Numbers ── */}
+      {/* ── Section 2: Google Business Profile ── */}
+      <p style={SECTION_HDR}>📍 Google Business Profile</p>
+      {gbp.length === 0 ? (
+        <div style={{fontSize:13,color:'#9ca3af',marginBottom:24,padding:'12px 0'}}>
+          No GBP number assigned. Edit a number and select "Google Business Profile" to assign it.
+        </div>
+      ) : (
+        gbp.map(n => (
+          <div key={n.id} style={{...CARD,borderColor:'#86efac',background:'#f0fdf4'}}>
+            <span style={NUM}>{n.phone_number || '—'}</span>
+            <span style={ARR}>→</span>
+            <span style={FWD}>{n.forward_to || '—'}</span>
+            <span style={{padding:'2px 10px',borderRadius:10,fontSize:12,fontWeight:600,background:'#bbf7d0',color:'#15803d'}}>
+              Google Business Profile
+            </span>
+            <span style={CALLS}>{n.calls_30d ?? 0} calls / 30d</span>
+            {statusDot(n.status)}
+            {editBtn(n)}
+          </div>
+        ))
+      )}
+      <div style={{fontSize:11,color:'#9ca3af',marginBottom:24,marginTop: gbp.length ? 4 : 0}}>
+        Static number placed on the Google Business Profile listing. Calls show "GBP" in source attribution.
+      </div>
+
+      {/* ── Section 3: Website DNI Numbers ── */}
       <p style={SECTION_HDR}>🌐 Website DNI Numbers</p>
       {websiteDNI.length === 0 ? (
         <div style={{fontSize:13,color:'#9ca3af',marginBottom:24,padding:'12px 0'}}>
@@ -18175,7 +18202,7 @@ function NumbersGrouped({ numbers, onEdit, onToggleStatus }) {
         Numbers displayed on websites via swap.js DNI. Caller data captured with gclid for conversion attribution.
       </div>
 
-      {/* ── Section 3: Reserve / Unassigned ── */}
+      {/* ── Section 4: Reserve / Unassigned ── */}
       <p style={SECTION_HDR}>📋 Reserve Numbers</p>
       {reserve.length === 0 ? (
         <div style={{fontSize:13,color:'#9ca3af',padding:'12px 0'}}>No reserve numbers.</div>

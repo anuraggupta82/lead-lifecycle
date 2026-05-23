@@ -3721,6 +3721,23 @@ HOW TO USE:
                     if len(descriptions) < 2:
                         logger.warning(f"Dropping replace_ad — too few descriptions ({len(descriptions)})")
                         continue
+                    # ── Landing-page override ────────────────────────────────────────────
+                    # If campaigns.landing_page is set, use it as the authoritative
+                    # final_url so new ads always point to the current landing page.
+                    try:
+                        from database import get_campaign_by_name as _gcbn_lp
+                        _camp_row_lp = _gcbn_lp(campaign) if campaign else None
+                        _lp = ((_camp_row_lp or {}).get("landing_page") or "").strip()
+                        if _lp and _lp.lower().startswith(("http://", "https://")):
+                            if item.get("final_url") != _lp:
+                                logger.info(
+                                    f"replace_ad [{campaign}]: overriding final_url "
+                                    f"'{item.get('final_url')}' → '{_lp}' (from campaigns.landing_page)"
+                                )
+                                item["final_url"] = _lp
+                    except Exception as _e:
+                        logger.warning(f"replace_ad landing_page override failed: {_e}")
+                    # ────────────────────────────────────────────────────────────────────
                     if not item.get("final_url"):
                         logger.warning("Dropping replace_ad — missing final_url")
                         continue
