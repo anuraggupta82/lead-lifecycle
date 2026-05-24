@@ -8462,11 +8462,16 @@ def admin_set_device_bid_modifier(campaign_id: str, body: DeviceBidModifierReque
     modifier = body.modifier
     if modifier < -1.0 or modifier > 9.0:
         raise HTTPException(status_code=422, detail="modifier must be between -1.0 and 9.0")
-    if device_str == "MOBILE" and modifier == -1.0:
-        raise HTTPException(status_code=422, detail="MOBILE cannot be fully excluded (modifier=-1.0)")
+    # Guard: bid_modifier_value = 1.0 + modifier. At modifier=-1.0 this yields 0.0 which
+    # completely disables the device in Google Ads (same as exclusion). Disallow for all
+    # devices, not just MOBILE, since 0.0 silently kills impressions with no warning.
+    if modifier <= -0.9:
+        raise HTTPException(status_code=422, detail="modifier cannot be -0.9 or lower — values near -1.0 yield bid_modifier≈0.0 which disables the device entirely. Use -0.8 (-80%) as the floor.")
 
-    # bid_modifier field = 1 + modifier (e.g. -50% → 0.5, +30% → 1.3, -1.0 → 0.0)
+    # bid_modifier field = 1 + modifier (e.g. -50% → 0.5, +30% → 1.3)
     bid_modifier_value = round(1.0 + modifier, 6)
+    if bid_modifier_value < 0.1:
+        raise HTTPException(status_code=422, detail=f"Computed bid_modifier_value={bid_modifier_value:.3f} is too low (min 0.1). Adjust modifier.")
 
     settings = get_settings()
     customer_id = settings.google_ads_customer_id
@@ -9457,6 +9462,309 @@ def admin_set_campaign_schedule_slots(campaign_id: str, body: SetScheduleSlotsRe
         if action_id:
             update_gads_action_result(action_id, executed=True,
                                       execution_result="error", error_detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+# ─── Landing page apply: preview + execute ───────────────────────────────────
+
+@app.get("/api/admin/campaigns/{campaign_id}/landing-page-apply/preview",
+         dependencies=[Depends(_require_admin)])
+def admin_landing_page_apply_preview(campaign_id: str):
+    """
+    Preview what will change when campaigns.landing_page is applied to all active
+    RSAs and keyword final_url overrides in the campaign. No mutations.
+
+    Returns:
+      {campaign_id, campaign_name, new_url,
+       ads: {to_replace, details: [{ad_group_ad_resource, ad_group_resource,
+                                    ad_group_name, current_final_url,
+                                    headlines_count, descriptions_count}]},
+       keywords: {to_update, details: [{resource, keyword, current_final_url}]}}
+    """
+    from google_ads_create import _build_client
+    from database import get_campaign_by_id
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    camp_resource = camp.get("gads_campaign_resource") or ""
+    if not camp_resource:
+        raise HTTPException(status_code=400, detail="Campaign not linked to Google Ads")
+    new_url = (camp.get("landing_page") or "").strip()
+    if not new_url:
+        raise HTTPException(status_code=400, detail="campaigns.landing_page is empty — set it first")
+    if not new_url.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail=f"landing_page must be an http(s) URL (got '{new_url}')")
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+
+    try:
+        client = _build_client()
+        ga_service = client.get_service("GoogleAdsService")
+
+        # ── Active RSAs ──────────────────────────────────────────────────────
+        ad_q = f"""
+            SELECT
+              ad_group_ad.resource_name,
+              ad_group_ad.ad.responsive_search_ad.headlines,
+              ad_group_ad.ad.responsive_search_ad.descriptions,
+              ad_group_ad.ad.final_urls,
+              ad_group_ad.ad_group,
+              ad_group.name
+            FROM ad_group_ad
+            WHERE ad_group_ad.status = 'ENABLED'
+              AND campaign.resource_name = '{camp_resource}'
+              AND ad_group_ad.ad.type = 'RESPONSIVE_SEARCH_AD'
+        """
+        ad_details = []
+        for r in ga_service.search(customer_id=customer_id, query=ad_q):
+            cur_urls = list(r.ad_group_ad.ad.final_urls)
+            cur_url = cur_urls[0] if cur_urls else ""
+            if cur_url == new_url:
+                continue  # already on target
+            ad_details.append({
+                "ad_group_ad_resource": r.ad_group_ad.resource_name,
+                "ad_group_resource": r.ad_group_ad.ad_group,
+                "ad_group_name": r.ad_group.name,
+                "current_final_url": cur_url,
+                "headlines_count": len(r.ad_group_ad.ad.responsive_search_ad.headlines),
+                "descriptions_count": len(r.ad_group_ad.ad.responsive_search_ad.descriptions),
+            })
+
+        # ── Keywords with existing final_url overrides ───────────────────────
+        kw_q = f"""
+            SELECT
+              ad_group_criterion.resource_name,
+              ad_group_criterion.keyword.text,
+              ad_group_criterion.final_urls
+            FROM ad_group_criterion
+            WHERE ad_group_criterion.status = 'ENABLED'
+              AND campaign.resource_name = '{camp_resource}'
+              AND ad_group_criterion.type = 'KEYWORD'
+              AND ad_group_criterion.final_urls CONTAINS ANY ('http://', 'https://')
+        """
+        kw_details = []
+        for r in ga_service.search(customer_id=customer_id, query=kw_q):
+            cur_urls = list(r.ad_group_criterion.final_urls)
+            cur_url = cur_urls[0] if cur_urls else ""
+            if cur_url == new_url:
+                continue
+            kw_details.append({
+                "resource": r.ad_group_criterion.resource_name,
+                "keyword": r.ad_group_criterion.keyword.text,
+                "current_final_url": cur_url,
+            })
+
+        return {
+            "campaign_id": campaign_id,
+            "campaign_name": camp.get("campaign_name"),
+            "new_url": new_url,
+            "ads": {"to_replace": len(ad_details), "details": ad_details},
+            "keywords": {"to_update": len(kw_details), "details": kw_details},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/landing-page-apply/execute",
+          dependencies=[Depends(_require_admin)])
+def admin_landing_page_apply_execute(campaign_id: str):
+    """
+    Apply campaigns.landing_page to every active RSA and keyword final_url
+    override in the campaign:
+      - RSAs: PAUSE existing + CREATE replacement with same copy + new URL
+              (pinned headlines/descriptions are preserved)
+      - Keywords: UPDATE final_urls in place (mutable — no pause needed)
+
+    Partial failures are tolerated — per-ad errors are collected and returned.
+
+    Returns:
+      {ok, campaign_id, new_url,
+       ads: {replaced, skipped, failed, results: [...]},
+       keywords: {updated, skipped, failures: [...]},
+       action_id}
+    """
+    from google_ads_create import _build_client
+    from google_ads_write import set_keyword_final_urls
+    from ai_optimizer import _execute_replace_ad
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import (get_campaign_by_id, log_admin_manual_action,
+                          update_gads_action_result, set_audit_approval)
+    from google.protobuf import field_mask_pb2 as _fm
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    camp_resource = camp.get("gads_campaign_resource") or ""
+    if not camp_resource:
+        raise HTTPException(status_code=400, detail="Campaign not linked to Google Ads")
+    new_url = (camp.get("landing_page") or "").strip()
+    if not new_url or not new_url.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail=f"landing_page must be http(s) URL (got '{new_url}')")
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+
+    action_id = None
+    try:
+        action_id = log_admin_manual_action(
+            operation="landing_page_apply",
+            entity_type="campaign",
+            entity_id=camp_resource,
+            entity_name=camp.get("campaign_name"),
+            before={"landing_page_target": "various"},
+            after={"landing_page_target": new_url},
+            reason=f"Apply landing_page → {new_url} to all RSAs + keyword overrides",
+        )
+    except Exception as _log_err:
+        logger.warning(f"landing_page_apply: audit log failed (continuing): {_log_err}")
+
+    try:
+        client = _build_client()
+        ga_service = client.get_service("GoogleAdsService")
+
+        # ── Fetch every active RSA with full content + pinning ──────────────
+        ad_q = f"""
+            SELECT
+              ad_group_ad.resource_name,
+              ad_group_ad.ad.responsive_search_ad.headlines,
+              ad_group_ad.ad.responsive_search_ad.descriptions,
+              ad_group_ad.ad.responsive_search_ad.path1,
+              ad_group_ad.ad.responsive_search_ad.path2,
+              ad_group_ad.ad.final_urls,
+              ad_group_ad.ad_group
+            FROM ad_group_ad
+            WHERE ad_group_ad.status = 'ENABLED'
+              AND campaign.resource_name = '{camp_resource}'
+              AND ad_group_ad.ad.type = 'RESPONSIVE_SEARCH_AD'
+        """
+        ad_rows = list(ga_service.search(customer_id=customer_id, query=ad_q))
+
+        ad_results = []
+        for r in ad_rows:
+            old_resource = r.ad_group_ad.resource_name
+            ad_group_resource = r.ad_group_ad.ad_group
+            rsa = r.ad_group_ad.ad.responsive_search_ad
+            cur_urls = list(r.ad_group_ad.ad.final_urls)
+            if cur_urls and cur_urls[0] == new_url:
+                ad_results.append({"resource": old_resource, "status": "skipped",
+                                   "reason": "already on target URL"})
+                continue
+
+            has_pins = (any(h.pinned_field for h in rsa.headlines) or
+                        any(d.pinned_field for d in rsa.descriptions))
+            try:
+                if not has_pins:
+                    # No pinning — delegate to the shared helper
+                    result = _execute_replace_ad(
+                        client, customer_id,
+                        old_ad_group_ad_resource=old_resource,
+                        new_headlines=[h.text for h in rsa.headlines if h.text],
+                        new_descriptions=[d.text for d in rsa.descriptions if d.text],
+                        final_url=new_url,
+                        ad_group_resource=ad_group_resource,
+                        path1=rsa.path1 or "",
+                        path2=rsa.path2 or "",
+                    )
+                    ad_results.append({"resource": old_resource, "status": "ok",
+                                       "paused": result["paused_resource"],
+                                       "created": result["created_resource"]})
+                else:
+                    # Pinning-preserving path: inline pause + create
+                    aga_service = client.get_service("AdGroupAdService")
+
+                    pause_op = client.get_type("AdGroupAdOperation")
+                    pause_op.update.resource_name = old_resource
+                    pause_op.update.status = client.enums.AdGroupAdStatusEnum.PAUSED
+                    pause_op.update_mask.CopyFrom(_fm.FieldMask(paths=["status"]))
+                    pause_resp = aga_service.mutate_ad_group_ads(
+                        customer_id=customer_id, operations=[pause_op]
+                    )
+                    paused_rn = pause_resp.results[0].resource_name
+
+                    create_op = client.get_type("AdGroupAdOperation")
+                    new_aga = create_op.create
+                    new_aga.ad_group = ad_group_resource
+                    new_aga.status = client.enums.AdGroupAdStatusEnum.ENABLED
+                    new_aga.ad.final_urls.append(new_url)
+                    new_rsa = new_aga.ad.responsive_search_ad
+                    for h in rsa.headlines:
+                        nh = new_rsa.headlines.add()
+                        nh.text = h.text
+                        if h.pinned_field:
+                            nh.pinned_field = h.pinned_field
+                    for d in rsa.descriptions:
+                        nd = new_rsa.descriptions.add()
+                        nd.text = d.text
+                        if d.pinned_field:
+                            nd.pinned_field = d.pinned_field
+                    if rsa.path1:
+                        new_rsa.path1 = rsa.path1
+                    if rsa.path2:
+                        new_rsa.path2 = rsa.path2
+
+                    create_resp = aga_service.mutate_ad_group_ads(
+                        customer_id=customer_id, operations=[create_op]
+                    )
+                    created_rn = create_resp.results[0].resource_name
+                    logger.info(f"landing_page_apply (pinned): paused {paused_rn}, created {created_rn}")
+                    ad_results.append({"resource": old_resource, "status": "ok",
+                                       "paused": paused_rn, "created": created_rn,
+                                       "preserved_pins": True})
+            except Exception as e:
+                logger.exception(f"landing_page_apply: ad replace failed for {old_resource}")
+                ad_results.append({"resource": old_resource, "status": "error",
+                                   "error": str(e)[:300]})
+
+        # ── Update keyword final_url overrides ───────────────────────────────
+        try:
+            kw_summary = set_keyword_final_urls(camp_resource, new_url)
+        except Exception as e:
+            logger.exception("landing_page_apply: keyword batch update failed")
+            kw_summary = {"updated": 0, "skipped": 0,
+                          "failures": [{"resource": "<batch>", "error": str(e)[:300]}]}
+
+        ok_ads = sum(1 for a in ad_results if a["status"] == "ok")
+        err_ads = sum(1 for a in ad_results if a["status"] == "error")
+        skipped_ads = sum(1 for a in ad_results if a["status"] == "skipped")
+        all_ok = (err_ads == 0 and not kw_summary["failures"])
+
+        exec_result = "success" if all_ok else ("partial" if (ok_ads or kw_summary["updated"]) else "error")
+        update_gads_action_result(
+            action_id, executed=True,
+            execution_result=exec_result,
+            error_detail=(None if all_ok else
+                          f"ads_failed={err_ads}, kw_failures={len(kw_summary['failures'])}"),
+        )
+        if all_ok:
+            set_audit_approval(action_id, "admin")
+
+        return {
+            "ok": all_ok,
+            "campaign_id": campaign_id,
+            "new_url": new_url,
+            "ads": {
+                "replaced": ok_ads,
+                "skipped": skipped_ads,
+                "failed": err_ads,
+                "results": ad_results,
+            },
+            "keywords": kw_summary,
+            "action_id": action_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=str(e))
         raise HTTPException(status_code=500, detail=f"Google Ads API error: {e}")
 
 

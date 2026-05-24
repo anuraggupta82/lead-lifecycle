@@ -65,7 +65,9 @@ def _normalize_firestore_lead(doc: dict) -> dict:
         source = "smile_tool"
     elif "pearly" in source.lower() or "chat" in source.lower():
         source = "pearly"
-    elif "contact" in source.lower() or "form" in source.lower():
+    elif source.lower() == "gdc_contact_form":
+        source = "gdc_contact_form"
+    elif "contact" in source.lower() or "form" in source.lower() or "funnel" in source.lower():
         source = "contact_form"
 
     # Tracking
@@ -85,7 +87,9 @@ def _normalize_firestore_lead(doc: dict) -> dict:
         "last_name": last,
         "email": raw.get("email") or "",
         "phone": raw.get("phone") or raw.get("phone_number") or "",
-        "goals": raw.get("goals") or [],
+        # goals may be a list (Firestore) or comma string — always store as string
+        "goals": (", ".join(raw["goals"]) if isinstance(raw.get("goals"), list)
+                  else raw.get("goals") or ""),
         "gclid": tracking.get("gclid") or raw.get("gclid") or "",
         "fbclid": tracking.get("fbclid") or raw.get("fbclid") or "",
         "msclkid": tracking.get("msclkid") or raw.get("msclkid") or "",
@@ -98,7 +102,8 @@ def _normalize_firestore_lead(doc: dict) -> dict:
         "smile_image_url": raw.get("smile_url") or raw.get("smile_image_url") or "",
         "smile_blob_name": raw.get("smile_blob_name") or "",
         "smile_composite_blob_name": raw.get("smile_composite_blob_name") or "",
-        "notes": raw.get("message") or raw.get("notes") or "",
+        # 'concern' carries the funnel intake answers (pipe-separated)
+        "notes": raw.get("message") or raw.get("concern") or raw.get("notes") or "",
     }
 
 

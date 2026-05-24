@@ -266,12 +266,98 @@ def set_campaign_status_gads(campaign_resource: str, new_status: str) -> bool:
     return True
 
 
-# ── 6. Landing page / final_urls — NOT supported via API update ───────────────
-#
-# Google Ads RSA ad.final_urls is IMMUTABLE after creation (IMMUTABLE_FIELD).
-# AdGroup does not have a final_urls field in the API.
-# To change a landing page, ads must be paused and recreated.
-# There is intentionally no function here — call sites must handle this explicitly.
+# ── 6. Landing page apply — keyword final_urls update (RSAs handled separately) ─
+
+def set_keyword_final_urls(
+    campaign_resource: str,
+    new_url: str,
+    only_with_existing_override: bool = True,
+) -> dict:
+    """
+    Update final_urls on every ENABLED keyword in the campaign that already has
+    a final_urls override (those without an override inherit the ad-level URL
+    and do not need updating). RSA final_urls is IMMUTABLE — handled by the
+    caller via _execute_replace_ad / landing_page_apply_execute.
+
+    Returns: {"updated": int, "skipped": int, "failures": [...]}
+    Does NOT check the kill switch — caller must check first.
+    """
+    from google.protobuf import field_mask_pb2 as _fm
+
+    if not new_url or not new_url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"new_url must be an http(s) URL (got '{new_url}')")
+
+    customer_id = _customer_id_from_resource(campaign_resource)
+    client = _build_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    where_override = "AND ad_group_criterion.final_urls CONTAINS ANY ('http://', 'https://')" if only_with_existing_override else ""
+    query = f"""
+        SELECT
+          ad_group_criterion.resource_name,
+          ad_group_criterion.keyword.text,
+          ad_group_criterion.final_urls
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.status = 'ENABLED'
+          AND campaign.resource_name = '{campaign_resource}'
+          AND ad_group_criterion.type = 'KEYWORD'
+          {where_override}
+    """
+    rows = list(ga_service.search(customer_id=customer_id, query=query))
+    if not rows:
+        logger.info(f"set_keyword_final_urls: no keywords to update on {campaign_resource}")
+        return {"updated": 0, "skipped": 0, "failures": []}
+
+    service = client.get_service("AdGroupCriterionService")
+    operations = []
+    targets = []
+    skipped = 0
+    for r in rows:
+        crit = r.ad_group_criterion
+        if list(crit.final_urls) == [new_url]:
+            skipped += 1
+            continue  # idempotent — already on target URL
+        op = client.get_type("AdGroupCriterionOperation")
+        upd = op.update
+        upd.resource_name = crit.resource_name
+        upd.final_urls[:] = [new_url]
+        client.copy_from(op.update_mask, _fm.FieldMask(paths=["final_urls"]))
+        operations.append(op)
+        targets.append(crit.resource_name)
+
+    if not operations:
+        return {"updated": 0, "skipped": len(rows), "failures": []}
+
+    failures = []
+    try:
+        response = service.mutate_ad_group_criteria(
+            customer_id=customer_id,
+            operations=operations,
+            partial_failure=True,
+        )
+        if response.partial_failure_error and response.partial_failure_error.code:
+            try:
+                from google.ads.googleads.errors import GoogleAdsFailure
+                failure = GoogleAdsFailure.deserialize(
+                    response.partial_failure_error.details[0].value
+                )
+                for err in failure.errors:
+                    idx = (err.location.field_path_elements[0].index
+                           if err.location.field_path_elements else -1)
+                    target = targets[idx] if 0 <= idx < len(targets) else "<unknown>"
+                    failures.append({"resource": target, "error": err.message})
+            except Exception as _e:
+                logger.warning(f"set_keyword_final_urls: could not decode partial_failure: {_e}")
+                failures.append({"resource": "<batch>", "error": str(response.partial_failure_error)})
+        updated = sum(1 for r in response.results if r.resource_name)
+        logger.info(
+            f"set_keyword_final_urls: campaign={campaign_resource} new_url={new_url} "
+            f"updated={updated} skipped={skipped} failures={len(failures)}"
+        )
+        return {"updated": updated, "skipped": skipped, "failures": failures}
+    except Exception as e:
+        logger.error(f"set_keyword_final_urls failed for {campaign_resource}: {e}")
+        raise
 
 # ── 7. Replace geographic targeting (PR 3) ────────────────────────────────────
 

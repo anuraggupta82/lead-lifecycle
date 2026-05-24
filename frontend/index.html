@@ -1469,6 +1469,9 @@ function KanbanColumn({ stage, label, leads, color, selectedId, onCardClick, onD
   );
 }
 
+// Sources that are never Google Ads leads — excluded when GAds Only filter is active
+const NON_GADS_SOURCES = new Set(['contact_form', 'gdc_contact_form', 'pearly', 'nxtsmile_landing_page', 'manual']);
+
 function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll, campaigns }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [sourceFilter, setSourceFilter] = useState('all');
@@ -1575,6 +1578,13 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       if (!showCold && l.stage === 'cold') return false;
       if (sourceFilter !== 'all' && l.source !== sourceFilter) return false;
       if (followupOnly && !isStaffFollowUp(l)) return false;
+      // GAds Only: hide leads with no Google Ads attribution (no gclid + no campaign_name + non-GAds source)
+      if (!showAllSources) {
+        const hasGadsAttribution = l.gclid || l.campaign_name || (l.source === 'callrail') || (l.source === 'smile_tool' && l.gclid);
+        if (!hasGadsAttribution && NON_GADS_SOURCES.has(l.source || '')) return false;
+        // Also exclude leads with no source attribution that aren't manually created
+        if (!hasGadsAttribution && !l.source) return false;
+      }
       if (campaignSet) {
         const cn = (l.campaign_name || '').trim();
         // Manual leads (no campaign_name) always pass through — they come from
@@ -1590,7 +1600,7 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       }
       return true;
     });
-  }, [pipeline, searchTerm, sourceFilter, showCold, followupOnly, selectedCampaigns]);
+  }, [pipeline, searchTerm, sourceFilter, showCold, followupOnly, selectedCampaigns, showAllSources]);
 
   const byStage = useMemo(() => {
     const map = {};
@@ -6413,6 +6423,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [syncingToGads, setSyncingToGads]     = useState({});   // {campaign_id: bool}
   const [syncToResult, setSyncToResult]       = useState({});   // {campaign_id: result}
   const [lpDiscrepancy, setLpDiscrepancy]     = useState({});   // {campaign_id: {db_url,live_url,gads_edit_url}}
+  const [lpApplyModal, setLpApplyModal]       = useState(null); // {campaignId, preview, applying, result}
   const [expandedStrategy, setExpandedStrategy] = useState(null);
   const [campActionLoading, setCampActionLoading] = useState({});
   const [detailTab, setDetailTab] = useState('strategy');
@@ -7204,6 +7215,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const COLS = 8; // number of columns in campaign table
 
   return (
+    <React.Fragment>
     <div>
       {/* View toggle */}
       <div className="reports-view-toggle">
@@ -10020,6 +10032,25 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                               {camp.landing_page || practiceSettings.website}
                                             </a>
                                           : <span style={{color:'#9ca3af',fontStyle:'italic'}}>Not set</span>}
+                                        {isLinkedAlready && camp.landing_page && (
+                                          <div style={{marginTop:10}}>
+                                            <button
+                                              className="btn btn-sm"
+                                              style={{fontSize:11,background:'#eff6ff',border:'1px solid #bfdbfe',
+                                                color:'#1d4ed8',borderRadius:6,padding:'4px 10px',cursor:'pointer'}}
+                                              onClick={async () => {
+                                                setLpApplyModal({campaignId: camp.campaign_id, preview: null, applying: false, result: null});
+                                                try {
+                                                  const p = await api(`/api/admin/campaigns/${camp.campaign_id}/landing-page-apply/preview`);
+                                                  setLpApplyModal(m => m ? {...m, preview: p} : null);
+                                                } catch(e) {
+                                                  setLpApplyModal(m => m ? {...m, preview: {error: e.message}} : null);
+                                                }
+                                              }}>
+                                              🔄 Apply to All Ads
+                                            </button>
+                                          </div>
+                                        )}
                                       </div>
                                     )}
                                   </div>
@@ -12797,6 +12828,145 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
         );
       })()}
     </div>
+
+    {/* ── Apply Landing Page to All Ads — modal ─────────────────────────── */}
+    {lpApplyModal && (() => {
+      const m = lpApplyModal;
+      const preview = m.preview;
+      const isLoading = !preview;
+      const hasError = preview?.error;
+      const adsCount = preview?.ads?.to_replace ?? 0;
+      const kwCount  = preview?.keywords?.to_update ?? 0;
+      const nothingToDo = preview && !hasError && adsCount === 0 && kwCount === 0;
+
+      function closeModal() { setLpApplyModal(null); }
+
+      async function doExecute() {
+        setLpApplyModal(p => ({...p, applying: true}));
+        try {
+          const r = await api(`/api/admin/campaigns/${m.campaignId}/landing-page-apply/execute`, {method:'POST'});
+          setLpApplyModal(p => ({...p, applying: false, result: r}));
+        } catch(e) {
+          setLpApplyModal(p => ({...p, applying: false, result: {ok: false, error: e.message}}));
+        }
+      }
+
+      return (
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:9500,
+          display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
+          onClick={e => { if (e.target === e.currentTarget) closeModal(); }}>
+          <div style={{background:'#fff',borderRadius:12,padding:24,width:520,maxHeight:'85vh',
+            overflowY:'auto',boxShadow:'0 8px 32px rgba(0,0,0,0.25)'}}>
+
+            {/* Header */}
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+              <div style={{fontSize:16,fontWeight:700,color:'#111827'}}>🔄 Apply Landing Page to All Ads</div>
+              <button onClick={closeModal}
+                style={{background:'none',border:'none',fontSize:20,cursor:'pointer',color:'#6b7280'}}>✕</button>
+            </div>
+
+            {/* New URL */}
+            {preview && !hasError && (
+              <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:8,
+                padding:'10px 14px',marginBottom:16,fontSize:13}}>
+                <span style={{color:'#6b7280'}}>New URL: </span>
+                <a href={preview.new_url} target="_blank" rel="noopener noreferrer"
+                  style={{color:'#1d4ed8',wordBreak:'break-all'}}>{preview.new_url}</a>
+              </div>
+            )}
+
+            {/* Loading state */}
+            {isLoading && (
+              <div style={{textAlign:'center',padding:'32px 0',color:'#6b7280',fontSize:13}}>
+                Checking what will change…
+              </div>
+            )}
+
+            {/* Error from preview */}
+            {hasError && (
+              <div style={{background:'#fef2f2',border:'1px solid #fecaca',borderRadius:8,
+                padding:'12px 14px',color:'#dc2626',fontSize:13,marginBottom:16}}>
+                ⚠ Preview failed: {preview.error}
+              </div>
+            )}
+
+            {/* Nothing to do */}
+            {nothingToDo && (
+              <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,
+                padding:'12px 14px',color:'#166534',fontSize:13,marginBottom:16}}>
+                ✓ All ads already use this landing page — nothing to update.
+              </div>
+            )}
+
+            {/* Preview counts */}
+            {preview && !hasError && !nothingToDo && !m.result && (
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:13,color:'#374151',marginBottom:10}}>
+                  The following changes will be made:
+                </div>
+                {adsCount > 0 && (
+                  <div style={{background:'#fff7ed',border:'1px solid #fed7aa',borderRadius:8,
+                    padding:'10px 14px',marginBottom:8,fontSize:13}}>
+                    <strong>{adsCount} ad{adsCount !== 1 ? 's' : ''}</strong>
+                    <span style={{color:'#6b7280'}}> will be paused and recreated with the new URL</span>
+                    {preview.ads.details.length > 0 && (
+                      <ul style={{margin:'6px 0 0 0',paddingLeft:18,fontSize:12,color:'#92400e'}}>
+                        {preview.ads.details.map((ad,i) => (
+                          <li key={i}>{ad.ad_group_name} — {ad.headlines_count}h / {ad.descriptions_count}d</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+                {kwCount > 0 && (
+                  <div style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:8,
+                    padding:'10px 14px',fontSize:13}}>
+                    <strong>{kwCount} keyword{kwCount !== 1 ? 's' : ''}</strong>
+                    <span style={{color:'#6b7280'}}> with URL overrides will be updated</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Execute result */}
+            {m.result && (
+              <div style={{marginBottom:16}}>
+                {m.result.ok
+                  ? <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:8,
+                      padding:'12px 14px',color:'#166534',fontSize:13}}>
+                      ✓ Done — {m.result.ads?.replaced ?? 0} ad{(m.result.ads?.replaced??0) !== 1 ? 's' : ''} updated,
+                      {' '}{m.result.keywords?.updated ?? 0} keyword{(m.result.keywords?.updated??0) !== 1 ? 's' : ''} updated.
+                    </div>
+                  : <div style={{background:'#fef2f2',border:'1px solid #fecaca',borderRadius:8,
+                      padding:'12px 14px',color:'#dc2626',fontSize:13}}>
+                      ⚠ {m.result.error || `Partial: ${m.result.ads?.replaced ?? 0} ads updated, ${m.result.ads?.failed ?? 0} failed`}
+                    </div>
+                }
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+              <button onClick={closeModal}
+                style={{padding:'8px 16px',fontSize:13,border:'1px solid #d1d5db',borderRadius:7,
+                  background:'#f9fafb',color:'#374151',cursor:'pointer'}}>
+                {m.result ? 'Close' : 'Cancel'}
+              </button>
+              {!m.result && !hasError && !nothingToDo && !isLoading && (
+                <button onClick={doExecute} disabled={m.applying}
+                  style={{padding:'8px 16px',fontSize:13,borderRadius:7,border:'none',
+                    background: m.applying ? '#93c5fd' : '#1d4ed8',
+                    color:'#fff',cursor: m.applying ? 'not-allowed' : 'pointer',fontWeight:600}}>
+                  {m.applying ? 'Applying…' : `Apply to ${adsCount + kwCount} item${(adsCount+kwCount)!==1?'s':''}`}
+                </button>
+              )}
+            </div>
+
+          </div>
+        </div>
+      );
+    })()}
+    </React.Fragment>
   );
 }
 

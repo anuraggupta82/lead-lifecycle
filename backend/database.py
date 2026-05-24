@@ -3410,6 +3410,9 @@ def _pipeline_visibility_clause(lead_alias: str = "leads") -> str:
         )
         OR
         -- No campaign match: legacy GAds heuristic (PR 0 fallback for orphan leads)
+        -- Also always show nxtsmile organic leads (smile_tool, contact_form, pearly,
+        -- funnel_contact_request, gravity_forms) — these have no gclid/campaign_id
+        -- but are real leads that must appear in the dashboard.
         (c.campaign_id IS NULL AND (
             COALESCE({L}.gclid, '') != ''
             OR COALESCE({L}.campaign_id, '') != ''
@@ -3418,6 +3421,9 @@ def _pipeline_visibility_clause(lead_alias: str = "leads") -> str:
             OR COALESCE({L}.notes, '') LIKE '%Google Ads%'
             OR COALESCE({L}.notes, '') LIKE '%gclid%'
             OR {L}.source = 'manual'
+            OR {L}.source IN ('smile_tool', 'contact_form', 'pearly',
+                              'funnel_contact_request', 'gravity_forms',
+                              'nxtsmile_landing_page')
         ))
       )
     )"""
