@@ -19977,6 +19977,7 @@ function App() {
   );
   const prevUnreadRef = React.useRef(null);
   const prevLeadIdsRef = React.useRef(null); // track which lead_ids had unread last poll
+  const deletedIdsRef = React.useRef(new Set()); // tombstone locally-deleted leads so loadData doesn't re-add them
 
   useEffect(() => {
     loadData();
@@ -20031,7 +20032,9 @@ function App() {
         api('/api/admin/campaigns'),
         api(`/api/admin/ga4?days=${ga4Days}`).catch(() => null),
       ]);
-      setPipeline(p.leads || []);
+      // Filter out any leads the user deleted this session — tombstone prevents re-import
+      const freshLeads = (p.leads || []).filter(l => !deletedIdsRef.current.has(l.id));
+      setPipeline(freshLeads);
       setStats(s);
       setCampaignStats(c.campaigns || []);
       setKeywordStats(c.keywords || []);
@@ -20212,7 +20215,7 @@ function App() {
                 {selectedId && (
                   <DetailPanel lead={pipeline.find(l => l.id === selectedId)} onClose={() => setSelectedId(null)}
                     onStageChange={handleStageChange} onRefresh={loadData}
-                    onDelete={(id) => { setPipeline(p => p.filter(l => l.id !== id)); setSelectedId(null); }} />
+                    onDelete={(id) => { deletedIdsRef.current.add(id); setPipeline(p => p.filter(l => l.id !== id)); setSelectedId(null); }} />
                 )}
               </React.Fragment>
             )}
