@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Pipeline Dashboard — Grafton Dental Care</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💲</text></svg>">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
@@ -17358,7 +17359,7 @@ function UnifiedSyncProgress({ progress }) {
   );
 }
 
-function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCallProduction, onCallProductionBackfill, onGA4Refresh, onOptimize, onSyncPayments, onBackfillPayments, onRefreshCallIncome, onClassifyCalls, onTabSwitch }) {
+function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCallProduction, onCallProductionBackfill, onGA4Refresh, onOptimize, onSyncPayments, onBackfillPayments, onRefreshCallIncome, onClassifyCalls, onBackupDb, onTabSwitch }) {
   const [loading, setLoading] = useState({});
   const [chatMsg, setChatMsg] = useState('');
 
@@ -17515,6 +17516,16 @@ function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCa
               }} disabled={loading.paymentsbackfill || loading.payments}
                 style={{background:'#065f46'}}>
                 {loading.paymentsbackfill?'Backfilling...':'💰 Backfill All Payments'}
+              </button>
+              <button className="btn btn-teal" onClick={async ()=>{
+                if (!confirm('Back up pipeline.db to Google Drive now?')) return;
+                await handleAction('backupdb', async () => {
+                  const r = await api('/api/admin/backup-db', { method: 'POST' });
+                  alert(`✅ Backup complete: ${r.result?.filename} (${r.result?.compressed_mb} MB)`);
+                });
+              }} disabled={loading.backupdb}
+                style={{background:'#0369a1'}}>
+                {loading.backupdb ? '⟳ Backing up…' : '☁️ Backup DB Now'}
               </button>
               <button className="btn btn-teal" onClick={()=>onTabSwitch && onTabSwitch('ai_optimizer')}
                 style={{background:'#7c3aed'}}>
@@ -20251,6 +20262,7 @@ function App() {
                 onBackfillPayments={() => api('/api/admin/sync-payments?full=true', { method: 'POST' })}
                 onRefreshCallIncome={() => api('/api/admin/refresh-call-income?days=90', { method: 'POST' })}
                 onClassifyCalls={() => api('/api/admin/calls/classify', { method: 'POST' })}
+                onBackupDb={() => api('/api/admin/backup-db', { method: 'POST' })}
                 onTabSwitch={setTab} />
             )}
           </React.Fragment>

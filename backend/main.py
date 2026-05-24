@@ -100,7 +100,27 @@ _job_last_run: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ads_scheduler
-    # Startup
+    # Startup — integrity check before init (auto-restore from Drive if corrupt)
+    try:
+        import sqlite3 as _sqlite3
+        _db_path = get_settings().db_path
+        if os.path.exists(_db_path):
+            _check_conn = _sqlite3.connect(_db_path)
+            _check_result = _check_conn.execute("PRAGMA integrity_check").fetchone()
+            _check_conn.close()
+            if _check_result and _check_result[0] != "ok":
+                logger.error(f"Startup: DB integrity check FAILED ({_check_result[0]}) — attempting restore from Drive backup")
+                from backup_db import restore_latest
+                restored = restore_latest(_db_path)
+                if restored:
+                    logger.info("Startup: DB restored from Drive backup successfully")
+                else:
+                    logger.error("Startup: DB restore from Drive failed — starting with corrupt DB, expect errors")
+            else:
+                logger.info("Startup: DB integrity check passed")
+    except Exception as _ie:
+        logger.warning(f"Startup: DB integrity pre-check failed (non-fatal): {_ie}")
+
     init_db()
     logger.info("Database initialized")
 
@@ -586,8 +606,32 @@ async def lifespan(app: FastAPI):
         max_instances=1, coalesce=True, replace_existing=True,
     )
 
+    # 2 AM — Daily pipeline.db backup to Google Drive (keep last 7)
+    def _db_backup_job():
+        _stamp("db_backup")
+        try:
+            from backup_db import run_backup
+            result = run_backup(get_settings().db_path)
+            if result.get("status") == "ok":
+                logger.info(
+                    f"DB backup: {result['filename']} "
+                    f"({result['compressed_mb']} MB compressed, drive_id={result.get('drive_file_id','')})"
+                )
+            else:
+                logger.error(f"DB backup failed: {result}")
+        except Exception as e:
+            logger.error(f"DB backup job failed: {e}", exc_info=True)
+
+    ads_scheduler.add_job(
+        _db_backup_job,
+        CronTrigger(hour=2, minute=0),
+        id="db_backup",
+        name="pipeline.db Daily Backup → Google Drive",
+        max_instances=1, coalesce=True, replace_existing=True,
+    )
+
     ads_scheduler.start()
-    logger.info("Scheduled jobs started (1AM CallRail number sync, every-15min CallRail call poll, 15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 4:30AM SKAG lock, 4:45AM SKAG snapshot, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
+    logger.info("Scheduled jobs started (2AM DB backup, 1AM CallRail number sync, every-15min CallRail call poll, 15-day competitor intel, quarterly nearby-practices sync, 1st/month 2AM domain crawl, 4:30AM SKAG lock, 4:45AM SKAG snapshot, 5:30AM GA4, 6AM gads sync, 6:30AM KI rebuild, 7AM optimizer, 10PM OD, 10:30PM call-prod, 11PM conversions)")
 
     yield
 
@@ -1255,6 +1299,23 @@ def admin_upload_conversions():
         raise HTTPException(status_code=503, detail=f"Google Ads library not installed: {e}")
     except Exception as e:
         logger.error(f"Conversion upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/backup-db", dependencies=[Depends(_require_admin)])
+def admin_backup_db():
+    """On-demand: backup pipeline.db to Google Drive immediately."""
+    try:
+        from backup_db import run_backup
+        result = run_backup(get_settings().db_path)
+        if result.get("status") == "ok":
+            return {"status": "ok", "result": result}
+        else:
+            raise HTTPException(status_code=500, detail=result.get("error", "Backup failed"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Manual DB backup failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
