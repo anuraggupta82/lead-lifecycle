@@ -331,6 +331,24 @@ Voicemail message:
 
 Summary:"""
 
+_NAME_EXTRACT_PROMPT_VOICEMAIL = """\
+Extract the caller's name from this voicemail transcript. The caller may state their name explicitly (e.g. "My name is ...", "This is ...", "Hi it's ...").
+
+Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
+{{"first_name": "<FIRST_NAME>", "last_name": "<LAST_NAME>"}}
+
+Rules:
+- Use the name the caller states for themselves, not names they mention for other people.
+  Example: "This is John calling for my mother Sarah Campbell" → first_name="John", last_name=""
+- If only a first name is given, set last_name to "".
+- If no name is stated at all, set both to "".
+- If no name: {{"first_name": "", "last_name": ""}}
+- Do not invent or guess names.
+
+Transcript:
+{transcript}
+"""
+
 _GRADING_PROMPT = """\
 You are a call quality analyst for Grafton Dental Care. Grade the following phone call transcript based on the criteria below.
 
@@ -514,13 +532,42 @@ def _summarize(transcript: str, vertex_project_id: str, vertex_location: str,
         call_id=call_uuid,
     )
 
-    # Voicemail — plain text response, no structured fields
+    # Voicemail — plain text response, no structured fields.
+    # Run a separate lightweight Gemini call to extract the caller's name from the transcript.
     if voicemail:
+        patient_name = ""
+        try:
+            name_prompt = _NAME_EXTRACT_PROMPT_VOICEMAIL.format(transcript=cleaned)
+            name_text, name_in_tok, name_out_tok = _call_vertex(
+                name_prompt, vertex_model, vertex_project_id, vertex_location,
+                vertex_credentials_path, temperature=0.0, max_tokens=128,
+                response_mime_type="application/json",
+            )
+            log_gemini(
+                purpose="voicemail_name_extract",
+                model=vertex_model,
+                input_tokens=name_in_tok,
+                output_tokens=name_out_tok,
+                call_id=call_uuid,
+            )
+            name_raw = name_text.strip()
+            if name_raw.startswith("```"):
+                name_raw = re.sub(r'^```\w*\n?', '', name_raw)
+                name_raw = re.sub(r'\n?```$', '', name_raw)
+                name_raw = name_raw.strip()
+            name_parsed = json.loads(name_raw)
+            first = (name_parsed.get("first_name") or "").strip()
+            last  = (name_parsed.get("last_name") or "").strip()
+            patient_name = f"{first} {last}".strip()
+            log.info("[pipeline] voicemail name extracted for %s: %r", call_uuid, patient_name)
+        except Exception as exc:
+            log.warning("[pipeline] voicemail name extraction failed for %s: %s", call_uuid, exc)
+
         return {
             "summary": text,
             "appointment_scheduled": None,
             "appointment_type": "",
-            "patient_name": "",
+            "patient_name": patient_name,
             "_voicemail": True,
         }
 
