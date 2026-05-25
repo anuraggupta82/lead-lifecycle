@@ -238,6 +238,94 @@ def restore_latest(db_path: str) -> bool:
         return False
 
 
+def list_backups() -> list:
+    """
+    Return list of available backups on Drive, newest first.
+    Each entry: {file_id, name, created_time, size_bytes}
+    """
+    try:
+        service = _get_drive_service()
+        results = service.files().list(
+            q=f"'{DRIVE_FOLDER_ID}' in parents and name contains '{BACKUP_PREFIX}' and trashed=false",
+            orderBy="createdTime desc",
+            fields="files(id, name, createdTime, size)",
+            pageSize=20,
+        ).execute()
+        files = results.get("files", [])
+        return [
+            {
+                "file_id": f["id"],
+                "name": f["name"],
+                "created_time": f.get("createdTime", ""),
+                "size_bytes": int(f.get("size", 0)),
+            }
+            for f in files
+        ]
+    except Exception as e:
+        logger.error(f"list_backups failed: {e}")
+        raise
+
+
+def stage_restore(db_path: str, file_id: str) -> dict:
+    """
+    Download a specific backup from Drive and write it as
+    <db_path>.restore_pending  (does NOT touch the live DB).
+
+    The caller is responsible for restarting the process.
+    On next startup, main.py will detect the .restore_pending file,
+    swap it into place, and boot normally.
+
+    Returns {"status": "ok", "pending_path": ...} or raises on error.
+    """
+    import io
+    from googleapiclient.http import MediaIoBaseDownload
+
+    pending_path = db_path + ".restore_pending"
+    logger.info(f"stage_restore: downloading file_id={file_id} → {pending_path}")
+
+    service = _get_drive_service()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        gz_path = os.path.join(tmp, "backup.db.gz")
+        restored_path = os.path.join(tmp, "restored.db")
+
+        # Download
+        request = service.files().get_media(fileId=file_id)
+        with open(gz_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+        gz_size_mb = os.path.getsize(gz_path) / 1_048_576
+
+        # Decompress
+        with gzip.open(gz_path, "rb") as f_in, open(restored_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+        db_size_mb = os.path.getsize(restored_path) / 1_048_576
+
+        # Integrity check
+        conn = sqlite3.connect(restored_path)
+        check = conn.execute("PRAGMA integrity_check").fetchone()
+        conn.close()
+        if check[0] != "ok":
+            raise ValueError(f"Downloaded backup failed integrity check: {check[0]}")
+
+        # Write to pending path (atomic-ish: write then rename)
+        tmp_pending = pending_path + ".tmp"
+        shutil.copy2(restored_path, tmp_pending)
+        os.replace(tmp_pending, pending_path)
+
+    logger.info(f"stage_restore: staged {db_size_mb:.1f} MB DB at {pending_path} — ready for restart")
+    return {
+        "status": "ok",
+        "pending_path": pending_path,
+        "compressed_mb": round(gz_size_mb, 1),
+        "db_size_mb": round(db_size_mb, 1),
+    }
+
+
 # ── Standalone run ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys

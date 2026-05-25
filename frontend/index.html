@@ -17368,11 +17368,85 @@ function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCa
   const [unifiedSyncProgress, setUnifiedSyncProgress] = useState(null);
   const [lastSyncDisplay, setLastSyncDisplay] = useState(null);
 
+  // Restore state
+  const [backupList, setBackupList] = useState(null);
+  const [backupListLoading, setBackupListLoading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreStage, setRestoreStage] = useState(null); // null | 'staged' | 'restarting' | 'done'
+
   // Scroll page to top on mount so we always start at Admin Actions
   useEffect(() => {
     window.scrollTo(0, 0);
     loadLastSync();   // show last-run line on mount even without clicking the button
   }, []);
+
+  async function loadBackupList() {
+    setBackupListLoading(true);
+    setBackupList(null);
+    try {
+      const d = await api('/api/admin/backup-db/list');
+      setBackupList(d.backups || []);
+    } catch(e) {
+      alert('Failed to load backups: ' + e.message);
+    }
+    setBackupListLoading(false);
+  }
+
+  async function doRestore(backup) {
+    if (!confirm(
+      `⚠️ RESTORE DATABASE\n\n` +
+      `This will:\n` +
+      `1. Download "${backup.name}" from Google Drive\n` +
+      `2. Verify its integrity\n` +
+      `3. Stage it for restore\n` +
+      `4. Restart the app — you will lose your session briefly\n\n` +
+      `The current database will be preserved as pipeline.db.pre_restore\n\n` +
+      `Continue?`
+    )) return;
+
+    setRestoring(true);
+    setRestoreStage(null);
+
+    try {
+      // Step 1: stage the restore
+      await api('/api/admin/backup-db/stage-restore', {
+        method: 'POST',
+        body: JSON.stringify({ file_id: backup.file_id, name: backup.name })
+      });
+      setRestoreStage('staged');
+
+      // Step 2: trigger restart
+      try {
+        await api('/api/admin/restart', { method: 'POST' });
+      } catch(_) {} // expected — server restarts mid-response
+      setRestoreStage('restarting');
+
+      // Step 3: poll health until server is back
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        try {
+          await fetch('/api/admin/health');
+          clearInterval(poll);
+          setRestoreStage('done');
+          setRestoring(false);
+          setBackupList(null);
+          alert('✅ Database restored successfully! The app has restarted.');
+        } catch(_) {
+          if (attempts > 30) {
+            clearInterval(poll);
+            setRestoring(false);
+            alert('App did not come back after 30s — check the Terminal for errors.');
+          }
+        }
+      }, 1000);
+
+    } catch(e) {
+      setRestoring(false);
+      setRestoreStage(null);
+      alert('Restore failed: ' + e.message);
+    }
+  }
 
   async function handleAction(key, fn) {
     setLoading(prev=>({...prev, [key]:true}));
@@ -17527,11 +17601,78 @@ function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCa
                 style={{background:'#0369a1'}}>
                 {loading.backupdb ? '⟳ Backing up…' : '☁️ Backup DB Now'}
               </button>
+              <button className="btn btn-teal" onClick={loadBackupList}
+                disabled={backupListLoading}
+                style={{background:'#b91c1c'}}>
+                {backupListLoading ? '⟳ Loading…' : '🔄 Restore DB from Backup'}
+              </button>
               <button className="btn btn-teal" onClick={()=>onTabSwitch && onTabSwitch('ai_optimizer')}
                 style={{background:'#7c3aed'}}>
                 🤖 AI Optimizer &rarr;
               </button>
             </div>
+
+            {/* ── Restore DB panel ── */}
+            {(backupList !== null || restoring) && (
+              <div className="report-section" style={{marginTop:16, borderLeft:'3px solid #b91c1c', paddingLeft:12}}>
+                <div className="report-title" style={{color:'#b91c1c'}}>🔄 Restore Database from Backup</div>
+
+                {restoring && (
+                  <div style={{padding:'12px 0', fontSize:13}}>
+                    {restoreStage === null && <span>⟳ Downloading and verifying backup…</span>}
+                    {restoreStage === 'staged' && <span>⟳ Backup verified — restarting app…</span>}
+                    {restoreStage === 'restarting' && <span>⟳ App restarting — waiting for it to come back…</span>}
+                    {restoreStage === 'done' && <span style={{color:'#16a34a'}}>✅ Restore complete!</span>}
+                  </div>
+                )}
+
+                {!restoring && backupList !== null && backupList.length === 0 && (
+                  <p style={{fontSize:13, color:'var(--text-muted)'}}>No backups found on Google Drive.</p>
+                )}
+
+                {!restoring && backupList && backupList.length > 0 && (
+                  <table style={{width:'100%', borderCollapse:'collapse', fontSize:13, marginTop:8}}>
+                    <thead>
+                      <tr style={{borderBottom:'1px solid var(--border)'}}>
+                        <th style={{textAlign:'left', padding:'4px 8px', color:'var(--text-muted)'}}>Backup</th>
+                        <th style={{textAlign:'right', padding:'4px 8px', color:'var(--text-muted)'}}>Size</th>
+                        <th style={{textAlign:'right', padding:'4px 8px', color:'var(--text-muted)'}}>Created</th>
+                        <th style={{padding:'4px 8px'}}></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {backupList.map((b, i) => (
+                        <tr key={b.file_id} style={{borderBottom:'1px solid var(--border)', background: i===0 ? 'rgba(22,163,74,0.05)' : 'transparent'}}>
+                          <td style={{padding:'6px 8px'}}>
+                            {b.name.replace('pipeline_backup_','').replace('.db.gz','')}
+                            {i === 0 && <span style={{marginLeft:6, fontSize:11, background:'#16a34a', color:'#fff', borderRadius:3, padding:'1px 5px'}}>latest</span>}
+                          </td>
+                          <td style={{padding:'6px 8px', textAlign:'right', color:'var(--text-muted)'}}>
+                            {b.size_bytes ? (b.size_bytes/1_048_576).toFixed(1)+' MB' : '—'}
+                          </td>
+                          <td style={{padding:'6px 8px', textAlign:'right', color:'var(--text-muted)'}}>
+                            {b.created_time ? new Date(b.created_time).toLocaleString() : '—'}
+                          </td>
+                          <td style={{padding:'6px 8px', textAlign:'right'}}>
+                            <button
+                              className="btn"
+                              style={{background:'#b91c1c', color:'#fff', fontSize:12, padding:'3px 10px'}}
+                              onClick={() => doRestore(b)}
+                            >
+                              Restore
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                <p style={{fontSize:11, color:'var(--text-muted)', marginTop:8}}>
+                  ⚠️ Restoring will restart the app. Current DB is preserved as pipeline.db.pre_restore on disk.
+                </p>
+              </div>
+            )}
+
           </div>
         </div>
       </details>

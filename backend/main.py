@@ -100,10 +100,22 @@ _job_last_run: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ads_scheduler
-    # Startup — integrity check before init (auto-restore from Drive if corrupt)
+    # Startup — check for pending restore, then integrity check
     try:
         import sqlite3 as _sqlite3
         _db_path = get_settings().db_path
+        _pending_path = _db_path + ".restore_pending"
+
+        # 1. Swap in a staged restore if one is waiting
+        if os.path.exists(_pending_path):
+            logger.info(f"Startup: found restore_pending — swapping in restored DB")
+            _corrupt_path = _db_path + ".pre_restore"
+            if os.path.exists(_db_path):
+                os.replace(_db_path, _corrupt_path)
+            os.replace(_pending_path, _db_path)
+            logger.info(f"Startup: restore complete. Previous DB saved as {_corrupt_path}")
+
+        # 2. Integrity check (catches corruption AND verifies restored DB)
         if os.path.exists(_db_path):
             _check_conn = _sqlite3.connect(_db_path)
             _check_result = _check_conn.execute("PRAGMA integrity_check").fetchone()
@@ -1317,6 +1329,63 @@ def admin_backup_db():
     except Exception as e:
         logger.error(f"Manual DB backup failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/backup-db/list", dependencies=[Depends(_require_admin)])
+def admin_list_backups():
+    """List available backups on Google Drive, newest first."""
+    try:
+        from backup_db import list_backups
+        backups = list_backups()
+        return {"status": "ok", "backups": backups}
+    except Exception as e:
+        logger.error(f"List backups failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/backup-db/stage-restore", dependencies=[Depends(_require_admin)])
+def admin_stage_restore(body: dict):
+    """
+    Download a specific backup from Drive and stage it for restore on next restart.
+    Body: { "file_id": "...", "name": "..." }
+    After this returns, the caller should POST /api/admin/restart to apply it.
+    """
+    file_id = body.get("file_id")
+    if not file_id:
+        raise HTTPException(status_code=400, detail="file_id required")
+    try:
+        from backup_db import stage_restore
+        result = stage_restore(get_settings().db_path, file_id)
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"Stage restore failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/restart", dependencies=[Depends(_require_admin)])
+def admin_restart():
+    """
+    Restart the application process in-place using os.execv.
+    Used after staging a DB restore so the pending file is swapped in on boot.
+    The response is sent before the restart, so the client should poll
+    GET /api/admin/health until the server comes back up.
+    """
+    import threading, sys
+
+    def _do_restart():
+        import time
+        time.sleep(0.5)  # let the HTTP response flush
+        logger.info("Restart requested via admin API — restarting now")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return {"status": "ok", "message": "Restarting in 0.5s — poll /api/admin/health to confirm"}
+
+
+@app.get("/api/admin/health")
+def admin_health():
+    """Lightweight health check — used by restart polling."""
+    return {"status": "ok"}
 
 
 @app.post("/api/admin/sync-call-production", dependencies=[Depends(_require_admin)])
