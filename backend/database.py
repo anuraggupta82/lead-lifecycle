@@ -1683,7 +1683,7 @@ def _migrate(conn):
         ("attributed_keyword",            "TEXT DEFAULT ''"),
         ("attributed_match_type",         "TEXT DEFAULT ''"),
         ("attributed_ad_group",           "TEXT DEFAULT ''"),
-        ("attributed_keyword_method",     "TEXT DEFAULT ''"),   # lead_gclid|lead_phone_recent_click|time_window_gclid|campaign_only
+        ("attributed_keyword_method",     "TEXT DEFAULT ''"),   # callrail_keyword|skag_direct|call_search_term|ad_group_best_keyword|campaign_only|lead_gclid|lead_phone_recent_click|time_window_gclid
         ("attributed_keyword_confidence", "REAL DEFAULT 0.0"),
     ]
     for col_name, col_type in mango_phase4_cols:
@@ -8402,8 +8402,16 @@ def update_mango_call_attribution(
     gads_call_id: str = None,
     match_confidence: float = None,
     match_method: str = None,
+    attributed_keyword: str = None,
+    attributed_keyword_method: str = None,
+    attributed_keyword_confidence: float = None,
+    attributed_ad_group: str = None,
 ) -> None:
-    """Update attribution fields on a mango_calls row."""
+    """Update attribution fields on a mango_calls row.
+
+    keyword fields are only written when explicitly passed (non-None).
+    Use attributed_keyword_method='callrail_keyword' for CallRail-sourced keywords.
+    """
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
         conn.execute(
@@ -8412,9 +8420,15 @@ def update_mango_call_attribution(
                gads_call_id=COALESCE(?,gads_call_id),
                match_confidence=COALESCE(?,match_confidence),
                match_method=COALESCE(?,match_method),
+               attributed_keyword=COALESCE(?,attributed_keyword),
+               attributed_keyword_method=COALESCE(?,attributed_keyword_method),
+               attributed_keyword_confidence=COALESCE(?,attributed_keyword_confidence),
+               attributed_ad_group=COALESCE(?,attributed_ad_group),
                updated_at=?
                WHERE uuid=?""",
-            (lead_id, gads_call_id, match_confidence, match_method, now, uuid),
+            (lead_id, gads_call_id, match_confidence, match_method,
+             attributed_keyword, attributed_keyword_method, attributed_keyword_confidence,
+             attributed_ad_group, now, uuid),
         )
 
 
@@ -8952,6 +8966,11 @@ def backfill_call_keyword_attribution() -> int:
             current_ag = row[7] or ""
             current_method = row[8] or ""
 
+            # callrail_keyword is the actual Google search query from the user's browser —
+            # authoritative source, must never be downgraded by this backfill function.
+            if current_method == "callrail_keyword":
+                continue
+
             keyword = ""
             method = "campaign_only"
 
@@ -9049,6 +9068,7 @@ def backfill_call_keyword_attribution() -> int:
             # ad_group_best_keyword with a weaker campaign_only result) and from
             # bumping updated_at on no-op rewrites.
             quality_rank = {
+                "callrail_keyword": 5,  # actual search query from user's browser (CallRail DNI)
                 "skag_direct": 4,       # one keyword per ad group — certain
                 "call_search_term": 3,  # top converting search term for ad group
                 "ad_group_best_keyword": 2,

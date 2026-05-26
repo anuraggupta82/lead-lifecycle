@@ -3631,17 +3631,23 @@ function _statusBadge(status) {
   return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,background:color+'22',color,border:`1px solid ${color}44`}}>{status||'unknown'}</span>;
 }
 function _attrBadge(call) {
-  const isAd  = call.attribution_label && call.attribution_label.includes('Ad call');
+  const isAd     = call.attribution_label && call.attribution_label.includes('Ad call');
   const kwMethod = call.attributed_keyword_method || '';
   const attrKwRaw = (call.attributed_keyword || '').trim();
-  // Only show keyword in the row badge when it's exact (skag_direct) or from CallRail.
+  // Show keyword pill only for exact/authoritative methods.
   // 'call_search_term' and 'ad_group_best_keyword' are campaign-level estimates —
-  // suppress them from the table row to avoid showing fabricated keywords.
-  const attrKw = (kwMethod === 'skag_direct') ? attrKwRaw : '';
-  const crKw   = (call.callrail_keyword || '').trim();
-  // Show CallRail keyword only when it differs from the already-attributed keyword
-  const showCrFallback = !!crKw && crKw.toLowerCase() !== attrKwRaw.toLowerCase();
-  if (!call.attribution_label && !attrKw && !crKw) return null;
+  // suppress from table row to avoid showing fabricated keywords.
+  const isExact   = kwMethod === 'skag_direct';
+  const isCrKw    = kwMethod === 'callrail_keyword';
+  const showKw    = (isExact || isCrKw) && !!attrKwRaw;
+  // skag_direct = green (exact SKAG match); callrail_keyword = blue (actual user search query)
+  const kwBg    = isExact ? '#dcfce7' : '#dbeafe';
+  const kwColor = isExact ? '#14532d' : '#1e3a8a';
+  const kwBorder= isExact ? '#bbf7d0' : '#bfdbfe';
+  const kwTitle = isExact
+    ? `Exact SKAG keyword · ${call.attributed_ad_group||'no ad group'}`
+    : `CallRail keyword — actual search query · ${call.attributed_ad_group||'no ad group'}`;
+  if (!call.attribution_label && !showKw) return null;
   return (
     <div style={{display:'flex',flexDirection:'column',gap:2,alignItems:'flex-start'}}>
       {call.attribution_label && (
@@ -3649,18 +3655,12 @@ function _attrBadge(call) {
           background:isAd?'#0369a133':'#71513033',color:isAd?'#0369a1':'#92400e',
           border:`1px solid ${isAd?'#0369a144':'#92400e44'}`}}>{call.attribution_label}</span>
       )}
-      {attrKw && (
-        <span title={`Exact keyword match · ${call.attributed_ad_group||'no ad group'}`}
+      {showKw && (
+        <span title={kwTitle}
           style={{fontSize:9,padding:'1px 5px',borderRadius:3,cursor:'help',
-            background:'#dcfce7',color:'#14532d',border:'1px solid #bbf7d0',
+            background:kwBg,color:kwColor,border:`1px solid ${kwBorder}`,
             maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-          {attrKw}
-        </span>
-      )}
-      {showCrFallback && (
-        <span title="CallRail captured this exact search query at landing time"
-          style={{fontSize:9,color:'#6b7280',fontStyle:'italic'}}>
-          via CallRail: {crKw}
+          {attrKwRaw}
         </span>
       )}
     </div>
@@ -5157,13 +5157,16 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                       {call.attributed_keyword}
                       {call.attributed_keyword_method && (() => {
                         const m = call.attributed_keyword_method;
-                        const label = m === 'skag_direct'         ? 'exact keyword'
+                        const label = m === 'callrail_keyword'    ? 'CallRail keyword'
+                                    : m === 'skag_direct'         ? 'exact keyword'
                                     : m === 'call_search_term'    ? 'top search term'
                                     : m === 'ad_group_best_keyword' ? 'ad group kw'
                                     : 'estimated';
-                        const bg = m === 'skag_direct'      ? '#dcfce7'
+                        const bg = m === 'callrail_keyword' ? '#dbeafe'
+                                 : m === 'skag_direct'      ? '#dcfce7'
                                  : m === 'call_search_term' ? '#fef9c3' : '#f0fdf4';
-                        const col = m === 'skag_direct'      ? '#14532d'
+                        const col = m === 'callrail_keyword' ? '#1e3a8a'
+                                  : m === 'skag_direct'      ? '#14532d'
                                   : m === 'call_search_term' ? '#92400e' : '#166534';
                         return <span style={{marginLeft:6,fontSize:10,background:bg,color:col,padding:'1px 5px',borderRadius:3}}>{label}</span>;
                       })()}

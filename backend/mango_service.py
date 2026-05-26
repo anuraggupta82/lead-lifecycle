@@ -514,7 +514,7 @@ def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) ->
     linked = 0
     with _db_conn() as conn:
         unlinked = conn.execute("""
-            SELECT id, caller_number, called_at
+            SELECT id, caller_number, called_at, keyword, campaign, source
             FROM callrail_calls
             WHERE (mango_call_id IS NULL OR mango_call_id = '')
               AND called_at >= ?
@@ -524,6 +524,9 @@ def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) ->
         for row in unlinked:
             caller = row["caller_number"] or ""
             called_at_str = row["called_at"] or ""
+            cr_keyword = (row["keyword"] or "").strip()
+            cr_campaign = (row["campaign"] or "").strip()
+            cr_source = (row["source"] or "").strip()
             if not caller or not called_at_str:
                 continue
             try:
@@ -559,6 +562,29 @@ def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) ->
                     WHERE id = ? AND (mango_call_id IS NULL OR mango_call_id = '')
                 """, (mango_uuid, row["id"]))
                 linked += 1
+
+                # Write CallRail keyword attribution to the Mango call if:
+                # 1. This CallRail row is a google_ads call with a keyword
+                # 2. The Mango call doesn't already have a higher-quality keyword method
+                if cr_keyword and cr_source == "google_ads":
+                    ag_display = f"{cr_campaign} > " if cr_campaign else ""
+                    conn.execute("""
+                        UPDATE mango_calls SET
+                            attributed_keyword = ?,
+                            attributed_keyword_method = 'callrail_keyword',
+                            attributed_keyword_confidence = 0.95,
+                            attributed_ad_group = CASE
+                                WHEN ? != '' AND (attributed_ad_group IS NULL OR attributed_ad_group = '')
+                                THEN ?
+                                ELSE attributed_ad_group
+                            END,
+                            updated_at = ?
+                        WHERE uuid = ?
+                          AND (attributed_keyword_method NOT IN ('skag_direct', 'callrail_keyword')
+                               OR attributed_keyword_method IS NULL
+                               OR attributed_keyword_method = '')
+                    """, (cr_keyword, ag_display, ag_display,
+                          datetime.now(timezone.utc).isoformat(), mango_uuid))
 
     return linked
 
@@ -714,8 +740,9 @@ def finalize_call_lead(uuid: str) -> dict:
 
     Returns dict with {"updated": [list of fields written]} or {} if no lead linked.
     """
-    # High-confidence attribution methods that carry real keyword data
-    _KEYWORD_METHODS = {"skag_direct", "call_search_term", "ad_group_best_keyword"}
+    # High-confidence attribution methods that carry real keyword data.
+    # callrail_keyword = actual Google search query from user's browser (DNI) — highest fidelity.
+    _KEYWORD_METHODS = {"callrail_keyword", "skag_direct", "call_search_term", "ad_group_best_keyword"}
 
     try:
         with _db_conn() as conn:
@@ -835,20 +862,19 @@ def finalize_call_lead(uuid: str) -> dict:
 def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_token: Optional[str] = None) -> int:
     """
     Match unattributed inbound Mango calls against:
-      1. Google Ads call_view rows (ad-driven calls by area code + time window)
+      1. CallRail-confirmed Google Ads calls (authoritative — CallRail is ground truth)
       2. Lead phone numbers (existing leads who called in)
 
     Updates mango_calls.lead_id / gads_call_id / match_confidence / match_method.
     Safe to run repeatedly — only updates NULL attribution rows.
 
-    Matching tiers (highest confidence wins):
-      gads_window           0.95 — area code + ±90s + ±5s duration
-      gads_window_loose     0.75 — area code + ±300s + ±30s duration
-      gads_window_time_only 0.60 — area code + ±600s (no duration check)
-      gads_time_only_no_area 0.55 — NO area code on either side + ±120s + tight duration
-                                    (mobile ad-extension taps where Google strips area code)
+    Attribution model (CallRail-first, no time-window guessing):
+      callrail_confirmed 0.95 — CallRail row linked to this Mango call with source='google_ads'.
+                                 Finds closest gads_call_view row within ±60s for reporting.
+                                 Writes callrail_keyword if CallRail captured the search query.
+      phone_exact        0.90 — Caller phone matches an existing lead record.
 
-    After any GAds match: creates a call_flag if the call was missed or short.
+    After any CallRail-confirmed GAds match: creates a call_flag if the call was missed or short.
     After all GAds matching: flags unattributed missed new-patient calls.
 
     target_gads_call_id: if set, only attempt to match this one GAds row (used by
@@ -879,72 +905,12 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
         if gc_dt:
             gads_parsed.append((gc, gc_dt))
 
-    # Build a reverse map: gads_call_id → list of candidate Mango uuids at 0.55
-    # Used to detect ambiguous time-only matches and skip them.
-    _time_only_candidates: dict[str, list[str]] = {}   # gads_call_id → [mc_uuid, ...]
-    _mc_time_only_match:   dict[str, list[str]] = {}   # mc_uuid → [gads_call_id, ...]
-
     attributed = 0
-
-    # ── First pass: collect time-only candidates to detect ambiguity ─────────
-    for mc in unmatched:
-        mc_start_str = mc.get("started_at", "")
-        mc_area = _extract_area_code(mc.get("from_number", ""))
-        mc_dur = int(mc.get("duration_sec") or 0)
-        mc_uuid = mc["uuid"]
-
-        try:
-            mc_dt = datetime.fromisoformat(mc_start_str.replace("Z", "+00:00"))
-            if mc_dt.tzinfo is None:
-                mc_dt = mc_dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-
-        # Check if this call already has a strong phone-lead match
-        from_digits = re.sub(r"\D", "", mc.get("from_number", "") or "")
-        if len(from_digits) >= 10 and phone_to_lead.get(from_digits[-10:]):
-            continue  # known patient — skip time-only GAds fallback
-
-        for gc, gc_dt in gads_parsed:
-            gc_area = gc.get("caller_area_code", "")
-            gc_dur  = int(gc.get("call_duration_sec") or 0)
-            gc_status = (gc.get("call_status") or "").upper()
-
-            # Only consider GAds rows with no area code — rows with area codes are
-            # handled by area-code branches and don't need ambiguity tracking here
-            if gc_area:
-                continue
-
-            time_delta = abs((mc_dt - gc_dt).total_seconds())
-            if time_delta > 120:
-                continue
-
-            # Duration check (skip for MISSED — GAds duration is 0 for missed calls)
-            if gc_status != "MISSED":
-                dur_delta = abs(mc_dur - gc_dur)
-                max_dur = max(mc_dur, gc_dur)
-                # Fallback A (no Mango area): looser tolerance
-                # Fallback B (Mango has area): tighter tolerance
-                tol = max(15, 0.25 * max_dur) if mc_area else max(20, 0.3 * max_dur)
-                if dur_delta > tol:
-                    continue
-
-            gads_id = gc["call_id"]
-            _time_only_candidates.setdefault(gads_id, []).append(mc_uuid)
-            _mc_time_only_match.setdefault(mc_uuid, []).append(gads_id)
-
-    # Remove ambiguous: any GAds row matched by >1 Mango call at 0.55
-    _ambiguous_gads = {gid for gid, uuids in _time_only_candidates.items() if len(uuids) > 1}
-    # Remove ambiguous: any Mango call that could match >1 GAds row at 0.55
-    _ambiguous_mcs  = {uuid for uuid, gids in _mc_time_only_match.items() if len(gids) > 1}
-
-    def _is_clean_time_only(mc_uuid: str, gads_id: str) -> bool:
-        return gads_id not in _ambiguous_gads and mc_uuid not in _ambiguous_mcs
 
     # ── Main attribution loop ─────────────────────────────────────────────────
     # Track which GAds call_ids have already been claimed this pass so we never
     # assign the same GAds call to two different Mango records (can happen when
-    # two callers ring in at the same second and both pass the area+time+dur check).
+    # two back-to-back ad calls arrive within the callrail_confirmed ±60s window).
     _used_gads_ids: set = set()
 
     for mc in unmatched:
@@ -961,31 +927,31 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
         except Exception:
             continue
 
-        # Pre-check: is this caller a known lead? If so, skip time-only fallback.
-        _from_digits_main = re.sub(r"\D", "", mc.get("from_number", "") or "")
-        _mc_is_known_lead = (len(_from_digits_main) >= 10 and
-                             phone_to_lead.get(_from_digits_main[-10:]) is not None)
-
         # Pre-check: is this caller a confirmed existing OD patient?
-        # If so, they did NOT come from an ad — block all GAds time-window matching
-        # to avoid false-positive attribution (e.g. existing patient calling about
-        # billing matched to an unrelated ad click in the same time window).
+        # Existing patients did NOT come from an ad — block CallRail GAds attribution
+        # to prevent billing calls from showing as ad conversions.
         _od_status = (mc.get("od_patient_status") or "").strip()
         _mc_is_existing_patient = _od_status in ("existing_active", "existing_inactive")
 
         # ── CallRail-confirmed GAds attribution (highest priority) ────────────
-        # If a CallRail row links this Mango call and source='google_ads', that is
-        # authoritative — no time-window guessing. Find the matching gads_call_view
-        # entry by time (±60s) and write at 0.95 confidence.
+        # CallRail is the ground truth: if a linked CallRail row has source='google_ads',
+        # this call came from an ad. Find the matching gads_call_view entry by time (±60s)
+        # for reporting purposes, and write the CallRail keyword if captured.
         _cr_gads_confirmed = False
         with _db_conn() as _cr_conn:
             _cr_row = _cr_conn.execute("""
-                SELECT source, called_at FROM callrail_calls
-                WHERE mango_call_id = ? AND source = 'google_ads'
+                SELECT cr.source, cr.called_at, cr.keyword, cr.campaign
+                FROM callrail_calls cr
+                WHERE cr.mango_call_id = ? AND cr.source = 'google_ads'
+                ORDER BY CASE WHEN cr.gclid != '' AND cr.gclid IS NOT NULL THEN 0 ELSE 1 END,
+                         cr.called_at DESC
                 LIMIT 1
             """, (mc_uuid,)).fetchone()
         if _cr_row and not _mc_is_existing_patient:
-            # Find best gads_call_view match by time only (±60s) — CalRail already
+            _cr_keyword = (_cr_row["keyword"] or "").strip()
+            _cr_campaign = (_cr_row["campaign"] or "").strip()
+
+            # Find best gads_call_view match by time only (±60s) — CallRail already
             # confirmed it's Google Ads so we just need the call_id for reporting.
             _cr_best_id   = None
             _cr_best_gc   = None
@@ -998,6 +964,30 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                     _cr_best_delta = _delta
                     _cr_best_id    = gc["call_id"]
                     _cr_best_gc    = gc
+
+            # Determine attributed_ad_group from gads_call_view if matched,
+            # or from CallRail campaign name as fallback (for DNI-pool calls).
+            _cr_ag_display = ""
+            if _cr_best_gc:
+                _gcv_campaign = _cr_best_gc.get("campaign_name", "") or ""
+                _gcv_ag       = _cr_best_gc.get("ad_group_name", "") or ""
+                _cr_ag_display = f"{_gcv_campaign} > {_gcv_ag}" if _gcv_ag else _gcv_campaign
+            elif _cr_campaign:
+                _cr_ag_display = f"{_cr_campaign} > "
+
+            # Build keyword kwargs — only pass when keyword is present and current
+            # method is not already authoritative (skag_direct or callrail_keyword).
+            _cur_kw_method = (mc.get("attributed_keyword_method") or "").strip()
+            _write_kw = _cr_keyword and _cur_kw_method not in ("skag_direct", "callrail_keyword")
+            _kw_kwargs: dict = {}
+            if _write_kw:
+                _kw_kwargs = dict(
+                    attributed_keyword=_cr_keyword,
+                    attributed_keyword_method="callrail_keyword",
+                    attributed_keyword_confidence=0.95,
+                    attributed_ad_group=_cr_ag_display or None,
+                )
+
             if _cr_best_id:
                 _used_gads_ids.add(_cr_best_id)
                 update_mango_call_attribution(
@@ -1005,6 +995,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                     gads_call_id=_cr_best_id,
                     match_confidence=0.95,
                     match_method="callrail_confirmed",
+                    **_kw_kwargs,
                 )
                 attributed += 1
                 _queue_process_if_needed(mc, mango_token=mango_token)
@@ -1016,131 +1007,23 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                 except Exception as _fe:
                     logger.warning(f"call_flag creation failed for {mc_uuid}: {_fe}")
                 logger.info(
-                    "reconcile[callrail] Mango=%s -> GAds=%s (time_delta=%.0fs, callrail_confirmed)",
-                    mc_uuid, _cr_best_id, _cr_best_delta,
+                    "reconcile[callrail] Mango=%s -> GAds=%s (time_delta=%.0fs) kw=%s",
+                    mc_uuid, _cr_best_id, _cr_best_delta, _cr_keyword or "(none)",
                 )
-                _cr_gads_confirmed = True
             else:
-                # CallRail confirms GAds but no gads_call_view row found (not synced yet).
-                # Write a lead_id match at least so the call is tracked.
+                # CallRail confirms GAds but no gads_call_view row found yet (DNI pool
+                # call or delayed gads_call_view sync). Write keyword attribution now
+                # so the call shows correct keyword even without a gads_call_id.
+                if _kw_kwargs:
+                    update_mango_call_attribution(uuid=mc_uuid, **_kw_kwargs)
                 logger.info(
                     "reconcile[callrail] Mango=%s confirmed google_ads by CallRail "
-                    "but no gads_call_view row within 60s — skipping gads_call_id for now",
-                    mc_uuid,
+                    "but no gads_call_view row within 60s — kw=%s",
+                    mc_uuid, _cr_keyword or "(none)",
                 )
-                _cr_gads_confirmed = True  # skip time-window fallback
+            _cr_gads_confirmed = True
 
         if _cr_gads_confirmed:
-            continue
-
-        # ── Try GAds call_view match ──────────────────────────────────────────
-        best_gads_id = None
-        best_confidence = 0.0
-        best_method = ""
-        best_gc = None
-
-        for gc, gc_dt in gads_parsed:
-            # Skip GAds rows already claimed by an earlier Mango call this pass
-            if gc["call_id"] in _used_gads_ids:
-                continue
-
-            gc_area   = gc.get("caller_area_code", "")
-            gc_dur    = int(gc.get("call_duration_sec") or 0)
-            gc_status = (gc.get("call_status") or "").upper()
-
-            time_delta = abs((mc_dt - gc_dt).total_seconds())
-            dur_delta  = abs(mc_dur - gc_dur)
-            area_match = gc_area and mc_area and gc_area == mc_area
-
-            # Tight match: area code + ±90s time + ±5s duration
-            if area_match and time_delta <= 90 and dur_delta <= 5:
-                if 0.95 > best_confidence:
-                    best_gads_id   = gc["call_id"]
-                    best_confidence = 0.95
-                    best_method    = "gads_window"
-                    best_gc        = gc
-            # Loose match: area code + ±300s time + ±30s duration
-            # Skip for confirmed existing OD patients — they didn't come from an ad.
-            elif area_match and time_delta <= 300 and dur_delta <= 30 and not _mc_is_existing_patient:
-                if 0.75 > best_confidence:
-                    best_gads_id   = gc["call_id"]
-                    best_confidence = 0.75
-                    best_method    = "gads_window_loose"
-                    best_gc        = gc
-            # Very loose: area code + ±600s time (no duration check — GAds/Mango measure differently)
-            # Skip for confirmed existing OD patients — high false-positive risk.
-            elif area_match and time_delta <= 600 and not _mc_is_existing_patient:
-                if 0.60 > best_confidence:
-                    best_gads_id   = gc["call_id"]
-                    best_confidence = 0.60
-                    best_method    = "gads_window_time_only"
-                    best_gc        = gc
-            # Time-only fallback A: neither side has area code, ±120s, unambiguous,
-            # not a known lead (known leads get phone_exact match instead).
-            # Confidence 0.55 — lower than all area-code branches
-            elif (not gc_area) and (not mc_area) and time_delta <= 120 and not _mc_is_known_lead and not _mc_is_existing_patient:
-                if gc_status != "MISSED":
-                    max_dur  = max(mc_dur, gc_dur)
-                    dur_ok   = dur_delta <= max(20, 0.3 * max_dur)
-                    if not dur_ok:
-                        continue
-                if 0.55 > best_confidence and _is_clean_time_only(mc_uuid, gc["call_id"]):
-                    best_gads_id   = gc["call_id"]
-                    best_confidence = 0.55
-                    best_method    = "gads_time_only_no_area"
-                    best_gc        = gc
-            # Time-only fallback B: GAds has no area code but Mango does (Google strips
-            # area code for some mobile call extensions even when caller has one).
-            # ±120s time, tight duration match. Confidence 0.60 — Mango area code is real
-            # signal even if GAds doesn't have it, so slightly higher than fallback A.
-            elif (not gc_area) and mc_area and time_delta <= 120 and not _mc_is_known_lead and not _mc_is_existing_patient:
-                if gc_status != "MISSED":
-                    max_dur  = max(mc_dur, gc_dur)
-                    dur_ok   = dur_delta <= max(15, 0.25 * max_dur)
-                    if not dur_ok:
-                        continue
-                if 0.60 > best_confidence and _is_clean_time_only(mc_uuid, gc["call_id"]):
-                    best_gads_id   = gc["call_id"]
-                    best_confidence = 0.60
-                    best_method    = "gads_time_only_gads_no_area"
-                    best_gc        = gc
-            # Last resort for targeted matching: time only (±120s), any area code combo
-            elif target_gads_call_id and time_delta <= 120:
-                if 0.50 > best_confidence:
-                    best_gads_id   = gc["call_id"]
-                    best_confidence = 0.50
-                    best_method    = "gads_time_only"
-                    best_gc        = gc
-
-            if target_gads_call_id and gc["call_id"] == target_gads_call_id:
-                logger.info(
-                    "reconcile[targeted] GAds=%s Mango=%s | area: gc=%s mc=%s | "
-                    "time_delta=%.0fs dur_delta=%ds | best_so_far=%.2f via %s",
-                    gc["call_id"], mc_uuid, gc_area, mc_area,
-                    time_delta, dur_delta, best_confidence, best_method or "none",
-                )
-
-        if best_gads_id and best_gc:
-            # Claim this GAds call so no other Mango record can match it this pass
-            _used_gads_ids.add(best_gads_id)
-            update_mango_call_attribution(
-                uuid=mc_uuid,
-                gads_call_id=best_gads_id,
-                match_confidence=best_confidence,
-                match_method=best_method,
-            )
-            attributed += 1
-            _queue_process_if_needed(mc, mango_token=mango_token)
-
-            # Create call flag if this GAds call was missed or short
-            try:
-                with _db_conn() as conn:
-                    # Refresh mc with updated match fields for flag creation
-                    mc_fresh = dict(mc)
-                    mc_fresh["match_confidence"] = best_confidence
-                    _create_call_flag_if_needed(conn, mc_fresh, best_gc)
-            except Exception as _fe:
-                logger.warning(f"call_flag creation failed for {mc_uuid}: {_fe}")
             continue
 
         # ── Try lead phone match ──────────────────────────────────────────────
