@@ -267,8 +267,10 @@ async def lifespan(app: FastAPI):
                 password=settings.mango_password,
                 api_base=settings.mango_api_base,
             )
+            # Lazy init: MangoTokenManager no longer logs in at construction —
+            # it will authenticate on first get_token() call, so this never throws.
             app.state.mango_token_mgr = _mango_token_mgr
-            logger.info("Mango Voice token manager initialized")
+            logger.info("Mango Voice token manager registered (lazy — will authenticate on first sync)")
 
             def _mango_sync_job():
                 _stamp("mango_sync")
@@ -367,7 +369,7 @@ async def lifespan(app: FastAPI):
             )
 
         except Exception as e:
-            logger.warning(f"Mango Voice initialization failed (non-fatal): {e}")
+            logger.error(f"Mango Voice setup failed (import error?): {e}")
             app.state.mango_token_mgr = None
     else:
         app.state.mango_token_mgr = None
@@ -10268,7 +10270,16 @@ def admin_get_calls(
             # CallRail DNI captured a Google Ads visitor — no gads_call_id but keyword known
             c["attribution_label"] = "Ad call (DNI)"
         elif c.get("lead_id"):
-            c["attribution_label"] = "Known lead"
+            # "Known lead" was firing for ALL calls because CallRail creates a lead
+            # instantly on every webhook. Use od_patient_status + first_call instead.
+            od_status = c.get("od_patient_status") or ""
+            if od_status in ("existing_active", "existing_inactive"):
+                c["attribution_label"] = "Existing patient"
+            elif c.get("callrail_first_call") == 0:
+                c["attribution_label"] = "Returning caller"
+            else:
+                # first_call=1 or no CallRail row — new caller, no label needed
+                c["attribution_label"] = ""
         else:
             c["attribution_label"] = ""
     return {

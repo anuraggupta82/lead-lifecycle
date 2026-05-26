@@ -3632,10 +3632,15 @@ function _statusBadge(status) {
 }
 function _attrBadge(call) {
   const isAd  = call.attribution_label && call.attribution_label.includes('Ad call');
-  const attrKw = (call.attributed_keyword || '').trim();
+  const kwMethod = call.attributed_keyword_method || '';
+  const attrKwRaw = (call.attributed_keyword || '').trim();
+  // Only show keyword in the row badge when it's exact (skag_direct) or from CallRail.
+  // 'call_search_term' and 'ad_group_best_keyword' are campaign-level estimates —
+  // suppress them from the table row to avoid showing fabricated keywords.
+  const attrKw = (kwMethod === 'skag_direct') ? attrKwRaw : '';
   const crKw   = (call.callrail_keyword || '').trim();
   // Show CallRail keyword only when it differs from the already-attributed keyword
-  const showCrFallback = !!crKw && crKw.toLowerCase() !== attrKw.toLowerCase();
+  const showCrFallback = !!crKw && crKw.toLowerCase() !== attrKwRaw.toLowerCase();
   if (!call.attribution_label && !attrKw && !crKw) return null;
   return (
     <div style={{display:'flex',flexDirection:'column',gap:2,alignItems:'flex-start'}}>
@@ -3645,9 +3650,9 @@ function _attrBadge(call) {
           border:`1px solid ${isAd?'#0369a144':'#92400e44'}`}}>{call.attribution_label}</span>
       )}
       {attrKw && (
-        <span title={`Method: ${call.attributed_keyword_method||'?'} · ${Math.round((call.attributed_keyword_confidence||0)*100)}% conf · ${call.attributed_ad_group||'no ad group'} · ${call.attributed_match_type||'?'}`}
+        <span title={`Exact keyword match · ${call.attributed_ad_group||'no ad group'}`}
           style={{fontSize:9,padding:'1px 5px',borderRadius:3,cursor:'help',
-            background:'#f1f5f9',color:'#475569',border:'1px solid #cbd5e1',
+            background:'#dcfce7',color:'#14532d',border:'1px solid #bbf7d0',
             maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
           {attrKw}
         </span>

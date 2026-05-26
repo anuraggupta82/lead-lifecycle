@@ -127,6 +127,25 @@ def _find_recording_enabled(conn, tracking_number_id) -> bool:
     return bool(row and row[0])
 
 
+def _resolve_tracker_source(conn, tracking_number_id, webhook_source: str) -> str:
+    """
+    Return the true attribution source for this call.
+    If the tracking number is a GAds call extension (assignment_type='gads_campaign'),
+    return 'google_ads' regardless of what the webhook source field says.
+    CallRail sends source='Direct' for call extensions in webhook payloads even
+    though the tracker is a Google Ads asset — the tracker config is authoritative.
+    """
+    if not tracking_number_id:
+        return webhook_source or "Direct"
+    row = conn.execute(
+        "SELECT assignment_type FROM callrail_numbers WHERE id = ? LIMIT 1",
+        (tracking_number_id,)
+    ).fetchone()
+    if row and row[0] == "gads_campaign":
+        return "google_ads"
+    return webhook_source or "Direct"
+
+
 def _find_campaign_by_name(conn, campaign_name: str) -> tuple:
     """
     Return (campaign_id_str, campaign_name_str) from campaigns table by name.
@@ -292,6 +311,7 @@ def _upsert_callrail_call(
     lead_match_method: str = "",
     od_patient_num: str = "",
     od_patient_status: str = "",
+    resolved_source: str = "",
 ) -> tuple:
     """
     Idempotent upsert of a callrail_calls row.
@@ -311,7 +331,9 @@ def _upsert_callrail_call(
     first_call = int(bool(call.get("first_call")))
     called_at  = call.get("start_time", "")
     direction  = call.get("direction", "inbound")
-    source     = call.get("source", "")
+    # Use tracker-resolved source if provided (call extensions arrive as 'Direct'
+    # in webhook payloads even though they're Google Ads assets).
+    source     = resolved_source or call.get("source", "")
     campaign   = call.get("campaign", "")
     # API returns "keywords"; webhooks return "keyword" — accept both
     keyword    = call.get("keyword") or call.get("keywords") or ""
@@ -580,12 +602,18 @@ def process_webhook(payload: dict, raw_body: bytes) -> dict:
         recording_enabled  = False
         campaign_id_resolved = ""
         mango_uuid = ""
+        resolved_source = call.get("source", "Direct") or "Direct"
 
         with _conn() as conn:
             tracking_number_id = _find_tracking_number_id(
                 conn, call.get("tracking_phone_number", "")
             )
             recording_enabled = _find_recording_enabled(conn, tracking_number_id)
+            # Resolve true source from tracker config — call extensions arrive as
+            # source='Direct' in webhook payloads even though they're Google Ads assets.
+            resolved_source = _resolve_tracker_source(
+                conn, tracking_number_id, call.get("source", "Direct")
+            )
             campaign_id_resolved, _ = _find_campaign_by_name(
                 conn, call.get("campaign", "")
             )
@@ -665,6 +693,7 @@ def process_webhook(payload: dict, raw_body: bytes) -> dict:
                 lead_match_method=lead_match_method,
                 od_patient_num=od_lookup.get("pat_num", ""),
                 od_patient_status=od_lookup.get("status", ""),
+                resolved_source=resolved_source,
             )
 
         result["was_new_call_row"] = is_new

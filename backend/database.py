@@ -8319,10 +8319,11 @@ def get_mango_calls(
                            NULLIF(l.campaign_id, '')
                        ) AS effective_campaign_id,
                        -- CallRail DNI bridge: raw keyword captured at landing time
-                       cr.keyword  AS callrail_keyword,
-                       cr.gclid    AS callrail_gclid,
-                       cr.campaign AS callrail_campaign,
-                       cr.source   AS callrail_source
+                       cr.keyword     AS callrail_keyword,
+                       cr.gclid       AS callrail_gclid,
+                       cr.campaign    AS callrail_campaign,
+                       cr.source      AS callrail_source,
+                       cr.first_call  AS callrail_first_call
                 FROM mango_calls mc
                 LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
                 LEFT JOIN leads l ON l.id = mc.lead_id

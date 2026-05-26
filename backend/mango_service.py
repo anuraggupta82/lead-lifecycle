@@ -78,7 +78,10 @@ def _refresh_access_token(refresh_tok: str, api_base: str = _API_BASE) -> str:
 class MangoTokenManager:
     """
     Thread-safe JWT token manager for the Mango Voice API.
-    Logs in on construction and auto-refreshes every 50 minutes.
+    Lazy initialization: credentials are stored at construction but the first
+    actual login happens on the first get_token() call.  This prevents a Mango
+    API 500 at startup from blocking the entire lifespan and leaving
+    app.state.mango_token_mgr as None.
     Falls back to full re-login if refresh fails.
     Singleton per FastAPI process — instantiate once in main.py lifespan().
     """
@@ -90,7 +93,7 @@ class MangoTokenManager:
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._lock = threading.Lock()
-        self._do_login()
+        # Lazy: do NOT call _do_login() here — first get_token() will trigger it.
 
     def _do_login(self) -> None:
         tokens = _login_mango(self.username, self.password, self.api_base)
@@ -127,7 +130,17 @@ class MangoTokenManager:
 
     def get_token(self) -> Optional[str]:
         with self._lock:
-            return self._access_token
+            token = self._access_token
+        if token is None:
+            # First call after a failed startup — attempt login now
+            try:
+                self._do_login()
+                with self._lock:
+                    token = self._access_token
+            except Exception as e:
+                logger.error(f"Mango: deferred login failed: {e}")
+                return None
+        return token
 
 
 # ── Phone normalization ───────────────────────────────────────────────────────
@@ -477,7 +490,77 @@ def sync_mango_calls(
     _last_sync_cursor = datetime.now(timezone.utc)
     _save_sync_cursor(_last_sync_cursor)
     logger.info(f"Mango sync: upserted {count}/{len(normalized_calls)} calls")
+
+    # After every sync, attempt to link any CallRail rows that arrived before
+    # their Mango call was ingested (race condition: webhook fires ~8 min before sync).
+    try:
+        linked = _link_unmatched_callrail_to_mango()
+        if linked:
+            logger.info(f"Mango sync: linked {linked} CallRail row(s) to Mango calls (post-sync)")
+    except Exception as _le:
+        logger.warning(f"Mango sync: CallRail post-link failed (non-fatal): {_le}")
+
     return count
+
+
+def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) -> int:
+    """
+    For CallRail rows with mango_call_id='', try to match by phone + time to a
+    mango_calls row within ±window_minutes. Runs after every Mango sync to fix
+    the race where the CallRail webhook fires before the Mango call is ingested.
+    Returns count of rows linked.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    linked = 0
+    with _db_conn() as conn:
+        unlinked = conn.execute("""
+            SELECT id, caller_number, called_at
+            FROM callrail_calls
+            WHERE (mango_call_id IS NULL OR mango_call_id = '')
+              AND called_at >= ?
+            ORDER BY called_at DESC
+        """, (cutoff,)).fetchall()
+
+        for row in unlinked:
+            caller = row["caller_number"] or ""
+            called_at_str = row["called_at"] or ""
+            if not caller or not called_at_str:
+                continue
+            try:
+                called_dt = datetime.fromisoformat(called_at_str.replace("Z", "+00:00"))
+                if called_dt.tzinfo is None:
+                    called_dt = called_dt.replace(tzinfo=timezone.utc)
+                called_utc = called_dt.astimezone(timezone.utc)
+            except Exception:
+                continue
+
+            window_start = (called_utc - timedelta(minutes=window_minutes)).isoformat()
+            window_end   = (called_utc + timedelta(minutes=window_minutes)).isoformat()
+
+            digits = re.sub(r"\D", "", caller)
+            variants = list({caller, f"+{digits}", digits,
+                             digits[-10:] if len(digits) >= 10 else digits})
+            placeholders = ",".join("?" * len(variants))
+
+            mango_row = conn.execute(f"""
+                SELECT uuid FROM mango_calls
+                WHERE direction = 'inbound'
+                  AND from_number IN ({placeholders})
+                  AND started_at BETWEEN ? AND ?
+                ORDER BY ABS(strftime('%s', started_at) - strftime('%s', ?))
+                LIMIT 1
+            """, (*variants, window_start, window_end, called_utc.isoformat())).fetchone()
+
+            if mango_row:
+                mango_uuid = mango_row["uuid"]
+                conn.execute("""
+                    UPDATE callrail_calls
+                    SET mango_call_id = ?
+                    WHERE id = ? AND (mango_call_id IS NULL OR mango_call_id = '')
+                """, (mango_uuid, row["id"]))
+                linked += 1
+
+    return linked
 
 
 # ── Attribution reconciler ────────────────────────────────────────────────────
@@ -883,6 +966,73 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
         _mc_is_known_lead = (len(_from_digits_main) >= 10 and
                              phone_to_lead.get(_from_digits_main[-10:]) is not None)
 
+        # Pre-check: is this caller a confirmed existing OD patient?
+        # If so, they did NOT come from an ad — block all GAds time-window matching
+        # to avoid false-positive attribution (e.g. existing patient calling about
+        # billing matched to an unrelated ad click in the same time window).
+        _od_status = (mc.get("od_patient_status") or "").strip()
+        _mc_is_existing_patient = _od_status in ("existing_active", "existing_inactive")
+
+        # ── CallRail-confirmed GAds attribution (highest priority) ────────────
+        # If a CallRail row links this Mango call and source='google_ads', that is
+        # authoritative — no time-window guessing. Find the matching gads_call_view
+        # entry by time (±60s) and write at 0.95 confidence.
+        _cr_gads_confirmed = False
+        with _db_conn() as _cr_conn:
+            _cr_row = _cr_conn.execute("""
+                SELECT source, called_at FROM callrail_calls
+                WHERE mango_call_id = ? AND source = 'google_ads'
+                LIMIT 1
+            """, (mc_uuid,)).fetchone()
+        if _cr_row and not _mc_is_existing_patient:
+            # Find best gads_call_view match by time only (±60s) — CalRail already
+            # confirmed it's Google Ads so we just need the call_id for reporting.
+            _cr_best_id   = None
+            _cr_best_gc   = None
+            _cr_best_delta = float("inf")
+            for gc, gc_dt in gads_parsed:
+                if gc["call_id"] in _used_gads_ids:
+                    continue
+                _delta = abs((mc_dt - gc_dt).total_seconds())
+                if _delta <= 60 and _delta < _cr_best_delta:
+                    _cr_best_delta = _delta
+                    _cr_best_id    = gc["call_id"]
+                    _cr_best_gc    = gc
+            if _cr_best_id:
+                _used_gads_ids.add(_cr_best_id)
+                update_mango_call_attribution(
+                    uuid=mc_uuid,
+                    gads_call_id=_cr_best_id,
+                    match_confidence=0.95,
+                    match_method="callrail_confirmed",
+                )
+                attributed += 1
+                _queue_process_if_needed(mc, mango_token=mango_token)
+                try:
+                    with _db_conn() as _fc_conn:
+                        mc_fresh = dict(mc)
+                        mc_fresh["match_confidence"] = 0.95
+                        _create_call_flag_if_needed(_fc_conn, mc_fresh, _cr_best_gc)
+                except Exception as _fe:
+                    logger.warning(f"call_flag creation failed for {mc_uuid}: {_fe}")
+                logger.info(
+                    "reconcile[callrail] Mango=%s -> GAds=%s (time_delta=%.0fs, callrail_confirmed)",
+                    mc_uuid, _cr_best_id, _cr_best_delta,
+                )
+                _cr_gads_confirmed = True
+            else:
+                # CallRail confirms GAds but no gads_call_view row found (not synced yet).
+                # Write a lead_id match at least so the call is tracked.
+                logger.info(
+                    "reconcile[callrail] Mango=%s confirmed google_ads by CallRail "
+                    "but no gads_call_view row within 60s — skipping gads_call_id for now",
+                    mc_uuid,
+                )
+                _cr_gads_confirmed = True  # skip time-window fallback
+
+        if _cr_gads_confirmed:
+            continue
+
         # ── Try GAds call_view match ──────────────────────────────────────────
         best_gads_id = None
         best_confidence = 0.0
@@ -910,14 +1060,16 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                     best_method    = "gads_window"
                     best_gc        = gc
             # Loose match: area code + ±300s time + ±30s duration
-            elif area_match and time_delta <= 300 and dur_delta <= 30:
+            # Skip for confirmed existing OD patients — they didn't come from an ad.
+            elif area_match and time_delta <= 300 and dur_delta <= 30 and not _mc_is_existing_patient:
                 if 0.75 > best_confidence:
                     best_gads_id   = gc["call_id"]
                     best_confidence = 0.75
                     best_method    = "gads_window_loose"
                     best_gc        = gc
             # Very loose: area code + ±600s time (no duration check — GAds/Mango measure differently)
-            elif area_match and time_delta <= 600:
+            # Skip for confirmed existing OD patients — high false-positive risk.
+            elif area_match and time_delta <= 600 and not _mc_is_existing_patient:
                 if 0.60 > best_confidence:
                     best_gads_id   = gc["call_id"]
                     best_confidence = 0.60
@@ -926,7 +1078,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
             # Time-only fallback A: neither side has area code, ±120s, unambiguous,
             # not a known lead (known leads get phone_exact match instead).
             # Confidence 0.55 — lower than all area-code branches
-            elif (not gc_area) and (not mc_area) and time_delta <= 120 and not _mc_is_known_lead:
+            elif (not gc_area) and (not mc_area) and time_delta <= 120 and not _mc_is_known_lead and not _mc_is_existing_patient:
                 if gc_status != "MISSED":
                     max_dur  = max(mc_dur, gc_dur)
                     dur_ok   = dur_delta <= max(20, 0.3 * max_dur)
@@ -941,7 +1093,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
             # area code for some mobile call extensions even when caller has one).
             # ±120s time, tight duration match. Confidence 0.60 — Mango area code is real
             # signal even if GAds doesn't have it, so slightly higher than fallback A.
-            elif (not gc_area) and mc_area and time_delta <= 120 and not _mc_is_known_lead:
+            elif (not gc_area) and mc_area and time_delta <= 120 and not _mc_is_known_lead and not _mc_is_existing_patient:
                 if gc_status != "MISSED":
                     max_dur  = max(mc_dur, gc_dur)
                     dur_ok   = dur_delta <= max(15, 0.25 * max_dur)
