@@ -30,6 +30,8 @@ from database import (
     get_all_leads,
     update_mango_call_attribution,
     backfill_call_keyword_attribution,
+    upsert_lead,
+    add_lead_event,
     _conn as _db_conn,
 )
 
@@ -619,6 +621,134 @@ def _flag_unattributed_missed_new_patients(days: int = 7) -> int:
     return created
 
 
+def finalize_call_lead(uuid: str) -> dict:
+    """Copy attribution + OD match results from mango_calls (and joined callrail_calls)
+    back to the linked lead. Idempotent — only fills empty fields, never overwrites.
+
+    Called at:
+      1. End of process_call() — after OD match and booked_outcome are written
+      2. After backfill_call_keyword_attribution() in reconcile_attribution()
+
+    Returns dict with {"updated": [list of fields written]} or {} if no lead linked.
+    """
+    # High-confidence attribution methods that carry real keyword data
+    _KEYWORD_METHODS = {"skag_direct", "call_search_term", "ad_group_best_keyword"}
+
+    try:
+        with _db_conn() as conn:
+            # Fetch mango_call row + joined callrail_call (left join — may not exist)
+            row = conn.execute("""
+                SELECT
+                    mc.lead_id,
+                    mc.attributed_keyword,
+                    mc.attributed_ad_group,
+                    mc.attributed_keyword_method,
+                    mc.gads_call_id,
+                    mc.od_patient_num       AS mc_od_patient_num,
+                    mc.od_patient_status    AS mc_od_patient_status,
+                    mc.od_matched_at        AS mc_od_matched_at,
+                    cc.source               AS cr_source,
+                    cc.gclid                AS cr_gclid,
+                    cc.campaign             AS cr_campaign,
+                    cc.landing_page         AS cr_landing_page
+                FROM mango_calls mc
+                -- Deterministic subquery: multiple callrail_calls rows can exist per
+                -- mango_call (call.created + call.completed). Prefer the row with gclid,
+                -- then most recent event, so attribution fields are consistent.
+                LEFT JOIN callrail_calls cc ON cc.id = (
+                    SELECT id FROM callrail_calls
+                    WHERE mango_call_id = mc.uuid
+                    ORDER BY (COALESCE(gclid,'') != '') DESC, called_at DESC
+                    LIMIT 1
+                )
+                WHERE mc.uuid = ?
+            """, (uuid,)).fetchone()
+
+            if not row or not row["lead_id"]:
+                logger.debug(f"finalize_call_lead: no lead linked for {uuid}")
+                return {}
+
+            lead_id = row["lead_id"]
+
+            # Fetch current lead state (only the fields we may update)
+            lead = conn.execute("""
+                SELECT keyword_text, ad_group_name, campaign_name, gclid,
+                       od_patient_num, existing_patient, paid_source, landing_url
+                FROM leads WHERE id = ?
+            """, (lead_id,)).fetchone()
+
+            if not lead:
+                logger.warning(f"finalize_call_lead: lead {lead_id} not found")
+                return {}
+
+            updates: dict = {"id": lead_id}
+
+            # ── 1. OD patient linkage (biggest ROI impact) ───────────────────
+            if row["mc_od_patient_num"] and not lead["od_patient_num"]:
+                updates["od_patient_num"] = row["mc_od_patient_num"]
+                if row["mc_od_matched_at"]:
+                    updates["od_matched_at"] = row["mc_od_matched_at"]
+                # existing_patient: sticky upgrade via upsert_lead (database.py:3237).
+                # upsert_lead only writes existing_patient=1, never demotes to 0.
+                # Note: if od_patient_status is not existing_* (e.g. new patient),
+                # we intentionally do not set existing_patient=1 here.
+                if row["mc_od_patient_status"] in ("existing_active", "existing_inactive"):
+                    updates["existing_patient"] = 1
+
+            # ── 2. Keyword + ad group (only high-confidence methods) ─────────
+            kw_method = row["attributed_keyword_method"] or ""
+            if (row["attributed_keyword"]
+                    and kw_method in _KEYWORD_METHODS
+                    and not lead["keyword_text"]):
+                updates["keyword_text"] = row["attributed_keyword"]
+
+            if row["attributed_ad_group"] and not lead["ad_group_name"]:
+                ag_raw = row["attributed_ad_group"]
+                # Format is "Campaign Name > Ad Group Name"
+                if " > " in ag_raw:
+                    camp_part, ag_part = ag_raw.split(" > ", 1)
+                    updates["ad_group_name"] = ag_part.strip()
+                    if not lead["campaign_name"]:
+                        updates["campaign_name"] = camp_part.strip()
+                else:
+                    updates["ad_group_name"] = ag_raw.strip()
+
+            # ── 3. gclid backstop (webhook-miss recovery) ────────────────────
+            if row["cr_gclid"] and not lead["gclid"]:
+                updates["gclid"] = row["cr_gclid"]
+
+            # ── 4. paid_source (google_ads | organic | direct | '') ──────────
+            if row["cr_source"] and not lead["paid_source"]:
+                updates["paid_source"] = row["cr_source"]
+
+            # ── 5. landing_url fallback ───────────────────────────────────────
+            if row["cr_landing_page"] and not lead["landing_url"]:
+                updates["landing_url"] = row["cr_landing_page"]
+
+            # Nothing to write
+            written = [k for k in updates if k != "id"]
+            if not written:
+                logger.debug(f"finalize_call_lead: nothing to update for lead {lead_id}")
+                return {}
+
+            upsert_lead(updates)
+            add_lead_event(
+                lead_id,
+                "call_lead_finalized",
+                detail=json.dumps({
+                    "mango_call_uuid": uuid,
+                    "backfilled": written,
+                }),
+                source="mango_pipeline",
+            )
+            logger.info(f"finalize_call_lead: wrote {written} to lead {lead_id} (call {uuid})")
+            return {"updated": written}
+
+    except Exception as exc:
+        logger.warning(f"finalize_call_lead: failed for {uuid}: {exc}")
+        return {}
+
+
 def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_token: Optional[str] = None) -> int:
     """
     Match unattributed inbound Mango calls against:
@@ -886,6 +1016,29 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
             logger.info(f"Backfilled keyword attribution on {kw_backfilled} call(s)")
     except Exception as _kwe:
         logger.warning(f"backfill_call_keyword_attribution failed (non-fatal): {_kwe}")
+
+    # Copy attribution + OD match back to lead records for all recently-linked calls.
+    # Runs after keyword backfill so attributed_keyword is already populated.
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with _db_conn() as _fc_conn:
+            linked_uuids = [
+                r[0] for r in _fc_conn.execute("""
+                    SELECT uuid FROM mango_calls
+                    WHERE lead_id IS NOT NULL AND lead_id != ''
+                      AND transcription_status = 'done'
+                      AND started_at >= ?
+                """, (cutoff,)).fetchall()
+            ]
+        fc_count = 0
+        for _uuid in linked_uuids:
+            result = finalize_call_lead(_uuid)
+            if result.get("updated"):
+                fc_count += 1
+        if fc_count:
+            logger.info(f"finalize_call_lead: enriched {fc_count} lead(s) during reconcile")
+    except Exception as _fce:
+        logger.warning(f"finalize_call_lead reconcile pass failed (non-fatal): {_fce}")
 
     # Backfill flags for previously-attributed GAds calls that may have missed flag creation
     _backfill_call_flags_for_attributed(days=days)

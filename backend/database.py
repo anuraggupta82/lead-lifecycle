@@ -2621,6 +2621,10 @@ GROUP BY a.campaign_id, c.campaign_name;
     if "existing_patient" not in leads_img_cols:
         conn.execute("ALTER TABLE leads ADD COLUMN existing_patient INTEGER DEFAULT 0")
 
+    # ── finalize_call_lead: paid_source — google_ads | organic | direct | '' ──
+    if "paid_source" not in leads_img_cols:
+        conn.execute("ALTER TABLE leads ADD COLUMN paid_source TEXT DEFAULT ''")
+
     # ── Image Attachments: image_attachment on workflow_steps ─────────────────
     ws_cols = {row[1] for row in conn.execute("PRAGMA table_info(workflow_steps)").fetchall()}
     if "image_attachment" not in ws_cols:
@@ -3220,12 +3224,12 @@ def upsert_lead(data: dict) -> dict:
                         "utm_term","utm_content","landing_url",
                         "smile_image_url","smile_blob_name","smile_composite_blob_name",
                         "smile_generated_at","source","notes",
-                        "booking_id","od_patient_num","attributed_production",
+                        "booking_id","od_patient_num","od_matched_at","attributed_production",
                         "treatment_plan_value","attributed_income",
                         "appointment_date","appointment_status","no_show_count",
                         "keyword_text","search_term","ad_group_name","ad_group_id",
                         "ad_id","ad_name","campaign_name","campaign_id",
-                        "click_cost","gads_synced_at","tags"]:
+                        "click_cost","gads_synced_at","tags","paid_source"]:
                 if data.get(col) not in (None, ""):
                     fields.append(f"{col}=?")
                     values.append(data[col])

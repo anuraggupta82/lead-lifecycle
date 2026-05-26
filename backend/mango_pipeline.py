@@ -910,6 +910,41 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
             pipeline_attempts=attempts,
         )
 
+        # ── Pre-step: targeted lead-phone match ───────────────────────────────
+        # If this call has no lead_id yet, try to link it via phone number now
+        # so the lead is linked before pipeline results are written. This collapses
+        # the normal 30-min reconcile lag to seconds. We do a narrow phone-only
+        # match (no GAds fan-out, no thread spawning) to avoid the thread fan-out
+        # that a full reconcile_attribution() call would trigger.
+        if not call_row.get("lead_id") and not call_row.get("gads_call_id"):
+            try:
+                from_digits = re.sub(r"\D", "", call_row.get("from_number", "") or "")
+                if len(from_digits) >= 10:
+                    with db._conn() as _pre_conn:
+                        # Strip all non-digits from stored phone before matching
+                        # (mirrors reconcile loop's regex approach — handles E.164,
+                        # dashes, spaces, dots, parens consistently)
+                        lead_row = _pre_conn.execute(
+                            """SELECT id FROM leads
+                               WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                                 phone,'-',''),'(',''),')',''),' ',''),'.','')
+                               LIKE ?""",
+                            (f"%{from_digits[-10:]}",)
+                        ).fetchone()
+                    if lead_row:
+                        db.update_mango_call_attribution(
+                            uuid=uuid,
+                            lead_id=lead_row["id"],
+                            match_confidence=0.90,
+                            match_method="phone_exact",
+                        )
+                        call_row = call_row.copy()
+                        call_row["lead_id"] = lead_row["id"]
+                        log.info("[pipeline] Pre-step phone match: linked %s → lead %s",
+                                 uuid, lead_row["id"])
+            except Exception as _re:
+                log.warning("[pipeline] Pre-step phone match failed (non-fatal): %s", _re)
+
         # ── 1. Download recording ─────────────────────────────────────────────
         # Mango's S3 bucket is NOT publicly accessible. The only valid download
         # URLs are fresh pre-signed URLs returned by the Mango /calls/ API.
@@ -1215,6 +1250,17 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
                     db.update_mango_call_analysis(uuid, booked_outcome="booked")
         except Exception as od_err:
             log.warning("[pipeline] Step 8 OD match failed for %s (non-fatal): %s", uuid, od_err)
+
+        # ── Step 9: Write attribution + OD results back to the lead ──────────
+        # finalize_call_lead reads mango_calls (now fully written) + joined
+        # callrail_calls and copies keyword, ad_group, od_patient_num, paid_source
+        # back to leads — only filling empty fields, never overwriting good data.
+        try:
+            from mango_service import finalize_call_lead
+            finalize_call_lead(uuid)
+        except Exception as _fce:
+            log.warning("[pipeline] Step 9 finalize_call_lead failed for %s (non-fatal): %s",
+                        uuid, _fce)
 
         log.info("[pipeline] Call %s processed successfully", uuid)
 
