@@ -5221,19 +5221,36 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                 {call.match_method && (<React.Fragment>
                   <div style={{color:'var(--text-muted)',fontWeight:500}}>Match Method</div>
                   <div>
-                    {call.match_method}
                     {(() => {
+                      const m = call.match_method;
                       const conf = call.match_confidence || 0;
+                      // Human-readable label for each match method
+                      const methodLabel =
+                        m === 'callrail_confirmed'        ? 'CallRail confirmed (google_ads)' :
+                        m === 'phone_exact'               ? 'Phone match' :
+                        m === 'gads_window'               ? 'Time + area code match' :
+                        m === 'gads_window_loose'         ? 'Time + area code match (loose)' :
+                        m === 'gads_window_time_only'     ? 'Time + area code (no duration)' :
+                        m === 'gads_time_only_no_area'    ? 'Time only (no area code)' :
+                        m === 'gads_time_only_gads_no_area' ? 'Time only (GAds stripped area)' :
+                        m;
+                      const isCallRailConfirmed = m === 'callrail_confirmed';
+                      const isLegacy = m.startsWith('gads_');
                       const [col, label] = conf >= 0.75 ? ['#16a34a','high'] : conf >= 0.60 ? ['#b45309','medium'] : ['#dc2626','low'];
-                      return <span style={{marginLeft:5,fontWeight:600,color:col}}>
-                        {Math.round(conf*100)}% confidence ({label})
-                      </span>;
+                      return <>
+                        <span style={{color: isCallRailConfirmed ? '#0369a1' : 'inherit'}}>
+                          {methodLabel}
+                        </span>
+                        <span style={{marginLeft:5,fontWeight:600,color:col}}>
+                          {Math.round(conf*100)}% confidence ({label})
+                        </span>
+                        {isLegacy && (
+                          <div style={{fontSize:10,color:'#b45309',marginTop:2}}>
+                            ⚠ Pre-CallRail match — time-window estimate, not verified
+                          </div>
+                        )}
+                      </>;
                     })()}
-                    {(call.match_method === 'gads_time_only_no_area' || call.match_method === 'gads_time_only_gads_no_area') && (
-                      <div style={{fontSize:10,color:'#b45309',marginTop:2}}>
-                        ⚠ Matched by time only — Google Ad stripped area code (mobile ad tap)
-                      </div>
-                    )}
                   </div>
                 </React.Fragment>)}
 
