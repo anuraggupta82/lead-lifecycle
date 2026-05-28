@@ -6703,6 +6703,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
       // M1 fix: reset competitor overrides so stale overrides from the previous
       // campaign don't bleed into the newly opened campaign's competitor cards
       setCompOverrides({});
+      // Reset AI Refine state so previous campaign's results don't bleed into new campaign
+      setAiRefineResult(null);
+      setAiRefineInput('');
+      setAiRefineError('');
     }
     setBuildLoading('');
     setCampEditMode(false);

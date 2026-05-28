@@ -1080,7 +1080,17 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
 
         # ── Step 8d: Attach shared negative keyword lists ─────────────────────
         log.append("Step 8d: Attaching account shared negative keyword lists")
-        _neg_list_logs = _attach_shared_negative_lists(client, customer_id, camp_resource)
+        # Pass in-memory keywords to avoid Google Ads read-after-write propagation lag
+        _all_campaign_kws: set[str] = {
+            kw.strip().lower()
+            for kw in (exact_kws + phrase_kws + broad_kws)
+            if kw.strip()
+        }
+        _neg_list_logs = _attach_shared_negative_lists(
+            client, customer_id, camp_resource,
+            campaign_name=campaign_name,
+            known_active_keywords=_all_campaign_kws,
+        )
         log.extend(_neg_list_logs)
 
         # ── Step 8e: Callouts + Structured Snippets from campaign_build_json ──
@@ -1251,17 +1261,35 @@ def _build_client():
     })
 
 
-def _attach_shared_negative_lists(client, customer_id: str, camp_resource: str) -> list[str]:
+def _attach_shared_negative_lists(
+    client,
+    customer_id: str,
+    camp_resource: str,
+    campaign_name: str = "",
+    known_active_keywords: set | None = None,
+) -> list[str]:
     """
-    Attach all account-level shared negative keyword lists to a newly created campaign.
+    Attach account-level shared negative keyword lists to a newly created campaign.
     Returns a list of log strings describing what was done.
     Non-fatal — any exception is caught and returned as a warning log entry.
+
+    SAFETY GUARD: Before attaching, fetch every keyword in each shared list and
+    cross-check against the campaign's own active keywords.  Any list that would
+    block ≥1 active keyword is skipped with a warning rather than applied blindly.
+    The "GDC Competitor Negatives" list in particular must NOT be attached to
+    implant/nXtsmile campaigns because it contains service-category terms (e.g.
+    "dental implants", "all on 4") that are also active keywords in those campaigns.
+
+    Args:
+        known_active_keywords: Set of lowercased keyword texts already in memory
+            (passed by create_campaign_in_gads to avoid API read-after-write lag).
+            If provided, used as primary source; GAQL fetch is used as fallback.
     """
     logs = []
     try:
         ga_service = client.get_service("GoogleAdsService")
 
-        # Fetch all enabled shared negative keyword lists in the account
+        # ── 1. Fetch all enabled shared negative keyword lists ────────────────
         list_query = """
             SELECT shared_set.resource_name, shared_set.name
             FROM shared_set
@@ -1273,8 +1301,8 @@ def _attach_shared_negative_lists(client, customer_id: str, camp_resource: str) 
             logs.append("  ⓘ No shared negative keyword lists found in account — skipping")
             return logs
 
-        # Check which lists are already linked to this campaign (idempotency)
-        already_linked = set()
+        # ── 2. Check which lists are already linked (idempotency) ─────────────
+        already_linked: set = set()
         link_query = f"""
             SELECT campaign_shared_set.shared_set
             FROM campaign_shared_set
@@ -1286,17 +1314,126 @@ def _attach_shared_negative_lists(client, customer_id: str, camp_resource: str) 
         except Exception:
             pass  # If check fails, attempt to link anyway (mutate handles duplicates)
 
+        # ── 3. Build active keyword set ────────────────────────────────────────
+        # Prefer in-memory keywords passed by caller (avoids Google Ads API
+        # read-after-write propagation lag on freshly created campaigns).
+        conflict_check_available = False
+        active_kw_texts: set[str] = set()
+
+        if known_active_keywords:
+            active_kw_texts = {kw.strip().lower() for kw in known_active_keywords if kw}
+            conflict_check_available = bool(active_kw_texts)
+            logs.append(f"  ⓘ Conflict check: using {len(active_kw_texts)} in-memory keywords")
+        else:
+            # Fallback: query Google Ads (may return empty due to propagation lag)
+            try:
+                kw_query = f"""
+                    SELECT ad_group_criterion.keyword.text,
+                           ad_group_criterion.keyword.match_type
+                    FROM ad_group_criterion
+                    WHERE ad_group_criterion.type = 'KEYWORD'
+                      AND ad_group_criterion.status = 'ENABLED'
+                      AND ad_group.status = 'ENABLED'
+                      AND campaign.resource_name = '{camp_resource}'
+                """
+                kw_rows = list(ga_service.search(customer_id=customer_id, query=kw_query))
+                active_kw_texts = {row.ad_group_criterion.keyword.text.lower() for row in kw_rows}
+                conflict_check_available = bool(active_kw_texts)
+                if not conflict_check_available:
+                    msg = (
+                        f"  ⚠ CONFLICT CHECK BYPASSED: GAQL returned 0 active keywords for "
+                        f"{camp_resource} (possible API propagation lag). "
+                        f"Shared lists will attach WITHOUT conflict verification."
+                    )
+                    logs.append(msg)
+                    logger.warning(msg)
+            except Exception as _ke:
+                msg = (
+                    f"  ⚠ CONFLICT CHECK BYPASSED: could not fetch active keywords for "
+                    f"{camp_resource}: {_ke}. Lists will attach WITHOUT conflict verification."
+                )
+                logs.append(msg)
+                logger.warning(msg)
+
+        # ── 4. Helper: check if a negative blocks any active keyword ──────────
+        def _neg_conflicts_with_campaign(neg_text: str, neg_match_type: str) -> bool:
+            """
+            Return True if this negative would block at least one active keyword.
+            neg_match_type should be "EXACT", "PHRASE", or "BROAD" (.name from proto).
+            UNSPECIFIED/UNKNOWN falls through to broad-style check (most permissive).
+            """
+            nt = neg_text.strip().lower().split()
+            for kw in active_kw_texts:
+                kw_words = kw.split()  # already lowercased
+                if neg_match_type == "EXACT":
+                    if kw == neg_text.strip().lower():
+                        return True
+                elif neg_match_type == "PHRASE":
+                    if len(nt) <= len(kw_words):
+                        for i in range(len(kw_words) - len(nt) + 1):
+                            if kw_words[i:i + len(nt)] == nt:
+                                return True
+                else:  # BROAD or UNSPECIFIED — check all neg tokens appear in kw
+                    if all(w in kw_words for w in nt):
+                        return True
+            return False
+
+        # ── 5. For each shared list, check for conflicts before attaching ─────
         css_service = client.get_service("CampaignSharedSetService")
         link_ops = []
         names_to_link = []
+
         for row in list_rows:
-            ss_rn = row.shared_set.resource_name
+            ss_rn   = row.shared_set.resource_name
             ss_name = row.shared_set.name
+
             if ss_rn in already_linked:
                 logs.append(f"  ⓘ '{ss_name}' already linked — skipped")
                 continue
+
+            # Fetch keywords in this shared list and check for conflicts
+            conflict_found = False
+            total_conflicts = 0
+            blocking_examples: list[str] = []
+
+            if conflict_check_available:
+                try:
+                    sc_query = f"""
+                        SELECT shared_criterion.keyword.text,
+                               shared_criterion.keyword.match_type
+                        FROM shared_criterion
+                        WHERE shared_set.resource_name = '{ss_rn}'
+                    """
+                    sc_rows = list(ga_service.search(customer_id=customer_id, query=sc_query))
+                    for sc_row in sc_rows:
+                        neg_text  = sc_row.shared_criterion.keyword.text
+                        # .name returns "EXACT"/"PHRASE"/"BROAD"/"UNSPECIFIED"
+                        neg_match = sc_row.shared_criterion.keyword.match_type.name
+                        if _neg_conflicts_with_campaign(neg_text, neg_match):
+                            conflict_found = True
+                            total_conflicts += 1
+                            if len(blocking_examples) < 3:
+                                blocking_examples.append(f'[{neg_match}] "{neg_text}"')
+                except Exception as _sc_err:
+                    logger.warning(
+                        f"_attach_shared_negative_lists: could not check list '{ss_name}' keywords: {_sc_err}"
+                    )
+
+            if conflict_found:
+                examples_str = ", ".join(blocking_examples)
+                if total_conflicts > 3:
+                    examples_str += f" … (+{total_conflicts - 3} more)"
+                msg = (
+                    f"  ⚠ SKIPPED '{ss_name}' — {total_conflicts} negative(s) block active "
+                    f"keywords in campaign '{campaign_name or camp_resource}': {examples_str}. "
+                    f"Clean the shared list to fix."
+                )
+                logs.append(msg)
+                logger.warning(msg)
+                continue
+
             op = client.get_type("CampaignSharedSetOperation")
-            op.create.campaign = camp_resource
+            op.create.campaign  = camp_resource
             op.create.shared_set = ss_rn
             link_ops.append(op)
             names_to_link.append(ss_name)
@@ -1308,7 +1445,7 @@ def _attach_shared_negative_lists(client, customer_id: str, camp_resource: str) 
             for name in names_to_link:
                 logs.append(f"  ✓ Attached shared negative list: '{name}'")
         else:
-            logs.append("  ⓘ All shared negative lists already linked")
+            logs.append("  ⓘ All shared negative lists either already linked or skipped due to conflicts")
 
     except Exception as e:
         logs.append(f"  ⚠ Shared negative list attach failed (non-fatal): {e}")

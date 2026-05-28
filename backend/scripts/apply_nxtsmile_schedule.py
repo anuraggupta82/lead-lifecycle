@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-One-shot: apply ad schedule + Mon/Tue +20% bid modifiers to the nXtsmile Implants
-campaign by calling push_ad_schedule() directly. Bypasses the buggy
-/set-schedule HTTP endpoint.
+One-shot: apply ad schedule to the nXtsmile Implants campaign by calling
+push_ad_schedule() directly. Bypasses the buggy /set-schedule HTTP endpoint.
+
+Schedule (updated 2026-05-27):
+  Mon/Tue/Thu 10am-8pm (+10%), Wed 10am-8pm (1.0x)
+  Fri 10am-7pm (-10%), Sat 10am-4pm (-20%), Sun 12pm-6pm (-30%)
+  Removed 8am start to stop morning budget burn.
+  Added Sunday + evening extension for implant research traffic.
 
 Usage:
     cd /Users/anurag/Documents/Projects/gdc-apps/marketing/lead-lifecycle/backend
@@ -24,13 +29,13 @@ from google_ads_create import push_ad_schedule, _build_client  # noqa: E402
 CAMPAIGN_RESOURCE = "customers/2498049505/campaigns/23870298927"
 
 SCHEDULE = [
-    {"day": "MONDAY",    "start_hour": 8,  "end_hour": 18, "bid_modifier": 1.2},
-    {"day": "TUESDAY",   "start_hour": 8,  "end_hour": 18, "bid_modifier": 1.2},
-    {"day": "WEDNESDAY", "start_hour": 8,  "end_hour": 18, "bid_modifier": 1.0},
-    {"day": "THURSDAY",  "start_hour": 8,  "end_hour": 18, "bid_modifier": 1.0},
-    {"day": "FRIDAY",    "start_hour": 8,  "end_hour": 18, "bid_modifier": 1.0},
-    {"day": "SATURDAY",  "start_hour": 8,  "end_hour": 14, "bid_modifier": 1.0},
-    # No Sunday entry = ads paused on Sundays
+    {"day": "MONDAY",    "start_hour": 10, "end_hour": 20, "bid_modifier": 1.1},
+    {"day": "TUESDAY",   "start_hour": 10, "end_hour": 20, "bid_modifier": 1.1},
+    {"day": "WEDNESDAY", "start_hour": 10, "end_hour": 20, "bid_modifier": 1.0},
+    {"day": "THURSDAY",  "start_hour": 10, "end_hour": 20, "bid_modifier": 1.1},
+    {"day": "FRIDAY",    "start_hour": 10, "end_hour": 19, "bid_modifier": 0.9},
+    {"day": "SATURDAY",  "start_hour": 10, "end_hour": 16, "bid_modifier": 0.8},
+    {"day": "SUNDAY",    "start_hour": 12, "end_hour": 18, "bid_modifier": 0.7},
 ]
 
 
@@ -62,7 +67,7 @@ def main():
     print()
     print("Verify in Google Ads UI:")
     print("  Campaigns > nXtsmile Implants (05/23 - 100/day) > Settings > Ad schedule")
-    print("  Expected: Mon/Tue 8a-6p (+20%), Wed/Thu/Fri 8a-6p, Sat 8a-2p")
+    print("  Expected: Mon/Tue/Thu 10a-8p (+10%), Wed 10a-8p, Fri 10a-7p (-10%), Sat 10a-4p (-20%), Sun 12p-6p (-30%)")
 
 
 if __name__ == "__main__":

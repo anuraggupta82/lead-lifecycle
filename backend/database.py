@@ -10292,6 +10292,67 @@ def get_nearby_practices(
     return result
 
 
+# ── Generic dental token blocklist ────────────────────────────────────────────
+# Brand stems from nearby_practices are extracted from practice names. If every
+# token in a stem is a generic dental service/category word (not a proper noun),
+# the stem is not a real brand identifier and must NOT be added as a negative —
+# it would block active service-category keywords in implant/cosmetic campaigns.
+#
+# Note: geo-prefix stems like "westborough dental" are still passed through (the
+# city name "westborough" is not in this set). Those cases are handled at attach
+# time by the conflict-check in _attach_shared_negative_lists.
+GENERIC_DENTAL_TOKENS: frozenset[str] = frozenset({
+    # Core dental service terms
+    "dental", "dentist", "dentistry", "dentists",
+    "implant", "implants", "implantology",
+    "oral", "mouth", "teeth", "tooth",
+    "smile", "smiles",
+    "whitening", "bleaching",
+    "crown", "crowns", "veneer", "veneers",
+    "denture", "dentures",
+    "aligner", "aligners", "invisalign", "braces", "orthodontic", "orthodontics", "orthodontist",
+    "bridge", "bridges",
+    "root", "canal",
+    "extraction", "extractions",
+    "sedation",
+    "cleaning", "cleanings", "hygiene", "hygienist",
+    "exam", "exams", "checkup", "checkups",
+    # Practice descriptor words
+    "care", "health", "wellness",
+    "family", "general", "cosmetic", "emergency",
+    "advanced", "modern", "gentle", "premier", "complete", "affordable",
+    "specialty", "specialist", "specialists",
+    "periodontics", "periodontist", "periodontal",
+    "endodontics", "endodontist",
+    "surgery", "surgical", "surgeon",
+    "clinic", "center", "centre", "group",
+    "associates", "practice", "office", "offices",
+    # Patient-related terms
+    "patient", "patients", "new",
+    # Stop/filler words
+    "the", "and", "of", "at", "on", "for", "a", "an",
+    "near", "me", "nearby",
+})
+
+
+def _is_generic_brand_stem(stem: str) -> bool:
+    """
+    Return True if every token in the stem is a generic dental/location word.
+    A brand stem must contain ≥1 non-generic token (e.g. a city name, a doctor's
+    surname, a distinctive brand word) to be a useful brand identifier.
+
+    Examples:
+      "dental implants"       → True  (both tokens generic → blocked)
+      "westborough dental"    → False ("westborough" is non-generic → allowed)
+      "dr gupta"              → False ("gupta" is non-generic → allowed)
+      "affordable dental"     → True  (both generic → blocked)
+    """
+    tokens = stem.strip().lower().split()
+    if not tokens:
+        return True
+    return all(t in GENERIC_DENTAL_TOKENS for t in tokens)
+
+
 def get_brand_negatives_for_campaign(
     campaign_type: str = "general",
     max_miles: float = 20.0,
@@ -10310,9 +10371,16 @@ def get_brand_negatives_for_campaign(
 
     The is_excluded flag is the manual escape hatch — excluded practices are
     never negated regardless of this logic.
+
+    Generic dental service terms are ALWAYS excluded from brand stems — a stem
+    like "dental implants" or "dentist" is a service category, not a brand name,
+    and adding it as a negative would block valid campaign keywords.
     """
     from competitor_policy import CONQUEST_ELIGIBLE_TYPES, classify
     import json as _j
+
+    # Use the module-level constants (defined above this function)
+    _is_generic_stem = _is_generic_brand_stem  # local alias for readability
 
     practices = get_nearby_practices(max_miles=max_miles, include_excluded=False)
     ctype = (campaign_type or "general").strip().lower()
@@ -10346,9 +10414,20 @@ def get_brand_negatives_for_campaign(
             s_clean = (s or "").strip().lower()
             # Google Ads rejects negatives with > 10 words; skip stems that are too long
             # (common for doctor names like "dr matthew r annese d m d")
-            if s_clean and s_clean not in seen and len(s_clean.split()) <= 4:
-                seen.add(s_clean)
-                stems.append(s_clean)
+            if not s_clean or s_clean in seen or len(s_clean.split()) > 4:
+                continue
+            # Skip pure generic-service stems — they block real keywords and are
+            # not useful brand identifiers (e.g. a practice named "Dental Implants"
+            # produces the stem "dental implants" which would block every implant kw).
+            if _is_generic_stem(s_clean):
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    f"[brand_neg] Skipping generic stem '{s_clean}' "
+                    f"(practice: '{p.get('name', '')}') — would block service keywords"
+                )
+                continue
+            seen.add(s_clean)
+            stems.append(s_clean)
 
     return sorted(stems)
 
