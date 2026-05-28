@@ -5392,6 +5392,13 @@ Service Focus: {camp.get("service_focus", "")}
 Objective: {strategy.get("objective", "")}
 {_competitor_section}
 
+MATCH TYPE POLICY — HARD RULE:
+- Use EXACT and PHRASE match only. NEVER add broad match keywords (broad_match_modifier must always be empty []).
+- Dental campaigns are hyper-local and high-intent. Broad match routinely matches job seekers,
+  students, and out-of-area users — confirmed to waste >$1,700/month at this practice.
+- Broad match is only permitted if: 30+ monthly conversions AND smart bidding (Maximize Conversions).
+  Neither condition is currently met. Always return broad_match_modifier as [].
+
 Current keyword counts (do NOT repeat these — only generate the delta):
 {_kw_summary}
 
@@ -6637,14 +6644,20 @@ Return a JSON object with this exact structure:
 {{
   "exact_match": ["keyword1", "keyword2", ...],
   "phrase_match": ["keyword1", "keyword2", ...],
-  "broad_match_modifier": ["keyword1", "keyword2", ...],
+  "broad_match_modifier": [],
   "negative_keywords": ["keyword1", "keyword2", ...]
 }}
 
+MATCH TYPE POLICY — HARD RULE:
+- broad_match_modifier MUST always be an empty list []. Never populate it.
+- Broad match is prohibited for local dental campaigns. It routinely wastes budget on job seekers,
+  students, and out-of-area users. This was confirmed by $1,700+ wasted at this practice in May 2026.
+- All keyword volume is captured via exact + phrase. Phrase match already provides sufficient discovery.
+
 Rules:
 {_type_specific_exact_rule}
-- phrase_match: 10-15 moderate-intent phrases covering service variations and location modifiers
-- broad_match_modifier: 5-8 broader terms to capture volume (service category + location area)
+- phrase_match: 12-18 moderate-intent phrases covering service variations and location modifiers — use a larger phrase match list to compensate for no broad match
+- broad_match_modifier: always [] — never add broad match keywords (see policy above)
 - negative_keywords: Include ALL source campaign negatives above PLUS optimizer memory negatives PLUS {_neg_intent_note}{_brand_neg_rule}
 - Geographic targeting towns: Grafton, Shrewsbury, Westborough, Northborough, Millbury, Auburn, Worcester area{_conquest_rule}
 - Return ONLY the JSON object, no explanation."""

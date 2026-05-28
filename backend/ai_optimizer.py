@@ -193,6 +193,27 @@ OPERATIONS REFERENCE (for replace_ad / ad_copy_suggestion):
   final_url (https://...), optional path1 (≤15 chars), optional path2 (≤15 chars)
 - Never include phone numbers in any headline or description field
 - Never repeat a phrase across multiple headlines or descriptions
+
+KEYWORD MATCH TYPE POLICY (HARD RULES — LOCAL DENTAL):
+- DEFAULT match type strategy: PHRASE + EXACT only. Never recommend or create BROAD match keywords.
+- BROAD MATCH IS PROHIBITED unless ALL of the following are true simultaneously:
+    1. Campaign has 30+ tracked conversions in the past 30 days (form fills + calls combined)
+    2. Campaign is on Maximize Conversions or Target CPA smart bidding (not Manual CPC)
+    3. A robust negative keyword list (50+ negatives) is already in place
+  If any condition is not met, broad match must be paused or not created.
+- AUDIT TRIGGER: If any enabled keyword has match_type=BROAD, flag it immediately as a priority
+  action regardless of its spend or performance data. Do not wait for conversion data.
+- QS RULE: Any broad match keyword with Quality Score = 0 or QS ≤ 2 that has >$20 spend
+  must be recommended for pausing immediately — it indicates Google cannot assess intent,
+  meaning the traffic is too scattered.
+- MATCH TYPE SPEND RATIO: If BROAD match is consuming >30% of total campaign spend,
+  flag this as a budget waste warning even if individual keyword QS looks acceptable.
+- WHEN BUILDING NEW CAMPAIGNS: Create each keyword in EXACT and PHRASE only. Never add BROAD.
+  The phrase match version provides sufficient discovery for local dental intent.
+- REASONING: Dental services are hyper-local and high-intent. Broad match for local service
+  area campaigns routinely matches job seekers, students, and out-of-area users who will
+  never book. This was confirmed by $1,710 in wasted spend across GDC campaigns in May 2026
+  before broad match was paused account-wide on 2026-05-28.
 === END GOOGLE ADS HARD RULES ===
 """
 
