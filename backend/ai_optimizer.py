@@ -7751,6 +7751,54 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     logger.info(f"Collecting search terms since {search_start}...")
     search_terms = _get_search_terms(client, customer_id, start_date=search_start)
 
+    # Write fresh search terms into gads_search_terms_cache so the semantic classifier
+    # and the Search Terms UI both reflect the same data the optimizer is analyzing.
+    # _get_search_terms uses impressions > 0 (no clicks filter), so zero-click competitor
+    # and wrong-intent terms are captured here and available for classification.
+    if search_terms:
+        try:
+            from database import save_gads_search_terms_cache
+            cache_rows = []
+            for st in search_terms:
+                clicks = st.get("clicks", 0)
+                cost   = st.get("cost", 0.0)
+                cache_rows.append({
+                    "search_term":   st.get("search_term", ""),
+                    "campaign_name": st.get("campaign", ""),
+                    "ad_group_name": st.get("ad_group", ""),
+                    "impressions":   st.get("impressions", 0),
+                    "clicks":        clicks,
+                    "cost":          cost,
+                    "conversions":   st.get("conversions", 0.0),
+                    "cpc":           round(cost / clicks, 4) if clicks else 0.0,
+                    "status":        st.get("status", "NONE"),
+                })
+            save_gads_search_terms_cache(cache_rows, days=30)
+            logger.info(f"Wrote {len(cache_rows)} fresh search terms to gads_search_terms_cache")
+        except Exception as _st_cache_err:
+            logger.warning(f"search_terms_cache write failed (non-fatal): {_st_cache_err}")
+
+        # Run semantic classifier on the freshly written terms so verdict data is current.
+        try:
+            from database import get_setting
+            from search_term_classifier import classify_new_terms_for_campaign
+            _api_key = get_setting("anthropic_api_key") or ""
+            if _api_key:
+                _camp_names = list({st.get("campaign", "") for st in search_terms if st.get("campaign")})
+                for _cn in _camp_names:
+                    _clf = classify_new_terms_for_campaign(
+                        campaign_name=_cn,
+                        days=30,
+                        api_key=_api_key,
+                        force_reclassify=False,  # skip already-classified terms; only process new ones
+                    )
+                    logger.info(f"Semantic classifier [{_cn}]: classified={_clf['classified']} "
+                                f"negatives={len(_clf['negatives'])} skipped={_clf['skipped']}")
+            else:
+                logger.warning("Semantic classifier skipped — no Anthropic API key in settings")
+        except Exception as _clf_err:
+            logger.warning(f"Semantic classifier failed (non-fatal): {_clf_err}")
+
     logger.info("Building lead attribution...")
     attribution = _get_keyword_attribution()
 
