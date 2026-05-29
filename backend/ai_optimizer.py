@@ -1389,6 +1389,31 @@ def _get_campaign_settings(client, customer_id: str, days: int = 30) -> dict:
     except Exception as e:
         logger.warning(f"_get_campaign_settings impression share pass failed: {e}")
 
+    # Pass 4: enrich with local DB network + location settings so the optimizer can detect
+    # campaigns that still have dental-unfriendly defaults (search_partners ON, PRESENCE_OR_INTEREST).
+    # IMPORTANT: emit campaign_id as the TEXT logical key (campaigns.campaign_id), NOT the
+    # INTEGER surrogate PK (campaigns.id). The approve-chain and endpoints both use
+    # `WHERE campaign_id = ?` on the TEXT key.
+    try:
+        from database import _conn as _db_conn
+        with _db_conn() as _c:
+            db_rows = _c.execute(
+                """SELECT gads_campaign_resource, campaign_id,
+                          search_partners_enabled, display_network_enabled,
+                          location_targeting_restriction
+                   FROM campaigns
+                   WHERE gads_campaign_resource IS NOT NULL AND gads_campaign_resource != ''"""
+            ).fetchall()
+        for db_row in db_rows:
+            rn = db_row[0]
+            if rn in campaign_settings:
+                campaign_settings[rn]["campaign_id"]                   = db_row[1]  # TEXT logical key
+                campaign_settings[rn]["search_partners_enabled"]        = bool(db_row[2])
+                campaign_settings[rn]["display_network_enabled"]        = bool(db_row[3])
+                campaign_settings[rn]["location_targeting_restriction"] = db_row[4] or "PRESENCE_ONLY"
+    except Exception as e:
+        logger.warning(f"_get_campaign_settings DB network/location pass failed (non-fatal): {e}")
+
     return campaign_settings
 
 
@@ -2175,8 +2200,11 @@ def _lifecycle_sieve(ops: list, lifecycle: dict, conversions_30d: float, campaig
 
     # Operations always safe in any stage (zero-risk)
     # add_asset (callouts/snippets) is always allowed — zero cost, improves ad real estate
-    # and Quality Score without disrupting the learning phase
-    _ALWAYS_ALLOWED = {"add_negative_keyword", "claude_advisory", "add_asset"}
+    # and Quality Score without disrupting the learning phase.
+    # set_search_partners / set_location_restriction are always allowed — these fix
+    # Google's anti-dental defaults and should be corrected regardless of campaign age.
+    _ALWAYS_ALLOWED = {"add_negative_keyword", "claude_advisory", "add_asset",
+                       "set_search_partners", "set_location_restriction"}
 
     # Operations forbidden in new/unknown (increase_bid and change_bid_strategy handled separately below)
     _FORBIDDEN_NEW = {
@@ -3139,7 +3167,7 @@ CHECK 3 — QUALITY SCORE DIAGNOSTICS (run for every keyword in keyword_performa
 === END PRE-FLIGHT CHECKS ===
 
 Each recommendation MUST be a JSON object with these fields:
-- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group | update_geo_targeting | claude_advisory
+- "operation": one of: add_negative_keyword | pause_keyword | increase_bid | decrease_bid | add_exact_keyword | ad_copy_suggestion | geo_exclusion | enable_keyword | change_budget | change_bid_strategy | change_match_type | add_asset | replace_ad | pause_ad_group | update_geo_targeting | set_search_partners | set_location_restriction | claude_advisory
 - "reason": 1-2 sentence explanation with specific numbers from the data
 - "estimated_monthly_impact": object with keys:
     "savings_usd": estimated monthly dollar savings (0 if not applicable),
@@ -3271,6 +3299,34 @@ For update_geo_targeting (AI geo radius / ZIP recommendation — requires admin 
   - Implant/All-on-4 campaigns: proposed_radius_miles MUST be ≥ 15 — never shrink below
   - Only recommend if geo_signals data has ≥ 30 clicks in at least one location being changed
   - If geo_signals is absent or has insufficient data, do NOT return update_geo_targeting
+
+For set_search_partners (enable/disable Search Partners network — dental default is OFF):
+  "campaign_resource": campaign resource name (entity_id)
+  "campaign_id": local DB campaign id (from campaign_settings or data)
+  "enabled": false (always recommend false for dental — see DENTAL NETWORK DEFAULTS below)
+  "reason": cite the specific waste signal (e.g. search_partners_pct from account intelligence)
+  When to emit: if campaign_settings shows search_partners_enabled=true OR account intelligence
+  shows search_partners_pct > 0.0 (any spend on partner network).
+  One rec per affected campaign. Do NOT emit if search_partners_enabled is already false.
+
+For set_location_restriction (Presence-only vs Presence-or-Interest location targeting):
+  "campaign_resource": campaign resource name (entity_id)
+  "campaign_id": local DB campaign id
+  "restriction": "PRESENCE_ONLY" (always recommend PRESENCE_ONLY for dental)
+  "reason": cite that Google's default "Presence or Interest" shows ads to non-local users
+  When to emit: if campaign_settings shows location_targeting_restriction != "PRESENCE_ONLY".
+  PRESENCE_ONLY ensures ads only show to users physically present in the target area — critical
+  for a local dental practice where driving distance determines whether a click can become a patient.
+  Do NOT emit if location_targeting_restriction is already "PRESENCE_ONLY".
+
+DENTAL NETWORK DEFAULTS (apply these checks at the start of every per-campaign run):
+1. Search Partners: if campaign_settings.search_partners_enabled is true or not present in DB,
+   emit set_search_partners with enabled=false. Dental practices lose budget on partner sites
+   with no local intent (Yahoo, parked domains, Amazon search).
+2. Location Restriction: if campaign_settings.location_targeting_restriction != "PRESENCE_ONLY",
+   emit set_location_restriction with restriction="PRESENCE_ONLY". Google's default
+   "Presence or Interest" is the #1 dental budget drain — it targets users 50+ miles away
+   who are merely "interested" in the area, not located there.
 
 AD PERFORMANCE SCORING CONTEXT:
 The "ad_performance" field contains per-RSA metrics. Key fields:
@@ -4917,10 +4973,13 @@ RULES FOR ACCOUNT HEALTH RECS:
    - If invalid_clicks > 200 in 30d: flag for investigation regardless of rate.
 3. SEARCH PARTNERS:
    - If search_partners_pct is null: not yet synced — do NOT flag.
-   - If search_partners_pct == 0.0: Search Partners is disabled — note as a deliberate setting (good).
-   - If search_partners_pct > 0.15 (>15% of spend on Search Partners): emit claude_advisory.
-     Search Partners quality varies and dental practices often see lower intent there.
-     Suggest disabling Search Partners if conversion rate is not validated for this account.
+   - If search_partners_pct == 0.0: Search Partners is disabled — note as a positive deliberate setting.
+   - If search_partners_pct > 0.0 (any spend going to Search Partners): emit set_search_partners action
+     targeting the highest-spend ENABLED campaign. Dental practices should run Search Partners OFF:
+     partner sites (Yahoo, Amazon search, parked domains) lack Google's local intent precision,
+     generate fat-finger clicks, and distort conversion data. Use entity_id = campaign_resource_name,
+     after_state = {"search_partners_enabled": false, "campaign_id": "<local_id>"}.
+     Set reason = "Search Partners detected ({pct:.0%} of spend) — dental practices see lower intent on partner sites; disabling to protect budget".
 4. TOP / ABS-TOP IMPRESSION SHARE:
    - If abs_top_impression_pct < 0.10 (less than 10% of searches show our ad #1): advisory noting
      competitive positioning is weak at the top slot; bid intelligence may be needed.

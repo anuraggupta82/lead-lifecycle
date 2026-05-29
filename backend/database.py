@@ -1581,6 +1581,19 @@ def _migrate(conn):
         # Safe migration — column may already exist or migration may have run partially
         pass
 
+    # Campaign network + location settings (Dental Defaults migration — May 2026)
+    # search_partners_enabled: OFF by default — dental campaigns see lower intent on partner sites.
+    # display_network_enabled: OFF by default — Display burns Search budget on banner clicks.
+    # location_targeting_restriction: PRESENCE_ONLY by default — blocks ads to non-local "interest"
+    #   searchers (Google's default "Presence or Interest" is the #1 dental budget drain).
+    camp_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "search_partners_enabled" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN search_partners_enabled INTEGER NOT NULL DEFAULT 0")
+    if "display_network_enabled" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN display_network_enabled INTEGER NOT NULL DEFAULT 0")
+    if "location_targeting_restriction" not in camp_cols:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN location_targeting_restriction TEXT NOT NULL DEFAULT 'PRESENCE_ONLY'")
+
     # Sitelink library — shared pool of sitelinks that have been pushed to Google Ads
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sitelink_library (

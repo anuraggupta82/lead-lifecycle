@@ -555,11 +555,42 @@ def create_campaign_in_gads(campaign: dict, build: dict) -> dict:
             .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
         )
 
-        # Network settings — search only, no display, no partners
-        camp.network_settings.target_google_search     = True
-        camp.network_settings.target_search_network    = True
-        camp.network_settings.target_content_network   = False
+        # Network settings — core Google Search only.
+        # Search Partners (target_search_network) defaults OFF for dental campaigns:
+        # partner sites lack local intent precision and inflate spend with low-quality clicks.
+        # Display Network (target_content_network) always OFF for search campaigns.
+        # Both can be toggled post-launch via the /search-partners and /display-network endpoints.
+        _search_partners_enabled = bool(campaign.get("search_partners_enabled", False))
+        _display_network_enabled = bool(campaign.get("display_network_enabled", False))
+        camp.network_settings.target_google_search          = True
+        camp.network_settings.target_search_network         = _search_partners_enabled
+        camp.network_settings.target_content_network        = _display_network_enabled
         camp.network_settings.target_partner_search_network = False
+        log.append(f"  ℹ Networks: Google Search=ON, Search Partners={'ON' if _search_partners_enabled else 'OFF'}, Display={'ON' if _display_network_enabled else 'OFF'}")
+
+        # Location targeting restriction — Presence only vs Presence or Interest.
+        # Controlled via campaign.geo_target_type_setting.positive_geo_target_type:
+        #   PRESENCE           = only show to users physically in the target area (recommended for dental)
+        #   PRESENCE_OR_INTEREST = also shows to users anywhere who are "interested" in the area
+        #                          (Google's default — the #1 dental budget drain)
+        # NOTE: TargetingDimensionEnum.LOCATION does NOT exist in GAds v24 — do NOT use TargetRestriction
+        # for this. The correct field is geo_target_type_setting.positive_geo_target_type.
+        _loc_restriction = (campaign.get("location_targeting_restriction") or "PRESENCE_ONLY").upper().strip()
+        if _loc_restriction not in ("PRESENCE_ONLY", "PRESENCE_OR_INTEREST"):
+            logger.warning(f"[create] Unknown location_targeting_restriction '{_loc_restriction}' — defaulting to PRESENCE_ONLY")
+            _loc_restriction = "PRESENCE_ONLY"
+        try:
+            _pos_geo_enum = client.enums.PositiveGeoTargetTypeEnum
+            camp.geo_target_type_setting.positive_geo_target_type = (
+                _pos_geo_enum.PRESENCE
+                if _loc_restriction == "PRESENCE_ONLY"
+                else _pos_geo_enum.PRESENCE_OR_INTEREST
+            )
+            log.append(f"  ℹ Location restriction: {_loc_restriction} (geo_target_type_setting.positive_geo_target_type)")
+        except Exception as _geo_err:
+            # Non-fatal — log and continue; the campaign will still be created with geo criteria.
+            logger.warning(f"[create] geo_target_type_setting failed (non-fatal): {_geo_err}")
+            log.append(f"  ⚠ Location restriction not applied: {_geo_err}")
 
         # Start date
         if start_date:

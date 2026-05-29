@@ -2506,6 +2506,77 @@ async def gads_approve_action(action_id: str, request: Request):
                 f"new_ag={new_ag_resource!r} rsa_copied={skag_result.get('rsa_copied')} ({action_id[:8]})"
             )
 
+        elif operation == "set_search_partners":
+            # ── Enable / disable Search Partners network ──────────────────────────────────
+            after = json.loads(row["after_state_json"] or "{}")
+            enabled = bool(after.get("search_partners_enabled", False))
+            camp_rn = row["entity_id"]
+            camp_id_local = after.get("campaign_id") or ""
+
+            from google.protobuf import field_mask_pb2 as _fm2
+            client = _build_client()
+            _cid = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+            op = client.get_type("CampaignOperation")
+            op.update.resource_name = camp_rn
+            op.update.network_settings.target_search_network = enabled
+            client.copy_from(op.update_mask, _fm2.FieldMask(paths=["network_settings.target_search_network"]))
+            client.get_service("CampaignService").mutate_campaigns(customer_id=_cid, operations=[op])
+
+            # Update local DB — use campaign_id (TEXT logical key), NOT id (INTEGER surrogate PK)
+            if camp_id_local:
+                with get_db() as _c:
+                    _c.execute(
+                        "UPDATE campaigns SET search_partners_enabled = ? WHERE campaign_id = ?",
+                        (1 if enabled else 0, camp_id_local),
+                    )
+            else:
+                logger.warning(f"set_search_partners approve: no campaign_id in after_state — DB column not updated for {camp_rn}")
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(
+                f"set_search_partners approved: enabled={enabled} on {camp_rn} ({action_id[:8]})"
+            )
+
+        elif operation == "set_location_restriction":
+            # ── Presence-only vs Presence-or-Interest location targeting ─────────────────
+            # Uses geo_target_type_setting.positive_geo_target_type (PRESENCE / PRESENCE_OR_INTEREST).
+            # TargetingDimensionEnum.LOCATION does NOT exist in GAds v24 — TargetRestriction is
+            # for audience/demographic bid modifiers only.
+            after = json.loads(row["after_state_json"] or "{}")
+            restriction = (after.get("location_targeting_restriction") or "PRESENCE_ONLY").upper()
+            camp_rn = row["entity_id"]
+            camp_id_local = after.get("campaign_id") or ""
+
+            from google.protobuf import field_mask_pb2 as _fm3
+            client = _build_client()
+            _cid = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+            op = client.get_type("CampaignOperation")
+            op.update.resource_name = camp_rn
+            _pos_geo_enum = client.enums.PositiveGeoTargetTypeEnum
+            op.update.geo_target_type_setting.positive_geo_target_type = (
+                _pos_geo_enum.PRESENCE
+                if restriction == "PRESENCE_ONLY"
+                else _pos_geo_enum.PRESENCE_OR_INTEREST
+            )
+            client.copy_from(op.update_mask,
+                             _fm3.FieldMask(paths=["geo_target_type_setting.positive_geo_target_type"]))
+            client.get_service("CampaignService").mutate_campaigns(customer_id=_cid, operations=[op])
+
+            # Update local DB — use campaign_id (TEXT logical key), NOT id (INTEGER surrogate PK)
+            if camp_id_local:
+                with get_db() as _c:
+                    _c.execute(
+                        "UPDATE campaigns SET location_targeting_restriction = ? WHERE campaign_id = ?",
+                        (restriction, camp_id_local),
+                    )
+            else:
+                logger.warning(f"set_location_restriction approve: no campaign_id in after_state — DB column not updated for {camp_rn}")
+            update_gads_action_result(action_id, executed=True, execution_result="success")
+            set_audit_approval(action_id, approver="admin")
+            logger.info(
+                f"set_location_restriction approved: {restriction} on {camp_rn} ({action_id[:8]})"
+            )
+
         else:
             raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
 
@@ -8616,6 +8687,23 @@ class DeviceBidModifierRequest(BaseModel):
     reason: str = ""
 
 
+class NetworkSettingRequest(BaseModel):
+    enabled: bool
+    reason: str = ""
+
+
+class LocationRestrictionRequest(BaseModel):
+    restriction: str     # PRESENCE_ONLY | PRESENCE_OR_INTEREST
+    reason: str = ""
+
+
+class BiddingStrategyRequest(BaseModel):
+    strategy: str        # MANUAL_CPC | MAXIMIZE_CONVERSIONS | MAXIMIZE_CLICKS | TARGET_CPA | TARGET_ROAS
+    target_cpa_usd: float = 0.0   # required for TARGET_CPA (e.g. 75.0 = $75/conversion)
+    target_roas: float = 0.0      # required for TARGET_ROAS (e.g. 3.0 = 300% ROAS)
+    reason: str = ""
+
+
 @app.post("/api/admin/campaigns/{campaign_id}/device-bid-modifier",
           dependencies=[Depends(_require_admin)])
 def admin_set_device_bid_modifier(campaign_id: str, body: DeviceBidModifierRequest):
@@ -8748,6 +8836,288 @@ def admin_set_device_bid_modifier(campaign_id: str, body: DeviceBidModifierReque
         err_str = str(e)
         logger.error(f"device_modifier failed ({device_str}, {op_type}): {err_str}")
         update_gads_action_result(action_id, executed=True,
+                                  execution_result="error", error_detail=err_str)
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {err_str}")
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/search-partners",
+          dependencies=[Depends(_require_admin)])
+def admin_set_search_partners(campaign_id: str, body: NetworkSettingRequest):
+    """
+    Enable or disable Search Partners network for a campaign.
+    Dental default: DISABLED. Search Partners inflate spend with low-intent traffic from
+    partner sites (Amazon search, Yahoo, parked domains) that lack Google's local precision.
+    Updates both Google Ads (CampaignService FieldMask) and the local DB column.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from ai_optimizer import _build_client
+    from google.protobuf import field_mask_pb2 as _fm
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    settings = get_settings()
+    # Always strip non-digits — Google Ads API requires digits-only customer ID
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    client = _build_client()
+
+    before_val = bool(camp.get("search_partners_enabled", False))
+    action_id = log_admin_manual_action(
+        operation="set_search_partners",
+        entity_type="campaign",
+        entity_id=gads_resource,
+        entity_name=camp.get("campaign_name", ""),
+        before={"search_partners_enabled": before_val},
+        # Include campaign_id so the approve-chain handler can update the local DB
+        after={"search_partners_enabled": body.enabled, "campaign_id": campaign_id},
+        reason=body.reason or ("enable_search_partners" if body.enabled else "disable_search_partners"),
+    )
+
+    try:
+        camp_service = client.get_service("CampaignService")
+        op = client.get_type("CampaignOperation")
+        op.update.resource_name = gads_resource
+        op.update.network_settings.target_search_network = body.enabled
+        client.copy_from(op.update_mask, _fm.FieldMask(paths=["network_settings.target_search_network"]))
+        camp_service.mutate_campaigns(customer_id=customer_id, operations=[op])
+
+        # Update local DB — use campaign_id (TEXT logical key), NOT id (INTEGER surrogate PK)
+        from database import _conn as _db_conn
+        with _db_conn() as conn:
+            conn.execute(
+                "UPDATE campaigns SET search_partners_enabled = ? WHERE campaign_id = ?",
+                (1 if body.enabled else 0, campaign_id),
+            )
+
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        logger.info(f"search_partners set to {body.enabled} on '{camp.get('campaign_name')}' ({action_id[:8]})")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "set_search_partners",
+            "campaign_name": camp.get("campaign_name"),
+            "search_partners_enabled": body.enabled,
+        }
+    except Exception as e:
+        err_str = str(e)
+        logger.error(f"set_search_partners failed: {err_str}")
+        update_gads_action_result(action_id, executed=False,
+                                  execution_result="error", error_detail=err_str)
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {err_str}")
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/location-restriction",
+          dependencies=[Depends(_require_admin)])
+def admin_set_location_restriction(campaign_id: str, body: LocationRestrictionRequest):
+    """
+    Set the location targeting restriction for a campaign.
+    PRESENCE_ONLY — ads only show to users physically present in the target area (recommended).
+    PRESENCE_OR_INTEREST — Google default; also shows ads to users "interested" in the area
+    regardless of physical location (major budget drain for local dental practices).
+
+    Uses campaign.geo_target_type_setting.positive_geo_target_type (PRESENCE / PRESENCE_OR_INTEREST).
+    NOTE: TargetingDimensionEnum.LOCATION does NOT exist in GAds v24 — do NOT use TargetRestriction
+    for this field. The correct API is geo_target_type_setting.
+    Updates both Google Ads (CampaignService FieldMask) and the local DB column.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from ai_optimizer import _build_client
+    from google.protobuf import field_mask_pb2 as _fm
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    restriction = (body.restriction or "").upper().strip()
+    if restriction not in ("PRESENCE_ONLY", "PRESENCE_OR_INTEREST"):
+        raise HTTPException(status_code=422,
+                            detail="restriction must be PRESENCE_ONLY or PRESENCE_OR_INTEREST")
+
+    settings = get_settings()
+    # Always strip non-digits — Google Ads API requires digits-only customer ID
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    client = _build_client()
+
+    before_val = camp.get("location_targeting_restriction", "PRESENCE_ONLY")
+    action_id = log_admin_manual_action(
+        operation="set_location_restriction",
+        entity_type="campaign",
+        entity_id=gads_resource,
+        entity_name=camp.get("campaign_name", ""),
+        before={"location_targeting_restriction": before_val},
+        # Include campaign_id so the approve-chain handler can update the local DB
+        after={"location_targeting_restriction": restriction, "campaign_id": campaign_id},
+        reason=body.reason or f"set_location_{restriction.lower()}",
+    )
+
+    try:
+        # Presence/interest is controlled via geo_target_type_setting.positive_geo_target_type.
+        # TargetingDimensionEnum.LOCATION does NOT exist in v24 — TargetRestriction is for
+        # audience/demographic bid modifiers, not geographic presence settings.
+        camp_service = client.get_service("CampaignService")
+        op = client.get_type("CampaignOperation")
+        op.update.resource_name = gads_resource
+        _pos_geo_enum = client.enums.PositiveGeoTargetTypeEnum
+        op.update.geo_target_type_setting.positive_geo_target_type = (
+            _pos_geo_enum.PRESENCE
+            if restriction == "PRESENCE_ONLY"
+            else _pos_geo_enum.PRESENCE_OR_INTEREST
+        )
+        client.copy_from(op.update_mask,
+                         _fm.FieldMask(paths=["geo_target_type_setting.positive_geo_target_type"]))
+        camp_service.mutate_campaigns(customer_id=customer_id, operations=[op])
+
+        # Update local DB — use campaign_id (TEXT logical key), NOT id (INTEGER surrogate PK)
+        from database import _conn as _db_conn
+        with _db_conn() as conn:
+            conn.execute(
+                "UPDATE campaigns SET location_targeting_restriction = ? WHERE campaign_id = ?",
+                (restriction, campaign_id),
+            )
+
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        logger.info(f"location_restriction set to {restriction} on '{camp.get('campaign_name')}' ({action_id[:8]})")
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "set_location_restriction",
+            "campaign_name": camp.get("campaign_name"),
+            "location_targeting_restriction": restriction,
+        }
+    except Exception as e:
+        err_str = str(e)
+        logger.error(f"set_location_restriction failed: {err_str}")
+        update_gads_action_result(action_id, executed=False,
+                                  execution_result="error", error_detail=err_str)
+        raise HTTPException(status_code=500, detail=f"Google Ads API error: {err_str}")
+
+
+@app.post("/api/admin/campaigns/{campaign_id}/bidding-strategy",
+          dependencies=[Depends(_require_admin)])
+def admin_set_bidding_strategy(campaign_id: str, body: BiddingStrategyRequest):
+    """
+    Change the bidding strategy for a live campaign.
+
+    Supported strategies:
+      MANUAL_CPC          — full manual keyword-level bid control (recommended for new campaigns)
+      MAXIMIZE_CONVERSIONS — smart bidding, optimize for most conversions (needs 30+ conv/30d)
+      TARGET_CPA          — smart bidding, target cost per acquisition (requires target_cpa_usd)
+      MAXIMIZE_CLICKS     — maximize click volume within budget
+      TARGET_ROAS         — target return on ad spend (requires target_roas, e.g. 3.0 = 300%)
+
+    Reuses the battle-tested _execute_change_bid_strategy() from ai_optimizer.py.
+    Logs to gads_audit_log with full before/after state.
+    """
+    from campaign_safety import check_writes_enabled, WriteBlockedError
+    from database import get_campaign_by_id, log_admin_manual_action, update_gads_action_result, set_audit_approval
+    from ai_optimizer import _build_client, _execute_change_bid_strategy
+
+    try:
+        check_writes_enabled()
+    except WriteBlockedError as e:
+        raise HTTPException(status_code=403, detail=f"Writes blocked: {e}")
+
+    camp = get_campaign_by_id(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gads_resource = camp.get("gads_campaign_resource") or ""
+    if not gads_resource:
+        raise HTTPException(status_code=400, detail="Campaign is not linked to Google Ads")
+
+    strategy = (body.strategy or "").upper().strip()
+    _valid_strategies = {"MANUAL_CPC", "MAXIMIZE_CONVERSIONS", "MAXIMIZE_CLICKS", "TARGET_CPA", "TARGET_ROAS"}
+    if strategy not in _valid_strategies:
+        raise HTTPException(status_code=422,
+                            detail=f"strategy must be one of: {', '.join(sorted(_valid_strategies))}")
+
+    if strategy == "TARGET_CPA" and body.target_cpa_usd <= 0:
+        raise HTTPException(status_code=422,
+                            detail="target_cpa_usd is required and must be > 0 for TARGET_CPA")
+    if strategy == "TARGET_ROAS" and body.target_roas <= 0:
+        raise HTTPException(status_code=422,
+                            detail="target_roas is required and must be > 0 for TARGET_ROAS")
+
+    settings = get_settings()
+    customer_id = "".join(ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit())
+    client = _build_client()
+
+    # Read current strategy from campaign snapshot if available
+    snapshot = {}
+    try:
+        import json as _json
+        snapshot = _json.loads(camp.get("gads_campaign_snapshot") or "{}") or {}
+    except Exception:
+        pass
+    before_strategy = snapshot.get("bidding_strategy_type") or "UNKNOWN"
+
+    target_cpa_micros = int(body.target_cpa_usd * 1_000_000) if body.target_cpa_usd > 0 else 0
+
+    action_id = log_admin_manual_action(
+        operation="change_bid_strategy",
+        entity_type="campaign",
+        entity_id=gads_resource,
+        entity_name=camp.get("campaign_name", ""),
+        before={"bidding_strategy_type": before_strategy},
+        after={
+            "bid_strategy": strategy,
+            "campaign_resource": gads_resource,
+            "campaign_id": campaign_id,
+            "target_cpa_micros": target_cpa_micros,
+            "target_roas": body.target_roas,
+        },
+        reason=body.reason or f"manual_bidding_strategy_change_to_{strategy.lower()}",
+    )
+
+    try:
+        _execute_change_bid_strategy(
+            client, customer_id, gads_resource,
+            bid_strategy=strategy,
+            target_cpa_micros=target_cpa_micros,
+            target_roas=body.target_roas,
+        )
+
+        update_gads_action_result(action_id, executed=True, execution_result="success")
+        set_audit_approval(action_id, "admin")
+        logger.info(
+            f"bidding_strategy changed to {strategy} on '{camp.get('campaign_name')}' ({action_id[:8]})"
+        )
+        return {
+            "ok": True,
+            "action_id": action_id,
+            "operation": "change_bid_strategy",
+            "campaign_name": camp.get("campaign_name"),
+            "strategy": strategy,
+            "target_cpa_usd": body.target_cpa_usd or None,
+            "target_roas": body.target_roas or None,
+        }
+    except Exception as e:
+        err_str = str(e)
+        logger.error(f"set_bidding_strategy failed ({strategy}): {err_str}")
+        update_gads_action_result(action_id, executed=False,
                                   execution_result="error", error_detail=err_str)
         raise HTTPException(status_code=500, detail=f"Google Ads API error: {err_str}")
 
