@@ -466,6 +466,24 @@ async def lifespan(app: FastAPI):
                           id="unified_od_sync", name="Unified OD Sync (chain)",
                           max_instances=1, coalesce=True, replace_existing=True)
 
+    # Microsoft Clarity nightly sync — runs at 22:30 (after OD sync starts).
+    # Pulls previous day's session metrics (scroll depth, rage clicks, engagement time)
+    # for both graftondentalcare.com and nxtsmile.com via Clarity Data Export API.
+    # 2 API calls/day (1 per property), leaving 8/day reserve per project.
+    def _clarity_sync_job():
+        _stamp("clarity_sync")
+        try:
+            from clarity_sync import run_nightly_sync
+            result = run_nightly_sync()
+            for prop, res in result.items():
+                logger.info(f"Clarity sync [{prop}]: {res}")
+        except Exception as e:
+            logger.error(f"Clarity nightly sync failed: {e}", exc_info=True)
+
+    ads_scheduler.add_job(_clarity_sync_job, CronTrigger(hour=22, minute=30),
+                          id="clarity_sync", name="Microsoft Clarity Nightly Sync",
+                          max_instances=1, coalesce=True, replace_existing=True)
+
     # Domain crawler — runs on the 1st of every month at 2 AM.
     # Incremental: only re-crawls pages whose HTML has changed (hash diff).
     # First crawl of a new domain is always full regardless of schedule.

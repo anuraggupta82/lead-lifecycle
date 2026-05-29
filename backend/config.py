@@ -169,6 +169,12 @@ class Settings(BaseSettings):
     # Webhook secret (HMAC-SHA256) — set in .env after generating in CallRail dashboard
     callrail_webhook_secret: str = ""
 
+    # ── Microsoft Clarity (session recording + heatmaps) ─────────────────────
+    # Tokens generated in Clarity → Settings → Data Export (long-lived JWTs)
+    # Credentials at: _CREDENTIALS_VAULT/Clarity Token.rtf
+    clarity_token_gdc: str = ""       # graftondentalcare.com project
+    clarity_token_nxtsmile: str = ""  # nxtsmile.com project
+
     class Config:
         env_file = ".env"
         case_sensitive = False
