@@ -10836,3 +10836,66 @@ def get_ab_experiment_lead_metrics(
             "base":  base_metrics,
             "trial": trial_metrics,
         }
+
+
+# ── Auction Insights ──────────────────────────────────────────────────────────
+
+def save_gads_auction_insights(rows: list) -> int:
+    """
+    Pass 8e: Upsert auction insight rows — one per (campaign_id, domain, date).
+    Tracks competitor impression share, overlap rate, outranking share,
+    top-of-page rate, abs-top-of-page rate, and position-above rate over time.
+    Returns count of rows upserted.
+    """
+    now = _now()
+    count = 0
+    with _conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gads_auction_insights (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id             TEXT NOT NULL,
+                campaign_name           TEXT NOT NULL DEFAULT '',
+                domain                  TEXT NOT NULL,
+                date                    TEXT NOT NULL DEFAULT 'SUMMARY',
+                impression_share        REAL DEFAULT 0.0,
+                overlap_rate            REAL DEFAULT 0.0,
+                outranking_share        REAL DEFAULT 0.0,
+                top_impression_pct      REAL DEFAULT 0.0,
+                abs_top_impression_pct  REAL DEFAULT 0.0,
+                position_above_rate     REAL DEFAULT 0.0,
+                synced_at               TEXT NOT NULL,
+                UNIQUE(campaign_id, domain, date)
+            )
+        """)
+        for row in rows:
+            conn.execute("""
+                INSERT INTO gads_auction_insights
+                    (campaign_id, campaign_name, domain, date,
+                     impression_share, overlap_rate, outranking_share,
+                     top_impression_pct, abs_top_impression_pct,
+                     position_above_rate, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(campaign_id, domain, date) DO UPDATE SET
+                    campaign_name=excluded.campaign_name,
+                    impression_share=excluded.impression_share,
+                    overlap_rate=excluded.overlap_rate,
+                    outranking_share=excluded.outranking_share,
+                    top_impression_pct=excluded.top_impression_pct,
+                    abs_top_impression_pct=excluded.abs_top_impression_pct,
+                    position_above_rate=excluded.position_above_rate,
+                    synced_at=excluded.synced_at
+            """, (
+                row.get("campaign_id", ""),
+                row.get("campaign_name", ""),
+                row.get("domain", ""),
+                row.get("date", "SUMMARY"),
+                round(float(row.get("impression_share", 0.0) or 0.0), 4),
+                round(float(row.get("overlap_rate", 0.0) or 0.0), 4),
+                round(float(row.get("outranking_share", 0.0) or 0.0), 4),
+                round(float(row.get("top_impression_pct", 0.0) or 0.0), 4),
+                round(float(row.get("abs_top_impression_pct", 0.0) or 0.0), 4),
+                round(float(row.get("position_above_rate", 0.0) or 0.0), 4),
+                now,
+            ))
+            count += 1
+    return count

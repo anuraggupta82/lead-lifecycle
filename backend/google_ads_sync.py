@@ -1388,6 +1388,15 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         logger.warning(f"Geo performance fetch failed (non-fatal): {e}")
         geo_perf_rows = 0
 
+    # Pass 8e: Auction Insights (competitor impression share + overlap rates)
+    logger.info("Fetching auction insights...")
+    try:
+        auction_insight_rows = _fetch_auction_insights(client, customer_id, days=30)
+        logger.info(f"Auction insights: {auction_insight_rows} rows upserted")
+    except Exception as e:
+        logger.warning(f"Auction insights fetch failed (non-fatal): {e}")
+        auction_insight_rows = 0
+
     # Pass 7: Ad creative metadata + daily metrics
     logger.info("Fetching ad creative metadata and daily metrics...")
     ad_rows = 0
@@ -1424,6 +1433,7 @@ def sync_gclids_to_keywords(days_back: int = 7) -> dict:
         "keyword_click_share_rows": click_share_rows,
         "device_performance_rows": device_perf_rows,
         "geo_performance_rows": geo_perf_rows,
+        "auction_insight_rows": auction_insight_rows,
     }
     logger.info(f"Google Ads sync complete: {result}")
     return result
@@ -1561,6 +1571,66 @@ def sync_call_view(days_back: int = 14) -> int:
 
     logger.info(f"sync_call_view: upserted {count} call_view rows")
     return count
+
+
+def _fetch_auction_insights(client, customer_id: str, days: int = 30) -> int:
+    """
+    Pass 8e: Fetch Auction Insights — competitor impression share, overlap rate,
+    outranking share, and top-of-page rate per campaign per date.
+
+    Google Ads API resource: auction_insight (campaign level).
+    Stores one row per (campaign_id, domain, date) so trends can be tracked.
+    Returns count of rows upserted.
+    """
+    from database import save_gads_auction_insights as _save
+    service = client.get_service("GoogleAdsService")
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+
+    rows = []
+    try:
+        # NOTE: Auction Insights is queried FROM campaign (not from a separate resource).
+        # The competitor domain is a SEGMENT: segments.auction_insight_domain.
+        # This feature requires the account to be allowlisted by Google for Auction Insights API access.
+        query = f"""
+            SELECT
+                campaign.id,
+                campaign.name,
+                segments.auction_insight_domain,
+                segments.date,
+                metrics.auction_insight_search_impression_share,
+                metrics.auction_insight_search_overlap_rate,
+                metrics.auction_insight_search_outranking_share,
+                metrics.auction_insight_search_top_impression_percentage,
+                metrics.auction_insight_search_absolute_top_impression_percentage,
+                metrics.auction_insight_search_position_above_rate
+            FROM campaign
+            WHERE segments.date BETWEEN '{start_date.strftime("%Y-%m-%d")}' AND '{end_date.strftime("%Y-%m-%d")}'
+              AND campaign.status = 'ENABLED'
+        """
+        for row in service.search(customer_id=customer_id, query=query):
+            rows.append({
+                "campaign_id":       str(row.campaign.id),
+                "campaign_name":     row.campaign.name or "",
+                "domain":            row.segments.auction_insight_domain or "",
+                "date":              str(row.segments.date) if row.segments.date else "",
+                "impression_share":  float(row.metrics.auction_insight_search_impression_share or 0.0),
+                "overlap_rate":      float(row.metrics.auction_insight_search_overlap_rate or 0.0),
+                "outranking_share":  float(row.metrics.auction_insight_search_outranking_share or 0.0),
+                "top_impression_pct": float(row.metrics.auction_insight_search_top_impression_percentage or 0.0),
+                "abs_top_impression_pct": float(row.metrics.auction_insight_search_absolute_top_impression_percentage or 0.0),
+                "position_above_rate": float(row.metrics.auction_insight_search_position_above_rate or 0.0),
+            })
+        logger.info(f"Auction insights: {len(rows)} rows fetched")
+    except Exception as e:
+        logger.warning(f"_fetch_auction_insights failed: {e}")
+        return 0
+
+    if rows:
+        count = _save(rows)
+        logger.info(f"Upserted {count} rows into gads_auction_insights")
+        return count
+    return 0
 
 
 if __name__ == "__main__":

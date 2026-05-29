@@ -1010,6 +1010,82 @@ def collect_existing_patient_calls(conn, days: int = 30) -> dict:
     }
 
 
+# ─── Auction Insights collector ───────────────────────────────────────────────
+
+def collect_auction_insights(conn, days: int = 30) -> dict:
+    """
+    Aggregate auction insight signals for the optimizer.
+    Returns top competitors by impression share with key competitive metrics.
+    Surfaces as 'auction_insights' key in the optimizer prompt context.
+    """
+    try:
+        rows = conn.execute("""
+            SELECT
+                domain,
+                campaign_name,
+                AVG(impression_share)       AS impression_share,
+                AVG(overlap_rate)           AS overlap_rate,
+                AVG(outranking_share)       AS outranking_share,
+                AVG(top_impression_pct)     AS top_impression_pct,
+                AVG(position_above_rate)    AS position_above_rate,
+                COUNT(DISTINCT date)        AS data_days
+            FROM gads_auction_insights
+            WHERE date >= date('now', ?) AND date != 'SUMMARY'
+            GROUP BY domain, campaign_name
+            ORDER BY impression_share DESC
+            LIMIT 10
+        """, [f"-{days} days"]).fetchall()
+
+        if not rows:
+            return {"available": False, "reason": "no_data"}
+
+        competitors = []
+        for r in rows:
+            competitors.append({
+                "domain":             r["domain"],
+                "campaign":           r["campaign_name"],
+                "impression_share":   round((r["impression_share"] or 0) * 100, 1),
+                "overlap_rate":       round((r["overlap_rate"] or 0) * 100, 1),
+                "outranking_share":   round((r["outranking_share"] or 0) * 100, 1),
+                "top_impression_pct": round((r["top_impression_pct"] or 0) * 100, 1),
+                "position_above_pct": round((r["position_above_rate"] or 0) * 100, 1),
+                "data_days":          int(r["data_days"] or 0),
+            })
+
+        # Google may label your own row as "You" or the actual domain
+        your_row = next((c for c in competitors if (c["domain"] or "").lower() == "you" or "grafton" in (c["domain"] or "").lower()), None)
+        top_competitor = next((c for c in competitors if c != your_row), None)
+
+        flags = []
+        if your_row and top_competitor:
+            gap = top_competitor["impression_share"] - your_row["impression_share"]
+            if gap > 20:
+                flags.append(
+                    f"{top_competitor['domain']} has {gap:.0f}pt IS advantage — "
+                    f"consider bid increase or budget expansion to close gap"
+                )
+            if top_competitor["position_above_pct"] > 60:
+                flags.append(
+                    f"{top_competitor['domain']} appears above you {top_competitor['position_above_pct']}% "
+                    f"when both show — they are winning position consistently"
+                )
+            if your_row["outranking_share"] > 50:
+                flags.append(
+                    f"You outrank {top_competitor['domain']} {your_row['outranking_share']}% of the time — "
+                    f"strong position quality despite lower IS"
+                )
+
+        return {
+            "available": True,
+            "competitors": competitors,
+            "your_metrics": your_row,
+            "top_competitor": top_competitor,
+            "flags": flags,
+        }
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def collect_all(days: int = 30) -> dict:
     """
@@ -1046,6 +1122,7 @@ def collect_all(days: int = 30) -> dict:
         ("no_shows",               collect_no_show_patterns),
         ("geo",                    collect_geo_signals),
         ("existing_patient_calls", collect_existing_patient_calls),  # PR 5
+        ("auction_insights",       collect_auction_insights),         # Pass 8e
     ]
 
     try:

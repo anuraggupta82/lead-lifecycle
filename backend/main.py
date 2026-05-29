@@ -1105,6 +1105,30 @@ def admin_callrail_sync_calls():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/clarity/sync", dependencies=[Depends(_require_admin)])
+def admin_clarity_sync(days: int = 1):
+    """
+    Manually trigger Microsoft Clarity data sync.
+    Pulls the last `days` days (1–3) for both properties.
+    Also runs nightly at 22:30 via APScheduler.
+    """
+    settings = get_settings()
+    if not settings.clarity_token_gdc and not settings.clarity_token_nxtsmile:
+        raise HTTPException(status_code=503, detail="No Clarity tokens configured in .env")
+    if days < 1 or days > 3:
+        raise HTTPException(status_code=400, detail="days must be 1, 2, or 3 (Clarity API limit)")
+    try:
+        from clarity_sync import run_nightly_sync, sync_property
+        results = {}
+        for prop in ["graftondentalcare.com", "nxtsmile.com"]:
+            results[prop] = sync_property(prop, num_days=days)
+        total_rows = sum(r.get("rows", 0) for r in results.values() if isinstance(r, dict))
+        return {"status": "ok", "days": days, "results": results, "total_rows": total_rows}
+    except Exception as e:
+        logger.error(f"Clarity manual sync failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/admin/callrail/numbers", dependencies=[Depends(_require_admin)])
 def admin_callrail_list_numbers():
     """All tracking numbers with 30-day call counts and campaign assignment names."""

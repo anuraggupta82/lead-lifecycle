@@ -16410,6 +16410,62 @@ function MangoSettingsCard() {
   );
 }
 
+// ── ClaritySyncCard — Manual Clarity sync trigger in Admin panel ──────────────
+
+function ClaritySyncCard() {
+  const [syncing, setSyncing]   = React.useState(false);
+  const [result,  setResult]    = React.useState(null);   // {total_rows, results}
+  const [days,    setDays]      = React.useState(1);
+
+  async function handleSync() {
+    setSyncing(true); setResult(null);
+    try {
+      const d = await api(`/api/admin/clarity/sync?days=${days}`, { method: 'POST' });
+      setResult(d);
+    } catch(e) {
+      setResult({ error: e.message || 'Sync failed' });
+    }
+    setSyncing(false);
+  }
+
+  return (
+    <div className="report-section" style={{marginBottom:12}}>
+      <div className="report-title" style={{marginBottom:10}}>📊 Microsoft Clarity Sync</div>
+      <p style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
+        Pulls behavioral data (scroll depth, rage clicks, engagement time) from the Clarity
+        Data Export API into pipeline.db. Runs automatically at 22:30 ET — use this to pull
+        data immediately. Limit: 10 requests/property/day; max 3-day lookback.
+      </p>
+      <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <label style={{fontSize:11,fontWeight:600}}>Days back:</label>
+        <select value={days} onChange={e=>setDays(Number(e.target.value))}
+          style={{fontSize:11,padding:'3px 7px',border:'1px solid var(--border)',borderRadius:4}}>
+          <option value={1}>1 day (yesterday)</option>
+          <option value={2}>2 days</option>
+          <option value={3}>3 days (max)</option>
+        </select>
+        <button onClick={handleSync} disabled={syncing}
+          style={{padding:'5px 14px',border:'none',borderRadius:6,
+            background: syncing ? '#a5b4fc' : '#6366f1',
+            color:'#fff',cursor:syncing?'default':'pointer',fontSize:12,fontWeight:600}}>
+          {syncing ? '⟳ Syncing…' : '⟳ Sync Clarity Now'}
+        </button>
+        {result && !syncing && (
+          result.error
+            ? <span style={{fontSize:11,color:'#dc2626'}}>❌ {result.error}</span>
+            : <span style={{fontSize:11,color:'#16a34a'}}>
+                ✓ {result.total_rows} rows written —&nbsp;
+                {Object.entries(result.results || {}).map(([prop, r]) =>
+                  `${prop.replace('.com','')}: ${r.rows ?? 0} rows`
+                ).join(' · ')}
+              </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 // ── AISpendCard — AI cost summary in Admin panel ──────────────────────────────
 
 function AISpendCard() {
@@ -17713,6 +17769,8 @@ function AdminTab({ onSync, onMatch, onGAds, onGAdsBackfill, onConversions, onCa
       <MangoSettingsCard />
 
       <AISpendCard />
+
+      <ClaritySyncCard />
 
       <AttributionConfidenceCard />
 
