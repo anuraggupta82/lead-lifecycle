@@ -1358,6 +1358,32 @@ def admin_upload_conversions():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/set-conversion-categories", dependencies=[Depends(_require_admin)])
+def admin_set_conversion_categories():
+    """
+    Set Primary vs Secondary on each GDC conversion action in Google Ads.
+
+    PRIMARY   (trains Smart Bidding): Qualified Lead
+    SECONDARY (observation only):     Appointment Booked, Treatment Accepted, Treatment Completed
+
+    Run once after any conversion action is created or this policy changes.
+    Safe to re-run — no-ops if already correct.
+    """
+    try:
+        from google_ads_conversions import set_conversion_categories
+        result = set_conversion_categories()
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error", "unknown error"))
+        return {"status": "ok", "result": result}
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"Google Ads library not installed: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"set_conversion_categories failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/backup-db", dependencies=[Depends(_require_admin)])
 def admin_backup_db():
     """On-demand: backup pipeline.db to Google Drive immediately."""

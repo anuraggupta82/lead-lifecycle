@@ -6,10 +6,26 @@ This teaches Google's bidding algorithm which keywords produce actual patients
 and revenue, not just clicks. Highest-ROI component of the tracking system.
 
 Conversion actions (created in Step 2):
-  - "Qualified Lead"       ($200)  — lead submitted contact info
-  - "Appointment Booked"   ($500)  — lead booked via scheduler
-  - "Treatment Accepted"   ($15k)  — patient accepted treatment plan in OD
-  - "Treatment Completed"  (dynamic) — actual production from OpenDental
+  - "Qualified Lead"       ($200)  — PRIMARY   — lead submitted contact info
+  - "Appointment Booked"   ($500)  — SECONDARY — appointment scheduled in OD (fast signal)
+  - "Treatment Accepted"   ($15k)  — SECONDARY — patient accepted treatment plan in OD
+  - "Treatment Completed"  (dynamic)— SECONDARY — actual production from OpenDental
+
+Primary vs Secondary (Gemini recommendation, implemented May 30 2026):
+  Google's algorithm trains ONLY on Primary conversions. Secondary conversions appear
+  in reports but do not influence Smart Bidding. Qualified Lead is Primary because it
+  fires immediately (same day as click) giving Google a fast, high-volume signal.
+  Appointment Booked / Treatment stages are Secondary (observation only) so Google
+  reports ROAS without waiting weeks for downstream events to train the algorithm.
+
+Appointment Booked trigger (updated May 30 2026):
+  Previously fired on showed_at (physical arrival — up to 10 days delay).
+  Now fires on scheduled_at (moment OD puts patient on calendar — same day or next day).
+  This cuts the algorithm's feedback loop from 10 days to <24 hours.
+  No-shows: Appointment Booked uploads even for no-shows because it is a Secondary
+  conversion (does not train Smart Bidding). Suppressing it adds complexity with
+  minimal algorithmic benefit. No-show leads appear in ROAS reports but do not
+  influence bid strategy.
 
 Run nightly via APScheduler (11 PM) or manually:
   POST /api/admin/upload-conversions
@@ -21,78 +37,219 @@ import os
 from datetime import datetime, timezone
 
 from google.ads.googleads.client import GoogleAdsClient
+from google.protobuf import field_mask_pb2
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Map lead stages to conversion action names.
-# NOTE: "Appointment Booked" is NOT determined by stage alone — see _resolve_conversion() below.
-# Only stages that have passed the appointment confirmation gate qualify for that conversion.
-STAGE_TO_CONVERSION = {
-    "new":                  "Qualified Lead",
-    "auto_nurture":         "Qualified Lead",
-    "scheduled":            None,               # not enough — requires OD confirmation (showed_at)
-    "no_show":              None,               # patient did not show — no appointment conversion
-    "showed":               "Appointment Booked",
-    "treatment_presented":  "Treatment Accepted",
-    "treatment_accepted":   "Treatment Accepted",
-    "treatment_completed":  "Treatment Completed",
-}
+# Conversion action names — must match exactly what's in Google Ads account
+CONV_QUALIFIED_LEAD    = "Qualified Lead"
+CONV_APPOINTMENT_BOOKED = "Appointment Booked"
+CONV_TREATMENT_ACCEPTED = "Treatment Accepted"
+CONV_TREATMENT_COMPLETED = "Treatment Completed"
 
-# Stage → timestamp column in the leads table (used for accurate conversion_date_time)
-STAGE_TO_TIMESTAMP_COL = {
-    "Qualified Lead":     "created_at",      # lead creation time
-    "Appointment Booked": "showed_at",       # when they actually came in (confirmed by OD)
-    "Treatment Accepted": "tx_accepted_at",  # when treatment plan was accepted
-    "Treatment Completed": "tx_completed_at", # when treatment was completed
-}
-
-
-def _resolve_conversion(lead: sqlite3.Row) -> tuple[str | None, str | None]:
-    """
-    Determine which conversion action (if any) applies to this lead, and the
-    correct timestamp to use for conversion_date_time.
-
-    Returns: (conversion_name, iso_timestamp) or (None, None) if not eligible.
-
-    Rules:
-      - "Qualified Lead"     → stage in (new, auto_nurture); timestamp = created_at
-      - "Appointment Booked" → showed_at IS NOT NULL (confirmed they came in); timestamp = showed_at
-      - "Treatment Accepted" → stage in (treatment_presented, treatment_accepted); timestamp = tx_accepted_at
-      - "Treatment Completed"→ stage = treatment_completed; timestamp = tx_completed_at
-
-    "scheduled" and "no_show" intentionally do NOT generate an "Appointment Booked" conversion —
-    a scheduled appointment that was never kept does not confirm patient acquisition.
-    """
-    stage = lead["stage"]
-    conversion_name = STAGE_TO_CONVERSION.get(stage)
-
-    # Stages mapped to None are explicitly excluded
-    if conversion_name is None:
-        return None, None
-
-    # "Appointment Booked" requires showed_at — even if stage is "showed", verify the field exists
-    if conversion_name == "Appointment Booked":
-        showed_at = lead["showed_at"] or ""
-        if not showed_at:
-            return None, None
-        return conversion_name, showed_at
-
-    # For all other conversions, look up the stage timestamp column
-    ts_col = STAGE_TO_TIMESTAMP_COL.get(conversion_name, "created_at")
-    ts = lead[ts_col] if ts_col in lead.keys() else ""
-    # Fall back to created_at if the specific timestamp is missing (legacy rows)
-    if not ts:
-        ts = lead["created_at"]
-    return conversion_name, ts
+# Which conversion actions are PRIMARY (train Google's algorithm) vs SECONDARY (observation only).
+# Change these via POST /api/admin/set-conversion-categories to sync with Google Ads.
+PRIMARY_CONVERSIONS = {CONV_QUALIFIED_LEAD}
+SECONDARY_CONVERSIONS = {CONV_APPOINTMENT_BOOKED, CONV_TREATMENT_ACCEPTED, CONV_TREATMENT_COMPLETED}
 
 # Default values for each conversion action (used when no production data)
 DEFAULT_VALUES = {
-    "Qualified Lead":     200.0,
-    "Appointment Booked": 500.0,
-    "Treatment Accepted": 15000.0,
-    "Treatment Completed": 25000.0,
+    CONV_QUALIFIED_LEAD:      200.0,
+    CONV_APPOINTMENT_BOOKED:  500.0,
+    CONV_TREATMENT_ACCEPTED:  15000.0,
+    CONV_TREATMENT_COMPLETED: 25000.0,
 }
+
+
+def _resolve_conversions(lead: sqlite3.Row) -> list[tuple[str, str]]:
+    """
+    Determine ALL conversion actions that apply to this lead and their timestamps.
+
+    Returns: list of (conversion_name, iso_timestamp) pairs — may be empty or multiple.
+
+    Rules (ordered — a lead progresses through these stages over time):
+      1. "Qualified Lead"      → stage in (new, auto_nurture)
+                                 timestamp = created_at
+      2. "Appointment Booked"  → scheduled_at IS NOT NULL (appointment created in OD)
+                                 timestamp = scheduled_at  ← FAST SIGNAL (<24h after click)
+                                 Guard: skip if appointment_status = 'broken' AND showed_at empty
+                                 (cancelled before showing — still upload; no-show noise is
+                                 less harmful than 10-day delay)
+      3. "Treatment Accepted"  → stage in (treatment_presented, treatment_accepted)
+                                 timestamp = tx_accepted_at
+      4. "Treatment Completed" → stage = treatment_completed
+                                 timestamp = tx_completed_at
+
+    The caller checks _already_uploaded() per (lead_id, conversion_name) before uploading,
+    so re-running nightly never double-uploads.
+    """
+    stage = lead["stage"]
+    results: list[tuple[str, str]] = []
+
+    # ── 1. Qualified Lead ─────────────────────────────────────────────────────
+    if stage in ("new", "auto_nurture"):
+        ts = lead["created_at"] or ""
+        if ts:
+            results.append((CONV_QUALIFIED_LEAD, ts))
+        return results  # these stages don't have downstream events yet
+
+    # ── 2. Appointment Booked — fires at scheduling, not arrival ─────────────
+    # Preferred timestamp: scheduled_at (moment OD puts patient on calendar).
+    # Fallback chain: showed_at → appointment_date → None.
+    # Fallback is needed for leads that leapfrog the "scheduled" stage — e.g.
+    # od_matcher sees a patient who already showed up on first OD sync and jumps
+    # straight from new → showed, never writing scheduled_at.
+    # No-show note: if appointment_status='broken' and showed_at is empty,
+    # the lead is still at stage='no_show'. scheduled_at IS set (appointment was
+    # created). We intentionally upload Appointment Booked even for no-shows
+    # because (a) it is a Secondary conversion that does NOT train Smart Bidding,
+    # and (b) suppressing it would require checking appointment_status, which adds
+    # complexity with minimal algorithmic benefit.
+    booked_ts = (
+        lead["scheduled_at"]
+        or lead["showed_at"]
+        or lead["appointment_date"]
+        or ""
+    )
+    if booked_ts:
+        results.append((CONV_APPOINTMENT_BOOKED, booked_ts))
+
+    # ── 3. Treatment Accepted ─────────────────────────────────────────────────
+    if stage in ("treatment_presented", "treatment_accepted", "treatment_completed"):
+        tx_accepted_at = lead["tx_accepted_at"] or ""
+        if tx_accepted_at:
+            results.append((CONV_TREATMENT_ACCEPTED, tx_accepted_at))
+
+    # ── 4. Treatment Completed ────────────────────────────────────────────────
+    if stage == "treatment_completed":
+        tx_completed_at = lead["tx_completed_at"] or ""
+        if tx_completed_at:
+            results.append((CONV_TREATMENT_COMPLETED, tx_completed_at))
+
+    return results
+
+
+# ── Legacy single-return shim (used by tests / external callers) ──────────────
+def _resolve_conversion(lead: sqlite3.Row) -> tuple[str | None, str | None]:
+    """
+    Compatibility shim — returns the HIGHEST-PRIORITY single conversion for this lead.
+    Use _resolve_conversions() for full multi-stage upload logic.
+    """
+    pairs = _resolve_conversions(lead)
+    if not pairs:
+        return None, None
+    return pairs[-1]  # last = highest stage reached
+
+# (DEFAULT_VALUES defined above with CONV_* constants — do not redefine here)
+
+
+def set_conversion_categories() -> dict:
+    """
+    PR 2: Set Primary vs Secondary category on each conversion action in Google Ads.
+
+    Primary   → include_in_conversions_metric = True  (trains Smart Bidding)
+    Secondary → include_in_conversions_metric = False (observation/reporting only)
+
+    GDC policy (Gemini recommendation, May 30 2026):
+      PRIMARY:   Qualified Lead         — fires same day as click; high volume; fast signal
+      SECONDARY: Appointment Booked     — fires at scheduling (<24h); ROAS reporting
+                 Treatment Accepted     — fires weeks later; ROAS reporting
+                 Treatment Completed    — fires months later; ROAS reporting
+
+    Run via: POST /api/admin/set-conversion-categories
+    """
+    settings = get_settings()
+    try:
+        client = _build_client()
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to build GAds client: {e}"}
+
+    customer_id = settings.google_ads_customer_id
+    service = client.get_service("ConversionActionService")
+    ga_service = client.get_service("GoogleAdsService")
+
+    # Fetch all enabled conversion actions with their resource names
+    query = """
+        SELECT conversion_action.resource_name,
+               conversion_action.name,
+               conversion_action.include_in_conversions_metric
+        FROM conversion_action
+        WHERE conversion_action.status = 'ENABLED'
+    """
+    response = ga_service.search(customer_id=customer_id, query=query)
+
+    results = []
+    operations = []
+
+    for row in response:
+        ca = row.conversion_action
+        name = ca.name
+        resource_name = ca.resource_name
+        current_include = ca.include_in_conversions_metric
+
+        # Determine desired setting
+        if name in PRIMARY_CONVERSIONS:
+            desired_include = True
+        elif name in SECONDARY_CONVERSIONS:
+            desired_include = False
+        else:
+            # Not one of our managed actions — skip
+            results.append({"name": name, "action": "skipped", "reason": "not managed"})
+            continue
+
+        if current_include == desired_include:
+            results.append({
+                "name": name,
+                "action": "no_change",
+                "include_in_conversions_metric": desired_include,
+            })
+            continue
+
+        # Build mutate operation
+        op = client.get_type("ConversionActionOperation")
+        ca_update = op.update
+        ca_update.resource_name = resource_name
+        ca_update.include_in_conversions_metric = desired_include
+
+        op.update_mask.CopyFrom(
+            field_mask_pb2.FieldMask(paths=["include_in_conversions_metric"])
+        )
+
+        operations.append(op)
+        results.append({
+            "name": name,
+            "action": "updated",
+            "from": current_include,
+            "to": desired_include,
+            "resource_name": resource_name,
+        })
+
+    if operations:
+        try:
+            mutate_response = service.mutate_conversion_actions(
+                customer_id=customer_id,
+                operations=operations,
+            )
+            logger.info(
+                f"set_conversion_categories: {len(operations)} actions updated. "
+                f"Results: {[r['name'] for r in results if r.get('action') == 'updated']}"
+            )
+        except Exception as e:
+            logger.error(f"set_conversion_categories mutate failed: {e}")
+            return {"ok": False, "error": str(e), "results": results}
+    else:
+        logger.info("set_conversion_categories: no changes needed — all actions already correct")
+
+    return {
+        "ok": True,
+        "operations_sent": len(operations),
+        "results": results,
+        "policy": {
+            "primary": sorted(PRIMARY_CONVERSIONS),
+            "secondary": sorted(SECONDARY_CONVERSIONS),
+        },
+    }
 
 
 def _build_client():
@@ -169,12 +326,12 @@ def upload_offline_conversions() -> dict:
     if not action_cache:
         return {"uploaded": 0, "skipped": 0, "errors": 1, "error": "No conversion actions found"}
 
-    # Get all leads with a gclid — include stage-transition timestamps for accurate conversion times
+    # Get all leads with a gclid — include all stage-transition timestamps
     db = _get_db()
     leads = db.execute("""
         SELECT id, gclid, stage, created_at, attributed_production, email, first_name,
                od_patient_num, od_relationship, od_matched_at,
-               showed_at, tx_accepted_at, tx_completed_at,
+               scheduled_at, showed_at, tx_accepted_at, tx_completed_at,
                appointment_date, appointment_status
         FROM leads
         WHERE gclid != '' AND gclid IS NOT NULL
@@ -233,93 +390,91 @@ def upload_offline_conversions() -> dict:
                 skipped += 1
                 continue
 
-        # Determine which conversion to upload — requires OD confirmation for appointment conversions
-        conversion_name, conversion_ts = _resolve_conversion(lead)
-        if not conversion_name:
+        # Resolve ALL conversions that apply to this lead (may be multiple across stages)
+        conversion_pairs = _resolve_conversions(lead)
+        if not conversion_pairs:
             skipped += 1
             continue
 
-        # Check if already uploaded
-        if _already_uploaded(db, lead_id, conversion_name):
-            skipped += 1
-            continue
+        lead_had_any_upload = False
 
-        # Get conversion action resource name
-        action_resource = action_cache.get(conversion_name)
-        if not action_resource:
-            skipped += 1
-            continue
+        for conversion_name, conversion_ts in conversion_pairs:
 
-        # Determine conversion value
-        if conversion_name == "Treatment Completed" and lead["attributed_production"]:
-            value = float(lead["attributed_production"])
-        else:
-            value = DEFAULT_VALUES[conversion_name]
+            # Skip if already uploaded for this (lead, action) pair
+            if _already_uploaded(db, lead_id, conversion_name):
+                continue
 
-        # Build the click conversion
-        try:
-            click_conversion = client.get_type("ClickConversion")
-            click_conversion.gclid = gclid
-            click_conversion.conversion_action = action_resource
-            click_conversion.conversion_value = value
-            click_conversion.currency_code = "USD"
+            # Get conversion action resource name
+            action_resource = action_cache.get(conversion_name)
+            if not action_resource:
+                logger.warning(f"No resource name for '{conversion_name}' — skipping for lead {lead_id}")
+                continue
 
-            # Conversion time = actual stage-transition timestamp (not upload time).
-            # Using the real event time teaches Smart Bidding the correct conversion lag.
-            # conversion_ts comes from _resolve_conversion() — showed_at, tx_accepted_at, etc.
+            # Determine conversion value
+            if conversion_name == CONV_TREATMENT_COMPLETED and lead["attributed_production"]:
+                value = float(lead["attributed_production"])
+            else:
+                value = DEFAULT_VALUES[conversion_name]
+
+            # Build and upload the click conversion
+            ts_str = now  # fallback
             try:
                 # Normalize to Google Ads format: "YYYY-MM-DD HH:MM:SS+HH:MM"
                 ts = datetime.fromisoformat(conversion_ts.replace("Z", "+00:00"))
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S+00:00")
             except Exception:
-                # Fallback if timestamp is malformed
                 ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
-            click_conversion.conversion_date_time = ts_str
 
-            # Upload
-            response = conversion_upload_service.upload_click_conversions(
-                customer_id=customer_id,
-                conversions=[click_conversion],
-                partial_failure=True,
-            )
+            try:
+                click_conversion = client.get_type("ClickConversion")
+                click_conversion.gclid = gclid
+                click_conversion.conversion_action = action_resource
+                click_conversion.conversion_value = value
+                click_conversion.currency_code = "USD"
+                click_conversion.conversion_date_time = ts_str
 
-            # Check for partial failure
-            if response.partial_failure_error:
-                error_msg = response.partial_failure_error.message
-                logger.error(f"Partial failure for lead {lead_id}: {error_msg}")
-
-                db.execute("""
-                    INSERT INTO conversion_uploads
-                        (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
-                    VALUES (?,?,?,?,?,?,?,?)
-                """, (lead_id, conversion_name, gclid, ts_str, value, now, "failed", error_msg[:500]))
-                db.commit()
-                errors += 1
-            else:
-                # Success
-                db.execute("""
-                    INSERT INTO conversion_uploads
-                        (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
-                    VALUES (?,?,?,?,?,?,?,?)
-                """, (lead_id, conversion_name, gclid, ts_str, value, now, "uploaded", "success"))
-                db.commit()
-                uploaded += 1
-
-                logger.info(
-                    f"Uploaded: lead {lead_id} → '{conversion_name}' (${value:.2f}) "
-                    f"[{lead['first_name'] or 'unknown'}]"
+                response = conversion_upload_service.upload_click_conversions(
+                    customer_id=customer_id,
+                    conversions=[click_conversion],
+                    partial_failure=True,
                 )
 
-        except Exception as e:
-            logger.error(f"Error uploading conversion for lead {lead_id}: {e}")
-            _ts = locals().get("ts_str", now)
-            db.execute("""
-                INSERT INTO conversion_uploads
-                    (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (lead_id, conversion_name, gclid, _ts, value, now, "failed", str(e)[:500]))
-            db.commit()
-            errors += 1
+                if response.partial_failure_error:
+                    error_msg = response.partial_failure_error.message
+                    logger.error(f"Partial failure for lead {lead_id} / '{conversion_name}': {error_msg}")
+                    db.execute("""
+                        INSERT INTO conversion_uploads
+                            (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
+                        VALUES (?,?,?,?,?,?,?,?)
+                    """, (lead_id, conversion_name, gclid, ts_str, value, now, "failed", error_msg[:500]))
+                    db.commit()
+                    errors += 1
+                else:
+                    db.execute("""
+                        INSERT INTO conversion_uploads
+                            (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
+                        VALUES (?,?,?,?,?,?,?,?)
+                    """, (lead_id, conversion_name, gclid, ts_str, value, now, "uploaded", "success"))
+                    db.commit()
+                    uploaded += 1
+                    lead_had_any_upload = True
+                    logger.info(
+                        f"Uploaded: lead {lead_id} → '{conversion_name}' (${value:.2f}) "
+                        f"ts={ts_str} [{lead['first_name'] or 'unknown'}]"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error uploading '{conversion_name}' for lead {lead_id}: {e}")
+                db.execute("""
+                    INSERT INTO conversion_uploads
+                        (lead_id, conversion_action, gclid, conversion_time, conversion_value, uploaded_at, status, google_response)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (lead_id, conversion_name, gclid, ts_str, value, now, "failed", str(e)[:500]))
+                db.commit()
+                errors += 1
+
+        if not lead_had_any_upload:
+            skipped += 1
 
     db.close()
 

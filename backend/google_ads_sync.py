@@ -73,6 +73,10 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
     while current_date <= end_date:
         date_str = current_date.strftime("%Y-%m-%d")
 
+        # NOTE: click_view only allows a restricted set of resources in SELECT.
+        # AD_GROUP_AD is incompatible with click_view — both ad.id and ad.name
+        # cause INVALID_ARGUMENT errors. Only select: click_view, ad_group,
+        # campaign, and segments. ad_id stored as "" since it's not queryable here.
         query = f"""
             SELECT
                 click_view.gclid,
@@ -80,8 +84,6 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
                 click_view.keyword_info.match_type,
                 ad_group.name,
                 ad_group.id,
-                ad_group_ad.ad.id,
-                ad_group_ad.ad.name,
                 campaign.name,
                 campaign.id,
                 segments.date
@@ -104,8 +106,8 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
                     "match_type": str(row.click_view.keyword_info.match_type) if row.click_view.keyword_info.match_type else "",
                     "ad_group_name": row.ad_group.name or "",
                     "ad_group_id": str(row.ad_group.id) if row.ad_group.id else "",
-                    "ad_id": str(row.ad_group_ad.ad.id) if row.ad_group_ad.ad.id else "",
-                    "ad_name": row.ad_group_ad.ad.name or "",
+                    "ad_id": "",    # ad_group_ad not selectable with click_view resource
+                    "ad_name": "",  # ad_group_ad not selectable with click_view resource
                     "campaign_name": row.campaign.name or "",
                     "campaign_id": str(row.campaign.id) if row.campaign.id else "",
                     "click_date": row.segments.date or date_str,
@@ -119,10 +121,11 @@ def _fetch_click_data(client, customer_id: str, days_back: int = 90) -> dict:
                 logger.debug(f"  {date_str}: {day_count} clicks")
 
         except Exception as e:
-            # Skip days with errors (e.g. no data)
+            # Log full error — a silent exception here means ALL days return 0
+            # which is indistinguishable from "no clicks", masking real query bugs.
             error_str = str(e)
             if "EXPECTED_FILTER" not in error_str:
-                logger.warning(f"  {date_str}: error — {error_str[:100]}")
+                logger.error(f"click_view query failed for {date_str}: {error_str[:500]}")
 
         days_queried += 1
         current_date += timedelta(days=1)

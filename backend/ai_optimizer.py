@@ -59,6 +59,62 @@ from database import get_all_leads
 
 logger = logging.getLogger(__name__)
 
+# ── Evaluation Framework — decision tree injection ────────────────────────────
+try:
+    from evaluation_framework import run_evaluation, build_evaluation_prompt_block, EvaluationReport
+    _EVAL_FRAMEWORK_AVAILABLE = True
+except ImportError:
+    _EVAL_FRAMEWORK_AVAILABLE = False
+    def run_evaluation(*args, **kwargs):  # type: ignore
+        return None
+    def build_evaluation_prompt_block(*args, **kwargs) -> str:  # type: ignore
+        return ""
+    class EvaluationReport:  # type: ignore
+        pass
+
+# Module-level cache: populated once per optimizer run, reused by all per-campaign + account prompts
+_EVAL_REPORT: "EvaluationReport | None" = None
+
+
+def _get_or_build_eval_report(
+    account_intelligence: dict | None = None,
+    campaign_settings_raw: dict | None = None,
+    keyword_perf: list | None = None,
+    ad_group_performance: list | None = None,
+    search_terms: list | None = None,
+    keyword_click_share: list | None = None,
+) -> "EvaluationReport | None":
+    """Build the evaluation report once per optimizer run and cache it."""
+    global _EVAL_REPORT
+    if _EVAL_REPORT is not None:
+        return _EVAL_REPORT
+    if not _EVAL_FRAMEWORK_AVAILABLE:
+        return None
+    try:
+        _EVAL_REPORT = run_evaluation(
+            account_intelligence=account_intelligence,
+            campaign_settings_raw=campaign_settings_raw,
+            keyword_perf=keyword_perf,
+            ad_group_performance=ad_group_performance,
+            search_terms=search_terms,
+            keyword_click_share=keyword_click_share,
+        )
+        logger.info(
+            f"[evaluation_framework] Account score: {_EVAL_REPORT.account_score}/100 | "
+            f"{len(_EVAL_REPORT.findings)} findings | "
+            f"{sum(1 for f in _EVAL_REPORT.findings if f.level=='critical')} critical"
+        )
+    except Exception as _ef_err:
+        logger.warning(f"[evaluation_framework] run_evaluation failed (non-fatal): {_ef_err}")
+        _EVAL_REPORT = None
+    return _EVAL_REPORT
+
+
+def _reset_eval_report() -> None:
+    """Call at the start of each optimizer run to clear the cache."""
+    global _EVAL_REPORT
+    _EVAL_REPORT = None
+
 
 # ── Optimizer progress tracking ───────────────────────────────────────────────
 # In-memory state written by optimize_campaign() and read by the progress endpoint.
@@ -3078,7 +3134,11 @@ def _call_claude_advisories(keyword_perf: list, attribution: dict, search_terms:
         except Exception as _skag_err:
             logger.warning("SKAG signals failed for %r (non-fatal): %s", campaign, _skag_err)
 
-        prompt = excellence_block + GOOGLE_ADS_RULES + CAMPAIGN_INTENT_RULES + LIFECYCLE_RULES + (LEARNING_PHASE_RULES if lifecycle and lifecycle.get("stage") in ("new", "unknown") else "") + """
+        # ── Evaluation Framework block (decision tree findings) ───────────────
+        _eval_report = _get_or_build_eval_report()
+        _eval_block = build_evaluation_prompt_block(_eval_report, campaign_name=campaign) if _eval_report else ""
+
+        prompt = excellence_block + GOOGLE_ADS_RULES + CAMPAIGN_INTENT_RULES + LIFECYCLE_RULES + (LEARNING_PHASE_RULES if lifecycle and lifecycle.get("stage") in ("new", "unknown") else "") + _eval_block + """
 You are the Chief Marketing Officer (CMO) for Grafton Dental Care, a private dental practice in Grafton, MA. You think at two levels simultaneously:
 
 STRATEGIC level — Is this campaign serving the right patients? Are we allocating budget toward services with the highest patient lifetime value (implants, Invisalign, crowns > cleanings > emergency)? Is a campaign in a learning phase that needs patience rather than intervention? Should budget shift from a low-converting campaign to a proven one? Are we missing an entire patient segment worth targeting?
@@ -4688,7 +4748,11 @@ The practice has enabled Budget Constrained mode. This means:
 === END BUDGET CONSTRAINED MODE ===
 """
 
-        prompt = acct_excellence_block + GOOGLE_ADS_RULES + CAMPAIGN_INTENT_RULES + _acct_budget_constrained_note + """
+        # ── Evaluation Framework block (account-level — no campaign filter) ──
+        _acct_eval_report = _get_or_build_eval_report()
+        _acct_eval_block = build_evaluation_prompt_block(_acct_eval_report, campaign_name=None, max_findings=12) if _acct_eval_report else ""
+
+        prompt = acct_excellence_block + GOOGLE_ADS_RULES + CAMPAIGN_INTENT_RULES + _acct_budget_constrained_note + _acct_eval_block + """
 You are the Chief Marketing Officer (CMO) for Grafton Dental Care, a private dental practice in Grafton, MA, performing an ACCOUNT-LEVEL portfolio review.
 
 Think like a CMO: you are not optimizing individual campaigns in isolation — you are managing a portfolio of bets. Ask yourself:
@@ -7772,6 +7836,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     # This keeps the queue clean — each optimizer run produces a fresh set.
     # Users have 48h to review and apply recommendations before they're swept.
     _optimizer_progress["started_at"] = _time_mod.time()
+    _reset_eval_report()  # clear cached evaluation report from previous run
     _set_progress(0)  # Starting
     expired = expire_stale_pending(max_age_hours=48)
 
@@ -8944,6 +9009,77 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
     # PR 5: accumulate competitor intel across all campaigns for account-level pass
     _per_camp_competitor_blocks: dict = {}  # camp_name -> competitor_intel dict
 
+    # ── Pre-fetch all per-campaign data BEFORE the loop ──────────────────────────
+    # These dicts are used inside the per-campaign loop; they must be defined here.
+
+    # PR-F: Google Ads native phone call stats
+    _phone_stats = _get_campaign_phone_stats(days=30)
+    if _phone_stats:
+        logger.info(f"Phone stats loaded for {len(_phone_stats)} campaigns")
+
+    # PR-B: Conversion action breakdown (pre-bucketed by campaign_id)
+    _conversion_actions_all = _get_conversion_action_breakdown(days=30)
+    if _conversion_actions_all:
+        logger.info(f"Conversion action breakdown loaded: {len(_conversion_actions_all)} rows")
+    _conv_actions_by_camp_id: dict = {}
+    for _ca in _conversion_actions_all:
+        _conv_actions_by_camp_id.setdefault(_ca.get("campaign_id", ""), []).append(_ca)
+
+    # PR-B: Keyword click share + historical QS (pre-bucketed by campaign name)
+    _keyword_click_share_all = _get_keyword_click_share()
+    if _keyword_click_share_all:
+        logger.info(f"Keyword click share/hist QS loaded: {len(_keyword_click_share_all)} keywords")
+    _kw_cs_by_camp: dict = {}
+    for _kcs in _keyword_click_share_all:
+        _kw_cs_by_camp.setdefault(_kcs.get("campaign_name", "").lower(), []).append(_kcs)
+
+    # PR-C: Device performance (pre-bucketed by campaign_id)
+    _device_perf_all = _get_device_performance(days=30)
+    if _device_perf_all:
+        logger.info(f"Device performance loaded: {len(_device_perf_all)} rows")
+    _device_perf_by_camp_id: dict = {}
+    for _dp in _device_perf_all:
+        _device_perf_by_camp_id.setdefault(_dp.get("campaign_id", ""), []).append(_dp)
+
+    # PR-E: Geographic performance (pre-bucketed by campaign_id)
+    _geo_perf_all = _get_geo_performance(days=30)
+    if _geo_perf_all:
+        logger.info(f"Geo performance loaded: {len(_geo_perf_all)} locations")
+    _geo_perf_by_camp_id: dict = {}
+    for _gp in _geo_perf_all:
+        _geo_perf_by_camp_id.setdefault(_gp.get("campaign_id", ""), []).append(_gp)
+
+    # PR-A: Keyword bid estimates (pre-bucketed by campaign name)
+    _keyword_bid_estimates_all = _get_keyword_bid_estimates()
+    if _keyword_bid_estimates_all:
+        logger.info(f"Keyword bid estimates loaded: {len(_keyword_bid_estimates_all)} keywords, "
+                    f"{sum(1 for k in _keyword_bid_estimates_all if k.get('under_bid'))} under-bid")
+    _kw_bid_by_camp: dict = {}
+    for _k in _keyword_bid_estimates_all:
+        _kw_bid_by_camp.setdefault(_k.get("campaign_name", "").lower(), []).append(_k)
+
+    # Budget map (campaign_name → daily_budget_usd) — used in account-level pass
+    _acct_budget_by_campaign: dict = {}
+
+    # ── Fetch account intelligence early (also used later by _call_claude_account_level) ──
+    _account_intel = _get_account_intelligence()
+    if _account_intel:
+        logger.info(f"Account intelligence loaded: opt_score={_account_intel.get('optimization_score')}, "
+                    f"invalid_click_rate={_account_intel.get('invalid_click_rate')}")
+
+    # ── Seed evaluation framework before per-campaign loop ─────────────────────
+    # Must run here so _EVAL_REPORT is cached before _call_claude_advisories fires.
+    # all_ag_stats, campaign_settings, keyword_perf, search_terms are all defined above.
+    _all_kw_cs_for_eval = [kcs for lst in _kw_cs_by_camp.values() for kcs in lst]
+    _get_or_build_eval_report(
+        account_intelligence=_account_intel,
+        campaign_settings_raw=campaign_settings,
+        keyword_perf=keyword_perf,
+        ad_group_performance=all_ag_stats,
+        search_terms=search_terms,
+        keyword_click_share=_all_kw_cs_for_eval,
+    )
+
     for _camp_idx, camp_name in enumerate(all_campaign_names):
         _set_progress(10, campaign_context=f"{camp_name} ({_camp_idx + 1}/{_total_camps})")
         camp_lower = camp_name.strip().lower()
@@ -9496,13 +9632,9 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
 
     # Build campaign_name → daily_budget_usd map for budget sieve at account level
     # Sources in priority order: campaign_settings (resource-keyed) → camp_spend_for_acct
-    _acct_budget_by_campaign: dict = {}
     for cn in all_campaign_names:
-        # campaign_settings is keyed by resource name; we need name-keyed lookup
-        # camp_spend_for_acct has daily_budget_usd from keyword_perf daily_budget_micros
         bud = (camp_spend_for_acct.get(cn) or {}).get("daily_budget_usd")
         if bud is None:
-            # Fallback: scan campaign_settings for a matching name
             for cs in campaign_settings.values():
                 if cs.get("campaign_name", "").strip().lower() == cn.strip().lower():
                     bud = cs.get("daily_budget_usd")
@@ -9510,62 +9642,7 @@ def optimize_campaign(dry_run: bool = True, trigger: str = "admin_manual") -> di
         if bud is not None:
             _acct_budget_by_campaign[cn] = float(bud or 0.0)
 
-    # PR-F: Fetch Google Ads native phone call stats (call extensions / call-only ads)
-    _phone_stats = _get_campaign_phone_stats(days=30)
-    if _phone_stats:
-        logger.info(f"Phone stats loaded for {len(_phone_stats)} campaigns")
-
-    # PR-B: Fetch conversion action breakdown (all campaigns combined; filter per-campaign in loop)
-    _conversion_actions_all = _get_conversion_action_breakdown(days=30)
-    if _conversion_actions_all:
-        logger.info(f"Conversion action breakdown loaded: {len(_conversion_actions_all)} rows")
-    # Pre-bucket by campaign_id
-    _conv_actions_by_camp_id: dict = {}
-    for _ca in _conversion_actions_all:
-        _conv_actions_by_camp_id.setdefault(_ca.get("campaign_id", ""), []).append(_ca)
-
-    # PR-B: Fetch keyword click share + historical QS (all keywords; filter per-campaign in loop)
-    _keyword_click_share_all = _get_keyword_click_share()
-    if _keyword_click_share_all:
-        logger.info(f"Keyword click share/hist QS loaded: {len(_keyword_click_share_all)} keywords")
-    # Pre-bucket by campaign name (lowercase)
-    _kw_cs_by_camp: dict = {}
-    for _kcs in _keyword_click_share_all:
-        _kw_cs_by_camp.setdefault(_kcs.get("campaign_name", "").lower(), []).append(_kcs)
-
-    # PR-C: Fetch device performance breakdown (all campaigns; filter per-campaign in loop)
-    _device_perf_all = _get_device_performance(days=30)
-    if _device_perf_all:
-        logger.info(f"Device performance loaded: {len(_device_perf_all)} rows")
-    # Pre-bucket by campaign_id for O(1) per-campaign lookup
-    _device_perf_by_camp_id: dict = {}
-    for _dp in _device_perf_all:
-        _device_perf_by_camp_id.setdefault(_dp.get("campaign_id", ""), []).append(_dp)
-
-    # PR-E: Fetch geographic performance breakdown (all campaigns; filter per-campaign in loop)
-    _geo_perf_all = _get_geo_performance(days=30)
-    if _geo_perf_all:
-        logger.info(f"Geo performance loaded: {len(_geo_perf_all)} locations")
-    # Pre-bucket by campaign_id for O(1) per-campaign lookup
-    _geo_perf_by_camp_id: dict = {}
-    for _gp in _geo_perf_all:
-        _geo_perf_by_camp_id.setdefault(_gp.get("campaign_id", ""), []).append(_gp)
-
-    # PR-A: Fetch keyword bid estimates + serving status (point-in-time from last gads-sync)
-    _keyword_bid_estimates_all = _get_keyword_bid_estimates()
-    if _keyword_bid_estimates_all:
-        logger.info(f"Keyword bid estimates loaded: {len(_keyword_bid_estimates_all)} keywords, "
-                    f"{sum(1 for k in _keyword_bid_estimates_all if k.get('under_bid'))} under-bid")
-    # Pre-bucket by campaign name (lowercase) to avoid O(n*m) scan per campaign in the loop
-    _kw_bid_by_camp: dict = {}
-    for _k in _keyword_bid_estimates_all:
-        _kw_bid_by_camp.setdefault(_k.get("campaign_name", "").lower(), []).append(_k)
-
-    # PR-D: Fetch account-level intelligence snapshot for account-level Claude
-    _account_intel = _get_account_intelligence()
-    if _account_intel:
-        logger.info(f"Account intelligence loaded: opt_score={_account_intel.get('optimization_score')}, "
-                    f"invalid_click_rate={_account_intel.get('invalid_click_rate')}")
+    # PR-D: account intelligence already fetched before per-campaign loop (reuse _account_intel)
 
     acct_structured = _call_claude_account_level(
         all_keyword_perf=keyword_perf,

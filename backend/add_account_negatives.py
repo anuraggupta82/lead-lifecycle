@@ -24,6 +24,15 @@ TERMS_TO_ADD = [
     ("free trial",    "BROAD"),
     ("study",         "BROAD"),
     ("medicare",      "BROAD"),
+    ("nuvia",         "BROAD"),
+    ("clear choice",  "BROAD"),
+    ("polasky",       "BROAD"),
+    ("babu",          "BROAD"),
+    ("gedc",          "BROAD"),
+    ("ashland family","BROAD"),
+    ("orthodontist",  "BROAD"),
+    ("orthodontics",  "BROAD"),
+    ("x rays",        "BROAD"),
 ]
 
 
