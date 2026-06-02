@@ -14,6 +14,7 @@ Entry points:
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +36,13 @@ AD_GROUP_WASTE_SPEND = 50.0     # AG with >$50 spend + 0 conv = flag
 KEYWORD_DUPLICATE_FLAG = True   # flag duplicate keywords across AGs in same campaign
 TOP_IS_ZERO_ALERT = True        # flag when top impression share = 0
 
+# N-gram stopwords — short, high-frequency non-signal words to exclude from waste analysis
+_NGRAM_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "are", "was", "can",
+    "you", "how", "what", "near", "find", "best", "your", "about",
+    "not", "have", "from", "they", "will",
+})
+
 
 # ── Data classes ─────────────────────────────────────────────────────────────
 @dataclass
@@ -46,7 +54,7 @@ class Finding:
     issue: str          # short description
     detail: str         # full explanation with numbers
     action: str         # recommended action (maps to optimizer operations where possible)
-    operation: str      # optimizer op type: "add_negative_keyword" | "pause_keyword" | "pause_ad_group" | "increase_bid" | "claude_advisory" | "ad_copy_suggestion"
+    operation: str      # optimizer op type: "add_negative_keyword" | "pause_keyword" | "pause_ad_group" | "increase_bid" | "claude_advisory" | "ad_copy_suggestion" | "add_exact_keyword" | "change_bid_strategy"
     priority: int       # 1 (highest) to 5 (lowest)
     est_monthly_savings: float = 0.0   # estimated monthly $ impact
 
@@ -103,6 +111,15 @@ def run_evaluation(
     """
     Run the full decision tree evaluation.
     All inputs are optional — the framework degrades gracefully if data is missing.
+
+    Evaluation sections:
+      1. Account Health — QS, impression share, invalid clicks, audit score
+      2. Campaign Scoring — intent match, conversion efficiency, waste rate, IS
+      3. Ad Group Evaluation — dead AGs, unnamed AGs, high-spend/zero-conv, duplicate keywords
+      4. Keyword Strategy — QS-1 keywords, negative-classified search terms, creative below average
+      5. Impression Share / Bidding — smart bidding on tiny budgets, rank lost IS
+      6. Budget Reallocation — shift spend from low-score campaigns to budget-constrained winners
+      7. Opportunity Mining — surface search terms with 2+ conversions not yet in Exact Match
     """
     report = EvaluationReport()
     findings: list[Finding] = []
@@ -145,6 +162,12 @@ def run_evaluation(
 
     # ── Section 5: Impression Share / Bidding ────────────────────────────────
     findings += _evaluate_impression_share(name_to_settings, campaign_name_filter)
+
+    # ── Section 6: Budget Reallocation ───────────────────────────────────────
+    findings += _evaluate_budget_reallocation(name_to_settings, report.campaign_scores, campaign_name_filter)
+
+    # ── Section 7: Opportunity Mining ────────────────────────────────────────
+    findings += _evaluate_search_term_opportunities(st, kw_perf, campaign_name_filter)
 
     # Sort and prioritize
     findings.sort(key=lambda f: (f.priority, -f.est_monthly_savings))
@@ -338,6 +361,34 @@ def _evaluate_campaigns(
         # Score this campaign
         score = _score_campaign(spend, clicks, conversions, waste_rate, cs, kws)
         campaign_scores[campaign_name] = score
+
+        # N-Gram Waste Analysis — find root words that collectively waste budget
+        unigrams: dict[str, float] = defaultdict(float)
+        for s in st_camp:
+            if s.get("conversions", 0) == 0 and s.get("cost", 0) > 0:
+                for word in s.get("search_term", "").lower().split():
+                    # Include words ≥3 chars that aren't generic stopwords
+                    if len(word) >= 3 and word not in _NGRAM_STOPWORDS:
+                        unigrams[word] += s.get("cost", 0)
+        
+        for word, w_cost in sorted(unigrams.items(), key=lambda x: -x[1]):
+            if w_cost > 50.0:  # arbitrary threshold
+                findings.append(Finding(
+                    level="warning",
+                    category="campaign",
+                    subject=campaign_name,
+                    issue=f"N-Gram Waste: root word '{word}' spent ${w_cost:.0f} with 0 conversions",
+                    detail=(
+                        f"Search terms containing the word '{word}' have collectively spent "
+                        f"${w_cost:.0f} in this campaign without generating any conversions. "
+                        f"Consider adding '{word}' as a broad match negative."
+                    ),
+                    action=f"Add '{word}' as an account-level or campaign-level broad match negative.",
+                    operation="claude_advisory",
+                    priority=3,
+                    est_monthly_savings=w_cost,
+                ))
+                break # Only flag the top one per campaign to avoid noise
 
         # Waste rate finding
         if spend > MIN_SPEND_FOR_JUDGMENT and waste_rate > WASTE_RATE_WARN:
@@ -696,7 +747,6 @@ def _find_duplicate_keywords(kw_cs: list, campaign_filter: str | None) -> list[F
     """Find the same keyword appearing in multiple ad groups within the same campaign."""
     findings: list[Finding] = []
 
-    from collections import defaultdict
     # {campaign_name → {keyword_text → [ad_group_names]}}
     kw_to_ags: dict = defaultdict(lambda: defaultdict(list))
     for kw in kw_cs:
@@ -774,6 +824,113 @@ def _evaluate_impression_share(
     return findings
 
 
+# ── Section 6: Budget Reallocation ───────────────────────────────────────────
+def _evaluate_budget_reallocation(
+    name_to_settings: dict,
+    campaign_scores: dict,
+    campaign_filter: str | None,
+) -> list[Finding]:
+    """
+    Identify budget reallocation opportunities.
+    Winners (high score, budget-constrained) are filtered by campaign_filter when set.
+    Poor performers scan ALL campaigns — reallocation is inherently cross-campaign.
+    """
+    findings: list[Finding] = []
+
+    constrained_winners: list = []
+    poor_performers: list = []
+
+    for cn, cs in name_to_settings.items():
+        budget_lost = cs.get("search_budget_lost_is") or 0.0
+        daily_budget = cs.get("daily_budget_usd") or 0.0
+        score = campaign_scores.get(cn, 5.0)
+
+        # Only flag THIS campaign as a winner when campaign_filter is active
+        if budget_lost > 0.20 and score >= 7.0:
+            if not campaign_filter or campaign_filter.lower() in cn.lower():
+                constrained_winners.append((cn, cs, score, budget_lost))
+
+        # Always scan ALL campaigns for poor performers (reallocation is cross-campaign)
+        if score < 4.0 and daily_budget > 10.0:
+            poor_performers.append((cn, cs, score))
+
+    if constrained_winners and poor_performers:
+        winner_name = constrained_winners[0][0]
+        loser_name = poor_performers[0][0]
+        findings.append(Finding(
+            level="warning",
+            category="account",
+            subject="Budget Reallocation",
+            issue=f"Shift budget from '{loser_name}' to '{winner_name}'",
+            detail=(
+                f"Campaign '{winner_name}' has a high health score but is losing "
+                f"{constrained_winners[0][3]*100:.0f}% of impression share to budget limits. "
+                f"Meanwhile, '{loser_name}' is performing poorly (score {poor_performers[0][2]:.1f}/10) "
+                f"but spending budget."
+            ),
+            action=f"Reduce daily budget of '{loser_name}' and reallocate to '{winner_name}'.",
+            operation="claude_advisory",
+            priority=2,
+            est_monthly_savings=0.0,
+        ))
+
+    return findings
+
+
+# ── Section 7: Opportunity Mining ────────────────────────────────────────────
+def _evaluate_search_term_opportunities(
+    search_terms: list,
+    kw_perf: list,
+    campaign_filter: str | None,
+) -> list[Finding]:
+    findings: list[Finding] = []
+
+    # Build set of already-exact-matched keyword texts (normalized, no brackets)
+    exact_keywords: set[str] = set()
+    for kw in kw_perf:
+        mt = (kw.get("match_type") or "").upper()   # null-safe
+        if mt == "EXACT":
+            # Normalize: lowercase, strip outer brackets and quotes only
+            raw = (kw.get("keyword_text") or "").lower()
+            normalized = raw.strip().lstrip("[").rstrip("]")
+            if normalized:
+                exact_keywords.add(normalized)
+
+    # Find high-converting search terms not yet in Exact Match
+    for st in search_terms:
+        cn = st.get("campaign_name", "")
+        if campaign_filter and campaign_filter.lower() not in cn.lower():
+            continue
+
+        term = (st.get("search_term") or "").lower().strip()
+        conversions = st.get("conversions") or 0
+        cost = st.get("cost") or 0
+
+        if not term or conversions < 2:
+            continue
+
+        if term not in exact_keywords:
+            cpa = cost / conversions if conversions > 0 else 0
+            findings.append(Finding(
+                level="info",
+                category="keyword",
+                subject=f"{cn} > [{term}]",
+                issue=f"Proven converting search term '{term}' not active as Exact Match",
+                detail=(
+                    f"Search term '{term}' has generated {conversions} conversions "
+                    f"at ${cpa:.2f} CPA but is not currently an Exact Match keyword. "
+                    f"Adding it as Exact Match allows for tighter bid control and "
+                    f"higher impression share on this proven winner."
+                ),
+                action=f"Add '[{term}]' as an Exact Match keyword to campaign '{cn}'.",
+                operation="add_exact_keyword",
+                priority=3,
+                est_monthly_savings=0.0,
+            ))
+            
+    return findings
+
+
 # ── Prompt injection ──────────────────────────────────────────────────────────
 def build_evaluation_prompt_block(
     report: EvaluationReport,
@@ -818,10 +975,13 @@ def build_evaluation_prompt_block(
             or f.category == "account"
         ]
 
-    # Top priority findings
+    # Top priority findings (critical + warnings shown first, info opportunities separate)
     critical = [f for f in relevant if f.level == "critical"]
     warnings = [f for f in relevant if f.level == "warning"]
+    opportunities = [f for f in relevant if f.level == "info"]
+    # Show up to max_findings criticals+warnings, PLUS up to 3 opportunities independently
     shown = (critical + warnings)[:max_findings]
+    shown_opps = opportunities[:3]  # always show up to 3 opportunities regardless of warning count
 
     if shown:
         lines.append("PRIORITY FINDINGS (apply these before generic optimizations):")
@@ -833,6 +993,15 @@ def build_evaluation_prompt_block(
             lines.append(f"    Suggested operation: {f.operation}")
             lines.append("")
 
+    if shown_opps:
+        lines.append("OPPORTUNITY MINING (high-value actions to scale proven winners):")
+        for f in shown_opps:
+            lines.append(f"  [OPPORTUNITY] P{f.priority} | {f.category.upper()} | {f.subject}")
+            lines.append(f"    Issue: {f.issue}")
+            lines.append(f"    Action: {f.action}")
+            lines.append(f"    Suggested operation: {f.operation}")
+            lines.append("")
+
     lines += [
         "EVALUATION RULES FOR THIS RUN:",
         "1. Address CRITICAL findings before issuing other recommendations.",
@@ -840,6 +1009,8 @@ def build_evaluation_prompt_block(
         "3. 'add_negative_keyword' findings correspond to search terms already classified as negative.",
         "4. Do NOT contradict these findings with conflicting actions in the same run.",
         "5. If a finding conflicts with a lifecycle rule, lifecycle rule wins — emit claude_advisory instead.",
+        "6. For OPPORTUNITY MINING findings, verify the search term still drives volume before adding as Exact Match.",
+        "7. Budget reallocation requires campaign_resource of both source and target campaigns — look them up first.",
         "=== END EVALUATION FINDINGS ===",
         "",
     ]

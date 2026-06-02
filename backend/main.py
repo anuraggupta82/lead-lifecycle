@@ -466,6 +466,33 @@ async def lifespan(app: FastAPI):
                           id="unified_od_sync", name="Unified OD Sync (chain)",
                           max_instances=1, coalesce=True, replace_existing=True)
 
+    # Customer Match weekly sync — Sunday 23:00.
+    # Uploads hashed email/phone of 3 lead segments to Google Ads user lists:
+    #   Existing Patients (exclusion), Unconverted Leads (retargeting), High-Value (lookalike).
+    # Jobs run async; member counts update in GAds UI within a few hours.
+    def _customer_match_sync_job():
+        _stamp("customer_match_sync")
+        try:
+            from customer_match import sync_customer_match
+            result = sync_customer_match()
+            for lst in result.get("lists", []):
+                logger.info(
+                    f"Customer Match [{lst['list_name']}]: status={lst.get('status')} "
+                    f"ops={lst.get('op_count', 0)}"
+                )
+        except Exception as e:
+            logger.error(f"Customer Match weekly sync failed: {e}", exc_info=True)
+
+    ads_scheduler.add_job(
+        _customer_match_sync_job,
+        CronTrigger(day_of_week="sun", hour=23, minute=0),
+        id="customer_match_sync",
+        name="Customer Match Weekly Sync",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
     # Microsoft Clarity nightly sync — runs at 22:30 (after OD sync starts).
     # Pulls previous day's session metrics (scroll depth, rage clicks, engagement time)
     # for both graftondentalcare.com and nxtsmile.com via Clarity Data Export API.
@@ -1355,6 +1382,101 @@ def admin_upload_conversions():
         raise HTTPException(status_code=503, detail=f"Google Ads library not installed: {e}")
     except Exception as e:
         logger.error(f"Conversion upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/enable-enhanced-conversions", dependencies=[Depends(_require_admin)])
+def admin_enable_enhanced_conversions():
+    """
+    Enable Enhanced Conversions for Leads at the customer level (one-time, idempotent).
+
+    After running, accept Customer Data Terms in Google Ads UI:
+      Settings → Conversions → Enhanced Conversions for Leads → Accept terms
+
+    The hashed email/phone identifiers are ALREADY being attached to every conversion
+    upload (as of this PR). This endpoint just flips the account-level feature flag.
+    """
+    try:
+        from google_ads_conversions import enable_enhanced_conversions
+        result = enable_enhanced_conversions()
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error", "unknown error"))
+        return {"status": "ok", "result": result}
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"Google Ads library not installed: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"enable_enhanced_conversions failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/sync-customer-match", dependencies=[Depends(_require_admin)])
+def admin_sync_customer_match():
+    """
+    Sync all three Customer Match lists to Google Ads.
+
+    Lists maintained:
+      - GDC — Existing Patients   (exclude from new-patient campaigns)
+      - GDC — Unconverted Leads   (retargeting)
+      - GDC — High-Value Patients (lookalike seed)
+
+    Jobs run async — member counts update in GAds UI within a few hours.
+    Prerequisite: accept Customer Match terms in Google Ads UI (one-time, account-level).
+    """
+    try:
+        from customer_match import sync_customer_match
+        result = sync_customer_match()
+        return {"status": "ok", "result": result}
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"Google Ads library not installed: {e}")
+    except Exception as e:
+        logger.error(f"sync_customer_match failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/customer-match/status", dependencies=[Depends(_require_admin)])
+def admin_customer_match_status():
+    """Return current state of all Customer Match lists (last sync time, op count, status)."""
+    try:
+        from customer_match import get_customer_match_status
+        return {"status": "ok", "result": get_customer_match_status()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/sync-ga4-audiences", dependencies=[Depends(_require_admin)])
+def admin_sync_ga4_audiences():
+    """
+    Create GDC retargeting audiences in GA4 (create-once, safe to re-run).
+
+    Creates:
+      - GDC — Implant Page Visitors (No Form)  [retargeting]
+      - GDC — High-Engagement Visitors          [requires Clarity→GA4 integration]
+
+    Prerequisites (manual, one-time):
+      1. SA must have Editor role on GA4 property (currently likely Viewer)
+      2. Install: pip install google-analytics-admin>=0.22.0 --break-system-packages
+      3. GA4↔Google Ads link must have audience sharing + personalized ads enabled
+      4. Clarity→GA4 integration active in Clarity dashboard (for engagement audience)
+    """
+    try:
+        from ga4_audiences import sync_ga4_audiences
+        result = sync_ga4_audiences()
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"sync_ga4_audiences failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/ga4-audiences/status", dependencies=[Depends(_require_admin)])
+def admin_ga4_audiences_status():
+    """List all GA4 audiences for the GDC property (read-only, no SA upgrade needed)."""
+    try:
+        from ga4_audiences import get_audience_status
+        result = get_audience_status()
+        return {"status": "ok", "result": result}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

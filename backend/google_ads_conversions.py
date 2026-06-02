@@ -31,7 +31,9 @@ Run nightly via APScheduler (11 PM) or manually:
   POST /api/admin/upload-conversions
 """
 
+import hashlib
 import logging
+import re
 import sqlite3
 import os
 from datetime import datetime, timezone
@@ -288,6 +290,29 @@ def _get_conversion_action_id(client, customer_id: str, action_name: str) -> str
     return None
 
 
+def _normalize_and_hash(value: str, is_phone: bool = False) -> str | None:
+    """
+    Normalize and SHA-256 hash a PII value for Enhanced Conversions / Customer Match.
+    Email: lowercase + strip.
+    Phone: normalize to E.164 (+1XXXXXXXXXX for US), then hash.
+    Returns None if value is empty/None.
+    Never log the input value — only log the hash prefix for debugging.
+    """
+    if not value:
+        return None
+    if is_phone:
+        digits = re.sub(r"[^\d]", "", value)
+        if len(digits) == 10:
+            normalized = f"+1{digits}"
+        elif len(digits) == 11 and digits.startswith("1"):
+            normalized = f"+{digits}"
+        else:
+            normalized = f"+{digits}"  # best-effort for non-US
+    else:
+        normalized = value.strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _already_uploaded(db, lead_id: str, conversion_action: str) -> bool:
     """Check if this conversion was already uploaded."""
     row = db.execute(
@@ -330,9 +355,9 @@ def upload_offline_conversions() -> dict:
     db = _get_db()
     leads = db.execute("""
         SELECT id, gclid, stage, created_at, attributed_production, email, first_name,
-               od_patient_num, od_relationship, od_matched_at,
+               phone, od_patient_num, od_relationship, od_matched_at,
                scheduled_at, showed_at, tx_accepted_at, tx_completed_at,
-               appointment_date, appointment_status
+               appointment_date, appointment_status, source
         FROM leads
         WHERE gclid != '' AND gclid IS NOT NULL
         ORDER BY updated_at DESC
@@ -390,6 +415,27 @@ def upload_offline_conversions() -> dict:
                 skipped += 1
                 continue
 
+        # ── Call duration filter ──────────────────────────────────────────────
+        # CallRail is the source of truth for call attribution. Calls < 90s are
+        # hang-ups / wrong numbers and should not count as conversions. This
+        # mirrors the CallRail integration filter set in the Google Ads integration
+        # (>90s threshold). Only applies to callrail-sourced leads.
+        CALL_MIN_DURATION_SECONDS = 90
+        lead_source = lead["source"] or ""
+        if lead_source == "callrail":
+            call_row = db.execute(
+                "SELECT duration_seconds FROM callrail_calls WHERE lead_id = ? ORDER BY called_at DESC LIMIT 1",
+                (lead_id,)
+            ).fetchone()
+            call_duration = call_row["duration_seconds"] if call_row else 0
+            if call_duration < CALL_MIN_DURATION_SECONDS:
+                logger.debug(
+                    f"Lead {lead_id} skipped: callrail call too short "
+                    f"({call_duration}s < {CALL_MIN_DURATION_SECONDS}s minimum)"
+                )
+                skipped += 1
+                continue
+
         # Resolve ALL conversions that apply to this lead (may be multiple across stages)
         conversion_pairs = _resolve_conversions(lead)
         if not conversion_pairs:
@@ -433,13 +479,27 @@ def upload_offline_conversions() -> dict:
                 click_conversion.currency_code = "USD"
                 click_conversion.conversion_date_time = ts_str
 
+                # Enhanced Conversions: attach hashed first-party identifiers so Google
+                # can match conversions even when gclid is absent/expired (~15-30% lift).
+                # Requires Customer Data Terms accepted in Google Ads UI (Settings → Conversions).
+                for raw, is_phone in ((lead["email"], False), (lead["phone"], True)):
+                    h = _normalize_and_hash(raw, is_phone=is_phone)
+                    if not h:
+                        continue
+                    ui = client.get_type("UserIdentifier")
+                    if is_phone:
+                        ui.hashed_phone_number = h
+                    else:
+                        ui.hashed_email = h
+                    click_conversion.user_identifiers.append(ui)
+
                 response = conversion_upload_service.upload_click_conversions(
                     customer_id=customer_id,
                     conversions=[click_conversion],
                     partial_failure=True,
                 )
 
-                if response.partial_failure_error:
+                if response.partial_failure_error and response.partial_failure_error.code != 0:
                     error_msg = response.partial_failure_error.message
                     logger.error(f"Partial failure for lead {lead_id} / '{conversion_name}': {error_msg}")
                     db.execute("""
@@ -486,6 +546,54 @@ def upload_offline_conversions() -> dict:
     }
     logger.info(f"Conversion upload complete: {result}")
     return result
+
+
+def enable_enhanced_conversions() -> dict:
+    """
+    Enable Enhanced Conversions for Leads at the customer level.
+
+    Sets Customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled = True.
+    This is a one-time account-level toggle — safe to re-run (idempotent).
+
+    IMPORTANT: After running this, accept the Customer Data Terms in the Google Ads UI:
+      Settings → Conversions → Enhanced Conversions for Leads → Accept terms
+    Without accepting terms, hashed identifiers upload but won't be matched.
+
+    The actual hashed email/phone attachment in upload_offline_conversions() is always
+    active — this function only flips the account-level feature flag.
+    """
+    settings = get_settings()
+    try:
+        client = _build_client()
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to build GAds client: {e}"}
+
+    customer_id = settings.google_ads_customer_id
+    svc = client.get_service("CustomerService")
+
+    try:
+        op = client.get_type("CustomerOperation")
+        cust = op.update
+        cust.resource_name = f"customers/{customer_id}"
+        cust.conversion_tracking_setting.enhanced_conversions_for_leads_enabled = True
+        op.update_mask.CopyFrom(
+            field_mask_pb2.FieldMask(
+                paths=["conversion_tracking_setting.enhanced_conversions_for_leads_enabled"]
+            )
+        )
+        svc.mutate_customer(customer_id=customer_id, operation=op)
+        logger.info(f"Enhanced Conversions for Leads enabled on customer {customer_id}")
+        return {
+            "ok": True,
+            "customer_id": customer_id,
+            "note": (
+                "Feature flag enabled. To complete setup, accept Customer Data Terms in "
+                "Google Ads UI: Settings → Conversions → Enhanced Conversions for Leads."
+            ),
+        }
+    except Exception as e:
+        logger.error(f"enable_enhanced_conversions failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 if __name__ == "__main__":

@@ -1264,6 +1264,20 @@ def _migrate(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_type   ON campaigns(campaign_type)")
 
+    # Customer Match lists — tracks GAds user list state per named segment
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS customer_match_lists (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            list_name          TEXT NOT NULL UNIQUE,
+            gads_resource_name TEXT DEFAULT '',
+            last_sync_at       TEXT DEFAULT '',
+            member_count       INTEGER DEFAULT 0,
+            last_op_count      INTEGER DEFAULT 0,
+            last_status        TEXT DEFAULT '',
+            created_at         TEXT NOT NULL
+        )
+    """)
+
     # Create indexes if missing
     conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_gclid ON leads(gclid)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_conversions_lead ON conversion_uploads(lead_id)")

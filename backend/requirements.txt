@@ -9,6 +9,7 @@ pymysql==1.1.1
 python-multipart==0.0.12
 httpx==0.27.2
 google-analytics-data>=0.21.0
+google-analytics-admin>=0.22.0
 google-cloud-storage==2.18.2
 google-cloud-firestore==2.27.0
 google-cloud-aiplatform>=1.60.0
