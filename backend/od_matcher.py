@@ -193,38 +193,122 @@ def match_leads_to_od() -> dict:
                 SELECT PatNum,
                        LOWER(HmPhone)       AS home_phone,
                        LOWER(WirelessPhone) AS cell_phone,
-                       LOWER(Email)         AS email
+                       LOWER(Email)         AS email,
+                       LOWER(WkPhone)       AS work_phone,
+                       LOWER(FName)         AS first_name,
+                       LOWER(LName)         AS last_name
                 FROM patient
                 WHERE PatStatus = 0
-                  AND (HmPhone != '' OR WirelessPhone != '' OR Email != '')
+                  AND (HmPhone != '' OR WirelessPhone != '' OR Email != ''
+                       OR WkPhone != '' OR FName != '' OR LName != '')
             """)
             od_patients = cur.fetchall()
 
-        # Build hash lookup: {hash: PatNum}
+        # Build lookup maps: {hash: PatNum} and name maps
         phone_map = {}
         email_map = {}
+        # name_map: {(first, last): [PatNum, ...]} — list to detect ambiguity
+        name_map  = {}
+        # pat_data: {PatNum: {phone_hashes, email_hash, first, last}}
+        pat_data  = {}
+
         for row in od_patients:
-            pat_num = str(row[0])
-            for phone_raw in [row[1] or "", row[2] or ""]:
+            pat_num    = str(row[0])
+            home_phone = row[1] or ""
+            cell_phone = row[2] or ""
+            email_raw  = row[3] or ""
+            work_phone = row[4] or ""
+            first_name = (row[5] or "").strip().lower()
+            last_name  = (row[6] or "").strip().lower()
+
+            phone_hashes = set()
+            for phone_raw in [home_phone, cell_phone, work_phone]:
                 digits = "".join(c for c in phone_raw if c.isdigit())
                 if len(digits) >= 10:
-                    phone_map[_hash(digits[-10:])] = pat_num
-                    phone_map[_hash("1" + digits[-10:])] = pat_num
-            email_raw = row[3] or ""
+                    h1 = _hash(digits[-10:])
+                    h2 = _hash("1" + digits[-10:])
+                    phone_map[h1] = pat_num
+                    phone_map[h2] = pat_num
+                    phone_hashes.update([h1, h2])
+
+            email_h = None
             if email_raw:
-                email_map[_hash(email_raw)] = pat_num
+                email_h = _hash(email_raw.strip().lower())
+                email_map[email_h] = pat_num
+
+            if first_name and last_name:
+                key = (first_name, last_name)
+                name_map.setdefault(key, []).append(pat_num)
+
+            pat_data[pat_num] = {
+                "phone_hashes": phone_hashes,
+                "email_hash":   email_h,
+                "first":        first_name,
+                "last":         last_name,
+            }
+
+        def _secondary_match(pat_num, lead):
+            """Return True if lead's phone or email matches this OD patient."""
+            pd = pat_data.get(pat_num, {})
+            if lead.get("phone_hash") and lead["phone_hash"] in pd.get("phone_hashes", set()):
+                return True
+            if lead.get("email_hash") and lead["email_hash"] == pd.get("email_hash"):
+                return True
+            return False
 
         for lead in unmatched:
             try:
                 pat_num = None
                 match_method = None
 
-                if lead.get("phone_hash") and lead["phone_hash"] in phone_map:
-                    pat_num = phone_map[lead["phone_hash"]]
+                lead_first = (lead.get("first_name") or "").strip().lower()
+                lead_last  = (lead.get("last_name")  or "").strip().lower()
+
+                # ── Tier 1: Full name match + secondary verification ──────────
+                # Only attempt if both first and last are present and look like
+                # real names (skip caller-ID values like "WESTBOROUGH MA")
+                if (lead_first and lead_last
+                        and not any(c.isdigit() for c in lead_first + lead_last)
+                        and len(lead_last) > 1):
+                    name_key = (lead_first, lead_last)
+                    candidates = name_map.get(name_key, [])
+                    if len(candidates) == 1:
+                        # Unique full name — verify with phone or email
+                        if _secondary_match(candidates[0], lead):
+                            pat_num      = candidates[0]
+                            match_method = "full_name+secondary"
+                        else:
+                            # Unique name but no secondary match — still use it
+                            # (manually scheduled patients may lack phone/email in OD)
+                            pat_num      = candidates[0]
+                            match_method = "full_name_only"
+                    elif len(candidates) > 1:
+                        # Ambiguous name — require secondary to disambiguate
+                        for c in candidates:
+                            if _secondary_match(c, lead):
+                                pat_num      = c
+                                match_method = "full_name+secondary"
+                                break
+
+                # ── Tier 2: Phone match ───────────────────────────────────────
+                if not pat_num and lead.get("phone_hash") and lead["phone_hash"] in phone_map:
+                    pat_num      = phone_map[lead["phone_hash"]]
                     match_method = "phone"
-                elif lead.get("email_hash") and lead["email_hash"] in email_map:
-                    pat_num = email_map[lead["email_hash"]]
+
+                # ── Tier 3: Email match ───────────────────────────────────────
+                if not pat_num and lead.get("email_hash") and lead["email_hash"] in email_map:
+                    pat_num      = email_map[lead["email_hash"]]
                     match_method = "email"
+
+                # ── Tier 4: Last name only (unique + secondary) ───────────────
+                if not pat_num and lead_last and len(lead_last) > 2:
+                    last_candidates = [
+                        pn for (fn, ln), pns in name_map.items()
+                        if ln == lead_last for pn in pns
+                    ]
+                    if len(last_candidates) == 1 and _secondary_match(last_candidates[0], lead):
+                        pat_num      = last_candidates[0]
+                        match_method = "last_name+secondary"
 
                 if not pat_num:
                     continue

@@ -3237,7 +3237,8 @@ def upsert_lead(data: dict) -> dict:
         raise ValueError("lead id is required")
 
     phone_raw = data.get("phone", "")
-    email_raw = data.get("email", "")
+    # Sanitize email: strip whitespace (including spaces within the address like "gmail. com")
+    email_raw = "".join((data.get("email") or "").split()).lower()
     phone_digits = "".join(c for c in phone_raw if c.isdigit())
 
     with _conn() as conn:
