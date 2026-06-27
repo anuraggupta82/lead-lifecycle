@@ -6432,7 +6432,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [campStatusFilter, setCampStatusFilter] = useState('active'); // 'active' | 'paused' | 'all'
   const [syncAllLoading, setSyncAllLoading] = useState(false);
   const [syncAllResult, setSyncAllResult] = useState(null);
-  const [unifiedDays, setUnifiedDays] = useState(30);
+  const [unifiedDays, setUnifiedDays] = useState(0);
+  const [unifiedMonth, setUnifiedMonth] = useState(null);
   // Budget summary
   const [budgetSummary, setBudgetSummary] = useState(null);
   const [acctBudgetEdit, setAcctBudgetEdit] = useState(false);
@@ -6546,9 +6547,13 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
     setUnifiedLoading(true);
     try {
       const includeInactive = campStatusFilter !== 'active';
+      const campParams = unifiedMonth
+        ? `month=${unifiedMonth}&include_inactive=${includeInactive}`
+        : `days=${unifiedDays}&include_inactive=${includeInactive}`;
+      const callDays = unifiedMonth ? 365 : (unifiedDays || 3650);
       const [d, callRows] = await Promise.all([
-        api(`/api/admin/campaigns/unified?days=${unifiedDays}&include_inactive=${includeInactive}`),
-        api(`/api/admin/calls/campaign-attribution?days=${unifiedDays}`).catch(()=>[]),
+        api(`/api/admin/campaigns/unified?${campParams}`),
+        api(`/api/admin/calls/campaign-attribution?days=${callDays}`).catch(()=>[]),
       ]);
       setUnifiedCamps(d.campaigns || []);
       if (d.budget_summary) {
@@ -6567,7 +6572,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
     } catch(e) { console.error('Failed to load unified campaigns', e); }
     finally { setUnifiedLoading(false); }
   }
-  useEffect(() => { loadUnifiedCamps(); }, [unifiedDays, campStatusFilter]);
+  useEffect(() => { loadUnifiedCamps(); }, [unifiedDays, unifiedMonth, campStatusFilter]);
 
   async function loadIncomeData() {
     setIncomeLoading(true);
@@ -7222,11 +7227,22 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   }, []);
 
   const presets = [
-    { label: '7d', days: 7 },
-    { label: '30d', days: 30 },
+    { label: 'Lifetime', days: 0 },
     { label: '90d', days: 90 },
-    { label: 'All', days: 365 },
+    { label: '30d', days: 30 },
+    { label: '7d', days: 7 },
   ];
+  const monthPresets = (() => {
+    const result = [];
+    const now = new Date();
+    for (let i = 0; i < 6; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const val = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+      const label = d.toLocaleString('default', { month: 'short', year: '2-digit' });
+      result.push({ label, month: val });
+    }
+    return result;
+  })();
 
   async function refreshGA4() {
     setGa4Refreshing(true);
@@ -7484,9 +7500,17 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
             {presets.map(p=>(
               <button key={p.label}
                 style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
-                  background:unifiedDays===p.days?'var(--teal)':'#fff',
-                  color:unifiedDays===p.days?'#fff':'var(--text-muted)'}}
-                onClick={()=>setUnifiedDays(p.days)}>{p.label}</button>
+                  background:(unifiedMonth===null && unifiedDays===p.days)?'var(--teal)':'#fff',
+                  color:(unifiedMonth===null && unifiedDays===p.days)?'#fff':'var(--text-muted)'}}
+                onClick={()=>{setUnifiedDays(p.days);setUnifiedMonth(null);}}>{p.label}</button>
+            ))}
+            <div style={{width:1,height:16,background:'var(--border)',margin:'0 2px'}}/>
+            {monthPresets.map(p=>(
+              <button key={p.month}
+                style={{padding:'3px 8px',fontSize:10,border:'1px solid var(--border)',borderRadius:4,cursor:'pointer',
+                  background:unifiedMonth===p.month?'var(--teal)':'#fff',
+                  color:unifiedMonth===p.month?'#fff':'var(--text-muted)'}}
+                onClick={()=>{setUnifiedMonth(p.month);setUnifiedDays(0);}}>{p.label}</button>
             ))}
             <button className="btn btn-ghost btn-sm" onClick={loadUnifiedCamps} style={{fontSize:10}}>↻ Refresh</button>
             <button

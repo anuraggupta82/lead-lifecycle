@@ -4247,21 +4247,56 @@ def get_all_campaigns_with_workflows() -> list:
         return [dict(r) for r in rows]
 
 
-def get_unified_campaigns(days: int = 30) -> list:
+def get_unified_campaigns(days: int = 0, month: str = None) -> list:
     """
     Unified campaign view — merges managed campaigns table with gads_daily_stats.
     Returns managed rows with embedded metrics, plus synthetic rows for GAds
     campaigns that exist in gads_daily_stats but were never imported.
     Computes is_inactive_90d from full history (not just the window).
+
+    Date filtering (spend + leads + call income all use the same window):
+    - month='YYYY-MM': filter to that exact calendar month (e.g. '2026-06')
+    - days=0 (default): lifetime — no date filter
+    - days>0: rolling window of that many days
     """
     import json as _json
-    days = max(1, int(days))
+    from calendar import monthrange as _monthrange
     today = datetime.now(timezone.utc).date()
     cutoff_90d = (today - timedelta(days=90)).isoformat()
 
+    # Build date clauses
+    if month:
+        # Validate YYYY-MM
+        try:
+            y, m = int(month[:4]), int(month[5:7])
+            month_start = f"{y:04d}-{m:02d}-01"
+            _, last_day = _monthrange(y, m)
+            month_end_dt = datetime(y, m, last_day) + timedelta(days=1)
+            month_end = month_end_dt.strftime("%Y-%m-%d")
+        except Exception:
+            month = None  # fall back to lifetime
+
+    if month:
+        gads_date_clause  = f"AND date >= '{month_start}' AND date < '{month_end}'"
+        leads_date_clause = f"AND created_at >= '{month_start}' AND created_at < '{month_end}'"
+        call_date_clause  = f"AND strftime('%Y-%m', started_at) = '{month[:7]}'"
+        kpl_date_clause   = f"AND strftime('%Y-%m', created_at) = '{month[:7]}'"
+    elif days and int(days) > 0:
+        days = int(days)
+        gads_date_clause  = f"AND date >= DATE('now', '-{days} day')"
+        leads_date_clause = f"AND created_at >= DATE('now', '-{days} day')"
+        call_date_clause  = ""
+        kpl_date_clause   = ""
+    else:
+        # Lifetime — no date filter
+        gads_date_clause  = ""
+        leads_date_clause = ""
+        call_date_clause  = ""
+        kpl_date_clause   = ""
+
     with _conn() as conn:
         # ── Window aggregates from gads_daily_stats ──────────────────────
-        window_rows = conn.execute("""
+        window_rows = conn.execute(f"""
             SELECT
                 LOWER(TRIM(campaign_name)) AS k,
                 campaign_id                AS gads_numeric_id,
@@ -4271,10 +4306,10 @@ def get_unified_campaigns(days: int = 30) -> list:
                 SUM(cost_micros)           AS cost_micros,
                 SUM(conversions)           AS conversions
             FROM gads_daily_stats
-            WHERE date >= DATE('now', ?)
-              AND campaign_name != ''
+            WHERE campaign_name != ''
+              {gads_date_clause}
             GROUP BY LOWER(TRIM(campaign_name))
-        """, (f"-{days} day",)).fetchall()
+        """).fetchall()
         window_by_key = {r["k"]: dict(r) for r in window_rows}
         # Secondary lookup by GAds numeric campaign_id — handles name mismatches
         # (e.g. when dashboard name differs from the timestamped GAds display name)
@@ -4302,26 +4337,32 @@ def get_unified_campaigns(days: int = 30) -> list:
         }
 
         # ── Lead counts per campaign in the window ───────────────────────
-        lead_rows = conn.execute("""
+        lead_rows = conn.execute(f"""
             SELECT
                 LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign))) AS k,
                 COUNT(*)                              AS lead_count,
                 SUM(attributed_income)                AS attributed_income,
                 SUM(attributed_production)            AS attributed_production,
                 SUM(COALESCE(paid_amount_365d, 0.0))  AS paid_income_365d,
-                SUM(COALESCE(paid_amount_ltv,  0.0))  AS paid_income_ltv
+                SUM(COALESCE(paid_amount_ltv,  0.0))  AS paid_income_ltv,
+                SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
+                    'treatment_presented','treatment_accepted','treatment_completed')
+                    THEN 1 ELSE 0 END)                AS form_scheduled_count,
+                SUM(CASE WHEN stage IN ('showed',
+                    'treatment_presented','treatment_accepted','treatment_completed')
+                    THEN 1 ELSE 0 END)                AS form_showed_count
             FROM leads
-            WHERE created_at >= DATE('now', ?)
-              AND (campaign_name != '' OR utm_campaign != '')
+            WHERE (campaign_name != '' OR utm_campaign != '')
+              {leads_date_clause}
             GROUP BY LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign)))
-        """, (f"-{days} day",)).fetchall()
+        """).fetchall()
         leads_by_key = {r["k"]: dict(r) for r in lead_rows}
 
         # ── Call income per campaign (PR9/PR14) ───────────────────────────
         # attributed_ad_group is stored as "Campaign > Ad Group" — extract campaign
         # by taking everything before the first " > " separator.
         # new_patient calls only (genuine new acquisitions from ads).
-        call_income_rows = conn.execute("""
+        call_income_rows = conn.execute(f"""
             SELECT
                 LOWER(TRIM(
                     CASE WHEN INSTR(attributed_ad_group, ' > ') > 0
@@ -4335,6 +4376,7 @@ def get_unified_campaigns(days: int = 30) -> list:
             WHERE od_patient_status = 'new_patient'
               AND od_patient_income IS NOT NULL
               AND attributed_ad_group != ''
+              {call_date_clause}
             GROUP BY k
         """).fetchall()
         call_income_by_key = {r["k"]: dict(r) for r in call_income_rows}
@@ -4348,7 +4390,7 @@ def get_unified_campaigns(days: int = 30) -> list:
         # NULL confidence_tier means a pre-migration row written under the old 0.55 floor
         # — treat as 'high' (equivalent) so existing data is not hidden.
         # Optimizer-bound queries use confidence_tier='high' only (unchanged by PR 4).
-        call_paid_rows = conn.execute("""
+        call_paid_rows = conn.execute(f"""
             SELECT
                 LOWER(TRIM(campaign_name))            AS k,
                 SUM(COALESCE(paid_amount_365d, 0.0))  AS call_paid_365d,
@@ -4364,6 +4406,7 @@ def get_unified_campaigns(days: int = 30) -> list:
                 confidence_tier IN ('high', 'low', 'booked_override')
                 OR confidence_tier IS NULL
               )
+              {kpl_date_clause}
             GROUP BY LOWER(TRIM(campaign_name))
         """).fetchall()
         call_paid_by_key = {r["k"]: dict(r) for r in call_paid_rows}
@@ -4407,6 +4450,8 @@ def get_unified_campaigns(days: int = 30) -> list:
             production = lm.get("attributed_production") or 0
             call_income = cm.get("call_income") or 0.0
             call_count  = cm.get("call_count") or 0
+            form_scheduled_count = lm.get("form_scheduled_count") or 0
+            form_showed_count    = lm.get("form_showed_count") or 0
             # income = all verified OD collections: leads income + call income (new patients)
             income = revenue + call_income
             # PR 2: actual paid income — leads.paid_amount_* + kpl call:: paid amounts
@@ -4441,6 +4486,8 @@ def get_unified_campaigns(days: int = 30) -> list:
                     "clicks":       wm.get("clicks") or 0,
                     "cost":         round(cost, 2),
                     "leads":        leads,
+                    "form_scheduled_count": form_scheduled_count,
+                    "form_showed_count":    form_showed_count,
                     "revenue":      round(revenue, 2),
                     "production":   round(production, 2),
                     "call_income":  round(call_income, 2),
@@ -4473,6 +4520,8 @@ def get_unified_campaigns(days: int = 30) -> list:
             production = lm.get("attributed_production") or 0
             call_income = cm.get("call_income") or 0.0
             call_count  = cm.get("call_count") or 0
+            form_scheduled_count = lm.get("form_scheduled_count") or 0
+            form_showed_count    = lm.get("form_showed_count") or 0
             income = revenue + call_income
             income_365d = (lm.get("paid_income_365d") or 0.0) + (cp2.get("call_paid_365d") or 0.0)
             income_ltv  = (lm.get("paid_income_ltv") or 0.0) + (cp2.get("call_paid_ltv") or 0.0)
@@ -4507,6 +4556,8 @@ def get_unified_campaigns(days: int = 30) -> list:
                     "clicks":       wm.get("clicks") or 0,
                     "cost":         round(cost, 2),
                     "leads":        leads,
+                    "form_scheduled_count": form_scheduled_count,
+                    "form_showed_count":    form_showed_count,
                     "revenue":      round(revenue, 2),
                     "production":   round(production, 2),
                     "call_income":  round(call_income, 2),

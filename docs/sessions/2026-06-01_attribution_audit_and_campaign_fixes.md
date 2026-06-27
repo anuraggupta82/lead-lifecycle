@@ -138,3 +138,90 @@ All other keywords left untouched. Re-evaluation date: **June 4-5 2026**.
 3. **P2:** Add gclid decoration to graftondentalcare.com booking links
 4. **P3:** Add `{keyword}` ValueTrack to all GAds final URLs
 5. **June 4-5:** Re-evaluate nXtsmile impressions/CPL — consider bid reduction if still <10 clicks/day
+
+---
+
+# Session Continuation: Jun 2-3 2026 — Campaign Monitoring + OD Matcher Fix + Scheduler Analysis
+
+## Google Ads — Campaign Recovery (Jun 2)
+
+### All 3 campaigns switched to Manual CPC
+Emergency, General Dentistry, nXtsmile. Brand Awareness paused by user.
+
+### Emergency Dentistry
+17 keywords added (exact/phrase) from search term data. Result: 2 impressions Jun 1 → 23 impressions Jun 2 within hours of fix.
+
+### General Dentistry
+25 keywords added. 82 keyword bids reset from Maximize Conversions inflation ($15-35) back to $4-6. Removed "i need dental work but have no money."
+
+### nXtsmile Implants — June 4-5 Re-evaluation (Opus analysis)
+Opus reasoning on bid strategy. Key findings:
+- Market clearing price $15-25 for implant keywords
+- "dental implant specialist" eating 38% of budget ($306/14d) at mediocre intent
+- Ad group defaults inflated to $20 by Maximize Conversions — root cause of $23-33 CPCs
+
+Changes applied:
+- Near Me AG default: $6 → $12
+- Cost Comparison AG default: $7 → $14  
+- All-on-4: holds $18
+- "dental implant specialist" in All-on-4: explicit $9 cap
+- "nuvia dental" broad negative removed → replaced with 18 navigational-only negatives
+  (phone number, directions, hours, location, near me — keeps research/conquest traffic)
+- Next gate: June 20 at ~150 total clicks → if still 0 leads, investigate landing page
+
+Decision logged: d0b76835
+
+## CallRail Integration Fix
+
+### Google Ads integration activated
+- Created "GDC Website Pool - Google Ads" (session pool, 4 numbers, 508 area code)
+- Integration status: Active, CDF enabled
+- 90-second call duration filter set in CallRail
+
+### Backend: 90s call duration filter
+google_ads_conversions.py updated — callrail leads with calls <90s skipped before conversion upload.
+
+## OD Matcher Improvements
+
+### Root cause: Richard Tomaszewski not matching
+- Phone was WkPhone (work) — matcher only queried HmPhone/WirelessPhone
+- Email had space: "gmail. com" — hash mismatch
+- Manual fix: linked to PatNum 5750, stage → scheduled, date Jun 4 10 AM
+
+### Code fixes (od_matcher.py + database.py):
+1. Added WkPhone to OD patient query
+2. Added name-first matching tiers:
+   - Tier 1: Full name (first+last) → unique → secondary verification
+   - Tier 2: Phone (HmPhone, WirelessPhone, WkPhone — new)
+   - Tier 3: Email
+   - Tier 4: Last name only + secondary
+3. Email sanitization on lead creation — strips all whitespace before hashing
+
+Git commit ready: `fix: OD matcher — WkPhone + name matching tiers + email sanitization`
+
+## visitgdc.com GA4 Analysis
+
+### Funnel data (7 days, property 533672873):
+- 48 sessions total
+- 33 landed on scheduler
+- 11 started form (33% start rate)
+- 2 completed bookings (6% overall, 18% of starters)
+- 67% bounce before touching form → slow React hydration on first load
+
+### Traffic: graftondentalcare.com referral drives most traffic (26 sessions, 7m 47s)
+### Google CPC: 4 sessions, 8m 09s — highly engaged, 0 conversions
+
+### Root causes identified:
+1. Slow first load (React SPA hydration) — loses 67% before form_start
+2. Deposit friction — some abandoning at payment step
+
+## Scheduler Next Steps (saved to NEXT_STEPS.md)
+- P0: Loading skeleton in index.html
+- P1: Deposit step copy reassurance
+- P2: Register step_name/step_number as GA4 custom dimensions
+- P3: Add book.graftondentalcare.com + book.nxtsmile.com via GCP custom domain mapping
+- P4: Domain-aware theming (hostname-based GDC vs nXtsmile branding)
+
+## Pending Git Pushes
+1. `feat: 90s call duration filter for Google Ads conversion uploads` — google_ads_conversions.py
+2. `fix: OD matcher — WkPhone + name matching tiers + email sanitization` — od_matcher.py + database.py

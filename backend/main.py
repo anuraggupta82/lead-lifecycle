@@ -4977,18 +4977,26 @@ class CampaignStrategyUpdateRequest(BaseModel):
 
 
 @app.get("/api/admin/campaigns/unified", dependencies=[Depends(_require_admin)])
-def admin_campaigns_unified(days: int = 30, include_inactive: bool = False):
+def admin_campaigns_unified(days: int = 0, month: str = None, include_inactive: bool = False):
     """
     Unified campaigns view — replaces the old split between Campaign Performance
     and Managed Campaigns. Returns each campaign with aggregated GAds metrics,
     lead counts, last_activity_date, and is_inactive_90d flag.
     Synthetic rows are emitted for GAds campaigns in gads_daily_stats that were
     never imported into the campaigns table.
+
+    Date filtering:
+    - month=YYYY-MM: exact calendar month (spend + leads + call income all scoped)
+    - days=0 (default): lifetime — no date filter
+    - days>0: rolling window
     """
+    import re as _re
     from database import get_unified_campaigns, get_setting
-    if days < 1 or days > 365:
-        raise HTTPException(status_code=422, detail="days must be between 1 and 365")
-    rows = get_unified_campaigns(days=days)
+    if month and not _re.match(r'^\d{4}-\d{2}$', month):
+        raise HTTPException(status_code=422, detail="month must be YYYY-MM format")
+    if not month and days > 365:
+        raise HTTPException(status_code=422, detail="days must be between 0 and 365")
+    rows = get_unified_campaigns(days=days, month=month)
     if not include_inactive:
         rows = [r for r in rows if not r.get("is_inactive_90d")]
 
