@@ -3347,6 +3347,20 @@ def get_lead_by_email(email: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def get_lead_by_od_pat_num(od_pat_num: str) -> Optional[dict]:
+    """Return the most recently updated lead matched to this OpenDental patient number.
+    Used by sync_scheduler_bookings_via_api (PR 2) to match bookings by od_patient_num
+    before falling back to email match."""
+    if not od_pat_num:
+        return None
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM leads WHERE od_patient_num=? ORDER BY updated_at DESC LIMIT 1",
+            (str(od_pat_num),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 # Map stage name to its timestamp column
 _STAGE_TIMESTAMP_COL = {
     "auto_nurture":        "auto_nurture_at",

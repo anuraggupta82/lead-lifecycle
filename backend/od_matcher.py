@@ -5,12 +5,13 @@ Also syncs treatment plan stages for matched patients.
 Runs as a nightly job. Never stores raw PHI — uses SHA-256 hashes for comparison.
 Only accessible on the office LAN (GraftonServer).
 
-Five functions:
-  1. match_leads_to_od()              — match unmatched leads to OD patients
-  2. sync_treatment_stages()          — update stages for already-matched leads
-  3. sync_scheduler_direct_leads()    — auto-create leads for scheduler (visitgdc.com) bookings
-  4. run_full_od_sync()               — runs 1-3 (called by nightly scheduler)
-  5. match_calls_to_od_appointments() — link booked Mango calls → OD appointments
+Six functions:
+  1. match_leads_to_od()                  — match unmatched leads to OD patients
+  2. sync_treatment_stages()              — update stages for already-matched leads
+  3. sync_scheduler_direct_leads()        — DEPRECATED (OD-note grep, broken since May 19 2026)
+  4. sync_scheduler_bookings_via_api()    — PR 2: replaces #3; pulls posted_appointments via scheduler API
+  5. run_full_od_sync()                   — runs 1+2+4 (called by nightly scheduler)
+  6. match_calls_to_od_appointments()     — link booked Mango calls → OD appointments
 """
 import hashlib
 import logging
@@ -1022,13 +1023,220 @@ def sync_scheduler_direct_leads(lookback_days: int = 30) -> dict:
     return {"created": created, "skipped": skipped, "errors": errors, "total": len(rows)}
 
 
+# ── PR 2 (Option B): API-based scheduler booking sync ────────────────────────
+
+def sync_scheduler_bookings_via_api(lookback_days: int = 60) -> dict:
+    """Pull posted_appointments from the scheduler's Cloud Run API and reconcile
+    them into the marketing pipeline.
+
+    Replaces sync_scheduler_direct_leads (OD-note ATTR: grep), which has been
+    permanently broken since scheduler commit 6e4d671 removed _build_attr_marker
+    on May 19 2026. The scheduler's posted_appointments table still stores full
+    attribution (gclid/UTM) via _sanitize_attribution(); this function reads it
+    via the new GET /api/admin/internal/bookings endpoint.
+
+    Match order (idempotent — safe to re-run):
+      1. od_patient_num match (exact, strongest — scheduler resolved OD PatNum)
+      2. Email match via find_lead_by_identifiers
+      3. No match → create new 'scheduled' lead
+
+    Attribution backfill rule: only fill empty fields — never overwrite an
+    existing gclid/utm that the lead already carries from its web-form origin.
+    """
+    import os
+    import uuid
+    import requests as _requests
+
+    from database import (
+        find_lead_by_identifiers, get_lead_by_od_pat_num,
+        upsert_lead, is_deleted_lead,
+    )
+    from contextlib import closing
+    from database import _conn as _local_conn
+
+    base = (os.environ.get("SCHEDULER_API") or "").rstrip("/")
+    key  = (
+        os.environ.get("SCHEDULER_INTERNAL_KEY")
+        or os.environ.get("SCHEDULER_ADMIN_PASSWORD")
+        or ""
+    )
+    if not base:
+        logger.warning("[sched_api] SCHEDULER_API not configured — skipping")
+        return {"created": 0, "updated": 0, "skipped": 0, "errors": 0,
+                "error": "SCHEDULER_API not set"}
+
+    # Use naive UTC to match the scheduler's stored created_at format (datetime.utcnow()).
+    # Aware ISO (+00:00 suffix) sorts lexicographically wrong against naive strings.
+    since = (datetime.utcnow() - timedelta(days=lookback_days)).isoformat()
+    try:
+        resp = _requests.get(
+            f"{base}/api/admin/internal/bookings",
+            params={"since": since, "limit": 1000},
+            headers={"X-Internal-Key": key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        bookings = resp.json().get("bookings", [])
+    except Exception as e:
+        logger.warning(f"[sched_api] Failed to fetch bookings from scheduler: {e}")
+        return {"created": 0, "updated": 0, "skipped": 0, "errors": 0, "error": str(e)}
+
+    logger.info(f"[sched_api] Fetched {len(bookings)} bookings since {since[:10]}")
+
+    created = updated = skipped = errors = 0
+
+    for b in bookings:
+        try:
+            od_pat_num = str(b.get("od_pat_num") or "").strip()
+            email      = (b.get("patient_email") or "").strip().lower()
+            name_parts = (b.get("patient_name") or "").strip().split()
+            first_name = name_parts[0] if name_parts else ""
+            last_name  = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+            apt_dt     = b.get("apt_datetime") or ""
+            apt_type   = b.get("appointment_type") or ""
+
+            attr = {k: (b.get(k) or "") for k in (
+                "gclid", "utm_source", "utm_medium", "utm_campaign",
+                "utm_term", "utm_content", "landing_referrer", "ga4_client_id",
+            )}
+
+            if not email and not od_pat_num:
+                logger.debug(f"[sched_api] Booking {b.get('stripe_session_id')} has no email/od_pat_num — skipping")
+                skipped += 1
+                continue
+
+            if email and is_deleted_lead("", email=email):
+                logger.debug(f"[sched_api] {email} is tombstoned — skipping")
+                skipped += 1
+                continue
+
+            # ── Tier 1: match by od_patient_num ──────────────────────────────
+            lead = get_lead_by_od_pat_num(od_pat_num) if od_pat_num else None
+
+            # ── Tier 2: match by email ────────────────────────────────────────
+            if not lead and email:
+                lead = find_lead_by_identifiers(email=email, phone="")
+
+            if lead:
+                # Backfill empty attribution fields only — never overwrite
+                now = datetime.now(timezone.utc).isoformat()
+                sets, vals = [], []
+                for col in ("gclid", "utm_source", "utm_medium", "utm_campaign",
+                             "utm_term", "utm_content", "ga4_client_id"):
+                    if attr.get(col) and not (lead.get(col) or ""):
+                        sets.append(f"{col}=?"); vals.append(attr[col])
+                if attr.get("landing_referrer") and not (lead.get("landing_url") or ""):
+                    sets.append("landing_url=?"); vals.append(attr["landing_referrer"])
+                if od_pat_num and not (lead.get("od_patient_num") or ""):
+                    sets.append("od_patient_num=?"); vals.append(od_pat_num)
+                # Always refresh appointment metadata
+                sets += ["appointment_date=?", "appointment_status=?", "updated_at=?"]
+                vals += [apt_dt[:10] if apt_dt else "", "scheduled", now]
+                vals.append(lead["id"])
+
+                with closing(_local_conn()) as lc:
+                    lc.execute(f"UPDATE leads SET {', '.join(sets)} WHERE id=?", vals)
+
+                add_event(
+                    lead["id"], "scheduler_booking_reconciled",
+                    source="od_matcher",
+                    detail=json.dumps({
+                        "stripe_session_id": b.get("stripe_session_id"),
+                        "od_apt_num": b.get("od_apt_num"),
+                        "had_attribution": bool(attr.get("gclid") or attr.get("utm_campaign")),
+                    }),
+                )
+                logger.debug(f"[sched_api] Updated lead {lead['id'][:8]} for {email or od_pat_num}")
+                updated += 1
+
+            else:
+                # ── Create new lead ───────────────────────────────────────────
+                self_booked = 0
+                if attr.get("utm_campaign"):
+                    try:
+                        with closing(_local_conn()) as lc:
+                            _row = lc.execute(
+                                "SELECT auto_enter_pipeline_rule FROM campaigns "
+                                "WHERE LOWER(campaign_name)=LOWER(?) LIMIT 1",
+                                (attr["utm_campaign"],),
+                            ).fetchone()
+                        if _row and _row[0] == "always":
+                            self_booked = 1
+                    except Exception as _e:
+                        logger.debug(f"[sched_api] self_booked lookup failed: {_e}")
+
+                new_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc).isoformat()
+                lead_data = {
+                    "id": new_id,
+                    "created_at": now,
+                    "source": "scheduler",
+                    "stage": "scheduled",
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "email": email,
+                    "phone": "",
+                    "goals": [apt_type] if apt_type else [],
+                    "notes": (
+                        f"Auto-created from visitgdc.com scheduler booking via API sync. "
+                        f"Stripe session: {b.get('stripe_session_id') or 'unknown'}. "
+                        f"Appointment type: {apt_type or 'unknown'}. "
+                        f"Scheduled: {apt_dt[:10] if apt_dt else 'unknown'}."
+                    ),
+                    "gclid":              attr.get("gclid", ""),
+                    "utm_source":         attr.get("utm_source", ""),
+                    "utm_medium":         attr.get("utm_medium", ""),
+                    "utm_campaign":       attr.get("utm_campaign", ""),
+                    "utm_term":           attr.get("utm_term", ""),
+                    "utm_content":        attr.get("utm_content", ""),
+                    "landing_url":        attr.get("landing_referrer", ""),
+                    "ga4_client_id":      attr.get("ga4_client_id", ""),
+                    "appointment_date":   apt_dt[:10] if apt_dt else "",
+                    "appointment_status": "scheduled",
+                    "od_patient_num":     od_pat_num,
+                    "self_booked":        self_booked,
+                    "existing_patient":   0,  # unknown without OD; sync_treatment_stages corrects next run
+                }
+                upsert_lead(lead_data)
+                add_event(
+                    new_id, "lead_created",
+                    source="od_matcher",
+                    detail=json.dumps({
+                        "source": "scheduler_api",
+                        "stripe_session_id": b.get("stripe_session_id"),
+                        "od_pat_num": od_pat_num,
+                        "appointment_type": apt_type,
+                        "apt_datetime": apt_dt,
+                        "has_attribution": bool(attr.get("gclid") or attr.get("utm_campaign")),
+                        "self_booked": bool(self_booked),
+                    }),
+                )
+                logger.info(
+                    f"[sched_api] Created lead {new_id[:8]} for {email or od_pat_num} "
+                    f"apt_type={apt_type!r} gclid={'yes' if attr.get('gclid') else 'no'} "
+                    f"self_booked={self_booked}"
+                )
+                created += 1
+
+        except Exception as e:
+            logger.error(f"[sched_api] Error on booking {b.get('stripe_session_id')}: {e}", exc_info=True)
+            errors += 1
+
+    logger.info(f"[sched_api] Done — created={created} updated={updated} skipped={skipped} errors={errors}")
+    return {"created": created, "updated": updated, "skipped": skipped,
+            "errors": errors, "total": len(bookings)}
+
+
 # ── Combined runner ──────────────────────────────────────────────────────────
 
 def run_full_od_sync() -> dict:
     """Run both matching and treatment stage sync. Called by nightly scheduler."""
     match_result = match_leads_to_od()
     stage_result = sync_treatment_stages()
-    direct_result = sync_scheduler_direct_leads(lookback_days=30)
+    # PR 2 (Jul 2026): replaced sync_scheduler_direct_leads (OD-note ATTR: grep, broken
+    # since commit 6e4d671) with sync_scheduler_bookings_via_api (reads posted_appointments
+    # via scheduler's new /api/admin/internal/bookings endpoint).
+    direct_result = sync_scheduler_bookings_via_api(lookback_days=60)
     callrail_result = enrich_callrail_calls_with_od(limit=500)
     return {
         "match": match_result,
