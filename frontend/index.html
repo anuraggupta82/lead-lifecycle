@@ -1581,7 +1581,7 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       if (followupOnly && !isStaffFollowUp(l)) return false;
       // GAds Only: hide leads with no Google Ads attribution (no gclid + no campaign_name + non-GAds source)
       if (!showAllSources) {
-        const hasGadsAttribution = l.gclid || l.campaign_name || (l.source === 'callrail') || (l.source === 'smile_tool' && l.gclid);
+        const hasGadsAttribution = l.gclid || l.campaign_name || (l.source === 'callrail' && (l.gclid || l.campaign_name)) || (l.source === 'smile_tool' && l.gclid);
         if (!hasGadsAttribution && NON_GADS_SOURCES.has(l.source || '')) return false;
         // Also exclude leads with no source attribution that aren't manually created
         if (!hasGadsAttribution && !l.source) return false;
