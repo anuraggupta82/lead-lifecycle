@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     # Appointment scheduler (GCP)
     scheduler_api: str = "https://scheduler-api-981004615066.us-east4.run.app"
     scheduler_admin_password: str = "GDC-admin-2026!"
+    # ATTR-FIX 2026-07-06: declare the machine-to-machine key present in .env
+    # (SCHEDULER_INTERNAL_KEY) so Settings doesn't reject it on startup. Blank
+    # falls back to scheduler_admin_password for /api/admin/internal/bookings.
+    scheduler_internal_key: str = ""
 
     # OpenDental (local — only accessible on office network)
     od_db_host: str = "GraftonServer"

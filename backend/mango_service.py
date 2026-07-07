@@ -1041,6 +1041,62 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
         if _cr_gads_confirmed:
             continue
 
+        # ATTR-FIX2 2026-07-07: direct gads_call_view time-match (no CallRail bridge).
+        # The CallRail source='google_ads' bridge row (matched above) stopped being
+        # produced after the DNI pool broke ~May 22 (call-extension number
+        # recategorized), so every ad call since has gone unattributed even though
+        # gads_call_view itself is fully populated. Google redacts the caller's area
+        # code on call-extension rows, so time (±60s) is the only signal available —
+        # match directly here instead of depending on the broken bridge.
+        # Only consider RECEIVED (answered) gads rows; MISSED/0-duration rows have
+        # no reliable time anchor and would produce false matches. Attribute the ad
+        # touch regardless of new/existing patient status — the existing-patient
+        # *conversion* exclusion is a separate downstream rule, not applied here.
+        _dm_best_id, _dm_best_gc, _dm_best_delta = None, None, float("inf")
+        for gc, gc_dt in gads_parsed:
+            if gc["call_id"] in _used_gads_ids:
+                continue
+            if (gc.get("call_status") or "") != "RECEIVED":
+                continue
+            if int(gc.get("call_duration_sec") or 0) <= 0:
+                continue
+            _delta = abs((mc_dt - gc_dt).total_seconds())
+            if _delta <= 60 and _delta < _dm_best_delta:
+                _dm_best_delta, _dm_best_id, _dm_best_gc = _delta, gc["call_id"], gc
+
+        # Don't clobber a call that already has campaign attribution from some
+        # other path (defensive — get_mango_calls_unmatched already filters on
+        # gads_call_id IS NULL, but attributed_ad_group could theoretically be
+        # set without a gads_call_id in edge cases, so guard on it too).
+        if _dm_best_id and not (mc.get("attributed_ad_group") or "").strip():
+            _dm_campaign = _dm_best_gc.get("campaign_name", "") or ""
+            _dm_ag       = _dm_best_gc.get("ad_group_name", "") or ""
+            _dm_ag_display = f"{_dm_campaign} > {_dm_ag}" if _dm_ag else _dm_campaign
+
+            _used_gads_ids.add(_dm_best_id)
+            update_mango_call_attribution(
+                uuid=mc_uuid,
+                gads_call_id=_dm_best_id,
+                match_confidence=0.85,
+                match_method="gads_time_match",
+                attributed_ad_group=_dm_ag_display,
+                # No keyword: call-extension (tap-to-call) calls have no search term.
+            )
+            attributed += 1
+            _queue_process_if_needed(mc, mango_token=mango_token)
+            try:
+                with _db_conn() as _fc_conn:
+                    mc_fresh = dict(mc)
+                    mc_fresh["match_confidence"] = 0.85
+                    _create_call_flag_if_needed(_fc_conn, mc_fresh, _dm_best_gc)
+            except Exception as _fe:
+                logger.warning(f"call_flag creation failed for {mc_uuid}: {_fe}")
+            logger.info(
+                "reconcile[gads_time_match] Mango=%s -> GAds=%s (time_delta=%.0fs)",
+                mc_uuid, _dm_best_id, _dm_best_delta,
+            )
+            continue
+
         # ── Try lead phone match ──────────────────────────────────────────────
         from_digits = re.sub(r"\D", "", mc.get("from_number", "") or "")
         if len(from_digits) >= 10:

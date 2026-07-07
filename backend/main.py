@@ -11486,19 +11486,31 @@ def admin_backfill_gads_attribution(days: int = 90, dry_run: bool = True):
     Scope: inbound mango_calls in the last `days` days (default 90, max 365) that
     currently have NO campaign attribution (attributed_ad_group IS NULL/'').
 
+    ATTR-FIX2 2026-07-07: RESTRUCTURED. The original version required a
+    callrail_calls row with mango_call_id = this call's uuid as a precondition —
+    but that link is only ever populated by reconcile_attribution()'s CallRail
+    bridge, which stopped firing ~May 22 (DNI pool broke). That made this
+    endpoint chicken-and-egg: it could never backfill exactly the calls it was
+    built to backfill. Fixed by making the gads_call_view time-match PRIMARY
+    (no CallRail dependency) and keeping the CallRail-campaign lookup as a
+    fallback only.
+
     For each such call:
-      1. Look up its best-matching callrail_calls row (same "prefer non-empty
-         keyword, then newest" tie-break used elsewhere in this codebase).
-      2. Re-derive the true source with the NEW classifier logic: google_ads if
-         the CallRail row already has source='google_ads' (webhook-time
-         classification already applied at ingestion) OR it has a gclid, OR its
-         tracking number's assignment_type is 'gads_campaign'/'gads_call_extension'.
-      3. If google_ads and not an existing OD patient (existing_active/inactive are
-         excluded, same guard as reconcile_attribution): try a gads_call_view time
-         match (±60s) for gads_call_id + "Campaign > AdGroup"; else fall back to
-         CallRail's own campaign/keyword ("Campaign > ").
-      4. Only write (or, in dry_run, only report) if this yields new campaign info
-         that the row doesn't already have.
+      1. PRIMARY: attempt a direct gads_call_view time-match (±60s, RECEIVED/
+         answered rows only, closest unused row) → gads_call_id +
+         "Campaign > AdGroup", method 'gads_time_match', confidence 0.85.
+         No CallRail row is required for this path.
+      2. FALLBACK (only if no time-match): look up a callrail_calls row by
+         mango_call_id (webhook-populated, independent of reconcile) and re-derive
+         source with the classifier logic: google_ads if source='google_ads' OR
+         gclid present OR tracking number assignment_type is
+         'gads_campaign'/'gads_call_extension'. If google_ads with a campaign,
+         write "Campaign > " (method 'callrail_campaign_only') or the stronger
+         'callrail_keyword' method if CallRail captured a keyword.
+      3. Only write (or, in dry_run, only report) if this yields new campaign info
+         that the row doesn't already have. Existing OD patients (existing_active/
+         existing_inactive) are excluded from this backfill entirely, same guard
+         as reconcile_attribution.
 
     dry_run=True (default): computes and returns the summary WITHOUT writing
     anything to the DB — no UPDATE statements are executed at all in this mode.
@@ -11529,7 +11541,10 @@ def admin_backfill_gads_attribution(days: int = 90, dry_run: bool = True):
         "scanned": 0,
         "would_update" if dry_run else "updated": 0,
         "by_result": {
-            "gads_call_view_match": 0,   # got gads_call_id + campaign>ad_group
+            "gads_call_view_match": 0,   # got gads_call_id + campaign>ad_group (via CallRail bridge)
+            # ATTR-FIX2 2026-07-07: new primary path — direct gads_call_view time-match,
+            # no CallRail bridge row required (bridge stopped being produced ~May 22).
+            "gads_time_match": 0,        # got gads_call_id + campaign>ad_group (direct time-match)
             "callrail_campaign_only": 0, # campaign (no keyword/ad_group) from CallRail
             "no_change": 0,              # re-evaluated, still nothing to attribute
         },
@@ -11573,44 +11588,8 @@ def admin_backfill_gads_attribution(days: int = 90, dry_run: bool = True):
                         summary["by_result"]["no_change"] += 1
                         continue
 
-                    # Best-matching CallRail row for this call (same tie-break as
-                    # get_mango_calls / call_keyword_attribution).
-                    cr_row = conn.execute(
-                        """
-                        SELECT cr.source, cr.gclid, cr.campaign, cr.keyword, cr.tracking_number_id
-                        FROM callrail_calls cr
-                        WHERE cr.mango_call_id = ?
-                        ORDER BY (CASE WHEN COALESCE(cr.keyword,'') != '' THEN 0 ELSE 1 END),
-                                 cr.id DESC
-                        LIMIT 1
-                        """,
-                        (mc_uuid,),
-                    ).fetchone()
-
-                    if not cr_row:
-                        summary["by_result"]["no_change"] += 1
-                        continue
-
-                    # ── Re-derive source with the NEW classifier rule ──────────
-                    is_google_ads = (cr_row["source"] == "google_ads")
-                    if not is_google_ads and (cr_row["gclid"] or "").strip():
-                        is_google_ads = True
-                    if not is_google_ads and cr_row["tracking_number_id"]:
-                        tn = conn.execute(
-                            "SELECT assignment_type FROM callrail_numbers WHERE id = ? LIMIT 1",
-                            (cr_row["tracking_number_id"],),
-                        ).fetchone()
-                        if tn and tn[0] in ("gads_campaign", "gads_call_extension"):
-                            is_google_ads = True
-
-                    if not is_google_ads:
-                        summary["by_result"]["no_change"] += 1
-                        continue
-
-                    cr_campaign = (cr_row["campaign"] or "").strip()
-                    cr_keyword  = (cr_row["keyword"] or "").strip()
-
-                    # Time-match against gads_call_view (±60s), same as reconcile_attribution.
+                    # Parse this call's started_at once — needed for the primary
+                    # gads_call_view time-match below regardless of CallRail state.
                     mc_dt = None
                     try:
                         s = (cand.get("started_at") or "").replace("Z", "+00:00")
@@ -11620,45 +11599,99 @@ def admin_backfill_gads_attribution(days: int = 90, dry_run: bool = True):
                     except Exception:
                         mc_dt = None
 
+                    ag_display = ""
+                    result_key = "no_change"
+                    update_kwargs = {}
+
+                    # ATTR-FIX2 2026-07-07: PRIMARY path — direct gads_call_view
+                    # time-match, independent of any CallRail bridge row. The old
+                    # logic required a callrail_calls row with mango_call_id = this
+                    # call's uuid, but that link is only ever written by the (broken)
+                    # reconcile pass — chicken-and-egg. gads_call_view is populated
+                    # straight from the Google Ads API and needs no bridge at all.
+                    # Only RECEIVED (answered), real-duration rows are eligible;
+                    # Google redacts caller area code on call-extension rows so time
+                    # (±60s, closest, not already claimed this pass) is the only signal.
                     best_id, best_gc, best_delta = None, None, float("inf")
                     if mc_dt:
                         for gc, gc_dt in gads_parsed:
                             if gc["call_id"] in _used_gads_ids:
                                 continue
+                            if (gc.get("call_status") or "") != "RECEIVED":
+                                continue
+                            if int(gc.get("call_duration_sec") or 0) <= 0:
+                                continue
                             delta = abs((mc_dt - gc_dt).total_seconds())
                             if delta <= 60 and delta < best_delta:
                                 best_delta, best_id, best_gc = delta, gc["call_id"], gc
 
-                    ag_display = ""
-                    result_key = "no_change"
-                    update_kwargs = {}
                     if best_gc:
                         gcv_campaign = best_gc.get("campaign_name", "") or ""
                         gcv_ag       = best_gc.get("ad_group_name", "") or ""
                         ag_display = f"{gcv_campaign} > {gcv_ag}" if gcv_ag else gcv_campaign
-                        result_key = "gads_call_view_match"
-                        update_kwargs = dict(gads_call_id=best_id, match_confidence=0.95,
-                                              match_method="callrail_confirmed",
+                        result_key = "gads_time_match"
+                        update_kwargs = dict(gads_call_id=best_id, match_confidence=0.85,
+                                              match_method="gads_time_match",
                                               attributed_ad_group=ag_display)
-                        if cr_keyword:
-                            update_kwargs.update(
-                                attributed_keyword=cr_keyword,
-                                attributed_keyword_method="callrail_keyword",
-                                attributed_keyword_confidence=0.95,
-                            )
-                    elif cr_campaign:
-                        ag_display = f"{cr_campaign} > "
-                        result_key = "callrail_campaign_only"
-                        update_kwargs = dict(attributed_ad_group=ag_display,
-                                              attributed_keyword_method="callrail_campaign_only",
-                                              attributed_keyword_confidence=0.60)
-                        if cr_keyword:
-                            # Has a keyword after all — use the stronger method/label.
-                            update_kwargs.update(
-                                attributed_keyword=cr_keyword,
-                                attributed_keyword_method="callrail_keyword",
-                                attributed_keyword_confidence=0.95,
-                            )
+                        # No keyword written here — call-extension calls have none.
+
+                    else:
+                        # ── FALLBACK — CallRail-campaign-only path ─────────────
+                        # No direct gads_call_view time-match. Fall back to the
+                        # CallRail row for this call, if one exists and carries a
+                        # campaign. NOTE (assumption, per instructions): this still
+                        # looks up callrail_calls by mango_call_id only. That link
+                        # is populated by the webhook at call time (not by
+                        # reconcile), so it can exist independently of the broken
+                        # bridge — but if the webhook also never linked this call,
+                        # this fallback will find nothing. A phone+time lookup
+                        # against callrail_calls was considered but callrail_calls
+                        # does not reliably expose a comparable normalized phone
+                        # column alongside called_at in this schema, so it was left
+                        # out rather than guessed at; flag for follow-up if the
+                        # no_change count stays high after this fix.
+                        cr_row = conn.execute(
+                            """
+                            SELECT cr.source, cr.gclid, cr.campaign, cr.keyword, cr.tracking_number_id
+                            FROM callrail_calls cr
+                            WHERE cr.mango_call_id = ?
+                            ORDER BY (CASE WHEN COALESCE(cr.keyword,'') != '' THEN 0 ELSE 1 END),
+                                     cr.id DESC
+                            LIMIT 1
+                            """,
+                            (mc_uuid,),
+                        ).fetchone()
+
+                        if cr_row:
+                            is_google_ads = (cr_row["source"] == "google_ads")
+                            if not is_google_ads and (cr_row["gclid"] or "").strip():
+                                is_google_ads = True
+                            if not is_google_ads and cr_row["tracking_number_id"]:
+                                tn = conn.execute(
+                                    "SELECT assignment_type FROM callrail_numbers WHERE id = ? LIMIT 1",
+                                    (cr_row["tracking_number_id"],),
+                                ).fetchone()
+                                if tn and tn[0] in ("gads_campaign", "gads_call_extension"):
+                                    is_google_ads = True
+
+                            if is_google_ads:
+                                cr_campaign = (cr_row["campaign"] or "").strip()
+                                cr_keyword  = (cr_row["keyword"] or "").strip()
+                                if cr_campaign:
+                                    ag_display = f"{cr_campaign} > "
+                                    result_key = "callrail_campaign_only"
+                                    update_kwargs = dict(
+                                        attributed_ad_group=ag_display,
+                                        attributed_keyword_method="callrail_campaign_only",
+                                        attributed_keyword_confidence=0.60,
+                                    )
+                                    if cr_keyword:
+                                        # Has a keyword after all — use the stronger method/label.
+                                        update_kwargs.update(
+                                            attributed_keyword=cr_keyword,
+                                            attributed_keyword_method="callrail_keyword",
+                                            attributed_keyword_confidence=0.95,
+                                        )
 
                     if not ag_display:
                         summary["by_result"]["no_change"] += 1
