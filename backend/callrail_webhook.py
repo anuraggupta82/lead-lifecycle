@@ -127,21 +127,35 @@ def _find_recording_enabled(conn, tracking_number_id) -> bool:
     return bool(row and row[0])
 
 
-def _resolve_tracker_source(conn, tracking_number_id, webhook_source: str) -> str:
+def _resolve_tracker_source(conn, tracking_number_id, webhook_source: str,
+                             click_id: str = "") -> str:
     """
     Return the true attribution source for this call.
-    If the tracking number is a GAds call extension (assignment_type='gads_campaign'),
-    return 'google_ads' regardless of what the webhook source field says.
-    CallRail sends source='Direct' for call extensions in webhook payloads even
-    though the tracker is a Google Ads asset — the tracker config is authoritative.
+
+    # ATTR-FIX 2026-07-06: broadened from a single assignment_type check to two
+    # independent signals, either of which is sufficient to classify 'google_ads':
+    #   (a) the call carries a Google click id (gclid, or gbraid/wbraid for
+    #       privacy-sandbox / app-to-web clicks) — passed in via `click_id` by the
+    #       caller, which already reads call.get("gclid"). A click id can only be
+    #       present if the visitor arrived via a Google Ads click, regardless of
+    #       how the tracking number itself is configured in CallRail.
+    #   (b) the tracking number's assignment_type is either 'gads_campaign' (DNI
+    #       swap pool) OR 'gads_call_extension' (static call-extension number
+    #       shown directly on the ad, no web session/DNI involved). Previously
+    #       only 'gads_campaign' was recognized, so tap-to-call conversions on a
+    #       call-extension number were misclassified as 'Direct'.
+    # Otherwise behavior is unchanged: fall back to webhook_source or 'Direct'.
     """
+    if (click_id or "").strip():
+        return "google_ads"
+
     if not tracking_number_id:
         return webhook_source or "Direct"
     row = conn.execute(
         "SELECT assignment_type FROM callrail_numbers WHERE id = ? LIMIT 1",
         (tracking_number_id,)
     ).fetchone()
-    if row and row[0] == "gads_campaign":
+    if row and row[0] in ("gads_campaign", "gads_call_extension"):
         return "google_ads"
     return webhook_source or "Direct"
 
@@ -611,8 +625,17 @@ def process_webhook(payload: dict, raw_body: bytes) -> dict:
             recording_enabled = _find_recording_enabled(conn, tracking_number_id)
             # Resolve true source from tracker config — call extensions arrive as
             # source='Direct' in webhook payloads even though they're Google Ads assets.
+            # ATTR-FIX 2026-07-06: pass the Google click id through so _resolve_tracker_source
+            # can classify 'google_ads' purely from click-id presence, independent of the
+            # tracking number's assignment_type. CallRail's confirmed field is "gclid";
+            # gbraid/wbraid (Enhanced Conversions / privacy-sandbox variants) are checked
+            # defensively in case CallRail adds them to the payload — NOT verified against
+            # a live payload, since we don't have a sample with those fields present.
+            _click_id = (
+                call.get("gclid") or call.get("gbraid") or call.get("wbraid") or ""
+            )
             resolved_source = _resolve_tracker_source(
-                conn, tracking_number_id, call.get("source", "Direct")
+                conn, tracking_number_id, call.get("source", "Direct"), click_id=_click_id
             )
             campaign_id_resolved, _ = _find_campaign_by_name(
                 conn, call.get("campaign", "")

@@ -10850,6 +10850,14 @@ def admin_get_calls(
               and (c.get("callrail_keyword") or "").strip()):
             # CallRail DNI captured a Google Ads visitor — no gads_call_id but keyword known
             c["attribution_label"] = "Ad call (DNI)"
+        elif (c.get("callrail_source") == "google_ads"
+              and (c.get("callrail_campaign") or "").strip()):
+            # ATTR-FIX 2026-07-06: call-extension (tap-to-call) call — CallRail confirmed
+            # google_ads and gave us a campaign name, but no web session/keyword exists
+            # (see mango_service.reconcile_attribution's 'callrail_campaign_only' path).
+            # Without this branch these calls fell through to "" and looked unattributed
+            # in the calls list even though campaign was known.
+            c["attribution_label"] = "Ad call (extension)"
         elif c.get("lead_id"):
             # "Known lead" was firing for ALL calls because CallRail creates a lead
             # instantly on every webhook. Use od_patient_status + first_call instead.
@@ -11459,6 +11467,233 @@ def admin_backfill_call_keyword_attribution():
         n = backfill_call_keyword_attribution()
         return {"updated": n}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ATTR-FIX 2026-07-06: guarded historical backfill for the gclid/call-extension
+# classifier fix (callrail_webhook._resolve_tracker_source) and the
+# callrail_campaign_only attribution path (mango_service.reconcile_attribution).
+# Re-evaluates calls that currently have NO campaign attribution
+# (mango_calls.attributed_ad_group empty) using the new classification rules and
+# reports what would change. dry_run defaults to True and performs ZERO writes —
+# it only opens read cursors and computes the same-shape update it would have made.
+# THIS ENDPOINT HAS NOT BEEN RUN. It must be triggered manually (see rollout notes).
+@app.post("/api/admin/calls/backfill-gads-attribution", dependencies=[Depends(_require_admin)])
+def admin_backfill_gads_attribution(days: int = 90, dry_run: bool = True):
+    """
+    Historical backfill for the 2026-07-06 gclid / call-extension attribution fix.
+
+    Scope: inbound mango_calls in the last `days` days (default 90, max 365) that
+    currently have NO campaign attribution (attributed_ad_group IS NULL/'').
+
+    For each such call:
+      1. Look up its best-matching callrail_calls row (same "prefer non-empty
+         keyword, then newest" tie-break used elsewhere in this codebase).
+      2. Re-derive the true source with the NEW classifier logic: google_ads if
+         the CallRail row already has source='google_ads' (webhook-time
+         classification already applied at ingestion) OR it has a gclid, OR its
+         tracking number's assignment_type is 'gads_campaign'/'gads_call_extension'.
+      3. If google_ads and not an existing OD patient (existing_active/inactive are
+         excluded, same guard as reconcile_attribution): try a gads_call_view time
+         match (±60s) for gads_call_id + "Campaign > AdGroup"; else fall back to
+         CallRail's own campaign/keyword ("Campaign > ").
+      4. Only write (or, in dry_run, only report) if this yields new campaign info
+         that the row doesn't already have.
+
+    dry_run=True (default): computes and returns the summary WITHOUT writing
+    anything to the DB — no UPDATE statements are executed at all in this mode.
+    dry_run=False: performs the same writes reconcile_attribution() would have
+    made, via update_mango_call_attribution(), and is safe to re-run (idempotent —
+    only touches rows still missing attribution).
+
+    Uses the app's standard DB connection helper (database._conn) exclusively —
+    never a raw sqlite3.connect(). Read-only in dry_run mode; all writes in
+    non-dry-run mode go through the existing update_mango_call_attribution() helper
+    used by reconcile_attribution(), so downstream readers (calls list, campaign
+    rollups) see identical row shapes to a normal reconcile pass.
+    """
+    from database import _conn, update_mango_call_attribution
+    from mango_service import _parse_gads_dt
+
+    days = max(1, min(int(days), 365))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    logger.info(
+        "[backfill-gads-attribution] starting dry_run=%s days=%s cutoff=%s",
+        dry_run, days, cutoff,
+    )
+
+    summary = {
+        "dry_run": dry_run,
+        "days": days,
+        "scanned": 0,
+        "would_update" if dry_run else "updated": 0,
+        "by_result": {
+            "gads_call_view_match": 0,   # got gads_call_id + campaign>ad_group
+            "callrail_campaign_only": 0, # campaign (no keyword/ad_group) from CallRail
+            "no_change": 0,              # re-evaluated, still nothing to attribute
+        },
+        "errors": 0,
+        "sample": [],  # up to 25 example rows of what changed/would change, for review
+    }
+
+    try:
+        with _conn() as conn:
+            # Candidates: inbound calls with no campaign attribution yet.
+            candidates = conn.execute(
+                """
+                SELECT uuid, started_at, od_patient_status
+                FROM mango_calls
+                WHERE direction = 'inbound'
+                  AND started_at >= ?
+                  AND (attributed_ad_group IS NULL OR attributed_ad_group = '')
+                ORDER BY started_at DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+            candidates = [dict(r) for r in candidates]
+
+            # Pull gads_call_view rows once for the window (read-only; same helper
+            # reconcile_attribution() uses).
+            from database import get_gads_call_view
+            gads_calls = get_gads_call_view(days=days)
+            gads_parsed = []
+            for gc in gads_calls:
+                gc_dt = _parse_gads_dt(gc.get("start_call_date_time", ""))
+                if gc_dt:
+                    gads_parsed.append((gc, gc_dt))
+            _used_gads_ids: set = set()
+
+            for cand in candidates:
+                summary["scanned"] += 1
+                mc_uuid = cand["uuid"]
+                try:
+                    od_status = (cand.get("od_patient_status") or "").strip()
+                    if od_status in ("existing_active", "existing_inactive"):
+                        summary["by_result"]["no_change"] += 1
+                        continue
+
+                    # Best-matching CallRail row for this call (same tie-break as
+                    # get_mango_calls / call_keyword_attribution).
+                    cr_row = conn.execute(
+                        """
+                        SELECT cr.source, cr.gclid, cr.campaign, cr.keyword, cr.tracking_number_id
+                        FROM callrail_calls cr
+                        WHERE cr.mango_call_id = ?
+                        ORDER BY (CASE WHEN COALESCE(cr.keyword,'') != '' THEN 0 ELSE 1 END),
+                                 cr.id DESC
+                        LIMIT 1
+                        """,
+                        (mc_uuid,),
+                    ).fetchone()
+
+                    if not cr_row:
+                        summary["by_result"]["no_change"] += 1
+                        continue
+
+                    # ── Re-derive source with the NEW classifier rule ──────────
+                    is_google_ads = (cr_row["source"] == "google_ads")
+                    if not is_google_ads and (cr_row["gclid"] or "").strip():
+                        is_google_ads = True
+                    if not is_google_ads and cr_row["tracking_number_id"]:
+                        tn = conn.execute(
+                            "SELECT assignment_type FROM callrail_numbers WHERE id = ? LIMIT 1",
+                            (cr_row["tracking_number_id"],),
+                        ).fetchone()
+                        if tn and tn[0] in ("gads_campaign", "gads_call_extension"):
+                            is_google_ads = True
+
+                    if not is_google_ads:
+                        summary["by_result"]["no_change"] += 1
+                        continue
+
+                    cr_campaign = (cr_row["campaign"] or "").strip()
+                    cr_keyword  = (cr_row["keyword"] or "").strip()
+
+                    # Time-match against gads_call_view (±60s), same as reconcile_attribution.
+                    mc_dt = None
+                    try:
+                        s = (cand.get("started_at") or "").replace("Z", "+00:00")
+                        mc_dt = datetime.fromisoformat(s)
+                        if mc_dt.tzinfo is None:
+                            mc_dt = mc_dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        mc_dt = None
+
+                    best_id, best_gc, best_delta = None, None, float("inf")
+                    if mc_dt:
+                        for gc, gc_dt in gads_parsed:
+                            if gc["call_id"] in _used_gads_ids:
+                                continue
+                            delta = abs((mc_dt - gc_dt).total_seconds())
+                            if delta <= 60 and delta < best_delta:
+                                best_delta, best_id, best_gc = delta, gc["call_id"], gc
+
+                    ag_display = ""
+                    result_key = "no_change"
+                    update_kwargs = {}
+                    if best_gc:
+                        gcv_campaign = best_gc.get("campaign_name", "") or ""
+                        gcv_ag       = best_gc.get("ad_group_name", "") or ""
+                        ag_display = f"{gcv_campaign} > {gcv_ag}" if gcv_ag else gcv_campaign
+                        result_key = "gads_call_view_match"
+                        update_kwargs = dict(gads_call_id=best_id, match_confidence=0.95,
+                                              match_method="callrail_confirmed",
+                                              attributed_ad_group=ag_display)
+                        if cr_keyword:
+                            update_kwargs.update(
+                                attributed_keyword=cr_keyword,
+                                attributed_keyword_method="callrail_keyword",
+                                attributed_keyword_confidence=0.95,
+                            )
+                    elif cr_campaign:
+                        ag_display = f"{cr_campaign} > "
+                        result_key = "callrail_campaign_only"
+                        update_kwargs = dict(attributed_ad_group=ag_display,
+                                              attributed_keyword_method="callrail_campaign_only",
+                                              attributed_keyword_confidence=0.60)
+                        if cr_keyword:
+                            # Has a keyword after all — use the stronger method/label.
+                            update_kwargs.update(
+                                attributed_keyword=cr_keyword,
+                                attributed_keyword_method="callrail_keyword",
+                                attributed_keyword_confidence=0.95,
+                            )
+
+                    if not ag_display:
+                        summary["by_result"]["no_change"] += 1
+                        continue
+
+                    summary["by_result"][result_key] += 1
+                    summary["would_update" if dry_run else "updated"] += 1
+                    if len(summary["sample"]) < 25:
+                        summary["sample"].append({
+                            "uuid": mc_uuid,
+                            "result": result_key,
+                            "attributed_ad_group": ag_display,
+                            "attributed_keyword": update_kwargs.get("attributed_keyword", ""),
+                            "gads_call_id": update_kwargs.get("gads_call_id", ""),
+                        })
+
+                    if not dry_run:
+                        if best_id:
+                            _used_gads_ids.add(best_id)
+                        update_mango_call_attribution(uuid=mc_uuid, **update_kwargs)
+
+                except Exception as e:
+                    summary["errors"] += 1
+                    logger.warning(
+                        "[backfill-gads-attribution] failed for call %s: %s", mc_uuid, e
+                    )
+
+        logger.info(
+            "[backfill-gads-attribution] done dry_run=%s scanned=%s result=%s errors=%s",
+            dry_run, summary["scanned"], summary["by_result"], summary["errors"],
+        )
+        return summary
+
+    except Exception as e:
+        logger.error("[backfill-gads-attribution] failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

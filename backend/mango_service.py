@@ -987,6 +987,21 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                     attributed_keyword_confidence=0.95,
                     attributed_ad_group=_cr_ag_display or None,
                 )
+            # ATTR-FIX 2026-07-06: call-extension (tap-to-call) calls are CallRail-
+            # confirmed google_ads but usually have NO search keyword (no web session /
+            # DNI swap happened — the number is dialed straight off the ad). Previously
+            # _kw_kwargs stayed empty in that case, so attributed_ad_group (the field the
+            # calls-list and campaign rollups read for "campaign") was never written even
+            # though CallRail's `campaign` field (_cr_campaign) was known. Fix: when there's
+            # no keyword but we do have a CallRail campaign and _kw_kwargs is still empty,
+            # write attributed_ad_group alone (method stays distinguishable via
+            # 'callrail_campaign_only' so we don't overwrite a real keyword-level method).
+            elif _cr_ag_display and _cur_kw_method not in ("skag_direct", "callrail_keyword", "callrail_campaign_only"):
+                _kw_kwargs = dict(
+                    attributed_keyword_method="callrail_campaign_only",
+                    attributed_keyword_confidence=0.60,
+                    attributed_ad_group=_cr_ag_display,
+                )
 
             if _cr_best_id:
                 _used_gads_ids.add(_cr_best_id)

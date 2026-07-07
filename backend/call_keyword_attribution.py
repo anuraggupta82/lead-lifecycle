@@ -349,7 +349,9 @@ def get_attribution_diagnostics(days: int = 30) -> dict:
             # Exclude non-keyword methods from "keyword-attributed" count
             # campaign_only = matched campaign but not keyword
             # no_signal = no GAds signal at all (terminal state to prevent re-scanning)
-            NON_KEYWORD = {"unattributed", "campaign_only", "no_signal"}
+            # callrail_campaign_only = ATTR-FIX 2026-07-06: CallRail-confirmed call-extension
+            #   (tap-to-call) call with a campaign but no captured search keyword
+            NON_KEYWORD = {"unattributed", "campaign_only", "no_signal", "callrail_campaign_only"}
             keyword_attributed = sum(
                 v for k, v in breakdown.items()
                 if k not in NON_KEYWORD
