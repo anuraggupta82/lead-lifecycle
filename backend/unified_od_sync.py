@@ -310,7 +310,7 @@ def run_unified_od_sync(trigger: str = "manual") -> dict:
         # ── Step 2: Google Ads gclid → keyword ───────────────────────────────
         def _do_gads():
             from google_ads_sync import sync_gclids_to_keywords
-            return sync_gclids_to_keywords(days_back=7)
+            return sync_gclids_to_keywords(days_back=30)  # ATTR-FIX3 2026-07-07: widened from 7 — weeks-old leads were skipped
 
         _run_step(1, _do_gads, _summarize_gads)
 

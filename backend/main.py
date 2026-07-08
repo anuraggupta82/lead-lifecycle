@@ -202,7 +202,7 @@ async def lifespan(app: FastAPI):
         _stamp("gads_sync")
         try:
             from google_ads_sync import sync_gclids_to_keywords
-            result = sync_gclids_to_keywords(days_back=7)
+            result = sync_gclids_to_keywords(days_back=30)  # ATTR-FIX3 2026-07-07: widened from 7 — leads weeks old were skipped, 0 resolved
             logger.info(f"Scheduled Google Ads sync: {result}")
         except Exception as e:
             logger.error(f"Scheduled Google Ads sync failed: {e}")
@@ -431,7 +431,7 @@ async def lifespan(app: FastAPI):
         _stamp("gads_morning_refresh")
         try:
             from google_ads_sync import sync_gclids_to_keywords
-            result = sync_gclids_to_keywords(days_back=7)
+            result = sync_gclids_to_keywords(days_back=30)  # ATTR-FIX3 2026-07-07: widened from 7 — leads weeks old were skipped, 0 resolved
             logger.info(f"GAds morning refresh: {result}")
         except Exception as e:
             logger.error(f"GAds morning refresh failed: {e}")
