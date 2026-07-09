@@ -1470,8 +1470,12 @@ function KanbanColumn({ stage, label, leads, color, selectedId, onCardClick, onD
   );
 }
 
-// Sources that are never Google Ads leads — excluded when GAds Only filter is active
-const NON_GADS_SOURCES = new Set(['contact_form', 'gdc_contact_form', 'pearly', 'nxtsmile_landing_page', 'manual']);
+// Sources that are only Google Ads leads if they carry a Google indication
+// (gclid / campaign_name) — otherwise excluded when GAds Only filter is active.
+// 'callrail' is included: a phone call is a Google Ads lead ONLY if Google tagged it
+// with a gclid. Without one it's a plain phone call (GBP/organic/direct) and must not
+// show in the GAds view (owner rule Jul 8: gclid is the sole Google-Ads indicator).
+const NON_GADS_SOURCES = new Set(['contact_form', 'gdc_contact_form', 'pearly', 'nxtsmile_landing_page', 'manual', 'callrail']);
 
 function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll, campaigns }) {
   const [searchTerm, setSearchTerm] = useState('');
