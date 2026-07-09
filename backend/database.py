@@ -4351,14 +4351,36 @@ def get_unified_campaigns(days: int = 0, month: str = None) -> list:
         }
 
         # ── Lead counts per campaign in the window ───────────────────────
+        # Dedup: exclude patients already counted on the call path (mirrors
+        # get_keyword_stats call_attributed_patients) so campaign income counts
+        # each OD patient once.
         lead_rows = conn.execute(f"""
+            WITH call_attributed_patients AS (
+                SELECT DISTINCT od_patient_num
+                FROM mango_calls
+                WHERE od_patient_status = 'new_patient'
+                  AND od_patient_num IS NOT NULL
+                  AND od_patient_num != ''
+            )
             SELECT
                 LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign))) AS k,
                 COUNT(*)                              AS lead_count,
-                SUM(attributed_income)                AS attributed_income,
-                SUM(attributed_production)            AS attributed_production,
-                SUM(COALESCE(paid_amount_365d, 0.0))  AS paid_income_365d,
-                SUM(COALESCE(paid_amount_ltv,  0.0))  AS paid_income_ltv,
+                SUM(CASE WHEN od_patient_num IS NULL
+                          OR od_patient_num = ''
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                     THEN attributed_income ELSE 0 END)     AS attributed_income,
+                SUM(CASE WHEN od_patient_num IS NULL
+                          OR od_patient_num = ''
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                     THEN attributed_production ELSE 0 END) AS attributed_production,
+                SUM(CASE WHEN od_patient_num IS NULL
+                          OR od_patient_num = ''
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                     THEN COALESCE(paid_amount_365d, 0.0) ELSE 0 END) AS paid_income_365d,
+                SUM(CASE WHEN od_patient_num IS NULL
+                          OR od_patient_num = ''
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                     THEN COALESCE(paid_amount_ltv, 0.0) ELSE 0 END)  AS paid_income_ltv,
                 SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
                     'treatment_presented','treatment_accepted','treatment_completed')
                     THEN 1 ELSE 0 END)                AS form_scheduled_count,

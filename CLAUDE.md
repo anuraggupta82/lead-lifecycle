@@ -1,3 +1,14 @@
+## ⚠️ CRITICAL: gcloud Run Services Rule
+
+**NEVER use `--set-env-vars` on a live Cloud Run service. ALWAYS use `--update-env-vars`.**
+
+- `--set-env-vars` REPLACES the entire env var list — silently wipes everything not in the command
+- `--update-env-vars` MERGES — only changes what you specify, leaves everything else intact
+
+This mistake took down visitgdc.com on July 6, 2026 when a Claude chat in this project added `INTERNAL_SYNC_KEY` to the scheduler-api Cloud Run service using `--set-env-vars`, wiping 20+ other env vars. The scheduler fell back to SQLite and all booking slugs returned 404 until discovered on July 8.
+
+---
+
 # Lead Lifecycle Pipeline — Claude Marketing Engine
 
 ## Identity
