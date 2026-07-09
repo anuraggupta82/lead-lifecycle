@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS leads (
     created_at TEXT NOT NULL,
     od_patient_num TEXT DEFAULT '',
     gclid TEXT DEFAULT '',
+    existing_patient INTEGER DEFAULT 0,
     paid_amount_365d REAL DEFAULT 0.0,
     paid_amount_ltv  REAL DEFAULT 0.0,
     first_payment_date TEXT DEFAULT '',
@@ -343,6 +344,58 @@ def test_existing_patient_exclusion():
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 5: OD unavailable
 # ─────────────────────────────────────────────────────────────────────────────
+# Test 4b: Existing-patient leads excluded at collection time
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_existing_patient_lead_exclusion():
+    """
+    Leads with existing_patient = 1 must be excluded by _collect_lead_targets
+    (their pre-existing payments would otherwise inflate Google Ads income).
+    A matching lead with existing_patient = 0 must still be collected.
+    """
+    from od_payment_sync import _collect_lead_targets, _days_back_cutoff
+
+    db = _make_db()
+
+    db.execute(
+        "INSERT INTO leads (id, created_at, od_patient_num, gclid, existing_patient) VALUES (?,?,?,?,?)",
+        ("lead-existing", "2025-06-01T00:00:00+00:00", "5001", "gclid-existing", 1),
+    )
+    db.execute(
+        "INSERT INTO leads (id, created_at, od_patient_num, gclid, existing_patient) VALUES (?,?,?,?,?)",
+        ("lead-new", "2025-06-01T00:00:00+00:00", "5002", "gclid-new", 0),
+    )
+    db.commit()
+
+    cutoff_iso = _days_back_cutoff(7)
+    targets = _collect_lead_targets(db, full_resync=True, cutoff_iso=cutoff_iso)
+    target_ids = {t["target_id"] for t in targets}
+
+    assert "lead-existing" not in target_ids, "existing_patient=1 lead must be excluded"
+    assert "lead-new" in target_ids, "existing_patient=0 lead must still be collected"
+
+    # Also verify via the public sync entrypoint: the existing patient's
+    # paid_amount_365d/ltv must stay 0 even though OD has payments for them.
+    od_payments = {
+        "5001": [("2025-07-01", 900.0)],
+        "5002": [("2025-07-01", 700.0)],
+    }
+    _run_sync_with_db(db, od_payments, full_resync=True)
+
+    existing_row = db.execute(
+        "SELECT paid_amount_365d, paid_amount_ltv FROM leads WHERE id='lead-existing'"
+    ).fetchone()
+    assert abs(existing_row["paid_amount_365d"] - 0.0) < 0.01, "existing patient must not accrue paid_amount_365d"
+    assert abs(existing_row["paid_amount_ltv"] - 0.0) < 0.01, "existing patient must not accrue paid_amount_ltv"
+
+    new_row = db.execute(
+        "SELECT paid_amount_365d, paid_amount_ltv FROM leads WHERE id='lead-new'"
+    ).fetchone()
+    assert abs(new_row["paid_amount_365d"] - 700.0) < 0.01, "non-existing patient should still accrue payments"
+    assert abs(new_row["paid_amount_ltv"] - 700.0) < 0.01, "non-existing patient should still accrue payments"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def test_od_unavailable(monkeypatch):
     """
@@ -355,3 +408,28 @@ def test_od_unavailable(monkeypatch):
     result = ops.sync_od_payments(days_back=7)
     assert result.get("status") == "skipped", f"Expected status=skipped, got {result}"
     assert result.get("reason") == "od_unavailable", f"Expected reason=od_unavailable, got {result}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 6: _parse_anchor UTC → Eastern conversion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_parse_anchor_utc_to_eastern():
+    """
+    _parse_anchor must convert UTC timestamps to Eastern before taking .date(),
+    so that evening-ET leads (already past midnight UTC) don't get an anchor
+    date one day late. Date-only strings must be returned unshifted.
+    """
+    from od_payment_sync import _parse_anchor
+
+    # 00:16 UTC == 8:16pm ET the PREVIOUS day
+    assert _parse_anchor("2026-06-04T00:16:00+00:00") == date(2026, 6, 3)
+    assert _parse_anchor("2026-06-04T00:16:00Z") == date(2026, 6, 3)
+    # 15:00 UTC == 11:00am ET SAME day
+    assert _parse_anchor("2026-06-03T15:00:00+00:00") == date(2026, 6, 3)
+    # Date-only anchor — no tz shift
+    assert _parse_anchor("2026-06-03") == date(2026, 6, 3)
+    # Naive (no tzinfo) timestamp is treated as UTC — 20:16 UTC == 4:16pm ET same day
+    assert _parse_anchor("2026-06-03 20:16:00") == date(2026, 6, 3)
+    # Empty string returns None
+    assert _parse_anchor("") is None

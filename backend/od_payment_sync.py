@@ -22,8 +22,11 @@ import logging
 import time
 from datetime import datetime, date, timezone, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+_EASTERN = ZoneInfo("America/New_York")
 
 # Payment query chunk size — avoids excessively large IN (...) clauses.
 _CHUNK_SIZE = 500
@@ -67,17 +70,30 @@ def _now_iso() -> str:
 
 
 def _parse_anchor(anchor_str: str) -> Optional[date]:
-    """Parse an ISO timestamp/date string to a date object. Returns None on failure."""
+    """Parse an ISO timestamp/date string to an Eastern (America/New_York) calendar
+    date. OpenDental PayDate is a plain Eastern date, so a UTC anchor timestamp must
+    be converted to Eastern before taking .date(), otherwise evening-ET leads (already
+    past midnight UTC) get an anchor one day late and same-day payments are dropped.
+    Date-only strings (no time component) are returned unshifted. Returns None on failure."""
     if not anchor_str:
         return None
-    try:
-        # Handle 'YYYY-MM-DD HH:MM:SS...' and 'YYYY-MM-DDTHH:MM:SS...' formats
-        return datetime.fromisoformat(anchor_str.replace("Z", "+00:00")).date()
-    except Exception:
+    s = anchor_str.strip()
+    # Date-only anchor (no time-of-day) — return as-is, no tz shift.
+    if len(s) <= 10:
         try:
-            return date.fromisoformat(anchor_str[:10])
+            return date.fromisoformat(s[:10])
         except Exception:
             return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            return date.fromisoformat(s[:10])
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)  # stored UTC
+    return dt.astimezone(_EASTERN).date()
 
 
 def _days_back_cutoff(days_back: int) -> str:
@@ -96,14 +112,9 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
     Filters:
     - od_patient_num != ''
     - gclid != ''
-    - Excludes existing patients (od_relationship is checked via od_patient_num
-      presence; the definitive existing-patient flag on calls is od_patient_status,
-      but for leads the field is od_relationship. The spec says to use
-      existing_active/existing_inactive from mango_calls. For leads there is no
-      od_patient_status column — od_matcher doesn't set one on the leads table
-      directly. We therefore skip this check at collection time for leads and rely
-      on the anchor-date defensive filter in the payment computation. If there is
-      a future od_patient_status column on leads we can add it here.)
+    - Excludes existing patients: leads with existing_patient = 1 are filtered
+      out at collection time via COALESCE(existing_patient, 0) = 0, so their
+      pre-existing payments never enter the payment computation.
     - Stale check: payment_synced_at < cutoff OR payment_synced_at == '' (unless full_resync)
     """
     if full_resync:
@@ -116,6 +127,7 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
               AND od_patient_num IS NOT NULL
               AND gclid != ''
               AND gclid IS NOT NULL
+              AND COALESCE(existing_patient, 0) = 0
         """).fetchall()
     else:
         rows = conn.execute("""
@@ -127,6 +139,7 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
               AND od_patient_num IS NOT NULL
               AND gclid != ''
               AND gclid IS NOT NULL
+              AND COALESCE(existing_patient, 0) = 0
               AND (payment_synced_at IS NULL
                    OR payment_synced_at = ''
                    OR payment_synced_at < ?)

@@ -4365,21 +4365,25 @@ def get_unified_campaigns(days: int = 0, month: str = None) -> list:
             SELECT
                 LOWER(TRIM(COALESCE(NULLIF(campaign_name,''), utm_campaign))) AS k,
                 COUNT(*)                              AS lead_count,
-                SUM(CASE WHEN od_patient_num IS NULL
+                SUM(CASE WHEN (od_patient_num IS NULL
                           OR od_patient_num = ''
-                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients))
+                          AND COALESCE(existing_patient, 0) = 0
                      THEN attributed_income ELSE 0 END)     AS attributed_income,
-                SUM(CASE WHEN od_patient_num IS NULL
+                SUM(CASE WHEN (od_patient_num IS NULL
                           OR od_patient_num = ''
-                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients))
+                          AND COALESCE(existing_patient, 0) = 0
                      THEN attributed_production ELSE 0 END) AS attributed_production,
-                SUM(CASE WHEN od_patient_num IS NULL
+                SUM(CASE WHEN (od_patient_num IS NULL
                           OR od_patient_num = ''
-                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients))
+                          AND COALESCE(existing_patient, 0) = 0
                      THEN COALESCE(paid_amount_365d, 0.0) ELSE 0 END) AS paid_income_365d,
-                SUM(CASE WHEN od_patient_num IS NULL
+                SUM(CASE WHEN (od_patient_num IS NULL
                           OR od_patient_num = ''
-                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients)
+                          OR od_patient_num NOT IN (SELECT od_patient_num FROM call_attributed_patients))
+                          AND COALESCE(existing_patient, 0) = 0
                      THEN COALESCE(paid_amount_ltv, 0.0) ELSE 0 END)  AS paid_income_ltv,
                 SUM(CASE WHEN stage IN ('scheduled','showed','no_show',
                     'treatment_presented','treatment_accepted','treatment_completed')
