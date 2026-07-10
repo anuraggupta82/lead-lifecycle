@@ -955,6 +955,30 @@ def get_pipeline(stage: Optional[str] = None, limit: int = 200, show_all: bool =
             "next_follow_up": next_action,
         })
 
+    # Attach CallRail source so the GAds-Only filter can recognize call-extension
+    # calls (source='google_ads') that carry no gclid. Prefer 'google_ads' when a
+    # lead has multiple CallRail rows.
+    try:
+        from database import _conn
+        _ids = [l["id"] for l in result if l.get("id")]
+        _cr_src = {}
+        if _ids:
+            with _conn() as _conn2:
+                _ph = ",".join("?" * len(_ids))
+                for _row in _conn2.execute(
+                    f"SELECT lead_id, source FROM callrail_calls WHERE lead_id IN ({_ph})",
+                    _ids,
+                ).fetchall():
+                    _lid = _row["lead_id"]
+                    _src = (_row["source"] or "")
+                    if _cr_src.get(_lid) != "google_ads":
+                        _cr_src[_lid] = _src
+        for l in result:
+            l["callrail_source"] = _cr_src.get(l.get("id"), "")
+    except Exception:
+        for l in result:
+            l.setdefault("callrail_source", "")
+
     return {"leads": result, "total": len(result)}
 
 

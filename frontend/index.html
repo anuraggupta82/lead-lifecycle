@@ -1472,9 +1472,11 @@ function KanbanColumn({ stage, label, leads, color, selectedId, onCardClick, onD
 
 // Sources that are only Google Ads leads if they carry a Google indication
 // (gclid / campaign_name) — otherwise excluded when GAds Only filter is active.
-// 'callrail' is included: a phone call is a Google Ads lead ONLY if Google tagged it
-// with a gclid. Without one it's a plain phone call (GBP/organic/direct) and must not
-// show in the GAds view (owner rule Jul 8: gclid is the sole Google-Ads indicator).
+// 'callrail' is included: a phone call is a Google Ads lead if it has a gclid OR
+// its callrail_source is 'google_ads' (call-extension calls dial the ad's phone
+// number directly and never visit the site, so they carry no gclid). Non-ad
+// callrail sources (Google My Business, Google Organic, Direct) without a gclid
+// stay hidden from the GAds view.
 const NON_GADS_SOURCES = new Set(['contact_form', 'gdc_contact_form', 'pearly', 'nxtsmile_landing_page', 'manual', 'callrail']);
 
 function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, onRefresh, showAllSources, onToggleShowAll, campaigns }) {
@@ -1585,7 +1587,7 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       if (followupOnly && !isStaffFollowUp(l)) return false;
       // GAds Only: hide leads with no Google Ads attribution (no gclid + no campaign_name + non-GAds source)
       if (!showAllSources) {
-        const hasGadsAttribution = l.gclid || l.campaign_name || (l.source === 'callrail' && (l.gclid || l.campaign_name)) || (l.source === 'smile_tool' && l.gclid);
+        const hasGadsAttribution = l.gclid || l.campaign_name || (l.source === 'callrail' && (l.gclid || l.campaign_name || l.callrail_source === 'google_ads')) || (l.source === 'smile_tool' && l.gclid);
         if (!hasGadsAttribution && NON_GADS_SOURCES.has(l.source || '')) return false;
         // Also exclude leads with no source attribution that aren't manually created
         if (!hasGadsAttribution && !l.source) return false;
