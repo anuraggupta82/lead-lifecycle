@@ -11270,6 +11270,69 @@ def admin_mango_match_patients(limit: int = 500):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/mango/infer-campaigns", dependencies=[Depends(_require_admin)])
+def admin_mango_infer_campaigns(limit: int = 50):
+    """
+    Run Gemini transcript-based campaign inference on GAds calls that have a
+    transcript but no campaign attribution yet. Targets calls where CallRail
+    says source='google_ads' but no gads_call_view match or gclid exists.
+    """
+    try:
+        from database import _conn as _db_conn
+        from mango_service import infer_campaign_from_transcript
+        from database import update_mango_call_attribution
+
+        with _db_conn() as conn:
+            rows = conn.execute("""
+                SELECT mc.*
+                FROM mango_calls mc
+                INNER JOIN callrail_calls cr ON cr.mango_call_id = mc.uuid
+                WHERE cr.source = 'google_ads'
+                  AND (mc.gads_call_id IS NULL OR mc.gads_call_id = '')
+                  AND mc.call_transcript IS NOT NULL AND mc.call_transcript != ''
+                  AND LENGTH(mc.call_transcript) >= 50
+                  AND (mc.match_method IS NULL OR mc.match_method = '' OR mc.match_method = 'phone_exact')
+                ORDER BY mc.started_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+        results = {"total": len(rows), "inferred": 0, "skipped": 0, "failed": 0, "details": []}
+        for row in rows:
+            mc = dict(row)
+            try:
+                result = infer_campaign_from_transcript(mc)
+                if result and result.get("campaign_name") and result["campaign_name"] != "none":
+                    _conf_map = {"high": 0.80, "medium": 0.65, "low": 0.45}
+                    _num_conf = _conf_map.get(result.get("confidence", "low"), 0.45)
+                    _method = "gemini_inferred" if _num_conf >= 0.65 else "gemini_low_confidence"
+                    _ag_display = f"{result['campaign_name']} > (gemini-inferred)"
+
+                    update_mango_call_attribution(
+                        uuid=mc["uuid"],
+                        match_confidence=_num_conf,
+                        match_method=_method,
+                        attributed_ad_group=_ag_display,
+                        attributed_keyword_method="gemini_inferred",
+                        attributed_keyword_confidence=_num_conf,
+                    )
+                    results["inferred"] += 1
+                    results["details"].append({
+                        "uuid": mc["uuid"][:8],
+                        "campaign": result["campaign_name"],
+                        "confidence": result["confidence"],
+                        "reasoning": result.get("reasoning", "")[:100],
+                    })
+                else:
+                    results["skipped"] += 1
+            except Exception as e:
+                results["failed"] += 1
+                results["details"].append({"uuid": mc["uuid"][:8], "error": str(e)[:100]})
+
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/admin/mango-calls/{uuid}/patient-override", dependencies=[Depends(_require_admin)])
 def admin_mango_patient_override(uuid: str, body: dict):
     """

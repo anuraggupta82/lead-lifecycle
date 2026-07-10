@@ -859,6 +859,153 @@ def finalize_call_lead(uuid: str) -> dict:
         return {}
 
 
+# ── Gemini transcript campaign inference ─────────────────────────────────────
+
+_CAMPAIGN_INFERENCE_PROMPT = """\
+You are an expert dental marketing analyst. Given a phone call transcript and a list of \
+currently-running Google Ads campaigns, determine which campaign (if any) most likely \
+generated this call.
+
+## Active Campaigns
+{campaign_context}
+
+## Call Transcript
+{transcript}
+
+## Instructions
+Analyze the transcript to identify the dental service the caller is inquiring about, then \
+match it to the most likely campaign from the list above.
+
+Confidence levels:
+- "high" — caller explicitly mentioned a service or concern that maps clearly to one campaign
+- "medium" — a service is discussed but could plausibly match multiple campaigns
+- "low" — the call is vague, off-topic, or the service discussed has only a weak link to any campaign
+
+Output JSON only:
+{{"campaign_name": "<exact campaign name from list, or \\"none\\">", "confidence": "high|medium|low", "reasoning": "<one sentence explaining the match>"}}
+"""
+
+
+def _build_campaign_context_for_inference() -> str:
+    """Build a structured text block describing active campaigns + top keywords."""
+    with _db_conn() as conn:
+        # Get active campaigns
+        campaigns = conn.execute("""
+            SELECT campaign_name, service_focus, target_audience, promo_offer
+            FROM campaigns
+            WHERE status NOT IN ('PAUSED', 'COMPLETED', 'ARCHIVED', 'REMOVED', 'removed')
+              AND campaign_name != ''
+        """).fetchall()
+
+        # Get top keywords per campaign (last 30 days)
+        kw_rows = conn.execute("""
+            SELECT campaign_name, keyword_text, match_type, impressions
+            FROM gads_keywords_cache
+            WHERE days = 30 AND campaign_name != ''
+            ORDER BY campaign_name, impressions DESC
+        """).fetchall()
+
+    # Group keywords by campaign, top 10 each
+    kw_by_campaign: dict[str, list[str]] = {}
+    kw_count: dict[str, int] = {}
+    for row in kw_rows:
+        cname = row["campaign_name"]
+        if kw_count.get(cname, 0) >= 10:
+            continue
+        kw_count[cname] = kw_count.get(cname, 0) + 1
+        kw_by_campaign.setdefault(cname, []).append(
+            f'{row["keyword_text"]} ({row["match_type"]}, {row["impressions"]} imp)'
+        )
+
+    # Build campaign names set for keyword-only campaigns (active in GAds but not in campaigns table)
+    campaign_names_in_table = {c["campaign_name"] for c in campaigns}
+
+    lines = []
+    for c in campaigns:
+        cname = c["campaign_name"]
+        block = f"Campaign: {cname}"
+        if c["service_focus"]:
+            block += f"\n  Service Focus: {c['service_focus']}"
+        if c["target_audience"]:
+            block += f"\n  Target Audience: {c['target_audience']}"
+        if c["promo_offer"]:
+            block += f"\n  Promo: {c['promo_offer']}"
+        kws = kw_by_campaign.get(cname, [])
+        if kws:
+            block += f"\n  Top Keywords: {', '.join(kws)}"
+        lines.append(block)
+
+    # Include keyword-only campaigns (present in gads_keywords_cache but not campaigns table)
+    for cname, kws in kw_by_campaign.items():
+        if cname not in campaign_names_in_table:
+            block = f"Campaign: {cname}\n  Top Keywords: {', '.join(kws)}"
+            lines.append(block)
+
+    return "\n\n".join(lines) if lines else "(no active campaigns found)"
+
+
+def infer_campaign_from_transcript(mc: dict) -> Optional[dict]:
+    """
+    Use Gemini to infer which campaign a call came from based on transcript content.
+
+    Args:
+        mc: A mango_calls row dict with at least call_transcript or call_summary.
+
+    Returns:
+        {"campaign_name": str, "confidence": str, "reasoning": str} or None on failure.
+    """
+    transcript = (mc.get("call_transcript") or mc.get("call_summary") or "").strip()
+    if len(transcript) < 50:
+        return None
+
+    try:
+        campaign_context = _build_campaign_context_for_inference()
+        prompt = _CAMPAIGN_INFERENCE_PROMPT.format(
+            campaign_context=campaign_context,
+            transcript=transcript[:6000],  # cap transcript to avoid token bloat
+        )
+
+        from mango_pipeline import _call_vertex
+        from config import get_settings
+        cfg = get_settings()
+
+        text, in_tok, out_tok = _call_vertex(
+            prompt=prompt,
+            model="gemini-2.5-flash",
+            project_id=cfg.vertex_project_id,
+            location=cfg.vertex_location,
+            credentials_path=cfg.vertex_credentials_path,
+            temperature=0.1,
+            max_tokens=300,
+            response_mime_type="application/json",
+        )
+
+        if not text:
+            logger.warning("infer_campaign_from_transcript: empty Vertex response")
+            return None
+
+        result = json.loads(text)
+        # Validate expected keys
+        if "campaign_name" not in result:
+            logger.warning("infer_campaign_from_transcript: missing campaign_name in response: %s", text[:200])
+            return None
+
+        result.setdefault("confidence", "low")
+        result.setdefault("reasoning", "")
+        logger.info(
+            "infer_campaign_from_transcript: campaign=%s confidence=%s tokens=%d/%d",
+            result["campaign_name"], result["confidence"], in_tok, out_tok,
+        )
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.warning("infer_campaign_from_transcript: JSON parse error: %s (raw: %s)", e, text[:200] if 'text' in dir() else "N/A")
+        return None
+    except Exception as e:
+        logger.warning("infer_campaign_from_transcript: failed: %s", e)
+        return None
+
+
 def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_token: Optional[str] = None) -> int:
     """
     Match unattributed inbound Mango calls against:
@@ -1096,6 +1243,43 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                 mc_uuid, _dm_best_id, _dm_best_delta,
             )
             continue
+
+        # ── Gemini transcript campaign inference ──────────────────────────────
+        # For GAds calls (callrail_source='google_ads') with no gclid and no
+        # gads_call_view match, try to infer campaign from the call transcript.
+        if not _cr_gads_confirmed and not _dm_best_id:
+            _is_gads_no_gclid = False
+            with _db_conn() as _gi_conn:
+                _gi_row = _gi_conn.execute("""
+                    SELECT 1 FROM callrail_calls
+                    WHERE mango_call_id = ? AND source = 'google_ads'
+                    LIMIT 1
+                """, (mc_uuid,)).fetchone()
+                _is_gads_no_gclid = bool(_gi_row)
+
+            if _is_gads_no_gclid and mc.get("call_transcript"):
+                result = infer_campaign_from_transcript(mc)
+                if result and result.get("campaign_name") and result["campaign_name"] != "none":
+                    _conf_map = {"high": 0.80, "medium": 0.65, "low": 0.45}
+                    _num_conf = _conf_map.get(result.get("confidence", "low"), 0.45)
+                    _method = "gemini_inferred" if _num_conf >= 0.65 else "gemini_low_confidence"
+
+                    _gi_ag_display = f"{result['campaign_name']} > (gemini-inferred)"
+
+                    update_mango_call_attribution(
+                        uuid=mc_uuid,
+                        match_confidence=_num_conf,
+                        match_method=_method,
+                        attributed_ad_group=_gi_ag_display,
+                        attributed_keyword_method="gemini_inferred",
+                        attributed_keyword_confidence=_num_conf,
+                    )
+                    attributed += 1
+                    logger.info(
+                        "reconcile[gemini_inferred] Mango=%s -> campaign=%s (confidence=%s, reason=%s)",
+                        mc_uuid, result["campaign_name"], result["confidence"], result.get("reasoning", "")[:80],
+                    )
+                    continue
 
         # ── Try lead phone match ──────────────────────────────────────────────
         from_digits = re.sub(r"\D", "", mc.get("from_number", "") or "")

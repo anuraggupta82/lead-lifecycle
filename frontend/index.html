@@ -1581,13 +1581,23 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
 
   const filtered = useMemo(() => {
     const campaignSet = selectedCampaigns.length > 0 ? new Set(selectedCampaigns) : null;
+    // Build set of known Google Ads campaign names from the campaigns prop
+    // so that CallRail labels like "Google My Business" don't count as GAds attribution.
+    const knownCampaignNames = new Set();
+    if (Array.isArray(campaigns)) {
+      campaigns.forEach(c => {
+        const n = (c?.campaign_name || c?.campaign || '').trim();
+        if (n) knownCampaignNames.add(n);
+      });
+    }
     return pipeline.filter(l => {
       if (!showCold && l.stage === 'cold') return false;
       if (sourceFilter !== 'all' && l.source !== sourceFilter) return false;
       if (followupOnly && !isStaffFollowUp(l)) return false;
-      // GAds Only: hide leads with no Google Ads attribution (no gclid + no campaign_name + non-GAds source)
+      // GAds Only: hide leads with no Google Ads attribution (no gclid + campaign not in known GAds campaigns + non-GAds source)
       if (!showAllSources) {
-        const hasGadsAttribution = l.gclid || l.campaign_name || (l.source === 'callrail' && (l.gclid || l.campaign_name || l.callrail_source === 'google_ads')) || (l.source === 'smile_tool' && l.gclid);
+        const knownCamp = knownCampaignNames.has((l.campaign_name || '').trim());
+        const hasGadsAttribution = l.gclid || knownCamp || (l.source === 'callrail' && (l.gclid || knownCamp || l.callrail_source === 'google_ads')) || (l.source === 'smile_tool' && l.gclid);
         if (!hasGadsAttribution && NON_GADS_SOURCES.has(l.source || '')) return false;
         // Also exclude leads with no source attribution that aren't manually created
         if (!hasGadsAttribution && !l.source) return false;
@@ -1607,7 +1617,7 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
       }
       return true;
     });
-  }, [pipeline, searchTerm, sourceFilter, showCold, followupOnly, selectedCampaigns, showAllSources]);
+  }, [pipeline, searchTerm, sourceFilter, showCold, followupOnly, selectedCampaigns, showAllSources, campaigns]);
 
   const byStage = useMemo(() => {
     const map = {};
