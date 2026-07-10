@@ -10940,83 +10940,216 @@ def admin_calls_campaign_attribution_early(days: int = 30):
     return [dict(r) for r in rows]
 
 
+# Form-side "scheduled+" stage set — mirrors database.py's form_scheduled_count logic
+# (a patient who ever reached scheduled or beyond on the form/lead path).
+_FORM_SCHEDULED_STAGES = (
+    "scheduled", "showed", "no_show",
+    "treatment_presented", "treatment_accepted", "treatment_completed",
+)
+
+
+def _campaign_scheduled_new_patients(conn, campaign_name: str, days: int = 30):
+    """
+    Single source of truth for "new patients who scheduled an appointment from
+    a campaign" = UNION of:
+      (A) FORM-scheduled new-patient leads attributed to the campaign, and
+      (B) CALL-booked new-patient appointments attributed to the campaign,
+    deduped so each patient is counted once.
+
+    Returns a list of dicts:
+      {patient_name, od_patient_num, lead_id, appointment_date,
+       appointment_status, income, source}
+    where source is 'form' or 'call'.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # --- CALL side: reuse the existing campaign-appts query, restricted to new patients ---
+    call_rows = conn.execute(
+        """SELECT
+             mc.lead_id,
+             mc.od_patient_num,
+             mc.od_patient_status,
+             COALESCE(NULLIF(l.appointment_date,''), NULLIF(l2.appointment_date,''), NULLIF(kpl.appointment_date,'')) AS od_appt_date,
+             COALESCE(NULLIF(l.appointment_status,''), NULLIF(l2.appointment_status,'')) AS od_appt_status,
+             COALESCE(
+                 NULLIF(mc.od_patient_name,''),
+                 NULLIF(mc.ai_patient_name,''),
+                 NULLIF(TRIM(l.first_name||' '||l.last_name),''),
+                 NULLIF(TRIM(l2.first_name||' '||l2.last_name),'')
+             ) AS patient_name,
+             COALESCE(kpl.paid_amount_365d, 0) AS paid_amount_365d
+           FROM mango_calls mc
+           LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+           LEFT JOIN leads l ON l.id = mc.lead_id
+           LEFT JOIN leads l2 ON l2.od_patient_num = mc.od_patient_num
+                              AND mc.od_patient_num != ''
+                              AND (mc.lead_id IS NULL OR mc.lead_id = '')
+           -- PR 5 fix: aggregate KPL by patient — a patient can have multiple KPL
+           -- rows (lead-path + call::uuid_N per call). Without GROUP BY the LEFT JOIN
+           -- multiplied call rows in the modal and made paid_amount_365d ambiguous.
+           LEFT JOIN (
+             SELECT od_patient_num,
+                    MAX(paid_amount_365d) AS paid_amount_365d,
+                    MAX(appointment_date) AS appointment_date
+             FROM keyword_production_log
+             WHERE od_patient_num != ''
+             GROUP BY od_patient_num
+           ) kpl ON kpl.od_patient_num = mc.od_patient_num
+                AND mc.od_patient_num != ''
+           LEFT JOIN (
+             SELECT ad_group_name, campaign_name
+             FROM gads_call_view
+             WHERE ad_group_name != ''
+             GROUP BY ad_group_name
+           ) agcv ON agcv.ad_group_name = mc.attributed_ad_group
+                  AND (mc.gads_call_id IS NULL OR mc.gads_call_id = '')
+           WHERE mc.started_at >= ?
+             AND mc.direction = 'inbound'
+             AND mc.od_patient_status = 'new_patient'
+             AND (
+               (mc.od_appointment_id IS NOT NULL AND mc.od_appointment_id != '')
+               OR mc.booked_outcome = 'booked'
+             )
+             AND (
+               gcv.campaign_name = ?
+               OR l.campaign_name = ?
+               OR agcv.campaign_name = ?
+             )
+           ORDER BY mc.started_at DESC""",
+        (cutoff, campaign_name, campaign_name, campaign_name),
+    ).fetchall()
+
+    combined = []
+    for r in call_rows:
+        r = dict(r)
+        combined.append({
+            "patient_name": r.get("patient_name"),
+            "od_patient_num": r.get("od_patient_num"),
+            "lead_id": r.get("lead_id"),
+            "appointment_date": r.get("od_appt_date"),
+            "appointment_status": r.get("od_appt_status"),
+            "income": r.get("paid_amount_365d") or 0,
+            "source": "call",
+        })
+
+    # --- FORM side: leads reaching scheduled+ for this campaign, not time-filtered ---
+    placeholders = ",".join("?" for _ in _FORM_SCHEDULED_STAGES)
+    form_rows = conn.execute(
+        f"""SELECT
+             id AS lead_id,
+             od_patient_num,
+             TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS patient_name,
+             appointment_date,
+             appointment_status,
+             COALESCE(paid_amount_365d, 0) AS paid_amount_365d
+           FROM leads
+           WHERE LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+             AND stage IN ({placeholders})
+             AND COALESCE(existing_patient, 0) = 0""",
+        (campaign_name, *_FORM_SCHEDULED_STAGES),
+    ).fetchall()
+
+    for r in form_rows:
+        r = dict(r)
+        combined.append({
+            "patient_name": (r.get("patient_name") or "").strip() or None,
+            "od_patient_num": r.get("od_patient_num"),
+            "lead_id": r.get("lead_id"),
+            "appointment_date": r.get("appointment_date"),
+            "appointment_status": r.get("appointment_status"),
+            "income": r.get("paid_amount_365d") or 0,
+            "source": "form",
+        })
+
+    # --- DEDUP: one row per patient, keyed by od_patient_num (else lead_id) ---
+    deduped = {}
+    for row in combined:
+        opn = (row.get("od_patient_num") or "").strip() if isinstance(row.get("od_patient_num"), str) else row.get("od_patient_num")
+        if opn:
+            key = f"opn:{opn}"
+        else:
+            key = f"lead:{row.get('lead_id')}"
+
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = row
+            continue
+
+        # Merge: prefer 'call' source if it has income>0, else prefer higher income.
+        # Always keep a non-empty patient_name and the max income seen.
+        merged = dict(existing)
+        existing_income = existing.get("income") or 0
+        new_income = row.get("income") or 0
+
+        prefer_new = False
+        if row["source"] == "call" and new_income > 0:
+            prefer_new = True
+        elif existing["source"] == "call" and existing_income > 0:
+            prefer_new = False
+        elif new_income > existing_income:
+            prefer_new = True
+
+        base = row if prefer_new else existing
+        merged.update(base)
+        merged["income"] = max(existing_income, new_income)
+        if not merged.get("patient_name"):
+            merged["patient_name"] = row.get("patient_name") or existing.get("patient_name")
+        deduped[key] = merged
+
+    return list(deduped.values())
+
+
 @app.get("/api/admin/calls/campaign-appts", dependencies=[Depends(_require_admin)])
 def admin_calls_campaign_appts(campaign_name: str, days: int = 30):
     """
-    Return the individual call+appointment records for a specific campaign.
+    Return the individual scheduled-appointment records (form + call, deduped
+    to new patients) for a specific campaign.
     Used by the clickable APPTS modal in the campaign table.
-    Returns calls that have either od_appointment_id set OR booked_outcome='booked'.
-    Patient status filtering (new/existing/all) is done client-side in the frontend.
     """
     from database import _conn
-    from datetime import timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     with _conn() as conn:
-        rows = conn.execute(
-            """SELECT
-                 mc.uuid,
-                 mc.started_at,
-                 mc.caller_id_name,
-                 mc.duration_sec,
-                 mc.od_appointment_id,
-                 mc.od_patient_name,
-                 mc.ai_patient_name,
-                 mc.od_patient_num,
-                 mc.od_patient_status,
-                 mc.booked_outcome,
-                 mc.attributed_keyword,
-                 mc.attributed_ad_group,
-                 mc.call_summary,
-                 COALESCE(gcv.ad_group_name, mc.attributed_ad_group) AS gads_ad_group,
-                 COALESCE(NULLIF(l.appointment_date,''), NULLIF(l2.appointment_date,''), NULLIF(kpl.appointment_date,'')) AS od_appt_date,
-                 COALESCE(NULLIF(l.appointment_status,''), NULLIF(l2.appointment_status,'')) AS od_appt_status,
-                 COALESCE(
-                     NULLIF(mc.od_patient_name,''),
-                     NULLIF(mc.ai_patient_name,''),
-                     NULLIF(TRIM(l.first_name||' '||l.last_name),''),
-                     NULLIF(TRIM(l2.first_name||' '||l2.last_name),'')
-                 ) AS patient_name,
-                 COALESCE(kpl.paid_amount_365d, 0) AS paid_amount_365d
-               FROM mango_calls mc
-               LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
-               LEFT JOIN leads l ON l.id = mc.lead_id
-               LEFT JOIN leads l2 ON l2.od_patient_num = mc.od_patient_num
-                                  AND mc.od_patient_num != ''
-                                  AND (mc.lead_id IS NULL OR mc.lead_id = '')
-               -- PR 5 fix: aggregate KPL by patient — a patient can have multiple KPL
-               -- rows (lead-path + call::uuid_N per call). Without GROUP BY the LEFT JOIN
-               -- multiplied call rows in the modal and made paid_amount_365d ambiguous.
-               LEFT JOIN (
-                 SELECT od_patient_num,
-                        MAX(paid_amount_365d) AS paid_amount_365d,
-                        MAX(appointment_date) AS appointment_date
-                 FROM keyword_production_log
-                 WHERE od_patient_num != ''
-                 GROUP BY od_patient_num
-               ) kpl ON kpl.od_patient_num = mc.od_patient_num
-                    AND mc.od_patient_num != ''
-               LEFT JOIN (
-                 SELECT ad_group_name, campaign_name
-                 FROM gads_call_view
-                 WHERE ad_group_name != ''
-                 GROUP BY ad_group_name
-               ) agcv ON agcv.ad_group_name = mc.attributed_ad_group
-                      AND (mc.gads_call_id IS NULL OR mc.gads_call_id = '')
-               WHERE mc.started_at >= ?
-                 AND mc.direction = 'inbound'
-                 AND (
-                   (mc.od_appointment_id IS NOT NULL AND mc.od_appointment_id != '')
-                   OR mc.booked_outcome = 'booked'
-                 )
-                 AND (
-                   gcv.campaign_name = ?
-                   OR l.campaign_name = ?
-                   OR agcv.campaign_name = ?
-                 )
-               ORDER BY mc.started_at DESC""",
-            (cutoff, campaign_name, campaign_name, campaign_name),
-        ).fetchall()
-    return [dict(r) for r in rows]
+        return _campaign_scheduled_new_patients(conn, campaign_name, days)
+
+
+@app.get("/api/admin/campaigns/scheduled-new-patient-counts", dependencies=[Depends(_require_admin)])
+def admin_campaign_scheduled_new_patient_counts(days: int = 30):
+    """
+    Bulk endpoint: for every known campaign, return the deduped count of new
+    patients who scheduled an appointment (form OR call attribution), using
+    the same single source of truth as the APPTS drill-down modal.
+    """
+    from database import _conn
+    with _conn() as conn:
+        names = set()
+        for row in conn.execute(
+            "SELECT campaign_name FROM campaigns WHERE campaign_name != ''"
+        ).fetchall():
+            n = row["campaign_name"]
+            if n:
+                names.add(n)
+        for row in conn.execute(
+            "SELECT DISTINCT campaign_name FROM leads WHERE campaign_name IS NOT NULL AND campaign_name != ''"
+        ).fetchall():
+            n = row["campaign_name"]
+            if n:
+                names.add(n)
+        for row in conn.execute(
+            "SELECT DISTINCT campaign_name FROM gads_call_view WHERE campaign_name IS NOT NULL AND campaign_name != ''"
+        ).fetchall():
+            n = row["campaign_name"]
+            if n:
+                names.add(n)
+
+        counts = {}
+        for name in names:
+            try:
+                patients = _campaign_scheduled_new_patients(conn, name, days)
+            except Exception:
+                patients = []
+            counts[name] = len(patients)
+
+    return counts
 
 
 @app.get("/api/admin/reports/income", dependencies=[Depends(_require_admin)])

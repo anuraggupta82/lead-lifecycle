@@ -6415,7 +6415,7 @@ function NegativesTab({ campaigns, pw }) {
   );
 }
 
-function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading, onGa4DaysChange }) {
+function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading, onGa4DaysChange, onOpenLead }) {
   const [view, setView] = useState('campaigns');  // 'campaigns' | 'adgroups' | 'searchterms' | 'adcreatives' | 'income' | ...
   const [incomeData, setIncomeData] = useState(null);   // {rows, summary} or null
   const [incomeLoading, setIncomeLoading] = useState(false);
@@ -6446,6 +6446,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [budgetConstrained, setBudgetConstrained] = useState(false);
   const [budgetConstrainedSaving, setBudgetConstrainedSaving] = useState(false);
   const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts, new_appts}}
+  const [campApptCounts, setCampApptCounts] = useState({}); // {campaign_name: count} deduped new patients scheduled
   const [apptModal, setApptModal] = useState(null); // {campaign_name, rows: [...]} or null
   const [apptFilter, setApptFilter] = useState('new'); // 'new' | 'existing' | 'all'
   const [aiReviewSaving, setAiReviewSaving] = useState({});
@@ -6573,6 +6574,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
         if (r.campaign_name) attrib[r.campaign_name] = r; // fallback key by name
       });
       setCampCallAttrib(attrib);
+      try {
+        const apptCounts = await api(`/api/admin/campaigns/scheduled-new-patient-counts?days=${callDays}`);
+        setCampApptCounts(apptCounts || {});
+      } catch(e) { setCampApptCounts({}); }
     } catch(e) { console.error('Failed to load unified campaigns', e); }
     finally { setUnifiedLoading(false); }
   }
@@ -7734,8 +7739,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
               <th style={{width:88}}>End</th>
               <th className="num">Daily Budget</th>
               <th className="num">Leads</th>
-              <th className="num" title="Inbound calls attributed to this campaign">Calls</th>
-              <th className="num" title="New patient OD appointment matches from calls">Appts</th>
+              <th className="num" title="New patients who scheduled from this campaign (form + call, deduped)">Appts</th>
               <th className="num">Cost</th>
               <th className="num">CPL</th>
               <th className="num">ROI</th>
@@ -7893,34 +7897,24 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                     <td style={{fontSize:11}}>{c.end_date || '—'}</td>
                     <td className="num">{c.monthly_budget > 0 ? fmtDailyBudget(c.monthly_budget) : '—'}</td>
                     <td className="num">{m.leads > 0 ? m.leads : '—'}</td>
-                    {/* Calls + Appts from call attribution */}
+                    {/* Appts: deduped new patients scheduled (form + call) */}
                     {(()=>{
-                      const ca = campCallAttrib[c.campaign_id] || campCallAttrib[c.campaign_name] || {};
+                      const apptCount = campApptCounts[c.campaign_name] || 0;
                       return (
-                        <React.Fragment>
-                          <td className="num">
-                            {ca.total_calls > 0
-                              ? <span title={`${ca.booked_calls||0} graded booked`}>{ca.total_calls}</span>
-                              : <span style={{color:'var(--text-muted)'}}>—</span>}
-                          </td>
-                          <td className="num">
-                            {(ca.new_appts > 0 || ca.confirmed_appts > 0)
-                              ? <span
-                                  style={{color:'#059669',fontWeight:600,cursor:'pointer',textDecoration:'underline dotted'}}
-                                  title={`${ca.new_appts||0} new patient appts · ${ca.confirmed_appts||0} total OD matches — click for details`}
-                                  onClick={()=>{
-                                    const campName = c.campaign_name;
-                                    setApptFilter('new');
-                                    api(`/api/admin/calls/campaign-appts?campaign_name=${encodeURIComponent(campName)}&days=30`)
-                                      .then(rows=>setApptModal({campaign_name:campName,rows}))
-                                      .catch(()=>setApptModal({campaign_name:campName,rows:[]}));
-                                  }}
-                                >{ca.new_appts||0}</span>
-                              : ca.booked_calls > 0
-                                ? <span style={{color:'#92400e'}} title="Booked calls, OD match pending">~{ca.booked_calls}</span>
-                                : <span style={{color:'var(--text-muted)'}}>—</span>}
-                          </td>
-                        </React.Fragment>
+                        <td className="num">
+                          {apptCount > 0
+                            ? <span
+                                style={{color:'#059669',fontWeight:600,cursor:'pointer',textDecoration:'underline dotted'}}
+                                title="New patients who scheduled (form + call) — click for names"
+                                onClick={()=>{
+                                  const campName = c.campaign_name;
+                                  api(`/api/admin/calls/campaign-appts?campaign_name=${encodeURIComponent(campName)}&days=30`)
+                                    .then(rows=>setApptModal({campaign_name:campName,rows}))
+                                    .catch(()=>setApptModal({campaign_name:campName,rows:[]}));
+                                }}
+                              >{apptCount}</span>
+                            : <span style={{color:'var(--text-muted)'}}>—</span>}
+                        </td>
                       );
                     })()}
                     <td className="num">{m.cost > 0 ? fmtMoney(m.cost) : '—'}</td>
@@ -12723,23 +12717,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
 
       {/* ── Appointment Details Modal ─────────────────────────────────── */}
       {apptModal && (()=>{
-        // Client-side filter
         const allRows = apptModal.rows || [];
-        const filteredRows = apptFilter === 'new'
-          ? allRows.filter(r => r.od_patient_status === 'new_patient')
-          : apptFilter === 'existing'
-            ? allRows.filter(r => r.od_patient_status !== 'new_patient')
-            : allRows;
-        const newCount = allRows.filter(r => r.od_patient_status === 'new_patient').length;
-        const existingCount = allRows.filter(r => r.od_patient_status !== 'new_patient').length;
-        const showApptDate = apptFilter === 'new' || apptFilter === 'all';
-        const pillStyle = (val) => ({
-          padding: '3px 12px', borderRadius: 20, fontSize: 11, fontWeight: 600,
-          cursor: 'pointer', border: '1px solid',
-          background: apptFilter === val ? 'var(--teal)' : 'transparent',
-          color: apptFilter === val ? '#fff' : 'var(--teal)',
-          borderColor: 'var(--teal)',
-        });
         return (
           <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.45)',zIndex:9000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
             onClick={()=>setApptModal(null)}>
@@ -12748,138 +12726,61 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
               {/* Header */}
               <div style={{padding:'12px 18px',borderBottom:'1px solid var(--border)',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
                 <span style={{fontSize:14,fontWeight:700,color:'var(--teal)'}}>📅 Appointment Details</span>
-                <span style={{fontSize:12,color:'var(--text-muted)',flex:1}}>— {apptModal.campaign_name} (last 30 days)</span>
-                {/* Filter pills */}
-                <div style={{display:'flex',gap:6,alignItems:'center'}}>
-                  <button style={pillStyle('new')} onClick={()=>setApptFilter('new')}>
-                    New ({newCount})
-                  </button>
-                  <button style={pillStyle('existing')} onClick={()=>setApptFilter('existing')}>
-                    Existing / Unknown ({existingCount})
-                  </button>
-                  <button style={pillStyle('all')} onClick={()=>setApptFilter('all')}>
-                    All ({allRows.length})
-                  </button>
-                </div>
+                <span style={{fontSize:12,color:'var(--text-muted)',flex:1}}>— {apptModal.campaign_name} ({allRows.length} new patients scheduled)</span>
                 <button className="btn btn-ghost btn-sm" onClick={()=>setApptModal(null)}>✕ Close</button>
               </div>
               {/* Body */}
               <div style={{overflowY:'auto',flex:1}}>
-                {filteredRows.length === 0 ? (
+                {allRows.length === 0 ? (
                   <div style={{padding:32,textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
-                    No {apptFilter !== 'all' ? apptFilter+' patient ' : ''}appointment records found.
+                    No scheduled new patients found.
                   </div>
                 ) : (
                   <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
                     <thead>
                       <tr style={{background:'var(--gray-light)',position:'sticky',top:0}}>
-                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Call Date &amp; Time</th>
-                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Caller (Mango)</th>
-                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>OD Patient</th>
-                        {showApptDate && (
-                          <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Appt Date</th>
-                        )}
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Patient</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Source</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Appt Date</th>
                         <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Status</th>
-                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>OD Apt #</th>
-                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Keyword</th>
-                        <th style={{padding:'8px 10px',textAlign:'right',fontWeight:600,color:'var(--text-muted)'}}>Duration</th>
                         <th style={{padding:'8px 10px',textAlign:'right',fontWeight:600,color:'var(--text-muted)'}}>Income</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredRows.map((r,i)=>{
-                        const isOdMatch = !!(r.od_appointment_id);
-                        return (
-                          <tr key={i} style={{borderTop:'1px solid var(--border)',background:i%2===0?'#fff':'#fafafa'}}>
-                            {/* Call Date & Time */}
-                            <td style={{padding:'8px 10px',whiteSpace:'nowrap',fontSize:11}}>
-                              {r.started_at ? (()=>{
-                                const d = new Date(r.started_at);
-                                return (
-                                  <React.Fragment>
-                                    <div style={{fontWeight:600}}>{d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div>
-                                    <div style={{fontSize:10,color:'var(--text-muted)'}}>{d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div>
-                                  </React.Fragment>
-                                );
-                              })() : '—'}
-                            </td>
-                            {/* Caller name from Mango */}
-                            <td style={{padding:'8px 10px',fontSize:11}}>
-                              <div style={{fontWeight:600,color:'var(--text)'}}>{r.caller_id_name || '—'}</div>
-                            </td>
-                            {/* OD Patient name + status */}
-                            {(()=>{
-                              const displayName = r.patient_name || r.od_patient_name || r.ai_patient_name || '';
-                              const fromTranscript = !!(displayName && !r.od_patient_name && r.ai_patient_name && displayName === r.ai_patient_name);
-                              return (
-                                <td style={{padding:'8px 10px',fontSize:11}}>
-                                  {displayName
-                                    ? <React.Fragment>
-                                        <div style={{fontWeight:600,color:'#059669'}}>
-                                          {displayName}
-                                          {fromTranscript && (
-                                            <span style={{fontWeight:400,fontStyle:'italic',fontSize:9,color:'var(--text-muted)',marginLeft:4}}>(from transcript)</span>
-                                          )}
-                                        </div>
-                                        {r.od_patient_status && (
-                                          <span style={{fontSize:9,fontWeight:700,padding:'1px 4px',borderRadius:3,
-                                            background: r.od_patient_status==='new_patient' ? '#dbeafe' : '#d1fae5',
-                                            color:      r.od_patient_status==='new_patient' ? '#1d4ed8' : '#065f46'}}>
-                                            {r.od_patient_status.replace(/_/g,' ')}
-                                          </span>
-                                        )}
-                                      </React.Fragment>
-                                    : <span style={{color:'var(--text-muted)'}}>—</span>}
-                                </td>
-                              );
-                            })()}
-                            {/* Appt Date — shown for new/all filters */}
-                            {showApptDate && (
-                              <td style={{padding:'8px 10px',fontSize:11,whiteSpace:'nowrap'}}>
-                                {r.od_appt_date
-                                  ? <span style={{color:'#059669',fontWeight:600}}>{r.od_appt_date}</span>
-                                  : <span style={{color:'var(--text-muted)'}}>—</span>}
-                              </td>
-                            )}
-                            {/* OD match status */}
-                            <td style={{padding:'8px 10px'}}>
-                              {isOdMatch
-                                ? <span style={{fontSize:10,fontWeight:700,color:'#16a34a',background:'#dcfce7',padding:'2px 6px',borderRadius:4}}>✓ OD Match</span>
-                                : <span style={{fontSize:10,fontWeight:700,color:'#92400e',background:'#fef3c7',padding:'2px 6px',borderRadius:4}}>Booked</span>}
-                            </td>
-                            {/* OD Appointment # */}
-                            <td style={{padding:'8px 10px',fontFamily:'monospace',fontSize:10,color:'var(--text-muted)'}}>
-                              {r.od_appointment_id || '—'}
-                            </td>
-                            {/* Keyword */}
-                            <td style={{padding:'8px 10px',maxWidth:150,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-                              {r.attributed_keyword
-                                ? <span style={{color:'var(--teal)',fontWeight:500,fontSize:11}}>{r.attributed_keyword}</span>
-                                : <span style={{color:'var(--text-muted)'}}>—</span>}
-                            </td>
-                            {/* Duration */}
-                            <td style={{padding:'8px 10px',textAlign:'right',color:'var(--text-muted)',fontSize:11}}>
-                              {r.duration_sec ? Math.floor(r.duration_sec/60)+'m '+((r.duration_sec%60)+'s') : '—'}
-                            </td>
-                            {/* Income */}
-                            {(()=>{
-                              const inc = Number(r.paid_amount_365d || 0);
-                              return inc > 0
-                                ? <td style={{padding:'8px 10px',textAlign:'right',fontWeight:600,color:'#059669',fontSize:11}}>${inc.toFixed(0)}</td>
-                                : <td style={{padding:'8px 10px',textAlign:'right',color:'var(--text-muted)',fontSize:11}}>—</td>;
-                            })()}
-                          </tr>
-                        );
-                      })}
+                      {allRows.map((r,i)=>(
+                        <tr key={i} style={{borderTop:'1px solid var(--border)',background:i%2===0?'#fff':'#fafafa'}}>
+                          {/* Patient */}
+                          <td style={{padding:'8px 10px',fontSize:11}}>
+                            <button
+                              style={{background:'none',border:'none',padding:0,color:'#059669',fontWeight:600,cursor:'pointer',textDecoration:'underline'}}
+                              onClick={()=>{ if (r.lead_id && onOpenLead) onOpenLead(r.lead_id); setApptModal(null); }}
+                            >{r.patient_name || '(unnamed)'}</button>
+                          </td>
+                          {/* Source */}
+                          <td style={{padding:'8px 10px'}}>
+                            <span style={{fontSize:10,fontWeight:700,padding:'1px 6px',borderRadius:4,
+                              background: r.source === 'call' ? '#fef3c7' : '#dbeafe',
+                              color:      r.source === 'call' ? '#92400e' : '#1d4ed8'}}>
+                              {r.source}
+                            </span>
+                          </td>
+                          {/* Appt Date */}
+                          <td style={{padding:'8px 10px',fontSize:11,whiteSpace:'nowrap'}}>
+                            {r.appointment_date || '—'}
+                          </td>
+                          {/* Status */}
+                          <td style={{padding:'8px 10px',fontSize:11}}>
+                            {r.appointment_status || '—'}
+                          </td>
+                          {/* Income */}
+                          <td style={{padding:'8px 10px',textAlign:'right',fontSize:11,fontWeight: r.income > 0 ? 600 : 400,color: r.income > 0 ? '#059669' : 'var(--text-muted)'}}>
+                            {r.income > 0 ? '$'+Number(r.income).toFixed(0) : '—'}
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 )}
-              </div>
-              {/* Footer summary — always shows totals across all rows */}
-              <div style={{padding:'10px 18px',borderTop:'1px solid var(--border)',background:'var(--gray-light)',display:'flex',gap:20,fontSize:11,color:'var(--text-muted)',flexWrap:'wrap',alignItems:'center'}}>
-                <span><strong style={{color:'var(--text)'}}>{allRows.filter(r=>r.od_appointment_id).length}</strong> confirmed OD matches</span>
-                <span><strong style={{color:'#059669'}}>{newCount}</strong> new · <strong style={{color:'var(--text)'}}>{existingCount}</strong> existing/unknown</span>
-                <span style={{marginLeft:'auto'}}>Showing <strong style={{color:'var(--text)'}}>{filteredRows.length}</strong> of {allRows.length}</span>
               </div>
             </div>
           </div>
@@ -20486,7 +20387,7 @@ function App() {
                 )}
               </React.Fragment>
             )}
-            {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} ga4Days={ga4Days} ga4Loading={ga4Loading} onGa4DaysChange={(d) => { setGa4Days(d); loadGa4(d); }} />}
+            {tab === 'reports' && <ReportsTab campaignStats={campaignStats} keywordStats={keywordStats} ga4Data={ga4Data} ga4Days={ga4Days} ga4Loading={ga4Loading} onGa4DaysChange={(d) => { setGa4Days(d); loadGa4(d); }} onOpenLead={(id) => { setSelectedId(id); setTab('pipeline'); }} />}
             {tab === 'workflows' && <WorkflowsSection />}
             {tab === 'calls' && <CallAnalysisView />}
             {tab === 'tracking_numbers' && <TrackingNumbersTab />}
