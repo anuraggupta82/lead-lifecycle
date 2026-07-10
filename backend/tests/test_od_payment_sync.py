@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS mango_calls (
     started_at TEXT NOT NULL,
     od_patient_status TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS callrail_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id TEXT,
+    source TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS keyword_production_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     logged_at TEXT NOT NULL,
@@ -393,6 +398,69 @@ def test_existing_patient_lead_exclusion():
     ).fetchone()
     assert abs(new_row["paid_amount_365d"] - 700.0) < 0.01, "non-existing patient should still accrue payments"
     assert abs(new_row["paid_amount_ltv"] - 700.0) < 0.01, "non-existing patient should still accrue payments"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 4c: CallRail source='google_ads' lead captured even without gclid
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_callrail_google_ads_lead_captured():
+    """
+    A lead with no gclid (call-extension call, no click-through) must still
+    be captured if its CallRail row has source='google_ads'. A lead whose
+    CallRail row has a non-Google-Ads source (e.g. 'Direct') must NOT be
+    captured.
+    """
+    from od_payment_sync import _collect_lead_targets, _days_back_cutoff
+
+    db = _make_db()
+
+    # Google Ads call-extension lead: no gclid, but CallRail source='google_ads'
+    db.execute(
+        "INSERT INTO leads (id, created_at, od_patient_num, gclid, existing_patient) VALUES (?,?,?,?,?)",
+        ("lead-cr", "2025-06-01T00:00:00+00:00", "6001", "", 0),
+    )
+    db.execute(
+        "INSERT INTO callrail_calls (lead_id, source) VALUES (?,?)",
+        ("lead-cr", "google_ads"),
+    )
+
+    # Non-Google-Ads lead: no gclid, CallRail source='Direct'
+    db.execute(
+        "INSERT INTO leads (id, created_at, od_patient_num, gclid, existing_patient) VALUES (?,?,?,?,?)",
+        ("lead-nongads", "2025-06-01T00:00:00+00:00", "6002", "", 0),
+    )
+    db.execute(
+        "INSERT INTO callrail_calls (lead_id, source) VALUES (?,?)",
+        ("lead-nongads", "Direct"),
+    )
+    db.commit()
+
+    cutoff_iso = _days_back_cutoff(7)
+    targets = _collect_lead_targets(db, full_resync=True, cutoff_iso=cutoff_iso)
+    target_ids = {t["target_id"] for t in targets}
+
+    assert "lead-cr" in target_ids, "CallRail source='google_ads' lead must be captured even without gclid"
+    assert "lead-nongads" not in target_ids, "CallRail non-google_ads source lead must NOT be captured"
+
+    # Verify via the public sync path: lead-cr accrues income, lead-nongads does not.
+    od_payments = {
+        "6001": [("2025-07-01", 450.0)],
+        "6002": [("2025-07-01", 999.0)],
+    }
+    _run_sync_with_db(db, od_payments, full_resync=True)
+
+    cr_row = db.execute(
+        "SELECT paid_amount_365d, paid_amount_ltv FROM leads WHERE id='lead-cr'"
+    ).fetchone()
+    assert abs(cr_row["paid_amount_365d"] - 450.0) < 0.01, "CallRail google_ads lead should accrue income"
+    assert abs(cr_row["paid_amount_ltv"] - 450.0) < 0.01, "CallRail google_ads lead should accrue income"
+
+    nongads_row = db.execute(
+        "SELECT paid_amount_365d, paid_amount_ltv FROM leads WHERE id='lead-nongads'"
+    ).fetchone()
+    assert abs(nongads_row["paid_amount_365d"] - 0.0) < 0.01, "non-google_ads lead must not accrue income"
+    assert abs(nongads_row["paid_amount_ltv"] - 0.0) < 0.01, "non-google_ads lead must not accrue income"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

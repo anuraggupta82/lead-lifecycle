@@ -9508,7 +9508,16 @@ def get_calls_needing_processing(
     batch_size: int = 20,
     days_back: int = 90,
 ) -> list:
-    """Return mango_calls that need transcription/analysis, newest first."""
+    """Return mango_calls that need transcription/analysis, newest first.
+
+    GAds gate (owner Jul 9): the AUTO pipeline only transcribes/grades Google Ads
+    calls — a call qualifies if it has a gads_call_id (matched to Google's call
+    report), a linked lead_id (form/click lead), OR a CallRail row tagged
+    source='google_ads' (call-extension calls that carry no gclid). This mirrors
+    get_mango_calls_needing_od_match's paid/tracked predicate and stops us
+    transcribing every organic/untracked inbound call (Vertex/Whisper cost).
+    Manual per-call transcription uses a different path and is NOT gated.
+    """
     cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days_back)).isoformat()
     with _conn() as conn:
         rows = conn.execute(
@@ -9519,6 +9528,15 @@ def get_calls_needing_processing(
                  AND (transcription_status IS NULL OR transcription_status IN ('pending', 'failed'))
                  AND (pipeline_attempts IS NULL OR pipeline_attempts < ?)
                  AND started_at >= ?
+                 AND (
+                     (mango_calls.gads_call_id IS NOT NULL AND mango_calls.gads_call_id != '')
+                     OR mango_calls.lead_id IS NOT NULL
+                     OR EXISTS (
+                         SELECT 1 FROM callrail_calls cc
+                         WHERE cc.mango_call_id = mango_calls.uuid
+                           AND cc.source = 'google_ads'
+                     )
+                 )
                ORDER BY started_at DESC
                LIMIT ?""",
             (min_seconds, max_attempts, cutoff, batch_size)

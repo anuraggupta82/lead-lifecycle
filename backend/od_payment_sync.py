@@ -8,7 +8,8 @@ writes them into two buckets on leads and keyword_production_log:
   paid_amount_ltv  — all payments on or after the anchor date (no upper bound)
 
 Scope: Google Ads-attributed patients only.
-  - Leads: must have gclid != ''
+  - Leads: gclid present OR the lead's CallRail row has source='google_ads'
+    (call-extension calls carry no gclid)
   - Calls: keyword_production_log rows with lead_id LIKE 'call::%%' and
     attributed_keyword_confidence >= 0.55 (enforced upstream by
     call_production_log.py; we trust the KPL row implies >= 0.55)
@@ -111,7 +112,8 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
 
     Filters:
     - od_patient_num != ''
-    - gclid != ''
+    - Google Ads leads only: gclid present OR the lead's CallRail row has
+      source='google_ads' (call-extension calls carry no gclid)
     - Excludes existing patients: leads with existing_patient = 1 are filtered
       out at collection time via COALESCE(existing_patient, 0) = 0, so their
       pre-existing payments never enter the payment computation.
@@ -125,8 +127,14 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
             FROM leads
             WHERE od_patient_num != ''
               AND od_patient_num IS NOT NULL
-              AND gclid != ''
-              AND gclid IS NOT NULL
+              AND (
+                  (gclid != '' AND gclid IS NOT NULL)
+                  OR EXISTS (
+                      SELECT 1 FROM callrail_calls cc
+                      WHERE cc.lead_id = leads.id
+                        AND cc.source = 'google_ads'
+                  )
+              )
               AND COALESCE(existing_patient, 0) = 0
         """).fetchall()
     else:
@@ -137,8 +145,14 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
             FROM leads
             WHERE od_patient_num != ''
               AND od_patient_num IS NOT NULL
-              AND gclid != ''
-              AND gclid IS NOT NULL
+              AND (
+                  (gclid != '' AND gclid IS NOT NULL)
+                  OR EXISTS (
+                      SELECT 1 FROM callrail_calls cc
+                      WHERE cc.lead_id = leads.id
+                        AND cc.source = 'google_ads'
+                  )
+              )
               AND COALESCE(existing_patient, 0) = 0
               AND (payment_synced_at IS NULL
                    OR payment_synced_at = ''
