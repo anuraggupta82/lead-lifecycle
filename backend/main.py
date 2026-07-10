@@ -12374,6 +12374,28 @@ def get_pipeline_enriched(
         )
         rows = conn.execute(query, params).fetchall()
         leads = [dict(r) for r in rows]
+
+        # Attach CallRail source so the GAds-Only board filter recognizes
+        # call-extension calls (source='google_ads') that carry no gclid.
+        # (This is the endpoint the Kanban board actually fetches.)
+        try:
+            _ids = [l["id"] for l in leads if l.get("id")]
+            _cr_src = {}
+            if _ids:
+                _ph = ",".join("?" * len(_ids))
+                for _row in conn.execute(
+                    f"SELECT lead_id, source FROM callrail_calls WHERE lead_id IN ({_ph})",
+                    _ids,
+                ).fetchall():
+                    _lid = _row["lead_id"]
+                    _src = (_row["source"] or "")
+                    if _cr_src.get(_lid) != "google_ads":
+                        _cr_src[_lid] = _src
+            for l in leads:
+                l["callrail_source"] = _cr_src.get(l.get("id"), "")
+        except Exception:
+            for l in leads:
+                l.setdefault("callrail_source", "")
     return {"leads": leads, "total": len(leads)}
 
 
