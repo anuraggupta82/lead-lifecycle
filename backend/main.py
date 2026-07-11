@@ -7836,20 +7836,35 @@ def sync_all_campaign_statuses_from_gads() -> dict:
         if not resource_name:
             continue  # not linked to Google Ads
         gads_status = status_by_resource.get(resource_name)
+        current = (camp.get("status") or "").upper()
+        campaign_id = camp.get("campaign_id")
+        campaign_name = camp.get("campaign_name") or ""
+
         if gads_status is None:
-            continue  # REMOVED / not returned by GAds — never blank a status we can't see
+            # Campaign has a linked resource but is absent from GAds response
+            # (REMOVED from account). If currently ACTIVE in DB, mark as PAUSED.
+            checked += 1
+            if current == "ACTIVE":
+                if update_campaign_status(campaign_id, "PAUSED"):
+                    transitions.append({
+                        "campaign_id": campaign_id,
+                        "name":        campaign_name,
+                        "from":        current,
+                        "to":          "PAUSED",
+                        "reason":      "absent_from_gads",
+                    })
+            continue
+
         new_status = _map_gads_status_to_db(gads_status)
         if new_status is None:
             continue  # unknown GAds status — leave DB untouched
         checked += 1
-        current = (camp.get("status") or "").upper()
         if current == new_status:
             continue
-        campaign_id = camp.get("campaign_id")
         if update_campaign_status(campaign_id, new_status):
             transitions.append({
                 "campaign_id": campaign_id,
-                "name":        camp.get("campaign_name") or "",
+                "name":        campaign_name,
                 "from":        current or None,
                 "to":          new_status,
             })
