@@ -3791,8 +3791,10 @@ function PlayButton({uuid, call}) {
 // ── CallsSubView — enhanced call list with analysis columns ───────────────────
 
 function CallsSubView() {
+  const PAGE_SIZE = 100;
   const [calls, setCalls] = useState([]);
   const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [adCallCount, setAdCallCount] = useState(0);
   const [loading, setLoading] = useState(false);
   // GAds call conversions panel
@@ -3897,7 +3899,7 @@ function CallsSubView() {
   async function loadCalls() {
     setLoading(true);
     try {
-      const params = new URLSearchParams({ days, limit: 200, offset: 0 });
+      const params = new URLSearchParams({ days, limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE });
       if (dirFilter) params.set('direction', dirFilter);
       if (statusFilter) params.set('status', statusFilter);
       if (gadsOnly) params.set('gads_only', 'true');
@@ -3918,13 +3920,16 @@ function CallsSubView() {
     finally { setLoading(false); setLastRefreshed(new Date()); }
   }
 
-  useEffect(() => { loadCalls(); loadCallFlags(); }, [days, dirFilter, statusFilter, gadsOnly, filterNew, filterExisting, convertedOnly]);
+  // Reset to page 1 when filters change
+  useEffect(() => { setPage(1); }, [days, dirFilter, statusFilter, gadsOnly, filterNew, filterExisting, convertedOnly]);
+
+  useEffect(() => { loadCalls(); loadCallFlags(); }, [days, dirFilter, statusFilter, gadsOnly, filterNew, filterExisting, convertedOnly, page]);
 
   // Auto-refresh every 5 minutes to match backend Mango sync cadence
   useEffect(() => {
     const id = setInterval(() => { loadCalls(); loadCallFlags(); }, 5 * 60 * 1000);
     return () => clearInterval(id);
-  }, [days, dirFilter, statusFilter, gadsOnly, filterNew, filterExisting, convertedOnly]);
+  }, [days, dirFilter, statusFilter, gadsOnly, filterNew, filterExisting, convertedOnly, page]);
 
   async function loadConversions() {
     setConvLoading(true);
@@ -4706,19 +4711,49 @@ function CallsSubView() {
           </tbody>
         </table>
       </div>
-      <div style={{marginTop:8,fontSize:11,color:'var(--text-muted)'}}>
-        Showing {calls.length} of {total} calls
-        {(gadsOnly || filterNew || filterExisting || convertedOnly) && (
-          <span style={{marginLeft:8,color:'#7c3aed',fontWeight:600}}>
-            · Filtered:
-            {gadsOnly && ' GAds'}
-            {filterNew && ' New'}
-            {filterExisting && ' Existing'}
-            {convertedOnly && ' Converted'}
-          </span>
-        )}
-        {' · '}Syncs automatically every 5 min
-      </div>
+      {/* Pagination controls */}
+      {(() => {
+        const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+        const rangeStart = (page - 1) * PAGE_SIZE + 1;
+        const rangeEnd = Math.min(page * PAGE_SIZE, total);
+        return (
+          <div style={{marginTop:10,display:'flex',alignItems:'center',justifyContent:'space-between',fontSize:12,color:'var(--text-muted)'}}>
+            <span>
+              {total > 0 ? `Showing ${rangeStart}–${rangeEnd} of ${total} calls` : 'No calls'}
+              {(gadsOnly || filterNew || filterExisting || convertedOnly) && (
+                <span style={{marginLeft:8,color:'#7c3aed',fontWeight:600}}>
+                  · Filtered:
+                  {gadsOnly && ' GAds'}
+                  {filterNew && ' New'}
+                  {filterExisting && ' Existing'}
+                  {convertedOnly && ' Converted'}
+                </span>
+              )}
+            </span>
+            {totalPages > 1 && (
+              <div style={{display:'flex',alignItems:'center',gap:6}}>
+                <button
+                  onClick={() => setPage(p => Math.max(1, p - 1))}
+                  disabled={page <= 1 || loading}
+                  style={{padding:'3px 8px',fontSize:12,border:'1px solid var(--border)',borderRadius:4,background:page<=1?'var(--bg-secondary)':'var(--bg-primary)',cursor:page<=1?'default':'pointer',opacity:page<=1?0.4:1}}
+                  title="Previous page"
+                >← Prev</button>
+                <span style={{fontWeight:600,minWidth:60,textAlign:'center'}}>
+                  Page {page} of {totalPages}
+                </span>
+                <button
+                  onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                  disabled={page >= totalPages || loading}
+                  style={{padding:'3px 8px',fontSize:12,border:'1px solid var(--border)',borderRadius:4,background:page>=totalPages?'var(--bg-secondary)':'var(--bg-primary)',cursor:page>=totalPages?'default':'pointer',opacity:page>=totalPages?0.4:1}}
+                  title="Next page"
+                >Next →</button>
+              </div>
+            )}
+            <span style={{fontSize:11}}>Syncs every 5 min</span>
+          </div>
+        );
+      })()}
+
 
       {/* Detail drawer */}
       {drawerCall && (

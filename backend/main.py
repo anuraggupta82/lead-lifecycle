@@ -11632,6 +11632,58 @@ def admin_mango_reconcile_now(days: int = 14):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/calls/backfill-lead-links", dependencies=[Depends(_require_admin)])
+def admin_backfill_lead_links(days: int = 90, dry_run: bool = False):
+    """ATTR-FIX3: Link lead_id on calls that have GAds attribution but no lead_id.
+    Also runs finalize_call_lead to propagate campaign to the lead."""
+    import re as _re
+    from database import _conn as _db_conn, get_all_leads, update_mango_call_attribution
+    from mango_service import finalize_call_lead
+
+    with _db_conn() as conn:
+        cutoff = (__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                  - __import__("datetime").timedelta(days=days)).isoformat()
+        rows = conn.execute("""
+            SELECT uuid, from_number, lead_id
+            FROM mango_calls
+            WHERE direction='inbound'
+              AND (lead_id IS NULL OR lead_id = '')
+              AND (gads_call_id IS NOT NULL AND gads_call_id != ''
+                   OR attributed_ad_group IS NOT NULL AND attributed_ad_group != '')
+              AND started_at >= ?
+        """, (cutoff,)).fetchall()
+
+    all_leads = get_all_leads(limit=10000)
+    phone_to_lead: dict = {}
+    for lead in all_leads:
+        phone = _re.sub(r"\D", "", lead.get("phone", "") or "")
+        if len(phone) >= 10:
+            phone_to_lead[phone[-10:]] = lead["id"]
+
+    linked = 0
+    finalized = 0
+    details = []
+    for r in rows:
+        from_digits = _re.sub(r"\D", "", r["from_number"] or "")
+        if len(from_digits) < 10:
+            continue
+        matched_lead = phone_to_lead.get(from_digits[-10:])
+        if not matched_lead:
+            continue
+        if not dry_run:
+            update_mango_call_attribution(uuid=r["uuid"], lead_id=matched_lead)
+            linked += 1
+            result = finalize_call_lead(r["uuid"])
+            if result.get("updated"):
+                finalized += 1
+                details.append({"uuid": r["uuid"], "lead_id": matched_lead, "updated": result["updated"]})
+        else:
+            linked += 1
+            details.append({"uuid": r["uuid"], "lead_id": matched_lead, "would_link": True})
+
+    return {"linked": linked, "finalized": finalized, "dry_run": dry_run, "details": details}
+
+
 @app.post("/api/admin/calls/attribute-keywords", dependencies=[Depends(_require_admin)])
 def admin_attribute_keywords(days: int = 30):
     """Manually trigger keyword attribution for Mango calls. Use days=90 for backfill."""
@@ -12122,7 +12174,7 @@ def admin_backfill_patient_names(
             results["processed"] += 1
             continue
 
-        # Sync name to linked lead (task #27: od_patient_name > ai_patient_name > caller_id_name)
+        # Sync name to linked lead (task #17: od_patient_name > ai_patient_name > caller_id_name)
         lead_id = row.get("lead_id") or ""
         od_name = row.get("od_patient_name") or ""
         if lead_id and not od_name:

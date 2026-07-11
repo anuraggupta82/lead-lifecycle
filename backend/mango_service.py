@@ -23,9 +23,9 @@ from typing import Optional
 
 import requests
 
-# Limit concurrent auto-process jobs to prevent file-descriptor exhaustion
-# (each process_call downloads from S3, calls OpenAI Whisper, Vertex AI, etc.)
-_PROCESS_SEMAPHORE = threading.Semaphore(2)
+# No concurrency for auto-process — calls are processed one-by-one sequentially
+# to avoid file-descriptor exhaustion (each process_call downloads from S3,
+# calls OpenAI Whisper, Vertex AI, etc.).
 
 from database import (
     upsert_mango_call,
@@ -768,7 +768,9 @@ def finalize_call_lead(uuid: str) -> dict:
                     cc.source               AS cr_source,
                     cc.gclid                AS cr_gclid,
                     cc.campaign             AS cr_campaign,
-                    cc.landing_page         AS cr_landing_page
+                    cc.landing_page         AS cr_landing_page,
+                    -- ATTR-FIX3: join gads_call_view for campaign_id
+                    gcv.campaign_id         AS gcv_campaign_id
                 FROM mango_calls mc
                 -- Deterministic subquery: multiple callrail_calls rows can exist per
                 -- mango_call (call.created + call.completed). Prefer the row with gclid,
@@ -779,6 +781,7 @@ def finalize_call_lead(uuid: str) -> dict:
                     ORDER BY (COALESCE(gclid,'') != '') DESC, called_at DESC
                     LIMIT 1
                 )
+                LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
                 WHERE mc.uuid = ?
             """, (uuid,)).fetchone()
 
@@ -790,7 +793,7 @@ def finalize_call_lead(uuid: str) -> dict:
 
             # Fetch current lead state (only the fields we may update)
             lead = conn.execute("""
-                SELECT keyword_text, ad_group_name, campaign_name, gclid,
+                SELECT keyword_text, ad_group_name, campaign_name, campaign_id, gclid,
                        od_patient_num, existing_patient, paid_source, landing_url
                 FROM leads WHERE id = ?
             """, (lead_id,)).fetchone()
@@ -828,8 +831,14 @@ def finalize_call_lead(uuid: str) -> dict:
                     updates["ad_group_name"] = ag_part.strip()
                     if not lead["campaign_name"]:
                         updates["campaign_name"] = camp_part.strip()
+                    # ATTR-FIX3: also set campaign_id from gads_call_view
+                    if not lead["campaign_id"] and row.get("gcv_campaign_id"):
+                        updates["campaign_id"] = str(row["gcv_campaign_id"])
                 else:
                     updates["ad_group_name"] = ag_raw.strip()
+            # ATTR-FIX3: campaign_id even if ad_group_name already set
+            if not lead.get("campaign_id") and row.get("gcv_campaign_id") and "campaign_id" not in updates:
+                updates["campaign_id"] = str(row["gcv_campaign_id"])
 
             # ── 3. gclid backstop (webhook-miss recovery) ────────────────────
             if row["cr_gclid"] and not lead["gclid"]:
@@ -1267,6 +1276,16 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
             _cr_gads_confirmed = True
 
         if _cr_gads_confirmed:
+            # ATTR-FIX3 2026-07-11: link lead_id on GAds-attributed calls.
+            # Previously, callrail_confirmed path set gads_call_id but skipped
+            # phone→lead matching, so finalize_call_lead() never ran and the
+            # lead's campaign_name was never backfilled from the call's attribution.
+            _from_digits = re.sub(r"\D", "", mc.get("from_number", "") or "")
+            if len(_from_digits) >= 10:
+                _matched_lead_id = phone_to_lead.get(_from_digits[-10:])
+                if _matched_lead_id and not (mc.get("lead_id") or "").strip():
+                    update_mango_call_attribution(uuid=mc_uuid, lead_id=_matched_lead_id)
+                    logger.info("reconcile[lead_link] Mango=%s -> lead=%s (phone match after GAds attr)", mc_uuid, _matched_lead_id)
             continue
 
         # ATTR-FIX2 2026-07-07: direct gads_call_view time-match (no CallRail bridge).
@@ -1323,6 +1342,13 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                 "reconcile[gads_time_match] Mango=%s -> GAds=%s (time_delta=%.0fs)",
                 mc_uuid, _dm_best_id, _dm_best_delta,
             )
+            # ATTR-FIX3: link lead_id on gads_time_match calls (same as callrail_confirmed above)
+            _from_digits = re.sub(r"\D", "", mc.get("from_number", "") or "")
+            if len(_from_digits) >= 10:
+                _matched_lead_id = phone_to_lead.get(_from_digits[-10:])
+                if _matched_lead_id and not (mc.get("lead_id") or "").strip():
+                    update_mango_call_attribution(uuid=mc_uuid, lead_id=_matched_lead_id)
+                    logger.info("reconcile[lead_link] Mango=%s -> lead=%s (phone match after GAds attr)", mc_uuid, _matched_lead_id)
             continue
 
         # ── Gemini transcript campaign inference ──────────────────────────────
@@ -1360,6 +1386,13 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                         "reconcile[gemini_inferred] Mango=%s -> campaign=%s (confidence=%s, reason=%s)",
                         mc_uuid, result["campaign_name"], result["confidence"], result.get("reasoning", "")[:80],
                     )
+                    # ATTR-FIX3: link lead_id on gemini-inferred calls too
+                    _from_digits = re.sub(r"\D", "", mc.get("from_number", "") or "")
+                    if len(_from_digits) >= 10:
+                        _matched_lead_id = phone_to_lead.get(_from_digits[-10:])
+                        if _matched_lead_id and not (mc.get("lead_id") or "").strip():
+                            update_mango_call_attribution(uuid=mc_uuid, lead_id=_matched_lead_id)
+                            logger.info("reconcile[lead_link] Mango=%s -> lead=%s (phone match after Gemini attr)", mc_uuid, _matched_lead_id)
                     continue
 
         # ── Try lead phone match ──────────────────────────────────────────────
@@ -1397,7 +1430,6 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                 r[0] for r in _fc_conn.execute("""
                     SELECT uuid FROM mango_calls
                     WHERE lead_id IS NOT NULL AND lead_id != ''
-                      AND transcription_status = 'done'
                       AND started_at >= ?
                 """, (cutoff,)).fetchall()
             ]
@@ -1481,21 +1513,13 @@ def _queue_process_if_needed(mc: dict, mango_token: Optional[str] = None) -> Non
         logger.warning(f"[reconcile] No mango_token available — call {uuid[:8]} will remain pending for pipeline tick")
         return
 
-    logger.info(f"[reconcile] Queuing auto-process for newly matched call {uuid[:8]} ({duration}s)")
+    logger.info(f"[reconcile] Processing call {uuid[:8]} ({duration}s) synchronously")
 
-    def _run():
-        _PROCESS_SEMAPHORE.acquire()
-        try:
-            logger.info(f"[reconcile] Starting auto-process for {uuid[:8]} (semaphore acquired)")
-            from mango_pipeline import process_call
-            from database import get_mango_call
-            call_row = get_mango_call(uuid)
-            if call_row:
-                process_call(call_row, mango_token=mango_token)
-        except Exception as e:
-            logger.warning(f"[reconcile] Auto-process failed for {uuid[:8]}: {e}")
-        finally:
-            _PROCESS_SEMAPHORE.release()
-
-    t = threading.Thread(target=_run, daemon=True, name=f"auto-process-{uuid[:8]}")
-    t.start()
+    try:
+        from mango_pipeline import process_call
+        from database import get_mango_call
+        call_row = get_mango_call(uuid)
+        if call_row:
+            process_call(call_row, mango_token=mango_token)
+    except Exception as e:
+        logger.warning(f"[reconcile] Auto-process failed for {uuid[:8]}: {e}")
