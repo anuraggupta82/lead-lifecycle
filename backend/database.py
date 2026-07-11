@@ -3103,6 +3103,77 @@ GROUP BY a.campaign_id, c.campaign_name;
           AND auto_enter_pipeline_rule='always'
     """)
 
+    # ── Campaign status date tracking (activated_at / paused_at + history) ─────
+    _csd_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    if "activated_at" not in _csd_cols:
+        try:
+            conn.execute("ALTER TABLE campaigns ADD COLUMN activated_at TEXT DEFAULT ''")
+        except Exception:
+            pass
+    if "paused_at" not in _csd_cols:
+        try:
+            conn.execute("ALTER TABLE campaigns ADD COLUMN paused_at TEXT DEFAULT ''")
+        except Exception:
+            pass
+
+    # Campaign status history — append-only log of every status transition
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaign_status_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            changed_at  TEXT NOT NULL,
+            reason      TEXT DEFAULT '',
+            FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_csh_campaign
+        ON campaign_status_history(campaign_id, changed_at)
+    """)
+
+    # Seed activated_at / paused_at for existing campaigns that don't have them yet
+    _seed_rows = conn.execute("""
+        SELECT campaign_id, status, created_at, launch_date
+        FROM campaigns
+        WHERE (activated_at IS NULL OR activated_at = '')
+          AND (paused_at IS NULL OR paused_at = '')
+    """).fetchall()
+    _seed_now = datetime.now(timezone.utc).isoformat()
+    for _sr in _seed_rows:
+        _cid, _cst, _created, _launch = _sr[0], (_sr[1] or "").upper(), _sr[2], _sr[3]
+        if _cst == "ACTIVE":
+            # Best guess: use launch_date if available, else created_at
+            _act_date = _launch if _launch else _created
+            conn.execute(
+                "UPDATE campaigns SET activated_at=? WHERE campaign_id=?",
+                (_act_date, _cid)
+            )
+            conn.execute(
+                "INSERT INTO campaign_status_history (campaign_id, status, changed_at, reason) VALUES (?,?,?,?)",
+                (_cid, "ACTIVE", _act_date, "seed_from_launch_or_created")
+            )
+        elif _cst == "PAUSED":
+            conn.execute(
+                "UPDATE campaigns SET paused_at=? WHERE campaign_id=?",
+                (_seed_now, _cid)
+            )
+            # Also set activated_at from launch/created (it was active before being paused)
+            _act_date = _launch if _launch else _created
+            if _act_date:
+                conn.execute(
+                    "UPDATE campaigns SET activated_at=? WHERE campaign_id=?",
+                    (_act_date, _cid)
+                )
+                conn.execute(
+                    "INSERT INTO campaign_status_history (campaign_id, status, changed_at, reason) VALUES (?,?,?,?)",
+                    (_cid, "ACTIVE", _act_date, "seed_from_launch_or_created")
+                )
+            conn.execute(
+                "INSERT INTO campaign_status_history (campaign_id, status, changed_at, reason) VALUES (?,?,?,?)",
+                (_cid, "PAUSED", _seed_now, "seed_current_status")
+            )
+
 
 def _seed_call_grading_criteria(conn):
     """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
@@ -4914,6 +4985,8 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
         "booking_link",
         # PR 2 — pipeline routing
         "auto_enter_pipeline_rule", "pipeline_default_visibility",
+        # Campaign status date tracking
+        "activated_at", "paused_at",
     }
     safe = {k: v for k, v in fields.items() if k in ALLOWED}
     if not safe:
@@ -4929,24 +5002,49 @@ def update_campaign_fields(campaign_id: str, fields: dict) -> bool:
         return cur.rowcount > 0
 
 
-def update_campaign_status(campaign_id: str, status: str, launch_date: str | None = None) -> bool:
+def update_campaign_status(campaign_id: str, status: str, launch_date: str | None = None,
+                          reason: str = "") -> bool:
     """
     Patch a campaign's status (ACTIVE, PAUSED, COMPLETED, ARCHIVED, SCHEDULED, QUEUED).
+    Also sets activated_at / paused_at timestamps and logs to campaign_status_history.
     Optionally also set launch_date (used by the Launch flow for SCHEDULED + ACTIVE).
     Pass launch_date="" to explicitly clear it (e.g. when moving back to QUEUED).
     """
     now = _now()
+    upper_status = status.upper()
     with _conn() as conn:
+        # Set activated_at / paused_at based on transition direction
+        # ACTIVE: set activated_at=now, clear paused_at (stale from prior pause)
+        # PAUSED: set paused_at=now, keep activated_at (preserves first-activation date)
+        extra_sets = ""
+        extra_params: list = []
+        if upper_status == "ACTIVE":
+            extra_sets = ", activated_at=?, paused_at=?"
+            extra_params = [now, ""]
+        elif upper_status == "PAUSED":
+            extra_sets = ", paused_at=?"
+            extra_params = [now]
+
         if launch_date is not None:
             conn.execute(
-                "UPDATE campaigns SET status=?, updated_at=?, launch_date=? WHERE campaign_id=?",
-                (status, now, launch_date, campaign_id)
+                f"UPDATE campaigns SET status=?, updated_at=?, launch_date=?{extra_sets} WHERE campaign_id=?",
+                (status, now, launch_date, *extra_params, campaign_id)
             )
         else:
             conn.execute(
-                "UPDATE campaigns SET status=?, updated_at=? WHERE campaign_id=?",
-                (status, now, campaign_id)
+                f"UPDATE campaigns SET status=?, updated_at=?{extra_sets} WHERE campaign_id=?",
+                (status, now, *extra_params, campaign_id)
             )
+
+        # Log to status history
+        try:
+            conn.execute(
+                "INSERT INTO campaign_status_history (campaign_id, status, changed_at, reason) VALUES (?,?,?,?)",
+                (campaign_id, upper_status, now, reason)
+            )
+        except Exception:
+            pass  # table may not exist yet on very first init
+
         return conn.execute(
             "SELECT COUNT(*) FROM campaigns WHERE campaign_id=?", (campaign_id,)
         ).fetchone()[0] > 0

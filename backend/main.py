@@ -7845,7 +7845,7 @@ def sync_all_campaign_statuses_from_gads() -> dict:
             # (REMOVED from account). If currently ACTIVE in DB, mark as PAUSED.
             checked += 1
             if current == "ACTIVE":
-                if update_campaign_status(campaign_id, "PAUSED"):
+                if update_campaign_status(campaign_id, "PAUSED", reason="absent_from_gads"):
                     transitions.append({
                         "campaign_id": campaign_id,
                         "name":        campaign_name,
@@ -7861,7 +7861,7 @@ def sync_all_campaign_statuses_from_gads() -> dict:
         checked += 1
         if current == new_status:
             continue
-        if update_campaign_status(campaign_id, new_status):
+        if update_campaign_status(campaign_id, new_status, reason="gads_sync"):
             transitions.append({
                 "campaign_id": campaign_id,
                 "name":        campaign_name,
@@ -7885,6 +7885,117 @@ def admin_sync_all_campaign_statuses():
     except Exception as e:
         logger.error(f"On-demand campaign-status sync failed: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail=f"Google Ads sync failed: {e}")
+
+
+@app.post("/api/admin/campaigns/backfill-status-dates", dependencies=[Depends(_require_admin)])
+def admin_backfill_campaign_status_dates():
+    """
+    One-time backfill: use GAds daily impression data to determine when each
+    campaign was first and last active, and set activated_at / paused_at
+    accordingly. For PAUSED campaigns, paused_at = day after last impression.
+    Also updates campaign_status_history with the inferred dates.
+
+    Safe to run multiple times — overwrites existing dates with GAds truth.
+    """
+    from database import get_all_campaigns, update_campaign_fields, _conn as db_conn
+    from google_ads_create import fetch_campaigns_from_gads, _build_client
+    from config import get_settings
+
+    settings = get_settings()
+    client = _build_client()
+    service = client.get_service("GoogleAdsService")
+    customer_id = "".join(
+        ch for ch in (settings.google_ads_customer_id or "") if ch.isdigit()
+    )
+
+    # Query GAds for first/last impression date per campaign
+    from datetime import datetime as _dt
+    _today = _dt.now().strftime("%Y-%m-%d")
+    query = f"""
+        SELECT
+            campaign.id,
+            campaign.name,
+            segments.date,
+            metrics.impressions
+        FROM campaign
+        WHERE segments.date BETWEEN '2025-01-01' AND '{_today}'
+          AND metrics.impressions > 0
+        ORDER BY campaign.name, segments.date ASC
+    """
+    from collections import defaultdict
+    first_imp: dict[str, str] = {}
+    last_imp: dict[str, str] = {}
+    for row in service.search(customer_id=customer_id, query=query):
+        cid = str(row.campaign.id)
+        d = row.segments.date
+        if cid not in first_imp:
+            first_imp[cid] = d
+        last_imp[cid] = d  # overwrite — ASC order, so last value = latest date
+
+    all_camps = get_all_campaigns()
+    updates = []
+    for camp in all_camps:
+        campaign_id = camp.get("campaign_id") or ""
+        campaign_name = camp.get("campaign_name") or ""
+        current_status = (camp.get("status") or "").upper()
+        gads_numeric_id = camp.get("gads_campaign_numeric_id") or ""
+
+        # Try to match by gads_campaign_numeric_id
+        gid = gads_numeric_id or campaign_id
+        fi = first_imp.get(gid)
+        li = last_imp.get(gid)
+
+        if not fi:
+            continue  # no impression data — skip
+
+        new_activated_at = fi  # first impression ≈ first day active
+        new_paused_at = ""
+
+        if current_status == "PAUSED":
+            # paused_at = day after last impression
+            from datetime import datetime as _dt, timedelta as _td
+            try:
+                last_date = _dt.strptime(li, "%Y-%m-%d")
+                new_paused_at = (last_date + _td(days=1)).strftime("%Y-%m-%d")
+            except ValueError:
+                new_paused_at = li
+
+        # Update campaign fields
+        update_fields = {"activated_at": new_activated_at}
+        if new_paused_at:
+            update_fields["paused_at"] = new_paused_at
+
+        update_campaign_fields(campaign_id, update_fields)
+
+        # Update history table
+        with db_conn() as conn:
+            # Clear old seeded entries for this campaign
+            conn.execute(
+                "DELETE FROM campaign_status_history WHERE campaign_id = ? AND reason LIKE 'seed%'",
+                (campaign_id,)
+            )
+            # Insert corrected history
+            conn.execute(
+                "INSERT INTO campaign_status_history (campaign_id, status, changed_at, reason) VALUES (?,?,?,?)",
+                (campaign_id, "ACTIVE", new_activated_at, "seed_from_gads_impressions")
+            )
+            if new_paused_at:
+                conn.execute(
+                    "INSERT INTO campaign_status_history (campaign_id, status, changed_at, reason) VALUES (?,?,?,?)",
+                    (campaign_id, "PAUSED", new_paused_at, "seed_from_gads_impressions")
+                )
+
+        updates.append({
+            "campaign_id": campaign_id,
+            "name": campaign_name,
+            "status": current_status,
+            "activated_at": new_activated_at,
+            "paused_at": new_paused_at or None,
+            "first_impression": fi,
+            "last_impression": li,
+        })
+
+    return {"backfilled": len(updates), "details": updates}
 
 
 @app.post("/api/admin/campaigns/{campaign_id}/sync-from-gads", dependencies=[Depends(_require_admin)])

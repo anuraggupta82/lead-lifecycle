@@ -894,13 +894,15 @@ Output JSON only:
 """
 
 
-def _build_campaign_context_for_inference() -> str:
-    """Build a structured text block describing campaigns with recent activity.
+def _build_campaign_context_for_inference(call_time: str = "") -> str:
+    """Build a structured text block describing campaigns that were ACTIVE at call_time.
 
-    Uses gads_keywords_cache (last 30 days of impressions) as the primary filter,
-    then excludes campaigns marked PAUSED in the campaigns table (synced from GAds
-    daily at 6 AM via sync_all_campaign_statuses_from_gads). This prevents paused
-    campaigns with residual 30-day impressions from leaking into Gemini context.
+    Date-aware filtering: uses campaign_status_history to determine which campaigns
+    were ACTIVE when the call was made, not just which are active NOW. This prevents
+    both stale attribution (paused campaigns leaking in) and lost attribution
+    (historical calls not matching campaigns that were active at the time).
+
+    Fallback: if no call_time or no history data, uses current status == ACTIVE.
     """
     with _db_conn() as conn:
         # Get campaigns with recent keyword impressions (last 30 days)
@@ -911,12 +913,56 @@ def _build_campaign_context_for_inference() -> str:
             ORDER BY campaign_name, impressions DESC
         """).fetchall()
 
-        # Get campaign metadata — also used to filter out PAUSED campaigns
+        # Get campaign metadata
         all_campaigns = conn.execute("""
-            SELECT campaign_name, service_focus, target_audience, promo_offer, status
+            SELECT campaign_id, campaign_name, service_focus, target_audience,
+                   promo_offer, status, activated_at, paused_at
             FROM campaigns
             WHERE campaign_name != ''
         """).fetchall()
+
+        # Build name→campaign_id mapping for history lookup
+        name_to_cid = {c["campaign_name"]: c["campaign_id"] for c in all_campaigns}
+
+        # Determine which campaigns were active at call_time using history
+        allowed_names: set[str] = set()
+        if call_time:
+            # For each campaign, find its status at call_time from history
+            for camp in all_campaigns:
+                cid = camp["campaign_id"]
+                cname = camp["campaign_name"]
+                cstatus = (camp["status"] or "").upper()
+
+                # Quick check: if activated_at <= call_time and
+                # (paused_at is empty OR paused_at > call_time) → was active
+                act_at = camp["activated_at"] or ""
+                pau_at = camp["paused_at"] or ""
+
+                if act_at and act_at <= call_time:
+                    if not pau_at or pau_at > call_time:
+                        allowed_names.add(cname)
+                        continue
+
+                # Fall back to history table for more complex cases
+                # (multiple on/off cycles)
+                last_before = conn.execute("""
+                    SELECT status FROM campaign_status_history
+                    WHERE campaign_id = ? AND changed_at <= ?
+                    ORDER BY changed_at DESC, id DESC
+                    LIMIT 1
+                """, (cid, call_time)).fetchone()
+
+                if last_before:
+                    if last_before["status"] == "ACTIVE":
+                        allowed_names.add(cname)
+                elif cstatus == "ACTIVE":
+                    # No history before call_time — if currently active,
+                    # assume it was active (conservative fallback)
+                    allowed_names.add(cname)
+        else:
+            # No call_time — fall back to current status
+            allowed_names = {c["campaign_name"] for c in all_campaigns
+                            if (c["status"] or "").upper() == "ACTIVE"}
 
     # Group keywords by campaign, top 10 each
     kw_by_campaign: dict[str, list[str]] = {}
@@ -932,15 +978,13 @@ def _build_campaign_context_for_inference() -> str:
             f'{row["keyword_text"]} ({row["match_type"]}, {row["impressions"]} imp)'
         )
 
-    # Index campaign metadata by name and filter out PAUSED campaigns
+    # Intersect: must have both impressions AND been active at call_time
     meta_by_name = {c["campaign_name"]: c for c in all_campaigns}
-    paused_names = {c["campaign_name"] for c in all_campaigns
-                    if (c["status"] or "").upper() == "PAUSED"}
-    excluded = active_campaign_names & paused_names
+    excluded = active_campaign_names - allowed_names
     if excluded:
-        logger.info(f"[gemini_inference] excluding {len(excluded)} paused campaign(s): "
-                     f"{', '.join(sorted(excluded))}")
-    active_campaign_names -= paused_names
+        logger.info(f"[gemini_inference] excluding {len(excluded)} campaign(s) not active at "
+                    f"{call_time or 'now'}: {', '.join(sorted(excluded))}")
+    active_campaign_names &= allowed_names
 
     lines = []
     for cname in sorted(active_campaign_names):
@@ -958,8 +1002,8 @@ def _build_campaign_context_for_inference() -> str:
             block += f"\n  Top Keywords: {', '.join(kws)}"
         lines.append(block)
 
-    logger.info(f"[gemini_inference] campaign context: {len(active_campaign_names)} active campaigns "
-                f"(filtered by 30-day impressions)")
+    logger.info(f"[gemini_inference] campaign context: {len(active_campaign_names)} campaigns "
+                f"active at {call_time or 'now'} (filtered by 30-day impressions)")
     return "\n\n".join(lines) if lines else "(no active campaigns found)"
 
 
@@ -978,7 +1022,8 @@ def infer_campaign_from_transcript(mc: dict) -> Optional[dict]:
         return None
 
     try:
-        campaign_context = _build_campaign_context_for_inference()
+        call_time = mc.get("started_at") or ""
+        campaign_context = _build_campaign_context_for_inference(call_time=call_time)
         prompt = _CAMPAIGN_INFERENCE_PROMPT.format(
             campaign_context=campaign_context,
             transcript=transcript[:6000],  # cap transcript to avoid token bloat
