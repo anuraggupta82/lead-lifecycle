@@ -4692,7 +4692,7 @@ function CallsSubView() {
                   <td style={{padding:'8px 10px'}}>{_fmtDur(call.duration_sec)}</td>
                   <td style={{padding:'8px 10px'}}>{_statusBadge(call.status)}</td>
                   <td style={{padding:'8px 10px'}}>
-                    {_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}
+                    {_patientBadge(call.od_patient_status, call.od_patient_name||call.ai_patient_name||call.caller_id_name)}
                   </td>
                   <td style={{padding:'8px 10px'}}>{_attrBadge(call)}</td>
                   <td style={{padding:'8px 10px'}}>{_transcriptBadge(call.transcription_status)}</td>
@@ -4808,8 +4808,13 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
             <div>
               <div style={{fontSize:14,fontWeight:700,color:'var(--text)'}}>
-                {call.caller_id_name || call.from_number || 'Unknown Caller'}
+                {call.od_patient_name || call.ai_patient_name || call.caller_id_name || call.from_number || 'Unknown Caller'}
               </div>
+              {(call.od_patient_name || call.ai_patient_name) && call.caller_id_name && (
+                <div style={{fontSize:10,color:'var(--text-muted)',marginTop:1}}>
+                  Caller ID: {call.caller_id_name}
+                </div>
+              )}
               <div style={{fontSize:11,color:'var(--text-muted)',marginTop:2,display:'flex',gap:10,flexWrap:'wrap'}}>
                 <span>{_fmtTime(call.started_at)}</span>
                 <span>·</span>
@@ -4862,7 +4867,7 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                   background:'#f8fafc',border:'1px solid var(--border)',fontSize:12}}>
                   <div style={{display:'flex',alignItems:'center',gap:10}}>
                     <span style={{fontWeight:600,color:'var(--text-muted)',fontSize:10}}>OD PATIENT</span>
-                    {_patientBadge(call.od_patient_status, call.od_patient_name||call.caller_id_name)}
+                    {_patientBadge(call.od_patient_status, call.od_patient_name||call.ai_patient_name||call.caller_id_name)}
                     {call.od_patient_name && (
                       <span style={{fontWeight:600,color:'var(--text)'}}>{call.od_patient_name}</span>
                     )}

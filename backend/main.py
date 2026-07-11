@@ -11945,6 +11945,215 @@ def admin_backfill_call_keyword_attribution():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+_NAME_EXTRACT_PROMPT = """\
+Extract the PATIENT's name from this dental office phone call transcript.
+
+Rules:
+- The patient is the person calling about dental treatment for themselves or a family member.
+- Use the name stated during the conversation, not the caller ID.
+- If the caller is calling for someone else (e.g. "I'm calling for my son Jake"), extract the PATIENT's name (Jake), not the caller's.
+- If only a first name is given, set last_name to "".
+- If no patient name is stated at all, set both to "".
+- Do not invent or guess names. Only use names explicitly stated in the conversation.
+
+Respond ONLY with valid JSON (no markdown, no extra text):
+{{"first_name": "<FIRST>", "last_name": "<LAST>"}}
+
+Transcript:
+{transcript}
+"""
+
+
+@app.post("/api/admin/calls/backfill-patient-names", dependencies=[Depends(_require_admin)])
+def admin_backfill_patient_names(
+    limit: int = 50,
+    dry_run: bool = False,
+    background_tasks: BackgroundTasks = None,
+):
+    """Backfill ai_patient_name for calls that have a transcript but no name extracted.
+
+    Uses a lightweight Gemini name-extraction prompt (not full re-summarization).
+    Also syncs extracted name to the linked lead record.
+
+    Args:
+        limit: max calls to process (default 50, cap 500)
+        dry_run: if true, return candidates without updating
+    """
+    import re as _re
+    from database import _conn as _db_conn
+    from mango_pipeline import _call_vertex, _strip_greeting, log_gemini
+
+    limit = max(1, min(int(limit), 500))
+
+    # Get Vertex settings
+    with _db_conn() as conn:
+        settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
+        vertex_cfg = {
+            "vertex_project_id": settings.get("vertex_project_id", ""),
+            "vertex_location": settings.get("vertex_location", "us-central1"),
+            "vertex_credentials_path": settings.get("vertex_credentials_path", ""),
+            "vertex_model": settings.get("vertex_model", "gemini-2.5-flash"),
+        }
+
+    if not vertex_cfg["vertex_project_id"]:
+        raise HTTPException(status_code=500, detail="vertex_project_id not configured")
+
+    # Find calls with transcript but no ai_patient_name
+    with _db_conn() as conn:
+        rows = conn.execute("""
+            SELECT uuid, call_transcript, caller_id_name, lead_id,
+                   od_patient_name, ai_patient_name
+            FROM mango_calls
+            WHERE call_transcript IS NOT NULL AND call_transcript != ''
+              AND (ai_patient_name IS NULL OR ai_patient_name = '')
+              AND direction = 'inbound'
+            ORDER BY started_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+    candidates = [dict(r) for r in rows]
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "candidates": len(candidates),
+            "sample": [
+                {"uuid": c["uuid"][:8], "caller_id": c["caller_id_name"],
+                 "has_od_name": bool(c["od_patient_name"]),
+                 "has_lead": bool(c["lead_id"])}
+                for c in candidates[:20]
+            ],
+        }
+
+    results = {"processed": 0, "names_extracted": 0, "leads_updated": 0, "errors": 0, "details": []}
+
+    for row in candidates:
+        uuid = row["uuid"]
+        transcript = row["call_transcript"]
+
+        # Strip IVR greeting
+        cleaned, _ = _strip_greeting(transcript)
+        if len(cleaned.split()) < 5:
+            results["details"].append({"uuid": uuid[:8], "status": "skipped_short"})
+            results["processed"] += 1
+            continue
+
+        # Run Gemini name extraction
+        # Truncate very long transcripts to save tokens (name is usually in first 2000 words)
+        words = cleaned.split()
+        if len(words) > 2000:
+            cleaned = " ".join(words[:2000])
+        prompt = _NAME_EXTRACT_PROMPT.format(transcript=cleaned)
+        try:
+            raw_text, in_tok, out_tok = _call_vertex(
+                prompt,
+                vertex_cfg["vertex_model"],
+                vertex_cfg["vertex_project_id"],
+                vertex_cfg["vertex_location"],
+                vertex_cfg["vertex_credentials_path"],
+                temperature=0.0,
+                max_tokens=512,
+            )
+            log_gemini(
+                purpose="backfill_name_extract",
+                model=vertex_cfg["vertex_model"],
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                call_id=uuid,
+            )
+        except Exception as e:
+            logger.warning(f"backfill-names: Vertex call failed for {uuid}: {e}")
+            results["errors"] += 1
+            results["details"].append({"uuid": uuid[:8], "status": "vertex_error", "error": str(e)[:100]})
+            results["processed"] += 1
+            continue
+
+        if not raw_text:
+            results["details"].append({"uuid": uuid[:8], "status": "empty_response"})
+            results["processed"] += 1
+            continue
+
+        # Parse JSON response — Gemini may wrap in markdown or text
+        name_raw = raw_text.strip()
+        # Strip markdown code fences
+        if name_raw.startswith("```"):
+            name_raw = _re.sub(r'^```\w*\n?', '', name_raw)
+            name_raw = _re.sub(r'\n?```$', '', name_raw)
+            name_raw = name_raw.strip()
+        # Extract JSON object even if surrounded by text
+        json_match = _re.search(r'\{[^{}]*"first_name"[^{}]*\}', name_raw)
+        if json_match:
+            name_raw = json_match.group(0)
+
+        try:
+            parsed = json.loads(name_raw)
+            first = (parsed.get("first_name") or "").strip()
+            last = (parsed.get("last_name") or "").strip()
+            patient_name = f"{first} {last}".strip()
+        except (json.JSONDecodeError, ValueError) as _je:
+            logger.warning(f"backfill-names: JSON parse failed for {uuid}: {_je} — raw: {raw_text[:300]}")
+            results["errors"] += 1
+            results["details"].append({"uuid": uuid[:8], "status": "parse_error", "raw": raw_text[:200]})
+            results["processed"] += 1
+            continue
+
+        if not patient_name:
+            results["details"].append({"uuid": uuid[:8], "status": "no_name_found"})
+            results["processed"] += 1
+            continue
+
+        # Write ai_patient_name to mango_calls
+        try:
+            with _db_conn() as conn:
+                conn.execute(
+                    "UPDATE mango_calls SET ai_patient_name = ?, updated_at = ? WHERE uuid = ?",
+                    (patient_name, datetime.now(timezone.utc).isoformat(), uuid),
+                )
+            results["names_extracted"] += 1
+            results["details"].append({
+                "uuid": uuid[:8],
+                "status": "extracted",
+                "caller_id": row["caller_id_name"],
+                "patient_name": patient_name,
+            })
+        except Exception as e:
+            logger.warning(f"backfill-names: DB write failed for {uuid}: {e}")
+            results["errors"] += 1
+            results["processed"] += 1
+            continue
+
+        # Sync name to linked lead (task #27: od_patient_name > ai_patient_name > caller_id_name)
+        lead_id = row.get("lead_id") or ""
+        od_name = row.get("od_patient_name") or ""
+        if lead_id and not od_name:
+            # Only update lead name if OD name isn't already set (OD is authoritative)
+            try:
+                with _db_conn() as conn:
+                    # Check current lead name — only overwrite if it's empty or matches caller_id
+                    lead_row = conn.execute(
+                        "SELECT name FROM leads WHERE id = ?", (lead_id,)
+                    ).fetchone()
+                    if lead_row:
+                        current_name = (lead_row["name"] or "").strip()
+                        caller_id = (row["caller_id_name"] or "").strip()
+                        # Update if lead name is empty, matches caller_id, or is all-caps
+                        # (caller_id names are typically all-caps like "DJL ENTERPRISE")
+                        if (not current_name
+                                or current_name == caller_id
+                                or (current_name == current_name.upper() and len(current_name) > 2)):
+                            conn.execute(
+                                "UPDATE leads SET name = ?, updated_at = ? WHERE id = ?",
+                                (patient_name, datetime.now(timezone.utc).isoformat(), lead_id),
+                            )
+                            results["leads_updated"] += 1
+            except Exception as e:
+                logger.warning(f"backfill-names: lead update failed for {lead_id}: {e}")
+
+        results["processed"] += 1
+
+    return results
+
+
 # ATTR-FIX 2026-07-06: guarded historical backfill for the gclid/call-extension
 # classifier fix (callrail_webhook._resolve_tracker_source) and the
 # callrail_campaign_only attribution path (mango_service.reconcile_attribution).
