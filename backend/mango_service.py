@@ -897,13 +897,13 @@ Output JSON only:
 def _build_campaign_context_for_inference() -> str:
     """Build a structured text block describing campaigns with recent activity.
 
-    Uses gads_keywords_cache (last 30 days of impressions) as the ground truth
-    for which campaigns are actually running, instead of trusting the campaigns
-    table status field which can go stale when GAds console pauses aren't synced.
+    Uses gads_keywords_cache (last 30 days of impressions) as the primary filter,
+    then excludes campaigns marked PAUSED in the campaigns table (synced from GAds
+    daily at 6 AM via sync_all_campaign_statuses_from_gads). This prevents paused
+    campaigns with residual 30-day impressions from leaking into Gemini context.
     """
     with _db_conn() as conn:
-        # Get campaigns with recent keyword impressions (last 30 days) — ground truth
-        # for what's actually spending money right now
+        # Get campaigns with recent keyword impressions (last 30 days)
         kw_rows = conn.execute("""
             SELECT campaign_name, keyword_text, match_type, impressions
             FROM gads_keywords_cache
@@ -911,9 +911,9 @@ def _build_campaign_context_for_inference() -> str:
             ORDER BY campaign_name, impressions DESC
         """).fetchall()
 
-        # Get campaign metadata for enrichment (service_focus, etc.)
+        # Get campaign metadata — also used to filter out PAUSED campaigns
         all_campaigns = conn.execute("""
-            SELECT campaign_name, service_focus, target_audience, promo_offer
+            SELECT campaign_name, service_focus, target_audience, promo_offer, status
             FROM campaigns
             WHERE campaign_name != ''
         """).fetchall()
@@ -932,8 +932,15 @@ def _build_campaign_context_for_inference() -> str:
             f'{row["keyword_text"]} ({row["match_type"]}, {row["impressions"]} imp)'
         )
 
-    # Index campaign metadata by name
+    # Index campaign metadata by name and filter out PAUSED campaigns
     meta_by_name = {c["campaign_name"]: c for c in all_campaigns}
+    paused_names = {c["campaign_name"] for c in all_campaigns
+                    if (c["status"] or "").upper() == "PAUSED"}
+    excluded = active_campaign_names & paused_names
+    if excluded:
+        logger.info(f"[gemini_inference] excluding {len(excluded)} paused campaign(s): "
+                     f"{', '.join(sorted(excluded))}")
+    active_campaign_names -= paused_names
 
     lines = []
     for cname in sorted(active_campaign_names):
