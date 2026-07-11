@@ -10867,14 +10867,15 @@ def admin_get_calls(
     ad_call_total_duration = sum(c.get("call_duration_sec", 0) for c in gads_calls)
     # Enrich each call with matched status label
     for c in calls:
+        _cr_src = (c.get("callrail_source") or "").lower().replace(" ", "_")
         if c.get("gads_call_id"):
             conf = c.get("match_confidence", 0) or 0
             c["attribution_label"] = "Ad call ✓" if conf >= 0.90 else "Ad call (~)"
-        elif (c.get("callrail_source") == "google_ads"
+        elif (_cr_src == "google_ads"
               and (c.get("callrail_keyword") or "").strip()):
             # CallRail DNI captured a Google Ads visitor — no gads_call_id but keyword known
             c["attribution_label"] = "Ad call (DNI)"
-        elif (c.get("callrail_source") == "google_ads"
+        elif (_cr_src == "google_ads"
               and (c.get("callrail_campaign") or "").strip()):
             # ATTR-FIX 2026-07-06: call-extension (tap-to-call) call — CallRail confirmed
             # google_ads and gave us a campaign name, but no web session/keyword exists
@@ -10882,6 +10883,9 @@ def admin_get_calls(
             # Without this branch these calls fell through to "" and looked unattributed
             # in the calls list even though campaign was known.
             c["attribution_label"] = "Ad call (extension)"
+        elif _cr_src == "google_ads":
+            # Google Ads source confirmed by CallRail but no keyword or campaign name
+            c["attribution_label"] = "Ad call"
         elif c.get("lead_id"):
             # "Known lead" was firing for ALL calls because CallRail creates a lead
             # instantly on every webhook. Use od_patient_status + first_call instead.
@@ -11287,7 +11291,7 @@ def admin_mango_infer_campaigns(limit: int = 50):
                 SELECT mc.*
                 FROM mango_calls mc
                 INNER JOIN callrail_calls cr ON cr.mango_call_id = mc.uuid
-                WHERE cr.source = 'google_ads'
+                WHERE LOWER(REPLACE(cr.source, ' ', '_')) = 'google_ads'
                   AND (mc.gads_call_id IS NULL OR mc.gads_call_id = '')
                   AND mc.call_transcript IS NOT NULL AND mc.call_transcript != ''
                   AND LENGTH(mc.call_transcript) >= 50
@@ -11887,7 +11891,7 @@ def admin_backfill_gads_attribution(days: int = 90, dry_run: bool = True):
                         ).fetchone()
 
                         if cr_row:
-                            is_google_ads = (cr_row["source"] == "google_ads")
+                            is_google_ads = ((cr_row["source"] or "").lower().replace(" ", "_") == "google_ads")
                             if not is_google_ads and (cr_row["gclid"] or "").strip():
                                 is_google_ads = True
                             if not is_google_ads and cr_row["tracking_number_id"]:

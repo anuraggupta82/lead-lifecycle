@@ -153,7 +153,7 @@ def _attribute_one_call(conn, row: dict) -> str:
     # CallRail's keyword is the literal search query that landed the visitor, which
     # is more accurate than inferring from gads_clicks but lacks a gclid-level link.
     # Only fires for google_ads-sourced calls with a non-empty keyword.
-    if (row.get("cr_source") == "google_ads"
+    if ((row.get("cr_source") or "").lower().replace(" ", "_") == "google_ads"
             and (row.get("cr_keyword") or "").strip()):
         _write_attribution(conn, uuid,
                            keyword=row["cr_keyword"].strip(),

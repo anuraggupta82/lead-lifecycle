@@ -574,7 +574,7 @@ def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) ->
                 # Write CallRail keyword attribution to the Mango call if:
                 # 1. This CallRail row is a google_ads call with a keyword
                 # 2. The Mango call doesn't already have a higher-quality keyword method
-                if cr_keyword and cr_source == "google_ads":
+                if cr_keyword and (cr_source or "").lower().replace(" ", "_") == "google_ads":
                     ag_display = f"{cr_campaign} > " if cr_campaign else ""
                     conn.execute("""
                         UPDATE mango_calls SET
@@ -1114,7 +1114,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
             _cr_row = _cr_conn.execute("""
                 SELECT cr.source, cr.called_at, cr.keyword, cr.campaign
                 FROM callrail_calls cr
-                WHERE cr.mango_call_id = ? AND cr.source = 'google_ads'
+                WHERE cr.mango_call_id = ? AND LOWER(REPLACE(cr.source, ' ', '_')) = 'google_ads'
                 ORDER BY CASE WHEN cr.gclid != '' AND cr.gclid IS NOT NULL THEN 0 ELSE 1 END,
                          cr.called_at DESC
                 LIMIT 1
@@ -1277,7 +1277,7 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
             with _db_conn() as _gi_conn:
                 _gi_row = _gi_conn.execute("""
                     SELECT 1 FROM callrail_calls
-                    WHERE mango_call_id = ? AND source = 'google_ads'
+                    WHERE mango_call_id = ? AND LOWER(REPLACE(source, ' ', '_')) = 'google_ads'
                     LIMIT 1
                 """, (mc_uuid,)).fetchone()
                 _is_gads_no_gclid = bool(_gi_row)

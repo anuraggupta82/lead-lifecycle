@@ -8381,7 +8381,7 @@ def get_mango_calls(
             OR EXISTS (
                 SELECT 1 FROM callrail_calls cc2
                 WHERE cc2.mango_call_id = mc.uuid
-                  AND cc2.source = 'google_ads'
+                  AND LOWER(REPLACE(cc2.source, ' ', '_')) = 'google_ads'
                   AND COALESCE(cc2.keyword, '') != ''
             )
         )""")
@@ -8689,7 +8689,7 @@ def get_mango_calls_needing_od_match(limit: int = 500) -> list:
                      OR EXISTS (
                          SELECT 1 FROM callrail_calls cc
                          WHERE cc.mango_call_id = mc.uuid
-                           AND cc.source = 'google_ads'
+                           AND LOWER(REPLACE(cc.source, ' ', '_')) = 'google_ads'
                      )
                  )
                ORDER BY mc.started_at DESC
@@ -9534,7 +9534,7 @@ def get_calls_needing_processing(
                      OR EXISTS (
                          SELECT 1 FROM callrail_calls cc
                          WHERE cc.mango_call_id = mango_calls.uuid
-                           AND cc.source = 'google_ads'
+                           AND LOWER(REPLACE(cc.source, ' ', '_')) = 'google_ads'
                      )
                  )
                ORDER BY started_at DESC

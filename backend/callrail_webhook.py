@@ -160,7 +160,11 @@ def _resolve_tracker_source(conn, tracking_number_id, webhook_source: str,
     # so we rely on click_id (checked above) for PPC visitors; otherwise trust webhook_source.
     if row and row[0] == "gads_call_extension":
         return "google_ads"
-    return webhook_source or "Direct"
+    # Normalize CallRail's capitalized "Google Ads" → internal "google_ads"
+    raw = webhook_source or "Direct"
+    if raw.lower().replace(" ", "_") == "google_ads":
+        return "google_ads"
+    return raw
 
 
 def _find_campaign_by_name(conn, campaign_name: str) -> tuple:

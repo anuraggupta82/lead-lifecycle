@@ -132,7 +132,7 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
                   OR EXISTS (
                       SELECT 1 FROM callrail_calls cc
                       WHERE cc.lead_id = leads.id
-                        AND cc.source = 'google_ads'
+                        AND LOWER(REPLACE(cc.source, ' ', '_')) = 'google_ads'
                   )
               )
               AND COALESCE(existing_patient, 0) = 0
@@ -150,7 +150,7 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
                   OR EXISTS (
                       SELECT 1 FROM callrail_calls cc
                       WHERE cc.lead_id = leads.id
-                        AND cc.source = 'google_ads'
+                        AND LOWER(REPLACE(cc.source, ' ', '_')) = 'google_ads'
                   )
               )
               AND COALESCE(existing_patient, 0) = 0
