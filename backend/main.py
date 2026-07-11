@@ -11656,11 +11656,12 @@ def admin_gads_match_and_transcribe(call_id: str, request: Request, background_t
 
 
 @app.post("/api/admin/gads/sync-call-view", dependencies=[Depends(_require_admin)])
-def admin_gads_sync_call_view():
-    """Manually trigger Google Ads call_view sync (normally runs at 6:05am)."""
+def admin_gads_sync_call_view(days_back: int = 14):
+    """Manually trigger Google Ads call_view sync. Use days_back=90 for historical backfill."""
     try:
         from google_ads_sync import sync_call_view
-        n = sync_call_view(days_back=14)
+        days_back = max(1, min(int(days_back), 90))
+        n = sync_call_view(days_back=days_back)
         return {"synced": n}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

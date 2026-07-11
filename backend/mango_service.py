@@ -17,10 +17,15 @@ import json
 import logging
 import re
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
+
+# Limit concurrent auto-process jobs to prevent file-descriptor exhaustion
+# (each process_call downloads from S3, calls OpenAI Whisper, Vertex AI, etc.)
+_PROCESS_SEMAPHORE = threading.Semaphore(2)
 
 from database import (
     upsert_mango_call,
@@ -1423,7 +1428,9 @@ def _queue_process_if_needed(mc: dict, mango_token: Optional[str] = None) -> Non
     logger.info(f"[reconcile] Queuing auto-process for newly matched call {uuid[:8]} ({duration}s)")
 
     def _run():
+        _PROCESS_SEMAPHORE.acquire()
         try:
+            logger.info(f"[reconcile] Starting auto-process for {uuid[:8]} (semaphore acquired)")
             from mango_pipeline import process_call
             from database import get_mango_call
             call_row = get_mango_call(uuid)
@@ -1431,6 +1438,8 @@ def _queue_process_if_needed(mc: dict, mango_token: Optional[str] = None) -> Non
                 process_call(call_row, mango_token=mango_token)
         except Exception as e:
             logger.warning(f"[reconcile] Auto-process failed for {uuid[:8]}: {e}")
+        finally:
+            _PROCESS_SEMAPHORE.release()
 
     t = threading.Thread(target=_run, daemon=True, name=f"auto-process-{uuid[:8]}")
     t.start()
