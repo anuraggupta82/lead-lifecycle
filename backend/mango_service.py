@@ -541,18 +541,21 @@ def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) ->
             window_end   = (called_utc + timedelta(minutes=window_minutes)).isoformat()
 
             digits = re.sub(r"\D", "", caller)
-            variants = list({caller, f"+{digits}", digits,
-                             digits[-10:] if len(digits) >= 10 else digits})
-            placeholders = ",".join("?" * len(variants))
+            # Use last-10-digits comparison to handle format mismatches:
+            # CallRail stores "+17744524631", Mango stores "(774) 452-4631".
+            # REPLACE strips common formatting chars from from_number for comparison.
+            last10 = digits[-10:] if len(digits) >= 10 else digits
 
-            mango_row = conn.execute(f"""
+            mango_row = conn.execute("""
                 SELECT uuid FROM mango_calls
                 WHERE direction = 'inbound'
-                  AND from_number IN ({placeholders})
+                  AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                      from_number, '(', ''), ')', ''), '-', ''), ' ', ''), '+', '')
+                      LIKE '%' || ?
                   AND started_at BETWEEN ? AND ?
                 ORDER BY ABS(strftime('%s', started_at) - strftime('%s', ?))
                 LIMIT 1
-            """, (*variants, window_start, window_end, called_utc.isoformat())).fetchone()
+            """, (last10, window_start, window_end, called_utc.isoformat())).fetchone()
 
             if mango_row:
                 mango_uuid = mango_row["uuid"]

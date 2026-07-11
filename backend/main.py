@@ -11270,7 +11270,7 @@ def admin_mango_match_patients(limit: int = 500):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/admin/mango/infer-campaigns", dependencies=[Depends(_require_admin)])
+@app.api_route("/api/admin/mango/infer-campaigns", methods=["GET", "POST"], dependencies=[Depends(_require_admin_media)])
 def admin_mango_infer_campaigns(limit: int = 50):
     """
     Run Gemini transcript-based campaign inference on GAds calls that have a

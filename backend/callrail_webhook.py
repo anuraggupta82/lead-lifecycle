@@ -155,7 +155,10 @@ def _resolve_tracker_source(conn, tracking_number_id, webhook_source: str,
         "SELECT assignment_type FROM callrail_numbers WHERE id = ? LIMIT 1",
         (tracking_number_id,)
     ).fetchone()
-    if row and row[0] in ("gads_campaign", "gads_call_extension"):
+    # Only call-extension trackers force 'google_ads' — those are always ad assets.
+    # DNI pool ('gads_campaign') serves ALL website visitors (pool set to 'All visitors'),
+    # so we rely on click_id (checked above) for PPC visitors; otherwise trust webhook_source.
+    if row and row[0] == "gads_call_extension":
         return "google_ads"
     return webhook_source or "Direct"
 
@@ -193,21 +196,23 @@ def _find_mango_match(conn, caller_e164: str, called_at_iso: str) -> str:
         window_start = (called_utc - timedelta(minutes=_MANGO_MATCH_WINDOW_MINUTES)).isoformat()
         window_end   = (called_utc + timedelta(minutes=_MANGO_MATCH_WINDOW_MINUTES)).isoformat()
 
-        # Build phone variant list (mango may store without +1)
+        # Build last-10-digits for comparison — handles format mismatches:
+        # CallRail stores "+17744524631", Mango stores "(774) 452-4631".
         digits = re.sub(r"\D", "", caller_e164)
-        variants = list({caller_e164, f"+{digits}", digits, digits[-10:] if len(digits) >= 10 else digits})
+        last10 = digits[-10:] if len(digits) >= 10 else digits
 
-        placeholders = ",".join("?" * len(variants))
         row = conn.execute(
-            f"""
+            """
             SELECT uuid FROM mango_calls
             WHERE direction = 'inbound'
-              AND from_number IN ({placeholders})
+              AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                  from_number, '(', ''), ')', ''), '-', ''), ' ', ''), '+', '')
+                  LIKE '%' || ?
               AND started_at BETWEEN ? AND ?
             ORDER BY ABS(strftime('%s', started_at) - strftime('%s', ?))
             LIMIT 1
             """,
-            (*variants, window_start, window_end, called_utc.isoformat())
+            (last10, window_start, window_end, called_utc.isoformat())
         ).fetchone()
         return row[0] if row else ""
     except Exception as e:

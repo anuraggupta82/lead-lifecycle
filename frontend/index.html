@@ -1635,9 +1635,10 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
     return ['all', ...Array.from(set).sort()];
   }, [pipeline]);
 
-  // PR 3 — campaign chip names: prefer campaigns prop, fall back to pipeline data.
-  // Note: get_campaign_stats() rows use key 'campaign' (not 'campaign_name'), so
-  // we try both to be robust against either shape.
+  // PR 3 — campaign chip names: ONLY from the campaigns prop (known GAds campaigns).
+  // Previously also pulled from pipeline lead data, but that let CallRail labels like
+  // "gmb" appear as campaign chips. Pipeline leads with non-GAds campaign_name values
+  // still show under "All" — they just don't get their own chip.
   const campaignChipNames = useMemo(() => {
     const set = new Set();
     if (Array.isArray(campaigns)) {
@@ -1646,12 +1647,8 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
         if (n) set.add(n);
       });
     }
-    pipeline.forEach(l => {
-      const n = (l?.campaign_name || '').trim();
-      if (n) set.add(n);
-    });
     return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [campaigns, pipeline]);
+  }, [campaigns]);
 
   // Whether current selection differs from saved default (drives Save/Reset visibility)
   const isDirtyVsDefault = useMemo(() => {
