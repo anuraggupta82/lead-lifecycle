@@ -11553,8 +11553,8 @@ def admin_mango_infer_campaigns(limit: int = 50, force: bool = False):
                             with _db_conn() as _lconn:
                                 # Find matching campaign_id from campaigns table
                                 _camp_row = _lconn.execute(
-                                    "SELECT campaign_id FROM campaigns WHERE campaign_name = ? LIMIT 1",
-                                    (_inferred_name,)
+                                    "SELECT campaign_id FROM campaigns WHERE campaign_name = ? OR campaign_name LIKE ? LIMIT 1",
+                                    (_inferred_name, _inferred_name + '%')
                                 ).fetchone()
                                 _camp_id = _camp_row[0] if _camp_row else ""
                                 _lconn.execute(
