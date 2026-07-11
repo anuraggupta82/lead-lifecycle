@@ -7538,6 +7538,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
               onClick={async()=>{
                 setSyncAllLoading(true); setSyncAllResult(null);
                 try {
+                  // Sync campaign statuses (ENABLED/PAUSED) from Google Ads first
+                  await api('/api/admin/campaigns/sync-statuses',{method:'POST'});
+                  // Then sync performance data (search terms, daily stats)
                   const r = await api('/api/admin/campaigns/sync-all-active',{method:'POST'});
                   setSyncAllResult(r);
                   loadUnifiedCamps();
