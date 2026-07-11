@@ -11367,13 +11367,16 @@ def admin_mango_patient_override(uuid: str, body: dict):
 
 @app.post("/api/admin/calls/reconcile", dependencies=[Depends(_require_admin)])
 def admin_mango_reconcile_now(days: int = 14):
-    """Manually trigger attribution reconciliation. days can be widened up to 90."""
+    """Manually trigger attribution reconciliation. days can be widened up to 90.
+    Also re-links CallRail↔Mango rows (90-day window) before reconciling."""
     try:
-        from mango_service import reconcile_attribution
+        from mango_service import reconcile_attribution, _link_unmatched_callrail_to_mango
         days = max(1, min(int(days), 90))
+        # Re-link with wide window before reconciling — catches older unlinked calls
+        relinked = _link_unmatched_callrail_to_mango(window_minutes=3, days=90)
         _tok = app.state.mango_token_mgr.get_token() if hasattr(app.state, "mango_token_mgr") else None
         n = reconcile_attribution(days=days, mango_token=_tok)
-        return {"attributed": n, "days": days}
+        return {"attributed": n, "relinked": relinked, "days": days}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

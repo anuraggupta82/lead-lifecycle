@@ -485,8 +485,17 @@ def _call_vertex(prompt: str, model: str, project_id: str, location: str,
     text = ""
     try:
         text = response.text.strip()
-    except Exception:
-        log.warning("[vertex] response blocked or empty for model=%s", model)
+    except Exception as _vtx_err:
+        # Log block reason if available
+        _block_reason = ""
+        try:
+            if response.candidates:
+                _block_reason = f" finish_reason={response.candidates[0].finish_reason}"
+            elif hasattr(response, "prompt_feedback"):
+                _block_reason = f" prompt_feedback={response.prompt_feedback}"
+        except Exception:
+            pass
+        log.warning("[vertex] response blocked or empty for model=%s%s err=%s", model, _block_reason, _vtx_err)
         text = ""
 
     usage = getattr(response, "usage_metadata", None)

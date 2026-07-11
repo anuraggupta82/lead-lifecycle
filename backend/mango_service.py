@@ -979,15 +979,32 @@ def infer_campaign_from_transcript(mc: dict) -> Optional[dict]:
             location=cfg.vertex_location,
             credentials_path=cfg.vertex_credentials_path,
             temperature=0.1,
-            max_tokens=300,
-            response_mime_type="application/json",
+            max_tokens=1200,
         )
 
         if not text:
             logger.warning("infer_campaign_from_transcript: empty Vertex response")
             return None
 
-        result = json.loads(text)
+        logger.info("infer_campaign_from_transcript: raw response (%d chars, in=%d out=%d): %s", len(text), in_tok, out_tok, text[:500])
+
+        # Gemini sometimes wraps JSON in markdown fences despite response_mime_type
+        clean = text.strip()
+        if clean.startswith("```"):
+            # Strip ```json ... ``` or ``` ... ```
+            lines = clean.split("\n")
+            # Remove first line (```json) and last line (```)
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            clean = "\n".join(lines).strip()
+        # Also strip any preamble text before the JSON object
+        if "{" in clean and "}" in clean:
+            clean = clean[clean.index("{"):clean.rindex("}") + 1]
+
+        if not clean or clean[0] != "{":
+            logger.warning("infer_campaign_from_transcript: no JSON object in response: %s", text[:300])
+            return None
+
+        result = json.loads(clean)
         # Validate expected keys
         if "campaign_name" not in result:
             logger.warning("infer_campaign_from_transcript: missing campaign_name in response: %s", text[:200])
