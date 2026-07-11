@@ -436,6 +436,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"GAds morning refresh failed: {e}")
 
+        # Plan §2.3 task #13 (2026-07-11): sync ENABLED/PAUSED status for ALL
+        # campaigns from Google Ads so paused campaigns stop leaking into Gemini
+        # inference context / the AI optimizer. Separate guard so a status-sync
+        # failure never breaks the keyword refresh above.
+        try:
+            status_result = sync_all_campaign_statuses_from_gads()
+            logger.info(f"GAds morning campaign-status sync: {status_result}")
+        except Exception as e:
+            logger.error(f"GAds morning campaign-status sync failed: {e}")
+
     ads_scheduler.add_job(_gads_morning_refresh_job, CronTrigger(hour=6, minute=0),
                           id="gads_morning_refresh", name="Google Ads Morning Keyword Refresh",
                           replace_existing=True)
@@ -7782,6 +7792,85 @@ def admin_link_gads_campaign(body: LinkGadsCampaignRequest, background_tasks: Ba
     }
 
 
+def _map_gads_status_to_db(gads_status: str) -> str | None:
+    """
+    Map Google Ads campaign.status ("ENABLED"/"PAUSED") to our DB campaigns.status
+    ("ACTIVE"/"PAUSED"). Returns None for any other/unknown value so callers skip
+    writing rather than blanking the field.
+    """
+    if gads_status == "ENABLED":
+        return "ACTIVE"
+    if gads_status == "PAUSED":
+        return "PAUSED"
+    return None
+
+
+def sync_all_campaign_statuses_from_gads() -> dict:
+    """
+    Daily bulk status sync: pull ENABLED/PAUSED for ALL campaigns from Google Ads
+    in ONE read-only call and reconcile the local campaigns.status column.
+
+    - Read-only against Google Ads (fetch_campaigns_from_gads — one API call).
+    - Writes campaigns.status ONLY when it actually changed (via update_campaign_status).
+    - Campaigns not present in the GAds response (REMOVED/unlinked) are skipped,
+      never blanked.
+
+    Added 2026-07-11 (Plan §2.3 task #13) — wired into _gads_morning_refresh_job so
+    paused campaigns stop leaking into Gemini inference context / the AI optimizer.
+
+    Returns {checked, changed, transitions:[{campaign_id, name, from, to}]}.
+    """
+    from database import get_all_campaigns, update_campaign_status
+    from google_ads_create import fetch_campaigns_from_gads
+
+    live_campaigns = fetch_campaigns_from_gads()
+    status_by_resource = {
+        c.get("resource_name"): c.get("gads_status", "")
+        for c in live_campaigns if c.get("resource_name")
+    }
+
+    checked = 0
+    transitions: list = []
+    for camp in get_all_campaigns():
+        resource_name = camp.get("gads_campaign_resource") or ""
+        if not resource_name:
+            continue  # not linked to Google Ads
+        gads_status = status_by_resource.get(resource_name)
+        if gads_status is None:
+            continue  # REMOVED / not returned by GAds — never blank a status we can't see
+        new_status = _map_gads_status_to_db(gads_status)
+        if new_status is None:
+            continue  # unknown GAds status — leave DB untouched
+        checked += 1
+        current = (camp.get("status") or "").upper()
+        if current == new_status:
+            continue
+        campaign_id = camp.get("campaign_id")
+        if update_campaign_status(campaign_id, new_status):
+            transitions.append({
+                "campaign_id": campaign_id,
+                "name":        camp.get("campaign_name") or "",
+                "from":        current or None,
+                "to":          new_status,
+            })
+
+    return {"checked": checked, "changed": len(transitions), "transitions": transitions}
+
+
+@app.post("/api/admin/campaigns/sync-statuses", dependencies=[Depends(_require_admin)])
+def admin_sync_all_campaign_statuses():
+    """
+    On-demand bulk status sync: reconcile every linked campaign's ENABLED/PAUSED
+    status from Google Ads (same logic the 6 AM cron runs). Read-only against GAds;
+    writes campaigns.status only on genuine changes. Also the hook for wiring the
+    "Sync Google Ads" button to pull status (Plan §2.3 item #7).
+    """
+    try:
+        return sync_all_campaign_statuses_from_gads()
+    except Exception as e:
+        logger.error(f"On-demand campaign-status sync failed: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Google Ads sync failed: {e}")
+
 
 @app.post("/api/admin/campaigns/{campaign_id}/sync-from-gads", dependencies=[Depends(_require_admin)])
 def admin_sync_campaign_from_gads(campaign_id: str):
@@ -7836,10 +7925,9 @@ def admin_sync_campaign_from_gads(campaign_id: str):
                 synced_fields["monthly_budget"] = round(daily_usd * 30.4, 2)
 
             gads_status = live.get("gads_status", "")  # "ENABLED" or "PAUSED"
-            if gads_status == "ENABLED":
-                synced_fields["status"] = "ACTIVE"
-            elif gads_status == "PAUSED":
-                synced_fields["status"] = "PAUSED"
+            mapped_status = _map_gads_status_to_db(gads_status)
+            if mapped_status is not None:
+                synced_fields["status"] = mapped_status
 
             if synced_fields:
                 update_campaign_fields(campaign_id, synced_fields)
