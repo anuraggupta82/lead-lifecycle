@@ -11544,6 +11544,28 @@ def admin_mango_infer_campaigns(limit: int = 50, force: bool = False):
                         attributed_keyword_method="gemini_inferred",
                         attributed_keyword_confidence=_num_conf,
                     )
+
+                    # Also sync campaign name to the linked lead (task #16)
+                    _lead_id = mc.get("lead_id") or ""
+                    _inferred_name = result["campaign_name"]
+                    if _lead_id and _inferred_name:
+                        try:
+                            with _db_conn() as _lconn:
+                                # Find matching campaign_id from campaigns table
+                                _camp_row = _lconn.execute(
+                                    "SELECT campaign_id FROM campaigns WHERE campaign_name = ? LIMIT 1",
+                                    (_inferred_name,)
+                                ).fetchone()
+                                _camp_id = _camp_row[0] if _camp_row else ""
+                                _lconn.execute(
+                                    """UPDATE leads SET campaign_name=?, campaign_id=?, updated_at=?
+                                       WHERE id=?""",
+                                    (_inferred_name, _camp_id,
+                                     datetime.now(timezone.utc).isoformat(), _lead_id)
+                                )
+                        except Exception as _le:
+                            logger.warning(f"infer-campaigns: failed to update lead {_lead_id}: {_le}")
+
                     results["inferred"] += 1
                     results["details"].append({
                         "uuid": mc["uuid"][:8],
