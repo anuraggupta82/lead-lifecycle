@@ -165,9 +165,31 @@ Always use `author: "ai_agent"` when writing entries.
 
 ---
 
-## Call Tracking
+## Call Tracking & Attribution
 
-Google Ads call tracking is live (website call conversions with `phone_conversion_number: 508-318-4477`). Mango call tracking integration is planned for later to capture inbound call details, caller ID, and call recordings for lead attribution.
+### CallRail Integration
+- **Account:** 431682122 / Company 340886676
+- **Call extension number:** 508-321-5428 (CallRail, forwards to office 508-318-4477)
+- **Website pool:** 5 numbers for Google Ads DNI (dynamic number insertion)
+- **Webhook:** real-time POST to `/webhook/callrail/call` + API poll every 15 min via `sync_callrail_calls()` (at :02,:17,:32,:47)
+- **Source normalization:** CallRail API returns `"Google Ads"` (capitalized) — all internal code normalizes to `"google_ads"` via `.lower().replace(" ", "_")`
+
+### Mango Call Recording
+- Records all inbound calls (separate from CallRail)
+- Linked to CallRail by caller phone + ±3 min time window
+- Transcription: OpenAI Whisper (BAA-covered) → Vertex AI summary/grading
+- Auto-transcribe only GAds calls (gate in `get_calls_needing_processing`)
+
+### Attribution Waterfall
+1. **gclid present** → Google click_view match (keyword, campaign, CPC)
+2. **CallRail source=google_ads + no gclid** (call extension) → Google `gads_call_view` time-match ±60s → `gads_time_match` (confidence 0.85)
+3. **No Google match** → Gemini transcript inference → `gemini_inferred` (confidence 0.80/0.65/0.45)
+4. **Phone match only** → `phone_exact` (confidence 0.90) — OD patient match, no campaign
+
+### Known Issues (as of Jul 11 2026)
+- **No automated campaign status sync from GAds** — `campaigns.status` goes stale when paused in console. Affects Gemini inference context and AI optimizer.
+- **Gemini-attributed leads don't appear in campaign page** — `effective_campaign_id` not set, only `lead_campaign_name`
+- **Patient name extraction missing** — caller ID names like "DJL ENTERPRISE" not resolved to real patient name from transcript
 
 ---
 
@@ -199,6 +221,25 @@ Identify when underperformance is NOT an ad problem:
 - Do not make decisions based on data you know is stale — flag it instead
 
 ---
+
+## Working Rules
+
+- **Planning mode is default.** Present a plan and ask before executing code changes.
+- **Git pushes via GitHub Desktop.** Just say "ready to push" with a summary + description. Don't give git commands.
+- **Never modify pipeline.db directly while the server is running.** Use API endpoints or MCP tools.
+- **Admin password:** stored in `backend/.env` as `ADMIN_PASSWORD`. Use header `X-Admin-Password` or `?pw=` query param for media endpoints.
+- **Test changes before committing.** Run `python3 -c "import py_compile; py_compile.compile('filename.py', doraise=True)"` on changed files.
+- **Update session summaries and memory** after every meaningful step.
+- **Screenshots:** Owner saves screenshots to `/Users/anurag/Documents/Projects/gdc-apps/marketing/Screenshots/`. When asked to check a screenshot, read the latest file from that folder.
+
+## Current Plan & Status
+
+**Read these files at the start of every session:**
+- `../Plan.md` — central plan & execution tracker (§1-6, status tags, sequenced roadmap)
+- `../Marketing project details and status.md` — facts, architecture, resources
+
+**Active work (Jul 11 2026):**
+Tasks #13-18 in Plan.md §2.3 — campaign status sync + Gemini inference fixes. See Plan.md "Remaining next-steps sequence" for full ordered list.
 
 ## File Locations
 

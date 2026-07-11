@@ -11275,19 +11275,30 @@ def admin_mango_match_patients(limit: int = 500):
 
 
 @app.api_route("/api/admin/mango/infer-campaigns", methods=["GET", "POST"], dependencies=[Depends(_require_admin_media)])
-def admin_mango_infer_campaigns(limit: int = 50):
+def admin_mango_infer_campaigns(limit: int = 50, force: bool = False):
     """
     Run Gemini transcript-based campaign inference on GAds calls that have a
     transcript but no campaign attribution yet. Targets calls where CallRail
     says source='google_ads' but no gads_call_view match or gclid exists.
+
+    force=True re-infers calls that already have gemini_inferred attribution
+    (useful after fixing campaign context staleness).
     """
     try:
         from database import _conn as _db_conn
         from mango_service import infer_campaign_from_transcript
         from database import update_mango_call_attribution
 
+        # Without force: only un-inferred calls; with force: also re-infer gemini_inferred
+        method_filter = (
+            "AND (mc.match_method IS NULL OR mc.match_method = '' "
+            "OR mc.match_method = 'phone_exact' OR mc.match_method LIKE 'gemini%')"
+            if force else
+            "AND (mc.match_method IS NULL OR mc.match_method = '' OR mc.match_method = 'phone_exact')"
+        )
+
         with _db_conn() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT mc.*
                 FROM mango_calls mc
                 INNER JOIN callrail_calls cr ON cr.mango_call_id = mc.uuid
@@ -11295,7 +11306,7 @@ def admin_mango_infer_campaigns(limit: int = 50):
                   AND (mc.gads_call_id IS NULL OR mc.gads_call_id = '')
                   AND mc.call_transcript IS NOT NULL AND mc.call_transcript != ''
                   AND LENGTH(mc.call_transcript) >= 50
-                  AND (mc.match_method IS NULL OR mc.match_method = '' OR mc.match_method = 'phone_exact')
+                  {method_filter}
                 ORDER BY mc.started_at DESC
                 LIMIT ?
             """, (limit,)).fetchall()

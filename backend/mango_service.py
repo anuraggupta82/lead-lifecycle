@@ -895,29 +895,36 @@ Output JSON only:
 
 
 def _build_campaign_context_for_inference() -> str:
-    """Build a structured text block describing active campaigns + top keywords."""
-    with _db_conn() as conn:
-        # Get active campaigns
-        campaigns = conn.execute("""
-            SELECT campaign_name, service_focus, target_audience, promo_offer
-            FROM campaigns
-            WHERE status NOT IN ('PAUSED', 'COMPLETED', 'ARCHIVED', 'REMOVED', 'removed')
-              AND campaign_name != ''
-        """).fetchall()
+    """Build a structured text block describing campaigns with recent activity.
 
-        # Get top keywords per campaign (last 30 days)
+    Uses gads_keywords_cache (last 30 days of impressions) as the ground truth
+    for which campaigns are actually running, instead of trusting the campaigns
+    table status field which can go stale when GAds console pauses aren't synced.
+    """
+    with _db_conn() as conn:
+        # Get campaigns with recent keyword impressions (last 30 days) — ground truth
+        # for what's actually spending money right now
         kw_rows = conn.execute("""
             SELECT campaign_name, keyword_text, match_type, impressions
             FROM gads_keywords_cache
-            WHERE days = 30 AND campaign_name != ''
+            WHERE days = 30 AND campaign_name != '' AND impressions > 0
             ORDER BY campaign_name, impressions DESC
+        """).fetchall()
+
+        # Get campaign metadata for enrichment (service_focus, etc.)
+        all_campaigns = conn.execute("""
+            SELECT campaign_name, service_focus, target_audience, promo_offer
+            FROM campaigns
+            WHERE campaign_name != ''
         """).fetchall()
 
     # Group keywords by campaign, top 10 each
     kw_by_campaign: dict[str, list[str]] = {}
     kw_count: dict[str, int] = {}
+    active_campaign_names: set[str] = set()
     for row in kw_rows:
         cname = row["campaign_name"]
+        active_campaign_names.add(cname)
         if kw_count.get(cname, 0) >= 10:
             continue
         kw_count[cname] = kw_count.get(cname, 0) + 1
@@ -925,30 +932,27 @@ def _build_campaign_context_for_inference() -> str:
             f'{row["keyword_text"]} ({row["match_type"]}, {row["impressions"]} imp)'
         )
 
-    # Build campaign names set for keyword-only campaigns (active in GAds but not in campaigns table)
-    campaign_names_in_table = {c["campaign_name"] for c in campaigns}
+    # Index campaign metadata by name
+    meta_by_name = {c["campaign_name"]: c for c in all_campaigns}
 
     lines = []
-    for c in campaigns:
-        cname = c["campaign_name"]
+    for cname in sorted(active_campaign_names):
         block = f"Campaign: {cname}"
-        if c["service_focus"]:
-            block += f"\n  Service Focus: {c['service_focus']}"
-        if c["target_audience"]:
-            block += f"\n  Target Audience: {c['target_audience']}"
-        if c["promo_offer"]:
-            block += f"\n  Promo: {c['promo_offer']}"
+        meta = meta_by_name.get(cname)
+        if meta:
+            if meta["service_focus"]:
+                block += f"\n  Service Focus: {meta['service_focus']}"
+            if meta["target_audience"]:
+                block += f"\n  Target Audience: {meta['target_audience']}"
+            if meta["promo_offer"]:
+                block += f"\n  Promo: {meta['promo_offer']}"
         kws = kw_by_campaign.get(cname, [])
         if kws:
             block += f"\n  Top Keywords: {', '.join(kws)}"
         lines.append(block)
 
-    # Include keyword-only campaigns (present in gads_keywords_cache but not campaigns table)
-    for cname, kws in kw_by_campaign.items():
-        if cname not in campaign_names_in_table:
-            block = f"Campaign: {cname}\n  Top Keywords: {', '.join(kws)}"
-            lines.append(block)
-
+    logger.info(f"[gemini_inference] campaign context: {len(active_campaign_names)} active campaigns "
+                f"(filtered by 30-day impressions)")
     return "\n\n".join(lines) if lines else "(no active campaigns found)"
 
 
