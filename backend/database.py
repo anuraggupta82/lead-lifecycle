@@ -3359,8 +3359,8 @@ def upsert_lead(data: dict) -> dict:
                     smile_image_url, smile_blob_name, smile_composite_blob_name,
                     notes, tags, ga4_client_id,
                     appointment_date, appointment_status, od_patient_num, self_booked,
-                    existing_patient)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    existing_patient, campaign_name, campaign_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 lead_id, data.get("created_at", now), now,
                 data.get("source") or "unknown", data.get("stage", "new"),
@@ -3383,6 +3383,8 @@ def upsert_lead(data: dict) -> dict:
                 data.get("od_patient_num", "") or "",
                 1 if data.get("self_booked") else 0,
                 1 if data.get("existing_patient") else 0,
+                data.get("campaign_name", ""),
+                data.get("campaign_id", ""),
             ))
             # Auto-note: inline into same connection so no nested-transaction risk
             try:

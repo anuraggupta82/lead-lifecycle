@@ -11684,6 +11684,39 @@ def admin_backfill_lead_links(days: int = 90, dry_run: bool = False):
     return {"linked": linked, "finalized": finalized, "dry_run": dry_run, "details": details}
 
 
+# ── §2.3a backfill: Re-finalize calls to propagate campaign data ─────────────
+
+@app.post("/api/admin/calls/backfill-campaigns", dependencies=[Depends(_require_admin)])
+def admin_backfill_campaigns():
+    """Re-run finalize_call_lead for auto-created leads missing campaign_name.
+    Also directly backfills from gads_call_view when finalize doesn't cover it."""
+    from database import _conn as _db_conn, upsert_lead
+    with _db_conn() as conn:
+        rows = conn.execute("""
+            SELECT mc.uuid, mc.lead_id, mc.gads_call_id,
+                   gcv.campaign_name AS gcv_campaign_name,
+                   gcv.campaign_id AS gcv_campaign_id
+            FROM mango_calls mc
+            JOIN leads l ON l.id = mc.lead_id
+            LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+            WHERE l.source = 'google_ads_call'
+              AND (l.campaign_name IS NULL OR l.campaign_name = '')
+              AND mc.gads_call_id IS NOT NULL AND mc.gads_call_id != ''
+        """).fetchall()
+    updated = 0
+    details = []
+    for r in rows:
+        cn = r["gcv_campaign_name"] or ""
+        ci = r["gcv_campaign_id"] or ""
+        if cn:
+            upsert_lead({"id": r["lead_id"], "campaign_name": cn, "campaign_id": str(ci) if ci else ""})
+            updated += 1
+            details.append({"lead_id": r["lead_id"][:8], "campaign": cn})
+        else:
+            details.append({"lead_id": r["lead_id"][:8], "campaign": "(no gcv data)", "gads_call_id": r["gads_call_id"]})
+    return {"total": len(rows), "updated": updated, "details": details[:10]}
+
+
 # ── §2.3a: Auto-create leads from GAds-attributed calls ──────────────────────
 
 @app.post("/api/admin/calls/create-missing-leads", dependencies=[Depends(_require_admin)])

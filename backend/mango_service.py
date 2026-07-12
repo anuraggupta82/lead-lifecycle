@@ -769,8 +769,9 @@ def finalize_call_lead(uuid: str) -> dict:
                     cc.gclid                AS cr_gclid,
                     cc.campaign             AS cr_campaign,
                     cc.landing_page         AS cr_landing_page,
-                    -- ATTR-FIX3: join gads_call_view for campaign_id
-                    gcv.campaign_id         AS gcv_campaign_id
+                    -- ATTR-FIX3: join gads_call_view for campaign_id/name
+                    gcv.campaign_id         AS gcv_campaign_id,
+                    gcv.campaign_name       AS gcv_campaign_name
                 FROM mango_calls mc
                 -- Deterministic subquery: multiple callrail_calls rows can exist per
                 -- mango_call (call.created + call.completed). Prefer the row with gclid,
@@ -836,9 +837,11 @@ def finalize_call_lead(uuid: str) -> dict:
                         updates["campaign_id"] = str(row["gcv_campaign_id"])
                 else:
                     updates["ad_group_name"] = ag_raw.strip()
-            # ATTR-FIX3: campaign_id even if ad_group_name already set
+            # ATTR-FIX3: campaign_id/name even if ad_group_name already set
             if not lead.get("campaign_id") and row.get("gcv_campaign_id") and "campaign_id" not in updates:
                 updates["campaign_id"] = str(row["gcv_campaign_id"])
+            if not lead.get("campaign_name") and row.get("gcv_campaign_name") and "campaign_name" not in updates:
+                updates["campaign_name"] = row["gcv_campaign_name"]
 
             # ── 3. gclid backstop (webhook-miss recovery) ────────────────────
             if row["cr_gclid"] and not lead["gclid"]:
