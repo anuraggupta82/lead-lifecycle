@@ -11684,6 +11684,246 @@ def admin_backfill_lead_links(days: int = 90, dry_run: bool = False):
     return {"linked": linked, "finalized": finalized, "dry_run": dry_run, "details": details}
 
 
+# ── §2.3a: Auto-create leads from GAds-attributed calls ──────────────────────
+
+@app.post("/api/admin/calls/create-missing-leads", dependencies=[Depends(_require_admin)])
+def admin_create_missing_leads(days: int = 90, dry_run: bool = True, limit: int = 500):
+    """Create lead records for GAds-attributed calls that have no linked lead.
+
+    Qualifying filter (ALL must be true):
+      1. gads_call_id IS NOT NULL (confirmed in Google's call_view)
+      2. direction = 'inbound'
+      3. duration_sec >= 60 (pre-recorded message is ~40s; under 60s = no human conversation)
+      4. od_patient_status NOT IN ('existing_active','existing_inactive') OR NULL
+      5. lead_id IS NULL or empty
+
+    Deduplicates by phone (last-10 digits) — links to existing lead if found.
+    Classifies calls into quality tiers A-D for follow-up routing.
+    """
+    import re as _re
+    import uuid as _uuid
+    from database import (
+        _conn as _db_conn, upsert_lead, get_lead_by_phone,
+        update_mango_call_attribution
+    )
+    from mango_service import finalize_call_lead
+
+    with _db_conn() as conn:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = conn.execute("""
+            SELECT
+                mc.uuid, mc.from_number, mc.caller_id_name, mc.duration_sec,
+                mc.started_at, mc.direction, mc.lead_id,
+                mc.gads_call_id, mc.attributed_ad_group,
+                mc.od_patient_status, mc.od_patient_num,
+                mc.ai_patient_name, mc.ai_appointment_scheduled,
+                mc.booked_outcome, mc.call_category, mc.lead_quality,
+                mc.answered_by, mc.status AS mc_status,
+                mc.transcription_status, mc.call_transcript,
+                gcv.campaign_id   AS gcv_campaign_id,
+                gcv.campaign_name AS gcv_campaign_name
+            FROM mango_calls mc
+            LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+            WHERE mc.direction = 'inbound'
+              AND mc.gads_call_id IS NOT NULL AND mc.gads_call_id != ''
+              AND mc.duration_sec >= 60
+              AND (mc.lead_id IS NULL OR mc.lead_id = '')
+              AND COALESCE(mc.od_patient_status, '') NOT IN ('existing_active', 'existing_inactive')
+              AND mc.started_at >= ?
+            ORDER BY mc.started_at DESC
+            LIMIT ?
+        """, (cutoff, limit)).fetchall()
+
+    created = 0
+    linked_existing = 0
+    skipped = 0
+    details = []
+    _seen_phones: set = set()  # Within-batch dedup
+
+    for r in rows:
+        # ── Step 1: Dedup by phone ──
+        from_number = r["from_number"] or ""
+        from_digits = _re.sub(r"\D", "", from_number)
+        if len(from_digits) < 10:
+            skipped += 1
+            details.append({"uuid": r["uuid"], "action": "skipped", "reason": "invalid phone"})
+            continue
+
+        phone_last10 = from_digits[-10:]
+
+        # Within-batch dedup: skip if we already created a lead for this phone in this run
+        if phone_last10 in _seen_phones:
+            skipped += 1
+            details.append({"uuid": r["uuid"], "action": "skipped", "reason": "duplicate phone in batch"})
+            continue
+
+        # Skip spam / not_qualified calls
+        if r["call_category"] and r["call_category"].lower() in ("spam", "wrong_number"):
+            skipped += 1
+            details.append({"uuid": r["uuid"], "action": "skipped", "reason": f"call_category={r['call_category']}"})
+            continue
+        if r["lead_quality"] and r["lead_quality"].lower() == "not_qualified":
+            skipped += 1
+            details.append({"uuid": r["uuid"], "action": "skipped", "reason": "lead_quality=not_qualified"})
+            continue
+
+        # ── Call quality tier classification ──
+        mc_status = (r["mc_status"] or "").lower()
+        is_missed = mc_status in ("missed", "voicemail") or not r["answered_by"]
+        has_transcript = bool(r["call_transcript"] and len(r["call_transcript"] or "") > 50)
+        booked = (r["booked_outcome"] or "").lower() == "booked" or r["ai_appointment_scheduled"] == 1
+
+        if booked:
+            tier = "A"  # Already booked — just needs lead record
+            follow_up_priority = "low"
+            follow_up_reason = "Google Ads caller — appointment booked (lead record created for tracking)"
+        elif is_missed and r["duration_sec"] >= 15:
+            tier = "C"  # Voicemail
+            follow_up_priority = "high"
+            follow_up_reason = "Google Ads caller left voicemail — callback needed"
+        elif is_missed:
+            tier = "B"  # Missed, short
+            follow_up_priority = "urgent"
+            follow_up_reason = "Missed Google Ads call — callback ASAP"
+        elif has_transcript or r["answered_by"]:
+            tier = "A"  # Spoke, didn't book
+            follow_up_priority = "high"
+            follow_up_reason = "Google Ads caller spoke with staff but did not schedule"
+        else:
+            tier = "D"  # Unclear
+            follow_up_priority = "medium"
+            follow_up_reason = "Google Ads caller — review call and follow up"
+
+        # ── Step 2: Check for existing lead by phone ──
+        existing_lead = get_lead_by_phone(from_number)
+
+        if existing_lead:
+            # Link call to existing lead, backfill campaign if empty
+            lead_id = existing_lead["id"]
+            if not dry_run:
+                update_mango_call_attribution(uuid=r["uuid"], lead_id=lead_id)
+                # Backfill campaign on lead if it has none but this call does
+                if not existing_lead.get("campaign_id") and r["gcv_campaign_id"]:
+                    upsert_lead({
+                        "id": lead_id,
+                        "campaign_id": r["gcv_campaign_id"],
+                        "campaign_name": r["gcv_campaign_name"] or "",
+                    })
+                finalize_call_lead(r["uuid"])
+            linked_existing += 1
+            _seen_phones.add(phone_last10)
+            details.append({
+                "uuid": r["uuid"], "action": "linked_existing",
+                "lead_id": lead_id, "tier": tier, "phone": phone_last10,
+                "campaign_backfill": bool(not existing_lead.get("campaign_id") and r["gcv_campaign_id"]),
+            })
+            continue
+
+        # ── Step 3: Create new lead ──
+        # Best name: prefer ai_patient_name > caller_id_name (title-cased if all-caps)
+        ai_name = (r["ai_patient_name"] or "").strip()
+        caller_id = (r["caller_id_name"] or "").strip()
+        if ai_name:
+            name_parts = ai_name.split(None, 1)
+        elif caller_id:
+            # Title-case all-caps caller IDs (e.g. "BURNS JEANINE" → "Burns Jeanine")
+            # but preserve mixed-case names as-is
+            _name = caller_id.title() if caller_id.isupper() else caller_id
+            # Caller ID format is often "LAST FIRST" — swap if all-caps original
+            if caller_id.isupper() and len(_name.split()) == 2:
+                parts = _name.split()
+                name_parts = [parts[1], parts[0]]  # Swap to First Last
+            else:
+                name_parts = _name.split(None, 1)
+        else:
+            name_parts = ["Unknown"]
+
+        first_name = name_parts[0] if name_parts else "Unknown"
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+        lead_id = str(_uuid.uuid4())
+
+        lead_data = {
+            "id": lead_id,
+            "created_at": r["started_at"],  # Preserve timeline
+            "source": "google_ads_call",
+            "stage": "new",
+            "first_name": first_name,
+            "last_name": last_name,
+            "phone": from_number,
+            "campaign_name": r["gcv_campaign_name"] or "",
+            "campaign_id": r["gcv_campaign_id"] or "",
+            "utm_source": "google",
+            "utm_medium": "cpc",
+            "tags": json.dumps(["auto_created", f"call_tier_{tier}"]),
+            "notes": f"Auto-created from GAds call {r['uuid']}. Tier {tier}: {follow_up_reason}",
+        }
+
+        if not dry_run:
+            upsert_lead(lead_data)
+            update_mango_call_attribution(uuid=r["uuid"], lead_id=lead_id)
+            finalize_call_lead(r["uuid"])
+
+            # Insert follow-up queue entry for actionable tiers
+            if tier in ("A", "B", "C", "D") and follow_up_priority != "low":
+                try:
+                    with _db_conn() as conn2:
+                        conn2.execute("""
+                            INSERT OR IGNORE INTO follow_up_queue
+                                (lead_id, step, channel, scheduled_for, status, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            lead_id, 0, "phone",
+                            datetime.now(timezone.utc).isoformat(),
+                            "pending",
+                            datetime.now(timezone.utc).isoformat(),
+                        ))
+                except Exception:
+                    pass  # Follow-up queue insert failure must not block lead creation
+
+            # Log lifecycle event
+            try:
+                with _db_conn() as conn3:
+                    conn3.execute("""
+                        INSERT INTO lifecycle_events
+                            (lead_id, event_type, stage_to, detail, source, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        lead_id, "lead_created", "new",
+                        json.dumps({
+                            "call_uuid": r["uuid"],
+                            "tier": tier, "priority": follow_up_priority,
+                            "reason": follow_up_reason,
+                            "campaign": r["gcv_campaign_name"] or "",
+                            "duration_sec": r["duration_sec"],
+                        }),
+                        "google_ads_call_auto",
+                        r["started_at"],
+                    ))
+            except Exception:
+                pass
+
+        created += 1
+        _seen_phones.add(phone_last10)
+        details.append({
+            "uuid": r["uuid"], "action": "created",
+            "lead_id": lead_id, "tier": tier, "phone": phone_last10,
+            "name": f"{first_name} {last_name}".strip(),
+            "campaign": r["gcv_campaign_name"] or "",
+            "duration_sec": r["duration_sec"],
+            "follow_up": follow_up_priority,
+        })
+
+    return {
+        "created": created,
+        "linked_existing": linked_existing,
+        "skipped": skipped,
+        "total_qualifying": len(rows),
+        "dry_run": dry_run,
+        "details": details,
+    }
+
+
 @app.post("/api/admin/calls/attribute-keywords", dependencies=[Depends(_require_admin)])
 def admin_attribute_keywords(days: int = 30):
     """Manually trigger keyword attribution for Mango calls. Use days=90 for backfill."""

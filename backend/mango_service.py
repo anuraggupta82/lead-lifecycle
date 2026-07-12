@@ -1443,6 +1443,14 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
     except Exception as _fce:
         logger.warning(f"finalize_call_lead reconcile pass failed (non-fatal): {_fce}")
 
+    # §2.3a: Auto-create leads for GAds-attributed calls with no lead
+    try:
+        auto_leads = _auto_create_leads_for_gads_calls(days=days)
+        if auto_leads:
+            logger.info(f"auto_create_leads: created {auto_leads} lead(s) during reconcile")
+    except Exception as _ale:
+        logger.warning(f"auto_create_leads failed (non-fatal): {_ale}")
+
     # Backfill flags for previously-attributed GAds calls that may have missed flag creation
     _backfill_call_flags_for_attributed(days=days)
 
@@ -1450,6 +1458,146 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
     _flag_unattributed_missed_new_patients(days=days)
 
     return attributed
+
+
+def _auto_create_leads_for_gads_calls(days: int = 7) -> int:
+    """Auto-create lead records for GAds-attributed calls with no linked lead.
+
+    Runs as part of reconcile_attribution (after finalize_call_lead).
+    Only creates leads for calls that pass the qualifying filter:
+      - gads_call_id present (confirmed in Google's call_view)
+      - inbound, >= 60s duration
+      - not existing patient
+      - not spam/wrong_number/not_qualified
+      - no existing lead by phone match
+
+    Returns count of leads created.
+    """
+    import uuid as _uuid
+    from database import upsert_lead, get_lead_by_phone, update_mango_call_attribution
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    created = 0
+
+    with _db_conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                mc.uuid, mc.from_number, mc.caller_id_name, mc.duration_sec,
+                mc.started_at, mc.lead_id,
+                mc.gads_call_id, mc.attributed_ad_group,
+                mc.od_patient_status,
+                mc.ai_patient_name, mc.ai_appointment_scheduled,
+                mc.booked_outcome, mc.call_category, mc.lead_quality,
+                mc.answered_by, mc.status AS mc_status,
+                mc.call_transcript,
+                gcv.campaign_id   AS gcv_campaign_id,
+                gcv.campaign_name AS gcv_campaign_name
+            FROM mango_calls mc
+            LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
+            WHERE mc.direction = 'inbound'
+              AND mc.gads_call_id IS NOT NULL AND mc.gads_call_id != ''
+              AND mc.duration_sec >= 60
+              AND (mc.lead_id IS NULL OR mc.lead_id = '')
+              AND COALESCE(mc.od_patient_status, '') NOT IN ('existing_active', 'existing_inactive')
+              AND mc.started_at >= ?
+        """, (cutoff,)).fetchall()
+
+    import json as _json
+    _seen_phones: set = set()  # Within-batch dedup
+
+    for r in rows:
+        from_number = r["from_number"] or ""
+        from_digits = re.sub(r"\D", "", from_number)
+        if len(from_digits) < 10:
+            continue
+
+        phone_last10 = from_digits[-10:]
+        if phone_last10 in _seen_phones:
+            continue
+
+        # Skip spam/junk
+        cat = (r["call_category"] or "").lower()
+        qual = (r["lead_quality"] or "").lower()
+        if cat in ("spam", "wrong_number") or qual == "not_qualified":
+            continue
+
+        # Check for existing lead by phone
+        existing_lead = get_lead_by_phone(from_number)
+        if existing_lead:
+            # Link call to existing lead (backfill campaign if empty)
+            update_mango_call_attribution(uuid=r["uuid"], lead_id=existing_lead["id"])
+            if not existing_lead.get("campaign_id") and r["gcv_campaign_id"]:
+                upsert_lead({
+                    "id": existing_lead["id"],
+                    "campaign_id": r["gcv_campaign_id"],
+                    "campaign_name": r["gcv_campaign_name"] or "",
+                })
+            finalize_call_lead(r["uuid"])
+            _seen_phones.add(phone_last10)
+            logger.info(f"auto_create_leads: linked Mango={r['uuid']} -> existing lead={existing_lead['id']}")
+            continue
+
+        # Determine best name (title-case all-caps caller IDs, swap LAST FIRST → First Last)
+        ai_name = (r["ai_patient_name"] or "").strip()
+        caller_id = (r["caller_id_name"] or "").strip()
+        if ai_name:
+            name_parts = ai_name.split(None, 1)
+        elif caller_id:
+            _name = caller_id.title() if caller_id.isupper() else caller_id
+            if caller_id.isupper() and len(_name.split()) == 2:
+                parts = _name.split()
+                name_parts = [parts[1], parts[0]]
+            else:
+                name_parts = _name.split(None, 1)
+        else:
+            name_parts = ["Unknown"]
+
+        first_name = name_parts[0] if name_parts else "Unknown"
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+        # Determine tier for tagging
+        mc_status = (r["mc_status"] or "").lower()
+        is_missed = mc_status in ("missed", "voicemail") or not r["answered_by"]
+        booked = (r["booked_outcome"] or "").lower() == "booked" or r["ai_appointment_scheduled"] == 1
+
+        if booked:
+            tier = "A"
+        elif is_missed and r["duration_sec"] >= 15:
+            tier = "C"
+        elif is_missed:
+            tier = "B"
+        elif r["answered_by"] or (r["call_transcript"] and len(r["call_transcript"] or "") > 50):
+            tier = "A"
+        else:
+            tier = "D"
+
+        lead_id = str(_uuid.uuid4())
+        lead_data = {
+            "id": lead_id,
+            "created_at": r["started_at"],
+            "source": "google_ads_call",
+            "stage": "new",
+            "first_name": first_name,
+            "last_name": last_name,
+            "phone": from_number,
+            "campaign_name": r["gcv_campaign_name"] or "",
+            "campaign_id": r["gcv_campaign_id"] or "",
+            "utm_source": "google",
+            "utm_medium": "cpc",
+            "tags": _json.dumps(["auto_created", f"call_tier_{tier}"]),
+            "notes": f"Auto-created from GAds call {r['uuid']}. Tier {tier}.",
+        }
+        upsert_lead(lead_data)
+        update_mango_call_attribution(uuid=r["uuid"], lead_id=lead_id)
+        finalize_call_lead(r["uuid"])
+        _seen_phones.add(phone_last10)
+        created += 1
+        logger.info(
+            "auto_create_leads: created lead=%s for Mango=%s (%s %s, campaign=%s, tier=%s)",
+            lead_id, r["uuid"], first_name, last_name, r["gcv_campaign_name"] or "unknown", tier,
+        )
+
+    return created
 
 
 def _backfill_call_flags_for_attributed(days: int = 7) -> int:
