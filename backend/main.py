@@ -13827,6 +13827,27 @@ def admin_get_calls(lead_id: str):
     return {"calls": get_calls(lead_id)}
 
 
+@app.get("/api/admin/lead/{lead_id}/mango-calls", dependencies=[Depends(_require_admin)])
+def admin_get_lead_mango_calls(lead_id: str):
+    """Return mango_calls (call recordings/analysis) linked to this lead."""
+    lead = get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    from database import _conn
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT mc.*,
+                      gcv.campaign_name AS gcv_campaign_name,
+                      gcv.ad_group_name AS gcv_ad_group_name
+               FROM mango_calls mc
+               LEFT JOIN gads_call_view gcv ON mc.gads_call_id = gcv.call_id
+               WHERE mc.lead_id = ?
+               ORDER BY mc.started_at DESC""",
+            (lead_id,)
+        ).fetchall()
+    return {"calls": [dict(r) for r in rows]}
+
+
 # ─── Next Action ──────────────────────────────────────────────────────────────
 
 class NextActionRequest(BaseModel):

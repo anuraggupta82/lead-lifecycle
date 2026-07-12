@@ -566,6 +566,74 @@ function StageRow({ stage, label, leads, selectedId, onCardClick, onDrop, onDrag
   );
 }
 
+function MangoCallCard({mc}) {
+  const [txOpen, setTxOpen] = React.useState(false);
+  const dur = mc.duration_sec ? (mc.duration_sec >= 60 ? Math.floor(mc.duration_sec/60)+'m '+mc.duration_sec%60+'s' : mc.duration_sec+'s') : '—';
+  const dt = mc.started_at ? new Date(mc.started_at.endsWith('Z') ? mc.started_at : mc.started_at+'Z').toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
+  const campaign = mc.gcv_campaign_name || mc.attributed_ad_group || '';
+  const keyword = mc.attributed_keyword || '';
+  const grade = mc.grade_overall_score;
+  const category = mc.call_category;
+  const patientName = mc.ai_patient_name || '';
+  const transcript = mc.call_transcript || '';
+  return (
+    <div style={{borderBottom:'1px solid var(--border)',padding:'10px 12px'}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
+        <span style={{fontSize:11,fontWeight:600,color:'var(--text)'}}>{dt}</span>
+        <span style={{fontSize:10,color:'var(--text-muted)'}}>{dur}</span>
+        <span style={{fontSize:10,color:mc.direction==='outbound'?'#7c3aed':'#0369a1'}}>
+          {mc.direction==='outbound'?'↗ Out':'↙ In'}
+        </span>
+        {mc.status && (
+          <span style={{fontSize:9,padding:'1px 5px',borderRadius:3,
+            background:mc.status==='answered'?'#dcfce7':'#fee2e2',
+            color:mc.status==='answered'?'#15803d':'#dc2626'}}>
+            {mc.status}
+          </span>
+        )}
+        {grade != null && (
+          <span style={{fontSize:9,padding:'1px 5px',borderRadius:3,fontWeight:600,
+            background:grade>=70?'#dcfce7':grade>=40?'#fef9c3':'#fee2e2',
+            color:grade>=70?'#15803d':grade>=40?'#a16207':'#dc2626'}}>
+            {grade}%
+          </span>
+        )}
+        <div style={{marginLeft:'auto'}}>
+          <PlayButton uuid={mc.uuid} call={mc} />
+        </div>
+      </div>
+      {campaign && (
+        <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:4}}>
+          📢 {campaign}{keyword ? ' · ' + keyword : ''}
+        </div>
+      )}
+      {category && (
+        <div style={{fontSize:10,marginBottom:4}}>
+          <span style={{padding:'1px 5px',borderRadius:3,fontSize:9,fontWeight:500,
+            background:'#ede9fe',color:'#7c3aed'}}>{category}</span>
+          {patientName && <span style={{marginLeft:6,fontSize:10,color:'var(--text-muted)'}}>Patient: {patientName}</span>}
+        </div>
+      )}
+      {mc.call_summary && (
+        <div style={{fontSize:10,color:'var(--text)',marginBottom:4,lineHeight:1.4}}>{mc.call_summary}</div>
+      )}
+      {transcript && (
+        <div>
+          <button onClick={() => setTxOpen(!txOpen)} style={{fontSize:10,color:'var(--teal)',background:'none',border:'none',cursor:'pointer',padding:0,marginTop:2}}>
+            {txOpen ? '▼ Hide transcript' : '▶ Show transcript'}
+          </button>
+          {txOpen && (
+            <div style={{fontSize:10,color:'var(--text)',background:'var(--surface-alt,#f8fafc)',borderRadius:4,
+              padding:8,marginTop:4,maxHeight:200,overflow:'auto',lineHeight:1.5,whiteSpace:'pre-wrap'}}>
+              {transcript}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const [detail, setDetail] = useState(null);
   const [notes, setNotes] = useState([]);
@@ -575,6 +643,8 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [testEmailStatus, setTestEmailStatus] = useState('');
+  const [mangoCalls, setMangoCalls] = useState([]);
+  const [mangoCallsLoaded, setMangoCallsLoaded] = useState(false);
   // Manual messaging state
   const [messages, setMessages] = useState([]);
   const [composeChannel, setComposeChannel] = useState('sms');
@@ -617,6 +687,15 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
     setComposeBody('');
     setComposeSubject('');
   }, [lead?.id]);
+
+  React.useEffect(() => {
+    if (tab !== 'calls') return;
+    setMangoCalls([]);
+    setMangoCallsLoaded(false);
+    api('/api/admin/lead/' + lead.id + '/mango-calls')
+      .then(d => { setMangoCalls(d.calls || []); setMangoCallsLoaded(true); })
+      .catch(() => setMangoCallsLoaded(true));
+  }, [tab, lead?.id]);
 
   async function saveTags(newTags) {
     setSavingTags(true);
@@ -879,7 +958,7 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
           </div>
         </div>
         <div style={{display:'flex',gap:0,borderBottom:'1px solid var(--border)'}}>
-          {[{k:'info',l:'Info'},{k:'conversation',l:'Conversation'},{k:'activity',l:'Activity'}].map(t=>(
+          {[{k:'info',l:'Info'},{k:'conversation',l:'Conversation'},{k:'calls',l:'Calls'},{k:'activity',l:'Activity'}].map(t=>(
             <button key={t.k} style={{flex:1,padding:'7px 0',fontSize:11,fontWeight:500,cursor:'pointer',
               background:'none',border:'none',borderBottom:tab===t.k?'2px solid var(--teal)':'2px solid transparent',
               color:tab===t.k?'var(--teal)':'var(--text-muted)'}}
@@ -1242,6 +1321,17 @@ function DetailPanel({ lead, onClose, onStageChange, onRefresh, onDelete }) {
                 </div>
                 {testEmailStatus && <div style={{fontSize:11,color:'var(--teal)',marginTop:6}}>{testEmailStatus}</div>}
               </details>
+            </div>
+          )}
+
+          {/* ══ CALLS TAB ══ */}
+          {tab==='calls' && (
+            <div style={{padding:'0'}}>
+              {!mangoCallsLoaded && <div style={{fontSize:11,color:'var(--text-muted)',padding:10}}>Loading calls...</div>}
+              {mangoCallsLoaded && mangoCalls.length === 0 && (
+                <div style={{fontSize:11,color:'var(--text-muted)',padding:10}}>No recorded calls linked to this lead</div>
+              )}
+              {mangoCalls.map(mc => <MangoCallCard key={mc.uuid} mc={mc} />)}
             </div>
           )}
 
