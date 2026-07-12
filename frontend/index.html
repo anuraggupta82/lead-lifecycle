@@ -8115,7 +8115,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                 title="New patients who scheduled (form + call) — click for names"
                                 onClick={()=>{
                                   const campName = c.campaign_name;
-                                  api(`/api/admin/calls/campaign-appts?campaign_name=${encodeURIComponent(campName)}&days=30`)
+                                  api(`/api/admin/calls/campaign-appts?campaign_name=${encodeURIComponent(campName)}&days=${unifiedMonth ? 365 : (unifiedDays || 3650)}`)
                                     .then(rows=>setApptModal({campaign_name:campName,rows}))
                                     .catch(()=>setApptModal({campaign_name:campName,rows:[]}));
                                 }}
