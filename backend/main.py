@@ -11717,6 +11717,70 @@ def admin_backfill_campaigns():
     return {"total": len(rows), "updated": updated, "details": details[:10]}
 
 
+# ── §2.3b backfill: Propagate ai_patient_name to lead names ──────────────────
+
+@app.post("/api/admin/calls/backfill-lead-names", dependencies=[Depends(_require_admin)])
+def admin_backfill_lead_names(dry_run: bool = True):
+    """Update lead first_name/last_name from mango_calls.ai_patient_name
+    when the lead name looks like a caller ID (all-caps, Unknown, city pattern)."""
+    from database import _conn as _db_conn, upsert_lead
+    with _db_conn() as conn:
+        rows = conn.execute("""
+            SELECT l.id AS lead_id, l.first_name, l.last_name,
+                   mc.ai_patient_name, mc.caller_id_name
+            FROM leads l
+            JOIN mango_calls mc ON mc.lead_id = l.id
+            WHERE mc.ai_patient_name IS NOT NULL AND mc.ai_patient_name != ''
+            ORDER BY mc.started_at DESC
+        """).fetchall()
+
+    updated = 0
+    details = []
+    seen_leads = set()
+    for r in rows:
+        lid = r["lead_id"]
+        if lid in seen_leads:
+            continue
+        seen_leads.add(lid)
+
+        _first = (r["first_name"] or "").strip()
+        _last = (r["last_name"] or "").strip()
+        _full = f"{_first} {_last}".strip()
+        _ai = (r["ai_patient_name"] or "").strip()
+
+        # Check if current name looks like a caller ID
+        needs_update = False
+        if not _full or _full.lower() == "unknown":
+            needs_update = True
+        elif _full.isupper() and len(_full) > 3:
+            needs_update = True
+        elif "," in _first and len(_last) <= 3:
+            needs_update = True  # City, ST pattern
+        elif _full.replace("-", "").replace("(", "").replace(")", "").replace(" ", "").isdigit():
+            needs_update = True
+
+        if needs_update and _ai:
+            _parts = _ai.split(None, 1)
+            new_first = _parts[0].title() if _parts else _ai.title()
+            if len(_parts) > 1:
+                new_last = _parts[1].title()
+            elif _last and _last.isupper():
+                new_last = _last.title()  # AI got first only — title-case existing last
+            else:
+                new_last = ""
+            details.append({
+                "lead_id": lid[:8],
+                "old_name": _full,
+                "new_name": f"{new_first} {new_last}".strip(),
+                "source": "ai_patient_name",
+            })
+            if not dry_run:
+                upsert_lead({"id": lid, "first_name": new_first, "last_name": new_last})
+            updated += 1
+
+    return {"total_checked": len(seen_leads), "updated": updated, "dry_run": dry_run, "details": details[:20]}
+
+
 # ── §2.3a: Auto-create leads from GAds-attributed calls ──────────────────────
 
 @app.post("/api/admin/calls/create-missing-leads", dependencies=[Depends(_require_admin)])
@@ -12448,27 +12512,28 @@ def admin_backfill_patient_names(
             continue
 
         # Sync name to linked lead (task #17: od_patient_name > ai_patient_name > caller_id_name)
+        # Fixed §2.3b: was referencing nonexistent leads.name column; now uses first_name/last_name
         lead_id = row.get("lead_id") or ""
         od_name = row.get("od_patient_name") or ""
         if lead_id and not od_name:
-            # Only update lead name if OD name isn't already set (OD is authoritative)
             try:
                 with _db_conn() as conn:
-                    # Check current lead name — only overwrite if it's empty or matches caller_id
                     lead_row = conn.execute(
-                        "SELECT name FROM leads WHERE id = ?", (lead_id,)
+                        "SELECT first_name, last_name FROM leads WHERE id = ?", (lead_id,)
                     ).fetchone()
                     if lead_row:
-                        current_name = (lead_row["name"] or "").strip()
+                        _cur = f"{lead_row['first_name'] or ''} {lead_row['last_name'] or ''}".strip()
                         caller_id = (row["caller_id_name"] or "").strip()
-                        # Update if lead name is empty, matches caller_id, or is all-caps
-                        # (caller_id names are typically all-caps like "DJL ENTERPRISE")
-                        if (not current_name
-                                or current_name == caller_id
-                                or (current_name == current_name.upper() and len(current_name) > 2)):
+                        if (not _cur
+                                or _cur == caller_id
+                                or (_cur == _cur.upper() and len(_cur) > 2)
+                                or _cur.lower() == "unknown"):
+                            _parts = patient_name.split(None, 1)
+                            _fn = _parts[0].title() if _parts else patient_name.title()
+                            _ln = _parts[1].title() if len(_parts) > 1 else ""
                             conn.execute(
-                                "UPDATE leads SET name = ?, updated_at = ? WHERE id = ?",
-                                (patient_name, datetime.now(timezone.utc).isoformat(), lead_id),
+                                "UPDATE leads SET first_name = ?, last_name = ?, updated_at = ? WHERE id = ?",
+                                (_fn, _ln, datetime.now(timezone.utc).isoformat(), lead_id),
                             )
                             results["leads_updated"] += 1
             except Exception as e:

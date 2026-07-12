@@ -762,6 +762,7 @@ def finalize_call_lead(uuid: str) -> dict:
                     mc.attributed_ad_group,
                     mc.attributed_keyword_method,
                     mc.gads_call_id,
+                    mc.ai_patient_name      AS mc_ai_patient_name,
                     mc.od_patient_num       AS mc_od_patient_num,
                     mc.od_patient_status    AS mc_od_patient_status,
                     mc.od_matched_at        AS mc_od_matched_at,
@@ -794,7 +795,8 @@ def finalize_call_lead(uuid: str) -> dict:
 
             # Fetch current lead state (only the fields we may update)
             lead = conn.execute("""
-                SELECT keyword_text, ad_group_name, campaign_name, campaign_id, gclid,
+                SELECT first_name, last_name, keyword_text, ad_group_name,
+                       campaign_name, campaign_id, gclid,
                        od_patient_num, existing_patient, paid_source, landing_url
                 FROM leads WHERE id = ?
             """, (lead_id,)).fetchone()
@@ -854,6 +856,42 @@ def finalize_call_lead(uuid: str) -> dict:
             # ── 5. landing_url fallback ───────────────────────────────────────
             if row["cr_landing_page"] and not lead["landing_url"]:
                 updates["landing_url"] = row["cr_landing_page"]
+
+            # ── 6. Patient name propagation (§2.3b) ─────────────────────────
+            # If lead name looks like a caller ID / business name and we have
+            # a real patient name from Gemini transcript extraction, update it.
+            _cur_first = (lead["first_name"] or "").strip()
+            _cur_last = (lead["last_name"] or "").strip()
+            _cur_full = f"{_cur_first} {_cur_last}".strip()
+            _ai_name = (row.get("mc_ai_patient_name") or "").strip()
+
+            def _looks_like_caller_id(first: str, last: str, full: str) -> bool:
+                """Return True if the name looks like a raw caller ID, not a real patient name."""
+                if not full or full.lower() == "unknown":
+                    return True
+                # All-caps business name (DJL ENTERPRISE, BURNS JEANINE)
+                if full.isupper() and len(full) > 3:
+                    return True
+                # City/state pattern: "Milford, MA" or "Auburn, MA"
+                if "," in first and len(last) <= 3:
+                    return True
+                # Phone number as name
+                if full.replace("-", "").replace("(", "").replace(")", "").replace(" ", "").isdigit():
+                    return True
+                return False
+
+            if _ai_name and _looks_like_caller_id(_cur_first, _cur_last, _cur_full):
+                _parts = _ai_name.split(None, 1)
+                updates["first_name"] = _parts[0].title() if _parts else _ai_name.title()
+                if len(_parts) > 1:
+                    updates["last_name"] = _parts[1].title()
+                elif _cur_last and _cur_last.isupper():
+                    # AI only got first name — at least title-case the existing last
+                    updates["last_name"] = _cur_last.title()
+                logger.info(
+                    "finalize_call_lead: name upgrade '%s' -> '%s %s' (ai_patient_name) for lead %s",
+                    _cur_full, updates["first_name"], updates.get("last_name", ""), lead_id,
+                )
 
             # Nothing to write
             written = [k for k in updates if k != "id"]
