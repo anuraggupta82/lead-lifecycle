@@ -1393,6 +1393,180 @@ def _get_od_patient_by_phone(conn, phone_10: str) -> str | None:
         return None
 
 
+def _get_family_members(conn, guarantor_patnum: str) -> list[dict]:
+    """
+    Given a guarantor's PatNum, return all family members (including the guarantor).
+    Each dict has: pat_num, first_name, last_name, pat_status.
+    Only returns active (0) and inactive (2) patients.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT PatNum, FName, LName, PatStatus
+                   FROM patient
+                   WHERE Guarantor = %s
+                     AND PatStatus IN (0, 2)
+                   ORDER BY PatNum ASC""",
+                (int(guarantor_patnum),),
+            )
+            return [
+                {
+                    "pat_num": str(r[0]),
+                    "first_name": (r[1] or "").strip(),
+                    "last_name": (r[2] or "").strip(),
+                    "pat_status": int(r[3]),
+                }
+                for r in cur.fetchall()
+            ]
+    except Exception as e:
+        logger.warning(f"[guarantor] Family lookup failed for guarantor {guarantor_patnum}: {e}")
+        return []
+
+
+def _resolve_guarantor_family(
+    conn,
+    matched_patnum: str,
+    caller_name: str = "",
+    ai_patient_name: str = "",
+    call_dt: datetime | None = None,
+) -> tuple[str, str]:
+    """
+    When a phone match returns a patient, check if they are a guarantor with
+    dependents. If the caller/patient name doesn't match the guarantor, try to
+    find the correct family member.
+
+    Resolution priority:
+      1. ai_patient_name (from Gemini transcript) — most reliable
+      2. caller_name (caller ID / CNAM) — less reliable but available early
+      3. Appointment proximity — if a dependent has an appointment near call_dt
+
+    Returns (resolved_patnum, resolution_method):
+      - (original, "self")         — matched patient IS the right person
+      - (dependent, "family_name") — resolved via name match to a dependent
+      - (dependent, "family_appt") — resolved via appointment proximity
+      - (original, "family_ambiguous") — has dependents but can't disambiguate
+    """
+    # Check if matched patient is a guarantor (Guarantor == self)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT Guarantor, FName, LName FROM patient WHERE PatNum = %s",
+                (int(matched_patnum),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return matched_patnum, "self"
+            guarantor_id, matched_fname, matched_lname = (
+                str(row[0]),
+                (row[1] or "").strip(),
+                (row[2] or "").strip(),
+            )
+    except Exception as e:
+        logger.warning(f"[guarantor] Guarantor check failed for {matched_patnum}: {e}")
+        return matched_patnum, "self"
+
+    # Only proceed if matched patient IS the guarantor (head of family)
+    if guarantor_id != matched_patnum:
+        return matched_patnum, "self"  # matched patient is a dependent, not the guarantor
+
+    # Get family members (including the guarantor)
+    family = _get_family_members(conn, matched_patnum)
+    dependents = [m for m in family if m["pat_num"] != matched_patnum]
+
+    if not dependents:
+        return matched_patnum, "self"  # no dependents, guarantor IS the patient
+
+    # ── Resolution 1: Match by ai_patient_name (Gemini transcript) ──────────
+    name_to_check = ai_patient_name.strip() if ai_patient_name else ""
+    if not name_to_check and caller_name:
+        # Fall back to caller_name only if it looks like a real person name
+        if _cnam_is_person(caller_name):
+            name_to_check = caller_name.strip()
+
+    if name_to_check:
+        name_tokens = set(t.lower() for t in name_to_check.split() if len(t) >= 3)
+        # Extract first name token specifically for disambiguation
+        _name_parts = name_to_check.strip().split()
+        _check_first = _name_parts[0].lower() if _name_parts else ""
+
+        if name_tokens:
+            # First check: does the FIRST NAME match the guarantor themselves?
+            # Can't just use token intersection — family members share last names,
+            # so "Emily Grondin" would match Christine Grondin on "grondin" alone.
+            _guar_first = matched_fname.lower().strip()
+            if _check_first and _guar_first and len(_check_first) >= 3 and _check_first == _guar_first:
+                logger.debug(
+                    f"[guarantor] First name '{_check_first}' matches guarantor "
+                    f"{matched_fname} {matched_lname} (PatNum={matched_patnum})"
+                )
+                return matched_patnum, "self"
+
+            # Check each dependent — require first name match, not just any token
+            name_matches = []
+            for dep in dependents:
+                _dep_first = dep["first_name"].lower().strip()
+                if _check_first and _dep_first and len(_dep_first) >= 3 and _check_first == _dep_first:
+                    name_matches.append(dep)
+                elif not _check_first or len(_check_first) < 3:
+                    # No usable first name — fall back to any-token match
+                    dep_tokens = set(
+                        t.lower()
+                        for t in f"{dep['first_name']} {dep['last_name']}".split()
+                        if len(t) >= 3
+                    )
+                    if name_tokens & dep_tokens:
+                        name_matches.append(dep)
+
+            if len(name_matches) == 1:
+                dep = name_matches[0]
+                logger.info(
+                    f"[guarantor] Resolved guarantor {matched_patnum} → "
+                    f"dependent {dep['pat_num']} ({dep['first_name']} {dep['last_name']}) "
+                    f"via name match '{name_to_check}'"
+                )
+                return dep["pat_num"], "family_name"
+            elif len(name_matches) > 1:
+                logger.info(
+                    f"[guarantor] Name '{name_to_check}' matched {len(name_matches)} "
+                    f"dependents of guarantor {matched_patnum} — ambiguous"
+                )
+                # Fall through to appointment check
+
+    # ── Resolution 2: Match by appointment proximity ────────────────────────
+    if call_dt:
+        try:
+            # Check which family member has an appointment near the call date
+            apt_matches = []
+            for member in family:
+                apt = _find_od_appointment_near_call(conn, member["pat_num"], call_dt)
+                if apt:
+                    apt_matches.append((member, apt))
+
+            if len(apt_matches) == 1:
+                member, apt = apt_matches[0]
+                logger.info(
+                    f"[guarantor] Resolved guarantor {matched_patnum} → "
+                    f"{member['pat_num']} ({member['first_name']} {member['last_name']}) "
+                    f"via appointment proximity (AptNum={apt})"
+                )
+                return member["pat_num"], "family_appt"
+            elif len(apt_matches) > 1:
+                # Multiple family members have appointments near the call — can't disambiguate
+                logger.info(
+                    f"[guarantor] {len(apt_matches)} family members of guarantor "
+                    f"{matched_patnum} have appointments near call — ambiguous"
+                )
+        except Exception as e:
+            logger.warning(f"[guarantor] Appointment proximity check failed: {e}")
+
+    # Can't disambiguate — return original with a flag
+    logger.info(
+        f"[guarantor] Guarantor {matched_patnum} ({matched_fname} {matched_lname}) "
+        f"has {len(dependents)} dependent(s) but can't disambiguate caller"
+    )
+    return matched_patnum, "family_ambiguous"
+
+
 def _find_od_appointment_near_call(conn, pat_num: str, call_dt: datetime,
                                     forward_days: int = 14, back_days: int = 1) -> str | None:
     """
@@ -1560,6 +1734,23 @@ def match_calls_to_od_appointments(days: int = 90, target_uuid: str = None) -> d
                 match_method    = "phone"
 
                 pat_num = _get_od_patient_by_phone(od_conn, phone_10)
+
+                # §2.3k: Guarantor resolution — if phone matched a guarantor,
+                # check family members using ai_patient_name or appointment proximity
+                if pat_num:
+                    resolved_pat, resolve_method = _resolve_guarantor_family(
+                        od_conn, pat_num,
+                        caller_name=caller_id_name,
+                        ai_patient_name=ai_patient_name,
+                        call_dt=call_dt,
+                    )
+                    if resolved_pat != pat_num:
+                        logger.info(
+                            f"[call_od_match] uuid={call['uuid']} guarantor {pat_num} → "
+                            f"dependent {resolved_pat} (method={resolve_method})"
+                        )
+                        pat_num = resolved_pat
+                        match_method = f"phone+{resolve_method}"
 
                 if not pat_num and ai_patient_name:
                     # Phone lookup failed — try Gemini's patient name from transcript.
@@ -1730,6 +1921,46 @@ def _get_od_patient_info_by_phone(conn, phone_10: str) -> dict | None:
     return None
 
 
+def _get_od_patient_info_by_patnum(conn, pat_num: str) -> dict | None:
+    """
+    Look up OD patient info directly by PatNum.
+    Returns same dict shape as _get_od_patient_info_by_phone.
+    Used after guarantor resolution to get the dependent's full info.
+    """
+    if not pat_num:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT PatNum, FName, LName, PatStatus FROM patient
+                   WHERE PatNum = %s""",
+                (int(pat_num),),
+            )
+            row = cur.fetchone()
+            if row:
+                earliest_apt_entry = None
+                try:
+                    cur.execute(
+                        "SELECT MIN(SecDateTEntry) FROM appointment WHERE PatNum = %s",
+                        (int(pat_num),),
+                    )
+                    apt_row = cur.fetchone()
+                    if apt_row and apt_row[0]:
+                        earliest_apt_entry = apt_row[0]
+                except Exception as apt_err:
+                    logger.warning(f"OD earliest-apt lookup failed for PatNum {pat_num}: {apt_err}")
+                return {
+                    "pat_num":            str(row[0]),
+                    "first_name":         (row[1] or "").strip(),
+                    "last_name":          (row[2] or "").strip(),
+                    "pat_status":         int(row[3]),
+                    "earliest_apt_entry": earliest_apt_entry,
+                }
+    except Exception as e:
+        logger.warning(f"OD patient info lookup failed for PatNum {pat_num}: {e}")
+    return None
+
+
 _CNAM_NON_PERSON_PATTERNS = (
     # US state abbreviations that appear in "CITY ST" CNAM values
     " MA", " RI", " NH", " CT", " VT", " ME", " NY", " NJ",
@@ -1880,10 +2111,34 @@ def match_mango_calls_to_od_patients(limit: int = 500) -> dict:
 
                 pat_info = _get_od_patient_info_by_phone(od_conn, phone_10)
                 caller_name = call.get("caller_id_name") or ""
+                ai_patient_name = call.get("ai_patient_name") or ""
+
+                # §2.3k: Guarantor resolution — if phone matched a patient who is a
+                # guarantor, check if the actual caller/patient is a dependent.
+                _guarantor_resolved = False
+                if pat_info:
+                    resolved_pat, resolve_method = _resolve_guarantor_family(
+                        od_conn,
+                        pat_info["pat_num"],
+                        caller_name=caller_name,
+                        ai_patient_name=ai_patient_name,
+                        call_dt=None,  # no call_dt needed for status matching
+                    )
+                    if resolved_pat != pat_info["pat_num"]:
+                        logger.info(
+                            f"[mango_od_match] uuid={call['uuid']} guarantor "
+                            f"{pat_info['pat_num']} → dependent {resolved_pat} "
+                            f"(method={resolve_method})"
+                        )
+                        # Re-fetch full patient info for the resolved dependent
+                        pat_info = _get_od_patient_info_by_patnum(od_conn, resolved_pat)
+                        _guarantor_resolved = True
+
                 # Name-mismatch guard: if OD found a record but the caller's CNAM shares no
                 # name token with the OD patient, treat as new_patient (phone reuse / family
-                # member / recycled number).
-                if pat_info and not _names_match(
+                # member / recycled number). Skip this check if we already resolved via
+                # guarantor family — the resolution already verified the name.
+                if pat_info and not _guarantor_resolved and not _names_match(
                     caller_name,
                     pat_info.get("first_name", ""),
                     pat_info.get("last_name", ""),

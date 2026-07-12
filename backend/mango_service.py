@@ -893,6 +893,32 @@ def finalize_call_lead(uuid: str) -> dict:
                     _cur_full, updates["first_name"], updates.get("last_name", ""), lead_id,
                 )
 
+            # ── 7. Guarantor re-derivation (§2.3k) ──────────────────────────
+            # If we have an ai_patient_name and the current od_patient_num belongs
+            # to a guarantor whose name doesn't match, check family members.
+            _od_pat = updates.get("od_patient_num") or lead["od_patient_num"]
+            if _od_pat and _ai_name:
+                try:
+                    from od_matcher import _resolve_guarantor_family, _get_db
+                    _od_conn = _get_db()
+                    if _od_conn:
+                        try:
+                            resolved_pat, resolve_method = _resolve_guarantor_family(
+                                _od_conn, _od_pat,
+                                ai_patient_name=_ai_name,
+                            )
+                            if resolved_pat != _od_pat:
+                                updates["od_patient_num"] = resolved_pat
+                                logger.info(
+                                    f"finalize_call_lead: re-derived od_patient_num "
+                                    f"{_od_pat} → {resolved_pat} (method={resolve_method}) "
+                                    f"for lead {lead_id}"
+                                )
+                        finally:
+                            _od_conn.close()
+                except Exception as e:
+                    logger.warning(f"finalize_call_lead: guarantor re-derivation failed: {e}")
+
             # Nothing to write
             written = [k for k in updates if k != "id"]
             if not written:
