@@ -11185,7 +11185,7 @@ def admin_calls_campaign_attribution_early(days: int = 30):
 # Form-side "scheduled+" stage set — mirrors database.py's form_scheduled_count logic
 # (a patient who ever reached scheduled or beyond on the form/lead path).
 _FORM_SCHEDULED_STAGES = (
-    "scheduled", "showed", "no_show",
+    "scheduled", "showed",
     "treatment_presented", "treatment_accepted", "treatment_completed",
 )
 
@@ -11342,6 +11342,46 @@ def _campaign_scheduled_new_patients(conn, campaign_name: str, days: int = 30):
     return list(deduped.values())
 
 
+def _campaign_canceled_noshow_leads(conn, campaign_name: str, stage_filter: str = None):
+    """
+    Query leads with stage = 'canceled' or 'no_show' for a given campaign.
+
+    Returns a list of dicts:
+      {patient_name, lead_id, od_patient_num, stage, scheduled_at, source, income}
+    """
+    stages = (stage_filter,) if stage_filter else ("canceled", "no_show")
+    placeholders = ",".join("?" for _ in stages)
+    rows = conn.execute(
+        f"""SELECT
+             id AS lead_id,
+             od_patient_num,
+             TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS patient_name,
+             stage,
+             scheduled_at,
+             source,
+             COALESCE(paid_amount_365d, 0) AS paid_amount_365d
+           FROM leads
+           WHERE LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+             AND stage IN ({placeholders})
+             AND COALESCE(existing_patient, 0) = 0""",
+        (campaign_name, *stages),
+    ).fetchall()
+
+    result = []
+    for r in rows:
+        r = dict(r)
+        result.append({
+            "patient_name": (r.get("patient_name") or "").strip() or None,
+            "lead_id": r.get("lead_id"),
+            "od_patient_num": r.get("od_patient_num"),
+            "stage": r.get("stage"),
+            "scheduled_at": r.get("scheduled_at"),
+            "source": r.get("source"),
+            "income": r.get("paid_amount_365d") or 0,
+        })
+    return result
+
+
 @app.get("/api/admin/calls/campaign-appts", dependencies=[Depends(_require_admin)])
 def admin_calls_campaign_appts(campaign_name: str, days: int = 30):
     """
@@ -11352,6 +11392,15 @@ def admin_calls_campaign_appts(campaign_name: str, days: int = 30):
     from database import _conn
     with _conn() as conn:
         return _campaign_scheduled_new_patients(conn, campaign_name, days)
+
+
+@app.get("/api/admin/calls/campaign-canceled-noshow", dependencies=[Depends(_require_admin)])
+def admin_calls_campaign_canceled_noshow(campaign_name: str, stage: str = None):
+    """Return canceled or no-show leads for a campaign. Optional stage filter."""
+    from database import _conn
+    with _conn() as conn:
+        rows = _campaign_canceled_noshow_leads(conn, campaign_name, stage_filter=stage)
+        return rows
 
 
 @app.get("/api/admin/campaigns/scheduled-new-patient-counts", dependencies=[Depends(_require_admin)])
@@ -11392,6 +11441,28 @@ def admin_campaign_scheduled_new_patient_counts(days: int = 30):
             counts[name] = len(patients)
 
     return counts
+
+
+@app.get("/api/admin/campaigns/canceled-noshow-counts", dependencies=[Depends(_require_admin)])
+def admin_campaign_canceled_noshow_counts():
+    """Bulk: for every campaign, return counts of canceled and no_show leads."""
+    from database import _conn
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT campaign_name, stage, COUNT(*) as cnt
+            FROM leads
+            WHERE stage IN ('canceled', 'no_show')
+              AND campaign_name IS NOT NULL AND campaign_name != ''
+              AND COALESCE(existing_patient, 0) = 0
+            GROUP BY campaign_name, stage
+        """).fetchall()
+        result = {}
+        for r in rows:
+            cn = r["campaign_name"]
+            if cn not in result:
+                result[cn] = {"canceled": 0, "no_show": 0}
+            result[cn][r["stage"]] = r["cnt"]
+        return result
 
 
 @app.get("/api/admin/reports/income", dependencies=[Depends(_require_admin)])

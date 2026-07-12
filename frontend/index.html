@@ -6653,6 +6653,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [campApptCounts, setCampApptCounts] = useState({}); // {campaign_name: count} deduped new patients scheduled
   const [apptModal, setApptModal] = useState(null); // {campaign_name, rows: [...]} or null
   const [apptFilter, setApptFilter] = useState('new'); // 'new' | 'existing' | 'all'
+  const [campCanceledNoShowCounts, setCampCanceledNoShowCounts] = useState({}); // {campaign_name: {canceled: N, no_show: N}}
+  const [canceledModal, setCanceledModal] = useState(null); // {campaign_name, stage, rows: [...]} or null
   const [aiReviewSaving, setAiReviewSaving] = useState({});
   const [aiMaxSaving, setAiMaxSaving] = useState({});
   const [syncingFromGads, setSyncingFromGads] = useState({});   // {campaign_id: bool}
@@ -6781,7 +6783,9 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
       try {
         const apptCounts = await api(`/api/admin/campaigns/scheduled-new-patient-counts?days=${callDays}`);
         setCampApptCounts(apptCounts || {});
-      } catch(e) { setCampApptCounts({}); }
+        const cnsCounts = await api('/api/admin/campaigns/canceled-noshow-counts');
+        setCampCanceledNoShowCounts(cnsCounts || {});
+      } catch(e) { setCampApptCounts({}); setCampCanceledNoShowCounts({}); }
     } catch(e) { console.error('Failed to load unified campaigns', e); }
     finally { setUnifiedLoading(false); }
   }
@@ -7947,6 +7951,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
               <th className="num">Daily Budget</th>
               <th className="num">Leads</th>
               <th className="num" title="New patients who scheduled from this campaign (form + call, deduped)">Appts</th>
+              <th className="num" title="Patients who canceled their appointment — needs follow-up">Cxl</th>
+              <th className="num" title="Patients who didn't show for their appointment">NS</th>
               <th className="num">Cost</th>
               <th className="num">CPL</th>
               <th className="num">ROI</th>
@@ -8120,6 +8126,48 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                                     .catch(()=>setApptModal({campaign_name:campName,rows:[]}));
                                 }}
                               >{apptCount}</span>
+                            : <span style={{color:'var(--text-muted)'}}>—</span>}
+                        </td>
+                      );
+                    })()}
+                    {/* Canceled count */}
+                    {(()=>{
+                      const cnsData = campCanceledNoShowCounts[c.campaign_name] || {};
+                      const cxlCount = cnsData.canceled || 0;
+                      return (
+                        <td className="num">
+                          {cxlCount > 0
+                            ? <span
+                                style={{color:'#dc2626',fontWeight:600,cursor:'pointer',textDecoration:'underline dotted'}}
+                                title="Canceled appointments — click for details"
+                                onClick={()=>{
+                                  const campName = c.campaign_name;
+                                  api(`/api/admin/calls/campaign-canceled-noshow?campaign_name=${encodeURIComponent(campName)}&stage=canceled`)
+                                    .then(rows=>setCanceledModal({campaign_name:campName,stage:'canceled',rows}))
+                                    .catch(()=>setCanceledModal({campaign_name:campName,stage:'canceled',rows:[]}));
+                                }}
+                              >{cxlCount}</span>
+                            : <span style={{color:'var(--text-muted)'}}>—</span>}
+                        </td>
+                      );
+                    })()}
+                    {/* No-show count */}
+                    {(()=>{
+                      const cnsData = campCanceledNoShowCounts[c.campaign_name] || {};
+                      const nsCount = cnsData.no_show || 0;
+                      return (
+                        <td className="num">
+                          {nsCount > 0
+                            ? <span
+                                style={{color:'#d97706',fontWeight:600,cursor:'pointer',textDecoration:'underline dotted'}}
+                                title="No-show patients — click for details"
+                                onClick={()=>{
+                                  const campName = c.campaign_name;
+                                  api(`/api/admin/calls/campaign-canceled-noshow?campaign_name=${encodeURIComponent(campName)}&stage=no_show`)
+                                    .then(rows=>setCanceledModal({campaign_name:campName,stage:'no_show',rows}))
+                                    .catch(()=>setCanceledModal({campaign_name:campName,stage:'no_show',rows:[]}));
+                                }}
+                              >{nsCount}</span>
                             : <span style={{color:'var(--text-muted)'}}>—</span>}
                         </td>
                       );
@@ -12980,6 +13028,69 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                             {r.appointment_status || '—'}
                           </td>
                           {/* Income */}
+                          <td style={{padding:'8px 10px',textAlign:'right',fontSize:11,fontWeight: r.income > 0 ? 600 : 400,color: r.income > 0 ? '#059669' : 'var(--text-muted)'}}>
+                            {r.income > 0 ? '$'+Number(r.income).toFixed(0) : '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {canceledModal && (()=>{
+        const allRows = canceledModal.rows || [];
+        const stageLabel = canceledModal.stage === 'canceled' ? 'Canceled' : 'No-Show';
+        const emoji = canceledModal.stage === 'canceled' ? '❌' : '⚠️';
+        const headerColor = canceledModal.stage === 'canceled' ? '#dc2626' : '#d97706';
+        return (
+          <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.45)',zIndex:9000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
+            onClick={()=>setCanceledModal(null)}>
+            <div style={{background:'#fff',borderRadius:10,width:'100%',maxWidth:700,maxHeight:'82vh',display:'flex',flexDirection:'column',overflow:'hidden',boxShadow:'0 8px 32px rgba(0,0,0,.25)'}}
+              onClick={e=>e.stopPropagation()}>
+              <div style={{padding:'12px 18px',borderBottom:'1px solid var(--border)',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                <span style={{fontSize:14,fontWeight:700,color:headerColor}}>{emoji} {stageLabel} Patients</span>
+                <span style={{fontSize:12,color:'var(--text-muted)',flex:1}}>— {canceledModal.campaign_name} ({allRows.length} patients)</span>
+                <button className="btn btn-ghost btn-sm" onClick={()=>setCanceledModal(null)}>✕ Close</button>
+              </div>
+              <div style={{overflowY:'auto',flex:1}}>
+                {allRows.length === 0 ? (
+                  <div style={{padding:32,textAlign:'center',color:'var(--text-muted)',fontSize:13}}>
+                    No {stageLabel.toLowerCase()} patients found.
+                  </div>
+                ) : (
+                  <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                    <thead>
+                      <tr style={{background:'var(--gray-light)',position:'sticky',top:0}}>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Patient</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Source</th>
+                        <th style={{padding:'8px 10px',textAlign:'left',fontWeight:600,color:'var(--text-muted)'}}>Scheduled At</th>
+                        <th style={{padding:'8px 10px',textAlign:'right',fontWeight:600,color:'var(--text-muted)'}}>Income</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {allRows.map((r,i)=>(
+                        <tr key={i} style={{borderTop:'1px solid var(--border)',background:i%2===0?'#fff':'#fafafa'}}>
+                          <td style={{padding:'8px 10px',fontSize:11}}>
+                            <button
+                              style={{background:'none',border:'none',padding:0,color:headerColor,fontWeight:600,cursor:'pointer',textDecoration:'underline'}}
+                              onClick={()=>{ if (r.lead_id && onOpenLead) onOpenLead(r.lead_id); setCanceledModal(null); }}
+                            >{r.patient_name || '(unnamed)'}</button>
+                          </td>
+                          <td style={{padding:'8px 10px'}}>
+                            <span style={{fontSize:10,fontWeight:700,padding:'1px 6px',borderRadius:4,
+                              background: r.source === 'call' ? '#fef3c7' : '#dbeafe',
+                              color:      r.source === 'call' ? '#92400e' : '#1d4ed8'}}>
+                              {r.source}
+                            </span>
+                          </td>
+                          <td style={{padding:'8px 10px',fontSize:11,whiteSpace:'nowrap'}}>
+                            {r.scheduled_at ? r.scheduled_at.split('T')[0] : '—'}
+                          </td>
                           <td style={{padding:'8px 10px',textAlign:'right',fontSize:11,fontWeight: r.income > 0 ? 600 : 400,color: r.income > 0 ? '#059669' : 'var(--text-muted)'}}>
                             {r.income > 0 ? '$'+Number(r.income).toFixed(0) : '—'}
                           </td>
