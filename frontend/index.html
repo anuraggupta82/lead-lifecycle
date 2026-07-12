@@ -3724,67 +3724,132 @@ function PlayButton({uuid, call}) {
   // If transcription_status is skipped_no_audio, no recording exists; show a muted icon.
   const noRecording = call && call.transcription_status === 'skipped_no_audio';
 
-  const [pState, setPState] = React.useState('idle'); // idle | loading | playing | error
+  const [pState, setPState] = React.useState('idle'); // idle | loading | playing | paused | error
   const [errMsg, setErrMsg] = React.useState('');
+  const [timeDisplay, setTimeDisplay] = React.useState('');  // "0:23/1:44"
+  const [duration, setDuration] = React.useState(0);
   const audioRef = React.useRef(null);
+  const sliderRef = React.useRef(null);   // uncontrolled range input
+  const seekingRef = React.useRef(false);
   // Include ?pw= so the browser Audio element can authenticate (it cannot send custom headers).
   const url = `/api/admin/calls/recording/${uuid}/play?pw=${encodeURIComponent(ADMIN_PW)}`;
+
+  const fmtTime = s => {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return m + ':' + (sec < 10 ? '0' : '') + sec;
+  };
 
   const toggle = e => {
     e.stopPropagation();
     if (noRecording) return;
     if (pState === 'playing') {
       audioRef.current && audioRef.current.pause();
-      setPState('idle');
+      setPState('paused');
+      return;
+    }
+    if (pState === 'paused' && audioRef.current) {
+      audioRef.current.play().catch(() => {});
+      setPState('playing');
       return;
     }
     if (pState === 'error') {
-      // Reset for retry
       if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
       setPState('idle');
       setErrMsg('');
+      setTimeDisplay('');
+      setDuration(0);
       return;
     }
     setPState('loading');
     setErrMsg('');
-    // Stream directly — browser handles range requests and buffering natively.
-    // Append a cache-buster so the browser doesn't serve a stale 401/cached response.
-    const a = new Audio(url + '&t=' + Date.now());
-    audioRef.current = a;
-    a.oncanplay  = () => setPState('playing');  // audio ready to play
-    a.onended    = () => setPState('idle');
-    a.onerror    = () => {
-      // FE-B2 fix: pass headers correctly as {headers: {...}}, not bare object
-      fetch(url, {headers: {'X-Admin-Password': ADMIN_PW}})
-        .then(r => r.ok ? null : r.json().catch(() => null).then(j => j?.detail || `HTTP ${r.status}`))
-        .then(msg => { setPState('error'); setErrMsg(msg || 'Recording unavailable'); })
-        .catch(() => { setPState('error'); setErrMsg('Recording unavailable'); });
-    };
-    a.play().catch(err => {
-      setPState('error');
-      setErrMsg(err.message || 'Playback failed');
-    });
+    // Fetch the entire recording as a blob, then create an object URL.
+    // Blob URLs are always fully seekable (no range-request support needed).
+    fetch(url + '&t=' + Date.now())
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.blob();
+      })
+      .then(blob => {
+        const blobUrl = URL.createObjectURL(blob);
+        const a = new Audio(blobUrl);
+        audioRef.current = a;
+        a.onloadedmetadata = () => setDuration(a.duration || 0);
+        a.ontimeupdate = () => {
+          if (seekingRef.current) return;
+          const t = a.currentTime || 0;
+          if (sliderRef.current) sliderRef.current.value = t;
+          setTimeDisplay(fmtTime(t) + '/' + fmtTime(a.duration || 0));
+        };
+        a.oncanplay  = () => setPState('playing');
+        a.onended    = () => { setPState('idle'); setTimeDisplay(''); URL.revokeObjectURL(blobUrl); };
+        a.onerror    = () => { setPState('error'); setErrMsg('Playback failed'); URL.revokeObjectURL(blobUrl); };
+        a.play().catch(err => { setPState('error'); setErrMsg(err.message || 'Playback failed'); });
+      })
+      .catch(err => {
+        setPState('error');
+        setErrMsg(err.message || 'Recording unavailable');
+      });
   };
 
-  React.useEffect(() => () => { audioRef.current && audioRef.current.pause(); }, []);
+  const onSeekStart = e => {
+    e.stopPropagation();
+    seekingRef.current = true;
+  };
+  const onSeekMove = e => {
+    e.stopPropagation();
+    const val = parseFloat(e.target.value);
+    setTimeDisplay(fmtTime(val) + '/' + fmtTime(duration));
+  };
+  const onSeekCommit = e => {
+    e.stopPropagation();
+    const val = parseFloat(e.target.value);
+    if (audioRef.current) audioRef.current.currentTime = val;
+    setTimeDisplay(fmtTime(val) + '/' + fmtTime(duration));
+    seekingRef.current = false;
+  };
+
+  React.useEffect(() => () => {
+    if (audioRef.current) {
+      const src = audioRef.current.src;
+      audioRef.current.pause();
+      if (src && src.startsWith('blob:')) URL.revokeObjectURL(src);
+    }
+  }, []);
 
   if (noRecording) {
     return <span title="No recording available for this call" style={{fontSize:11,color:'#94a3b8',cursor:'default'}}>—</span>;
   }
 
+  const isActive = pState === 'playing' || pState === 'paused';
   const label = pState === 'loading' ? '⏳' : pState === 'playing' ? '⏸' : pState === 'error' ? '↺' : '▶';
-  const color  = pState === 'error' ? '#dc2626' : pState === 'playing' ? '#7c3aed' : '#0369a1';
-  const bg     = pState === 'error' ? '#fef2f2' : pState === 'playing' ? '#f5f3ff' : '#e0f2fe';
-  const border = pState === 'error' ? '#dc2626' : pState === 'playing' ? '#7c3aed' : '#0369a1';
+  const color  = pState === 'error' ? '#dc2626' : isActive ? '#7c3aed' : '#0369a1';
+  const bg     = pState === 'error' ? '#fef2f2' : isActive ? '#f5f3ff' : '#e0f2fe';
+  const border = pState === 'error' ? '#dc2626' : isActive ? '#7c3aed' : '#0369a1';
   const titleText = pState === 'playing' ? 'Pause'
+    : pState === 'paused' ? 'Resume'
     : pState === 'error' ? `Error: ${errMsg} — click to retry`
     : 'Play recording (auto-deleted after 60 min)';
   return (
-    <button onClick={toggle} title={titleText}
-      style={{fontSize:11,padding:'3px 8px',border:`1px solid ${border}`,borderRadius:3,
-        cursor:'pointer',color,background:bg,whiteSpace:'nowrap'}}>
-      {label}
-    </button>
+    <span style={{display:'inline-flex',alignItems:'center',gap:4}} onClick={e => e.stopPropagation()}>
+      <button onClick={toggle} title={titleText}
+        style={{fontSize:11,padding:'3px 8px',border:`1px solid ${border}`,borderRadius:3,
+          cursor:'pointer',color,background:bg,whiteSpace:'nowrap'}}>
+        {label}
+      </button>
+      {isActive && duration > 0 && (
+        <React.Fragment>
+          <input type="range" ref={sliderRef} min={0} max={duration} step={0.5} defaultValue={0}
+            onMouseDown={onSeekStart} onTouchStart={onSeekStart}
+            onInput={onSeekMove}
+            onChange={onSeekCommit}
+            style={{width:80,height:4,cursor:'pointer',accentColor:'#7c3aed'}} />
+          <span style={{fontSize:10,color:'#64748b',whiteSpace:'nowrap',fontVariantNumeric:'tabular-nums'}}>
+            {timeDisplay}
+          </span>
+        </React.Fragment>
+      )}
+    </span>
   );
 }
 
