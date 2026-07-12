@@ -230,7 +230,6 @@ def _transcribe_openai(audio_path: Path, api_key: str) -> str:
             files={"file": (audio_path.name, f, "audio/mpeg")},
             data={
                 "model": "whisper-1",
-                "language": "en",
                 "response_format": "text",
                 "prompt": (
                     "This is a phone call for a dental office. "
@@ -258,7 +257,6 @@ def _transcribe_local(audio_path: Path, model_name: str) -> str:
     try:
         result = model.transcribe(
             str(audio_path),
-            language="en",
             fp16=fp16,
             initial_prompt=(
                 "This is a phone call for a dental office. "
