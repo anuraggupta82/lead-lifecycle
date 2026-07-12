@@ -1096,6 +1096,7 @@ LIFECYCLE_STAGES = [
     "auto_nurture",
     "scheduled",
     "no_show",
+    "canceled",
     "showed",
     "treatment_presented",
     "treatment_accepted",
@@ -3454,8 +3455,10 @@ def update_stage(lead_id: str, new_stage: str, source: str = "system", detail: s
         raise ValueError(f"Lead {lead_id} not found")
 
     old_stage = lead["stage"]
-    # no_show can come from scheduled; cold can come from anywhere
+    # no_show can come from scheduled; canceled can come from scheduled or no_show; cold from anywhere
     if new_stage == "no_show" and old_stage in ("scheduled",):
+        pass  # allow
+    elif new_stage == "canceled" and old_stage in ("scheduled", "no_show"):
         pass  # allow
     elif STAGE_ORDER.get(new_stage, 0) <= STAGE_ORDER.get(old_stage, 0) and new_stage != "cold":
         return lead  # Don't go backwards
