@@ -145,31 +145,44 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"communication_log backfill failed (non-fatal): {e}")
 
-    # Rescue any calls that were stranded as 'skipped_no_audio' due to missing
-    # Mango token during reconciliation — reset them so the pipeline tick can
-    # retry transcription on the next cycle.
-    try:
-        from database import reset_skipped_no_audio_calls
-        n_rescued = reset_skipped_no_audio_calls()
-        if n_rescued:
-            logger.info(f"Rescued {n_rescued} skipped_no_audio call(s) — reset to pending for pipeline retry")
-    except Exception as e:
-        logger.warning(f"reset_skipped_no_audio_calls failed (non-fatal): {e}")
+    # ── Non-blocking startup syncs (§2.8) ──────────────────────────────────
+    # These 3 calls are safe to run in a background thread — they don't affect
+    # the follow-up scheduler's duplicate-send guard (that's backfill_communication_log
+    # above, which MUST stay blocking). Running them in the background cuts 30-60s
+    # off startup time so the portal is usable immediately.
+    import threading
 
-    # Backfill keyword attribution on any calls already matched to GAds call_view rows
-    try:
-        n_kw = backfill_call_keyword_attribution()
-        if n_kw:
-            logger.info(f"Startup: backfilled keyword attribution on {n_kw} call(s)")
-    except Exception as e:
-        logger.warning(f"backfill_call_keyword_attribution failed (non-fatal): {e}")
+    def _startup_background_syncs():
+        """Run non-critical startup syncs in background after server is accepting requests."""
+        # 1. Rescue calls stranded as 'skipped_no_audio'
+        try:
+            from database import reset_skipped_no_audio_calls
+            n_rescued = reset_skipped_no_audio_calls()
+            if n_rescued:
+                logger.info(f"[bg-startup] Rescued {n_rescued} skipped_no_audio call(s)")
+        except Exception as e:
+            logger.warning(f"[bg-startup] reset_skipped_no_audio_calls failed: {e}")
 
-    # Auto-sync Firestore leads on startup (non-blocking — ignore errors)
-    try:
-        result = sync_from_firestore()
-        logger.info(f"Startup Firestore sync: {result}")
-    except Exception as e:
-        logger.warning(f"Startup Firestore sync failed (non-fatal): {e}")
+        # 2. Backfill keyword attribution on calls matched to GAds call_view rows
+        try:
+            n_kw = backfill_call_keyword_attribution()
+            if n_kw:
+                logger.info(f"[bg-startup] Backfilled keyword attribution on {n_kw} call(s)")
+        except Exception as e:
+            logger.warning(f"[bg-startup] backfill_call_keyword_attribution failed: {e}")
+
+        # 3. Sync Firestore leads
+        try:
+            result = sync_from_firestore()
+            logger.info(f"[bg-startup] Firestore sync: {result}")
+        except Exception as e:
+            logger.warning(f"[bg-startup] Firestore sync failed: {e}")
+
+        logger.info("[bg-startup] Background startup syncs complete")
+
+    _bg_thread = threading.Thread(target=_startup_background_syncs, name="startup-syncs", daemon=True)
+    _bg_thread.start()
+    logger.info("Startup syncs dispatched to background thread — portal ready")
 
     # Start follow-up scheduler (every 15 min)
     start_scheduler()
