@@ -1317,6 +1317,9 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                     **_kw_kwargs,
                 )
                 attributed += 1
+                # Update mc dict so _queue_process_if_needed sees the new attribution
+                mc["gads_call_id"] = _cr_best_id
+                mc["match_method"] = "callrail_confirmed"
                 _queue_process_if_needed(mc, mango_token=mango_token)
                 try:
                     with _db_conn() as _fc_conn:
@@ -1397,6 +1400,9 @@ def reconcile_attribution(days: int = 7, target_gads_call_id: str = "", mango_to
                 # No keyword: call-extension (tap-to-call) calls have no search term.
             )
             attributed += 1
+            # Update mc dict so _queue_process_if_needed sees the new attribution
+            mc["gads_call_id"] = _dm_best_id
+            mc["match_method"] = "gads_time_match"
             _queue_process_if_needed(mc, mango_token=mango_token)
             try:
                 with _db_conn() as _fc_conn:
@@ -1705,10 +1711,14 @@ def _backfill_call_flags_for_attributed(days: int = 7) -> int:
 
 def _queue_process_if_needed(mc: dict, mango_token: Optional[str] = None) -> None:
     """
-    If a newly-matched call hasn't been transcribed yet, queue it for full
-    pipeline processing (transcription → summary → grading) in a background
-    thread. Skips calls that are already done, in-progress, or too short to
-    be worth transcribing (<15s).
+    Auto-transcribe a call if it meets ALL of these criteria:
+      1. Not already transcribed (done / in_progress)
+      2. Duration ≥ 15s
+      3. Has paid-ads attribution (GAds gclid/call_id, or fbclid for future Meta)
+      4. Patient is NOT existing_active (only transcribe new-patient calls)
+
+    Calls that don't qualify for auto-transcription remain available for manual
+    transcription via the admin endpoint.
 
     mango_token must be passed so process_call can fetch a fresh pre-signed
     recording URL from Mango. Without it, process_call immediately writes
@@ -1724,11 +1734,27 @@ def _queue_process_if_needed(mc: dict, mango_token: Optional[str] = None) -> Non
         logger.debug(f"[reconcile] Skipping auto-process for {uuid[:8]} — too short ({duration}s)")
         return
 
+    # ── Source gate: only auto-transcribe paid-ads calls ──────────────────
+    has_gads = bool((mc.get("gads_call_id") or "").strip())
+    has_fbclid = bool((mc.get("fbclid") or "").strip())
+    # Also check match_method for GAds-attributed calls
+    _mm = (mc.get("match_method") or "")
+    has_paid_method = _mm in ("callrail_confirmed", "gads_time_match")
+    if not (has_gads or has_fbclid or has_paid_method):
+        logger.debug(f"[reconcile] Skipping auto-process for {uuid[:8]} — no paid-ads attribution (gads/fbclid)")
+        return
+
+    # ── Patient gate: skip existing active patients ──────────────────────
+    od_status = (mc.get("od_patient_status") or "").strip()
+    if od_status in ("existing_active", "existing_inactive"):
+        logger.debug(f"[reconcile] Skipping auto-process for {uuid[:8]} — {od_status} patient")
+        return
+
     if not mango_token:
         logger.warning(f"[reconcile] No mango_token available — call {uuid[:8]} will remain pending for pipeline tick")
         return
 
-    logger.info(f"[reconcile] Processing call {uuid[:8]} ({duration}s) synchronously")
+    logger.info(f"[reconcile] Auto-processing GAds new-patient call {uuid[:8]} ({duration}s)")
 
     try:
         from mango_pipeline import process_call

@@ -1899,6 +1899,7 @@ def _get_od_patient_info_by_phone(conn, phone_10: str) -> dict | None:
                 # reliable signal for when the patient was actually entered into OD,
                 # since SecDateEntry on the patient table can reflect system defaults.
                 earliest_apt_entry = None
+                earliest_completed_apt = None
                 try:
                     cur.execute(
                         "SELECT MIN(SecDateTEntry) FROM appointment WHERE PatNum = %s",
@@ -1909,12 +1910,25 @@ def _get_od_patient_info_by_phone(conn, phone_10: str) -> dict | None:
                         earliest_apt_entry = apt_row[0]  # datetime or string
                 except Exception as apt_err:
                     logger.warning(f"OD earliest-apt lookup failed for PatNum {pat_num}: {apt_err}")
+                # Earliest COMPLETED appointment (AptStatus=2) — the true signal
+                # for whether a patient has actually visited the practice.
+                try:
+                    cur.execute(
+                        "SELECT MIN(AptDateTime) FROM appointment WHERE PatNum = %s AND AptStatus = 2",
+                        (pat_num,),
+                    )
+                    comp_row = cur.fetchone()
+                    if comp_row and comp_row[0]:
+                        earliest_completed_apt = comp_row[0]
+                except Exception as comp_err:
+                    logger.warning(f"OD earliest-completed-apt lookup failed for PatNum {pat_num}: {comp_err}")
                 return {
-                    "pat_num":             str(pat_num),
-                    "first_name":          (row[1] or "").strip(),
-                    "last_name":           (row[2] or "").strip(),
-                    "pat_status":          int(row[3]),
-                    "earliest_apt_entry":  earliest_apt_entry,
+                    "pat_num":                str(pat_num),
+                    "first_name":             (row[1] or "").strip(),
+                    "last_name":              (row[2] or "").strip(),
+                    "pat_status":             int(row[3]),
+                    "earliest_apt_entry":     earliest_apt_entry,
+                    "earliest_completed_apt": earliest_completed_apt,
                 }
     except Exception as e:
         logger.warning(f"OD patient info lookup failed for phone {phone_10}: {e}")
@@ -1939,6 +1953,7 @@ def _get_od_patient_info_by_patnum(conn, pat_num: str) -> dict | None:
             row = cur.fetchone()
             if row:
                 earliest_apt_entry = None
+                earliest_completed_apt = None
                 try:
                     cur.execute(
                         "SELECT MIN(SecDateTEntry) FROM appointment WHERE PatNum = %s",
@@ -1949,12 +1964,23 @@ def _get_od_patient_info_by_patnum(conn, pat_num: str) -> dict | None:
                         earliest_apt_entry = apt_row[0]
                 except Exception as apt_err:
                     logger.warning(f"OD earliest-apt lookup failed for PatNum {pat_num}: {apt_err}")
+                try:
+                    cur.execute(
+                        "SELECT MIN(AptDateTime) FROM appointment WHERE PatNum = %s AND AptStatus = 2",
+                        (int(pat_num),),
+                    )
+                    comp_row = cur.fetchone()
+                    if comp_row and comp_row[0]:
+                        earliest_completed_apt = comp_row[0]
+                except Exception as comp_err:
+                    logger.warning(f"OD earliest-completed-apt lookup failed for PatNum {pat_num}: {comp_err}")
                 return {
-                    "pat_num":            str(row[0]),
-                    "first_name":         (row[1] or "").strip(),
-                    "last_name":          (row[2] or "").strip(),
-                    "pat_status":         int(row[3]),
-                    "earliest_apt_entry": earliest_apt_entry,
+                    "pat_num":                str(row[0]),
+                    "first_name":             (row[1] or "").strip(),
+                    "last_name":              (row[2] or "").strip(),
+                    "pat_status":             int(row[3]),
+                    "earliest_apt_entry":     earliest_apt_entry,
+                    "earliest_completed_apt": earliest_completed_apt,
                 }
     except Exception as e:
         logger.warning(f"OD patient info lookup failed for PatNum {pat_num}: {e}")
@@ -2011,18 +2037,25 @@ def _classify_od_status(pat_info: dict | None, call_time=None,
     Classify caller's OD relationship. Return values:
 
       no_match          — phone not found in OD at all (true new patient inquiry)
-      new_patient       — in OD (PatStatus=0) but all appointments were booked AFTER
-                          this call (record created in response to the call), or
-                          in OD with PatStatus=0 but no appointments ever.
-      existing_active   — PatStatus=0, has at least one appointment entry ≤ call_time
+      new_patient       — in OD but has never completed a visit before this call.
+                          Covers: (a) no appointments at all, (b) OD record created
+                          after the call, (c) appointments exist but none completed
+                          (AptStatus=2) before the call time. A patient who has only
+                          scheduled/future appointments is still marketing-new.
+      existing_active   — PatStatus=0, has at least one COMPLETED appointment
+                          (AptStatus=2) with AptDateTime before the call time
       existing_inactive — PatStatus=2 (Inactive) or 3 (Archived)
       unknown           — OD record found but PatStatus not in 0/2/3 (NonPatient,
                           Deceased, Prospective — shouldn't block lead creation)
 
-    Core rule: if the patient's earliest appointment entry in OD is AFTER the call
-    time, the record was created in response to this call → new_patient, regardless
-    of PatStatus. SecDateEntry on the patient table is unreliable (can reflect system
-    defaults); SecDateTEntry on the appointment table is the authoritative timestamp.
+    Primary rule: a patient is only "existing_active" if they have actually completed
+    a visit before this call. Having an OD record or scheduled appointments alone does
+    NOT make them existing — they could be a new patient lead who was booked but hasn't
+    been seen yet (e.g. Sara Hanna: form submission → OD record → scheduled appointment
+    → calls in → should still be classified as new_patient).
+
+    Fallback for no call_time: if call_time is unavailable, checks whether the patient
+    has ANY completed appointment (regardless of timing).
 
     GUARD logic in process_webhook: skips lead creation only for
     existing_active | existing_inactive. All other statuses → create lead.
@@ -2031,33 +2064,53 @@ def _classify_od_status(pat_info: dict | None, call_time=None,
         return "no_match"
     ps = pat_info.get("pat_status", -1)
     if ps == 0:
+        # Normalise datetimes for comparison
+        from datetime import datetime
+        def _to_dt(v):
+            if isinstance(v, datetime):
+                return v.replace(tzinfo=None)
+            if isinstance(v, str):
+                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        return datetime.strptime(v[:19], fmt)
+                    except ValueError:
+                        continue
+            return None
+
+        call_dt = _to_dt(call_time) if call_time else None
+
+        # ── Check 1: OD record creation timing (earliest appointment entry) ──
         earliest = pat_info.get("earliest_apt_entry")
         if not earliest:
-            # In OD but no appointments at all → new patient
             logger.debug(f"[classify_od] PatNum={pat_info.get('pat_num')} PatStatus=0, no appointments → new_patient")
             return "new_patient"
-        if call_time:
-            # Normalise both to naive datetimes for comparison
-            from datetime import datetime
-            def _to_dt(v):
-                if isinstance(v, datetime):
-                    return v.replace(tzinfo=None)
-                if isinstance(v, str):
-                    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                        try:
-                            return datetime.strptime(v[:19], fmt)
-                        except ValueError:
-                            continue
-                return None
+        if call_dt:
             earliest_dt = _to_dt(earliest)
-            call_dt     = _to_dt(call_time)
-            if earliest_dt and call_dt:
-                if earliest_dt > call_dt:
-                    logger.info(
-                        f"[classify_od] PatNum={pat_info.get('pat_num')} earliest_apt={earliest_dt} "
-                        f"> call_time={call_dt} → new_patient (record created after call)"
-                    )
-                    return "new_patient"
+            if earliest_dt and earliest_dt > call_dt:
+                logger.info(
+                    f"[classify_od] PatNum={pat_info.get('pat_num')} earliest_apt={earliest_dt} "
+                    f"> call_time={call_dt} → new_patient (record created after call)"
+                )
+                return "new_patient"
+
+        # ── Check 2: Has the patient COMPLETED a visit before this call? ─────
+        # This is the key distinction: a patient with only scheduled/future
+        # appointments is still new from a marketing perspective.
+        earliest_completed = pat_info.get("earliest_completed_apt")
+        if not earliest_completed:
+            logger.info(
+                f"[classify_od] PatNum={pat_info.get('pat_num')} has appointments but none completed → new_patient"
+            )
+            return "new_patient"
+        if call_dt:
+            completed_dt = _to_dt(earliest_completed)
+            if completed_dt and completed_dt > call_dt:
+                logger.info(
+                    f"[classify_od] PatNum={pat_info.get('pat_num')} earliest_completed={completed_dt} "
+                    f"> call_time={call_dt} → new_patient (no completed visits before call)"
+                )
+                return "new_patient"
+
         return "existing_active"
     elif ps in (2, 3):
         return "existing_inactive"
