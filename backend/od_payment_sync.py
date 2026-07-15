@@ -129,6 +129,7 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
               AND od_patient_num IS NOT NULL
               AND (
                   (gclid != '' AND gclid IS NOT NULL)
+                  OR (campaign_id != '' AND campaign_id IS NOT NULL)
                   OR EXISTS (
                       SELECT 1 FROM callrail_calls cc
                       WHERE cc.lead_id = leads.id
@@ -147,6 +148,7 @@ def _collect_lead_targets(conn, full_resync: bool, cutoff_iso: str) -> list:
               AND od_patient_num IS NOT NULL
               AND (
                   (gclid != '' AND gclid IS NOT NULL)
+                  OR (campaign_id != '' AND campaign_id IS NOT NULL)
                   OR EXISTS (
                       SELECT 1 FROM callrail_calls cc
                       WHERE cc.lead_id = leads.id
