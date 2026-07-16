@@ -36,7 +36,7 @@ import logging
 import re
 import sqlite3
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from google.ads.googleads.client import GoogleAdsClient
 from google.protobuf import field_mask_pb2
@@ -470,6 +470,32 @@ def upload_offline_conversions() -> dict:
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S+00:00")
             except Exception:
                 ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
+
+            # ── Click-time floor ──────────────────────────────────────────
+            # Google rejects conversions whose conversion_date_time precedes
+            # the gclid click.  gads_clicks.click_date is YYYY-MM-DD in
+            # account timezone (ET).  The latest a click can occur in UTC
+            # for a given ET date is ~04:00 UTC the next day.  We set the
+            # floor to click_date + 1 day 06:00 UTC to safely clear any
+            # same-day click, then bump ts_str if it falls below.
+            click_row = db.execute(
+                "SELECT click_date FROM gads_clicks WHERE gclid = ?", (gclid,)
+            ).fetchone()
+            if click_row and click_row["click_date"]:
+                try:
+                    _cd = datetime.strptime(click_row["click_date"], "%Y-%m-%d")
+                    click_floor_utc = _cd.replace(tzinfo=timezone.utc) + timedelta(days=1, hours=6)
+                    conv_ts_parsed = datetime.fromisoformat(ts_str)
+                    if not conv_ts_parsed.tzinfo:
+                        conv_ts_parsed = conv_ts_parsed.replace(tzinfo=timezone.utc)
+                    if conv_ts_parsed < click_floor_utc:
+                        ts_str = click_floor_utc.strftime("%Y-%m-%d %H:%M:%S+00:00")
+                        logger.info(
+                            f"Bumped conversion ts for lead {lead_id}/{conversion_name}: "
+                            f"click_date={click_row['click_date']}, bumped to {ts_str}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Click-floor check failed for lead {lead_id}: {e}")
 
             try:
                 click_conversion = client.get_type("ClickConversion")
