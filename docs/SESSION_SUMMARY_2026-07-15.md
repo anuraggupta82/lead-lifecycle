@@ -35,12 +35,23 @@
 - **Problem 3:** Pipeline kanban sorted by `updated_at` — old re-enriched leads jumped to top.
 - **Fix (frontend/index.html):** Added `created_at DESC` sort in `byStage` useMemo.
 
+### §2.3p: Webhook gclid Propagation + Name Cleanup
+- **Problem 1:** CallRail webhook links calls to mango rows but doesn't propagate `gclid` → `gads_call_id`. Webhook-linked calls never trigger auto-transcription.
+- **Fix (callrail_webhook.py):** After `_upsert_callrail_call()`, added propagation block: checks mango_uuid + click_id + google_ads source → updates gads_call_id, match_method='callrail_confirmed', re-triggers `_queue_process_if_needed()`.
+- **Problem 2:** Pipeline cards showed caller-ID names (ALL CAPS, commas) for leads finalized before §2.3n.
+- **Fix (main.py):** Added `POST /api/admin/calls/fix-caller-id-names` endpoint. Fixed 10 leads: GIANGREGORIO,PA→Paula Giangregorio, HELDENBERGH B.→Brian Heldenbergh, etc.
+
+### Docs added to git repo
+- Commit `a197bc5` — Added `docs/` folder with Plan.md, CLAUDE.md, Marketing master reference, all session summaries
+
 ## Git Commits (all pushed)
 - `9ef57bc` — Fix: Include campaign-attributed leads in OD payment sync (Claire $24K)
 - `97fd92e` — §2.3m: Fix existing-patient misclassification + gate auto-transcription
 - `7b7942c` — §2.8: Non-blocking startup (3 syncs to background thread)
 - `7635255` — Fix conversion upload timestamp — use click_date as floor
-- (pending) — §2.3n: CallRail→Mango propagation, OD name upgrade, pipeline sort
+- `b68e74e` — §2.3n: CallRail→Mango propagation, OD name upgrade, pipeline sort
+- `a197bc5` — Add project docs to repo (Plan.md, session summaries, CLAUDE.md, master reference)
+- (pending) — §2.3p: Webhook gclid propagation + caller-ID name cleanup endpoint
 
 ## Pending
 - §2.3o: Custom procedure code detection (Cnxtsmile, D7210, procedurelog check)

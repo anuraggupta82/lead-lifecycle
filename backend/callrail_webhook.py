@@ -729,6 +729,42 @@ def process_webhook(payload: dict, raw_body: bytes) -> dict:
             )
 
         result["was_new_call_row"] = is_new
+
+        # ── 8b. Propagate gclid → mango_calls.gads_call_id ─────────────
+        if mango_uuid and _click_id:
+            _src_norm = (resolved_source or "").lower().replace(" ", "_")
+            if _src_norm == "google_ads":
+                try:
+                    from database import _conn as _conn2
+                    with _conn2() as conn2:
+                        mc_row = conn2.execute(
+                            "SELECT gads_call_id, match_method FROM mango_calls WHERE uuid = ?",
+                            (mango_uuid,)
+                        ).fetchone()
+                        if mc_row and not (mc_row["gads_call_id"] or "").strip():
+                            conn2.execute("""
+                                UPDATE mango_calls
+                                SET gads_call_id = ?, match_method = 'callrail_confirmed',
+                                    updated_at = ?
+                                WHERE uuid = ?
+                            """, (_click_id, _now_iso(), mango_uuid))
+                            logger.info(
+                                "[callrail_webhook] propagated gclid→gads_call_id on mango %s "
+                                "for call %s", mango_uuid, call_id,
+                            )
+                            # Re-trigger auto-transcription gate
+                            mc_full = conn2.execute(
+                                "SELECT * FROM mango_calls WHERE uuid = ?", (mango_uuid,)
+                            ).fetchone()
+                            if mc_full:
+                                from mango_service import _queue_process_if_needed
+                                _queue_process_if_needed(dict(mc_full))
+                except Exception as e:
+                    logger.warning(
+                        "[callrail_webhook] gclid propagation failed for mango %s: %s",
+                        mango_uuid, e,
+                    )
+
         result["lead_match_method"] = lead_match_method
         result.update({"ok": True, "action": action})
 

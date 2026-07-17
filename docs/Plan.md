@@ -395,6 +395,14 @@ Fields to populate:
 3. Add fallback check on `procedurelog` ProcStatus=1 entries (treatment-planned procedures not yet in `proctp`/`treatplan`)
 4. Audit OD for other custom codes that should trigger treatment_presented
 
+### §2.3p Webhook gclid Propagation + Name Cleanup `[DONE — Jul 16]`
+
+**Problem 1:** CallRail webhook links calls to mango rows (`mango_call_id`) but doesn't propagate `gclid` → `gads_call_id`. Webhook-linked calls never trigger auto-transcription because the mango_calls row lacks `gads_call_id`.
+**Fix (callrail_webhook.py):** After `_upsert_callrail_call()`, added block that checks if `mango_uuid` + `_click_id` + google_ads source → updates `gads_call_id`, sets `match_method='callrail_confirmed'`, re-triggers `_queue_process_if_needed()`.
+
+**Problem 2:** Pipeline cards showed caller-ID-style names (ALL CAPS, commas, city/state) instead of patient names. Existing leads finalized before the §2.3n code change were stuck.
+**Fix (main.py):** Added `POST /api/admin/calls/fix-caller-id-names` endpoint. Finds leads with caller-ID names, updates from `od_patient_name` (priority) or `ai_patient_name` via linked `mango_calls`. Supports dry_run. Fixed 10 leads on first run.
+
 ### §2.3g Local Whisper Support `[PLAN — P3]`
 
 **Problem:** All transcription currently goes through OpenAI's cloud API ($0.006/min). For high call volume, local Whisper on Mac Mini (or GPU server) would eliminate per-call cost.

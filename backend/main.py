@@ -11716,6 +11716,78 @@ def admin_mango_reconcile_now(days: int = 14):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/calls/fix-caller-id-names", dependencies=[Depends(_require_admin)])
+def admin_fix_caller_id_names(dry_run: bool = False):
+    """One-time cleanup: find leads with caller-ID-style names (ALL CAPS, commas)
+    and update them from od_patient_name / ai_patient_name on their linked mango_calls."""
+    from database import _conn as _db_conn
+
+    def _is_caller_id(first: str, last: str) -> bool:
+        full = f"{first} {last}".strip()
+        if not full or full.lower() == "unknown":
+            return True
+        if full.isupper() and len(full) > 3:
+            return True
+        if "," in first and len(last) <= 3:
+            return True
+        if full.replace("-", "").replace("(", "").replace(")", "").replace(" ", "").isdigit():
+            return True
+        return False
+
+    fixed = []
+    skipped = []
+    with _db_conn() as conn:
+        # Find leads linked to mango_calls that have a better name available
+        rows = conn.execute("""
+            SELECT l.id, l.first_name, l.last_name,
+                   MAX(mc.od_patient_name) AS od_patient_name,
+                   MAX(mc.ai_patient_name) AS ai_patient_name
+            FROM leads l
+            JOIN mango_calls mc ON mc.lead_id = l.id
+            WHERE mc.lead_id IS NOT NULL
+              AND mc.lead_id != ''
+            GROUP BY l.id
+        """).fetchall()
+
+        for r in rows:
+            first = (r["first_name"] or "").strip()
+            last = (r["last_name"] or "").strip()
+            if not _is_caller_id(first, last):
+                continue
+
+            od_name = (r["od_patient_name"] or "").strip()
+            ai_name = (r["ai_patient_name"] or "").strip()
+            best = od_name or ai_name
+            if not best:
+                skipped.append({"lead_id": r["id"][:12], "current": f"{first} {last}",
+                                "reason": "no_better_name"})
+                continue
+
+            parts = best.split(None, 1)
+            new_first = parts[0].title() if parts else best.title()
+            new_last = parts[1].title() if len(parts) > 1 else ""
+            src = "od_patient_name" if od_name else "ai_patient_name"
+
+            if not dry_run:
+                conn.execute(
+                    "UPDATE leads SET first_name = ?, last_name = ?, updated_at = ? WHERE id = ?",
+                    (new_first, new_last,
+                     __import__("datetime").datetime.now(
+                         __import__("datetime").timezone.utc).isoformat(),
+                     r["id"]),
+                )
+
+            fixed.append({
+                "lead_id": r["id"][:12],
+                "old": f"{first} {last}",
+                "new": f"{new_first} {new_last}",
+                "source": src,
+            })
+
+    return {"dry_run": dry_run, "fixed": len(fixed), "skipped": len(skipped),
+            "details": fixed, "skipped_details": skipped}
+
+
 @app.post("/api/admin/calls/backfill-lead-links", dependencies=[Depends(_require_admin)])
 def admin_backfill_lead_links(days: int = 90, dry_run: bool = False):
     """ATTR-FIX3: Link lead_id on calls that have GAds attribution but no lead_id.
