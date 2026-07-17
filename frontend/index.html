@@ -1715,6 +1715,10 @@ function KanbanBoard({ pipeline, stats, selectedId, onCardClick, onStageChange, 
     filtered.forEach(l => {
       if (map[l.stage] !== undefined) map[l.stage].push(l);
     });
+    // Sort each column by created_at descending (newest first)
+    for (const stage of Object.keys(map)) {
+      map[stage].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    }
     return map;
   }, [filtered]);
 

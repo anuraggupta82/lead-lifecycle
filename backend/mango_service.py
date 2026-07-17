@@ -519,7 +519,7 @@ def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) ->
     linked = 0
     with _db_conn() as conn:
         unlinked = conn.execute("""
-            SELECT id, caller_number, called_at, keyword, campaign, source
+            SELECT id, caller_number, called_at, keyword, campaign, source, gclid
             FROM callrail_calls
             WHERE (mango_call_id IS NULL OR mango_call_id = '')
               AND called_at >= ?
@@ -593,6 +593,31 @@ def _link_unmatched_callrail_to_mango(window_minutes: int = 3, days: int = 7) ->
                                OR attributed_keyword_method = '')
                     """, (cr_keyword, ag_display, ag_display,
                           datetime.now(timezone.utc).isoformat(), mango_uuid))
+
+                # Propagate GAds attribution from CallRail to Mango call
+                cr_gclid = (row["gclid"] or "").strip()
+                if cr_gclid and cr_source.lower().replace(" ", "_") == "google_ads":
+                    # Check if mango call already has gads_call_id
+                    mc_row = conn.execute(
+                        "SELECT gads_call_id, match_method FROM mango_calls WHERE uuid = ?",
+                        (mango_uuid,)
+                    ).fetchone()
+                    if mc_row and not (mc_row["gads_call_id"] or "").strip():
+                        conn.execute("""
+                            UPDATE mango_calls
+                            SET gads_call_id = ?, match_method = 'callrail_confirmed',
+                                updated_at = ?
+                            WHERE uuid = ?
+                        """, (cr_gclid, datetime.now(timezone.utc).isoformat(), mango_uuid))
+                        logger.info(
+                            f"[link-cr] Propagated gads attribution to mango {mango_uuid[:8]}: "
+                            f"gclid={cr_gclid[:20]}…, method=callrail_confirmed"
+                        )
+                        # Re-trigger auto-transcription gate with updated fields
+                        mc_full = conn.execute("SELECT * FROM mango_calls WHERE uuid = ?", (mango_uuid,)).fetchone()
+                        if mc_full:
+                            mc_dict = dict(mc_full)
+                            _queue_process_if_needed(mc_dict)
 
     return linked
 
@@ -763,6 +788,7 @@ def finalize_call_lead(uuid: str) -> dict:
                     mc.attributed_keyword_method,
                     mc.gads_call_id,
                     mc.ai_patient_name      AS mc_ai_patient_name,
+                    mc.od_patient_name      AS mc_od_patient_name,
                     mc.od_patient_num       AS mc_od_patient_num,
                     mc.od_patient_status    AS mc_od_patient_status,
                     mc.od_matched_at        AS mc_od_matched_at,
@@ -864,6 +890,7 @@ def finalize_call_lead(uuid: str) -> dict:
             _cur_last = (lead["last_name"] or "").strip()
             _cur_full = f"{_cur_first} {_cur_last}".strip()
             _ai_name = (row.get("mc_ai_patient_name") or "").strip()
+            _od_name = (row.get("mc_od_patient_name") or "").strip()
 
             def _looks_like_caller_id(first: str, last: str, full: str) -> bool:
                 """Return True if the name looks like a raw caller ID, not a real patient name."""
@@ -880,17 +907,19 @@ def finalize_call_lead(uuid: str) -> dict:
                     return True
                 return False
 
-            if _ai_name and _looks_like_caller_id(_cur_first, _cur_last, _cur_full):
-                _parts = _ai_name.split(None, 1)
-                updates["first_name"] = _parts[0].title() if _parts else _ai_name.title()
+            _best_name = _od_name or _ai_name
+            if _best_name and _looks_like_caller_id(_cur_first, _cur_last, _cur_full):
+                _parts = _best_name.split(None, 1)
+                updates["first_name"] = _parts[0].title() if _parts else _best_name.title()
                 if len(_parts) > 1:
                     updates["last_name"] = _parts[1].title()
                 elif _cur_last and _cur_last.isupper():
                     # AI only got first name — at least title-case the existing last
                     updates["last_name"] = _cur_last.title()
+                _name_src = "od_patient_name" if _od_name else "ai_patient_name"
                 logger.info(
-                    "finalize_call_lead: name upgrade '%s' -> '%s %s' (ai_patient_name) for lead %s",
-                    _cur_full, updates["first_name"], updates.get("last_name", ""), lead_id,
+                    "finalize_call_lead: name upgrade '%s' -> '%s %s' (%s) for lead %s",
+                    _cur_full, updates["first_name"], updates.get("last_name", ""), _name_src, lead_id,
                 )
 
             # ── 7. Guarantor re-derivation (§2.3k) ──────────────────────────
