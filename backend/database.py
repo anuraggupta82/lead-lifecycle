@@ -2026,10 +2026,19 @@ GROUP BY a.campaign_id, c.campaign_name;
         LEFT JOIN gads_call_view gcv ON gcv.call_id = mc.gads_call_id
     """)
 
-    # Seed grading rubric on first run
+    # Seed grading rubric on first run, or migrate from old 7-criteria to new 14-criteria
     n_crit = conn.execute("SELECT COUNT(*) FROM call_grading_criteria").fetchone()[0]
     if n_crit == 0:
         _seed_call_grading_criteria(conn)
+    else:
+        # Detect old 7-criterion rubric by checking for the old name "Enthusiasm & Warmth"
+        old_check = conn.execute(
+            "SELECT 1 FROM call_grading_criteria WHERE name = 'Enthusiasm & Warmth'"
+        ).fetchone()
+        if old_check:
+            print("[db] Migrating call grading from 7-criteria to 14-criteria pass/fail rubric")
+            conn.execute("DELETE FROM call_grading_criteria")
+            _seed_call_grading_criteria(conn)
 
     # Seed team members from extension map on first run
     n_tm = conn.execute("SELECT COUNT(*) FROM call_team_members").fetchone()[0]
@@ -3177,34 +3186,59 @@ GROUP BY a.campaign_id, c.campaign_name;
 
 
 def _seed_call_grading_criteria(conn):
-    """Seed the 7 default Grafton Dental call grading criteria (from mango-call-analysis defaults)."""
+    """Seed the 14 pass/fail Grafton Dental call grading criteria.
+
+    Each criterion is scored Pass/Fail (or N/A when not applicable).
+    The weight column stores the point value earned on Pass (or auto-awarded on N/A).
+    Total possible = 100 points.
+    """
     now = datetime.now(timezone.utc).isoformat()
     criteria = [
-        (1,  "Enthusiasm & Warmth", 15,
-         "Did the team member sound enthusiastic, upbeat, and genuinely welcoming throughout the call? "
-         "People can feel your emotions over the phone — the goal is to sound bubbly and excited, not flat or rushed."),
-        (2,  "Proper Greeting", 10,
-         "Did the team member answer with the correct greeting: 'Thank you for calling [Practice], this is [Name], "
-         "how can I help you?' Was the call answered promptly (within 3 rings)?"),
-        (3,  "Call Control & Follow-Up Questions", 20,
-         "Did the team member take control of the call — answering the patient's question quickly and immediately "
-         "following up with their own question? Did they keep asking questions rather than letting the call go flat? "
-         "Did they ask 'How did you hear about us?'"),
-        (4,  "Information Collection", 20,
-         "For new patients, did the team member collect all 6 required pieces of information: "
-         "(1) Name, (2) Date of birth, (3) Email, (4) Cell phone, "
-         "(5) How they heard about the office, (6) Whether other family members need an appointment?"),
-        (5,  "Appointment Scheduling Technique", 15,
-         "Did the team member offer two specific appointment time options (prioritizing today and tomorrow)? "
-         "Did they ask about scheduling other family members? Did they repeat and confirm the appointment time? "
-         "Did they ask the patient to call ASAP if anything changes?"),
-        (6,  "Empathy & Concern Handling", 10,
-         "Did the team member show genuine empathy for patients in pain or distress? Did they handle cost and "
-         "insurance questions correctly — giving a price range then redirecting with a question — without "
-         "proactively asking about insurance unless the patient raised it?"),
-        (7,  "Active Listening & Clear Communication", 10,
-         "Did the team member practice 'silence is golden' — stop talking after asking a question and wait for "
-         "the patient to speak? Did they avoid TMI (too much information), keeping answers concise and not over-explaining?"),
+        (1,  "Greeted the caller", 10,
+         "Did the team member greet the caller with 'Thank you for calling...'? "
+         "Always evaluated."),
+        (2,  "Introduced herself", 10,
+         "Did the team member introduce herself by name? "
+         "Always evaluated."),
+        (3,  "Sounded bubbly and enthusiastic", 10,
+         "Did the team member sound unnaturally happy, awake, and excited? "
+         "Judge from language only — look for warm, welcoming word choices like 'Absolutely!', "
+         "'Of course!', 'We'd love to see you!' vs flat or disengaged phrasing. "
+         "Always evaluated."),
+        (4,  "Empathize with the patient", 5,
+         "Did the team member show empathy for the patient's situation, concern, or pain? "
+         "Always evaluated."),
+        (5,  "Took control of the call by asking questions", 10,
+         "Did the team member take control by asking questions rather than passively answering? "
+         "Always evaluated."),
+        (6,  "Asked when they were last here", 5,
+         "Did the team member ask 'When was the last time you were here?' This is asked on every call "
+         "instead of 'Are you a new patient?' so existing patients do not feel unrecognized. "
+         "Always evaluated."),
+        (7,  "Offered two appointment time choices", 5,
+         "Did the team member offer two specific appointment time options? "
+         "N/A if the caller already has a specific time in mind or the call does not involve scheduling."),
+        (8,  "Asked about referral source", 5,
+         "Did the team member ask how the patient heard about the practice? "
+         "Always evaluated."),
+        (9,  "Took permission for taking information", 5,
+         "Did the team member ask permission before collecting personal information (e.g. 'May I get some information from you?')? "
+         "N/A if no information collection was needed on the call."),
+        (10, "Took permission for putting on hold", 5,
+         "Did the team member ask permission before putting the caller on hold? "
+         "N/A if the call was never put on hold."),
+        (11, "Asked about family members who need to schedule", 5,
+         "Did the team member ask if any family members also need an appointment? "
+         "N/A for specialty consult calls (implants, surgery, etc.) or non-scheduling calls."),
+        (12, "Asked to let us know ASAP if schedule changes", 5,
+         "Did the team member ask the patient to call ASAP if anything changes in their schedule? "
+         "N/A if no appointment was scheduled on the call."),
+        (13, "Call less than 3 minutes", 5,
+         "Was the call completed in under 3 minutes? "
+         "Always evaluated — judge from transcript length and pacing."),
+        (14, "Scheduled the patient", 10,
+         "Was the patient successfully scheduled for an appointment? "
+         "N/A if the call purpose does not involve scheduling (e.g. billing question, lab follow-up)."),
     ]
     for sort_order, name, weight, description in criteria:
         conn.execute(
@@ -9488,7 +9522,7 @@ def set_call_grading_criteria(criteria: list) -> None:
 
 
 def reset_call_grading_criteria() -> None:
-    """Restore the 7 default Grafton criteria."""
+    """Restore the 14 default pass/fail Grafton criteria."""
     with _conn() as conn:
         conn.execute("DELETE FROM call_grading_criteria")
         _seed_call_grading_criteria(conn)

@@ -11456,6 +11456,40 @@ def admin_campaign_scheduled_new_patient_counts(days: int = 30):
     return counts
 
 
+@app.get("/api/admin/campaigns/showed-counts", dependencies=[Depends(_require_admin)])
+def admin_campaign_showed_counts():
+    """
+    Bulk endpoint: for every campaign, return the count of new patients who
+    actually SHOWED UP for their appointment (i.e. completed their consult —
+    future/scheduled-but-not-yet-happened appointments do NOT count).
+
+    Used by the frontend to compute CPAppt (Cost per Appointment) =
+    spend / showed_count.
+
+    A lead counts as "showed" if its pipeline stage reached 'showed' or
+    beyond (treatment_presented / treatment_accepted / treatment_completed),
+    or if the OD-synced appointment_status is 'complete' (AptStatus=2 in
+    OpenDental), or if showed_at has been populated. This mirrors the
+    showed-stage convention used elsewhere (see lqi_signals.py and the
+    scheduled-new-patient-counts endpoint above).
+    """
+    from database import _conn
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT campaign_name, COUNT(*) as cnt
+            FROM leads
+            WHERE campaign_name IS NOT NULL AND campaign_name != ''
+              AND COALESCE(existing_patient, 0) = 0
+              AND (
+                stage IN ('showed','treatment_presented','treatment_accepted','treatment_completed')
+                OR appointment_status = 'complete'
+                OR (showed_at IS NOT NULL AND showed_at != '')
+              )
+            GROUP BY campaign_name
+        """).fetchall()
+        return {r["campaign_name"]: r["cnt"] for r in rows}
+
+
 @app.get("/api/admin/campaigns/canceled-noshow-counts", dependencies=[Depends(_require_admin)])
 def admin_campaign_canceled_noshow_counts():
     """Bulk: for every campaign, return counts of canceled and no_show leads."""

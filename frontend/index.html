@@ -3790,7 +3790,16 @@ function _gradeBadge(score) {
   if (score == null) return <span style={{color:'var(--text-muted)'}}>—</span>;
   const color = score >= 80 ? '#16a34a' : score >= 60 ? '#d97706' : '#dc2626';
   return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
-    background:color+'22',color,border:`1px solid ${color}44`}}>{score}%</span>;
+    background:color+'22',color,border:`1px solid ${color}44`}}>{score}/100</span>;
+}
+
+function _passFailBadge(passVal) {
+  if (passVal === 'n/a' || passVal === 'N/A') return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
+    background:'#64748b22',color:'#64748b',border:'1px solid #64748b44'}}>N/A</span>;
+  if (passVal === true) return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
+    background:'#16a34a22',color:'#16a34a',border:'1px solid #16a34a44'}}>✓ Pass</span>;
+  return <span style={{padding:'1px 7px',borderRadius:10,fontSize:10,fontWeight:700,
+    background:'#dc262622',color:'#dc2626',border:'1px solid #dc262644'}}>✗ Fail</span>;
 }
 
 function _patientBadge(status, name) {
@@ -5264,7 +5273,7 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                   {call.grade_overall_score != null && (
                     <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
                       <div style={{fontSize:36,fontWeight:800,color:call.grade_overall_score>=80?'#16a34a':call.grade_overall_score>=60?'#d97706':'#dc2626'}}>
-                        {call.grade_overall_score}%
+                        {call.grade_overall_score}<span style={{fontSize:18,fontWeight:600,color:'var(--text-muted)'}}>/100</span>
                       </div>
                       {call.grade_overall_notes && (
                         <div style={{fontSize:12,color:'var(--text)',lineHeight:1.5,flex:1}}>{call.grade_overall_notes}</div>
@@ -5279,16 +5288,19 @@ function CallDetailDrawer({ call, onClose, onGrade, onAnalyze, updateCallInState
                       <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
                         <thead>
                           <tr style={{background:'var(--bg-card)'}}>
-                            {['Criterion','Score','Notes'].map(h=>(
+                            {['Criterion','Result','Points','Notes'].map(h=>(
                               <th key={h} style={{padding:'6px 8px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)'}}>{h}</th>
                             ))}
                           </tr>
                         </thead>
                         <tbody>
                           {scores.map((s,i)=>(
-                            <tr key={i} style={{borderBottom:'1px solid var(--border)'}}>
+                            <tr key={i} style={{borderBottom:'1px solid var(--border)',background:s.pass===false?'#dc262608':'transparent'}}>
                               <td style={{padding:'6px 8px',fontWeight:500}}>{s.criterion||s.name||'—'}</td>
-                              <td style={{padding:'6px 8px'}}>{_gradeBadge(s.score)}</td>
+                              <td style={{padding:'6px 8px'}}>{s.pass !== undefined ? _passFailBadge(s.pass) : _gradeBadge(s.score)}</td>
+                              <td style={{padding:'6px 8px',fontWeight:600,color:s.pass===false?'#dc2626':'var(--text)'}}>
+                                {s.earned !== undefined ? `${s.earned}/${s.points}` : `${s.score}%`}
+                              </td>
                               <td style={{padding:'6px 8px',color:'var(--text-muted)',fontSize:11}}>{s.notes||'—'}</td>
                             </tr>
                           ))}
@@ -5577,7 +5589,7 @@ function CallPerformanceSubView() {
                   <td style={{padding:'8px 12px',textAlign:'center',color:'var(--text-muted)'}}>{m.calls}</td>
                   <td style={{padding:'8px 12px',textAlign:'center'}}>
                     <span style={{fontWeight:700,fontSize:14,color:scoreColor(m.avg_score)}}>
-                      {m.avg_score != null ? m.avg_score + '%' : '—'}
+                      {m.avg_score != null ? m.avg_score + '/100' : '—'}
                     </span>
                   </td>
                   {orderedCriteriaNames.map(name => {
@@ -5585,7 +5597,7 @@ function CallPerformanceSubView() {
                     return (
                       <td key={name} style={{padding:'8px 12px',textAlign:'center'}}>
                         {val != null
-                          ? <span style={{fontWeight:600,color:scoreColor(val)}}>{val}%</span>
+                          ? <span style={{fontWeight:600,color:scoreColor(val)}}>{val}/100</span>
                           : <span style={{color:'var(--text-muted)'}}>—</span>}
                       </td>
                     );
@@ -5818,7 +5830,7 @@ function CallSettingsSubView() {
       <div style={{background:'#fff',border:'1px solid var(--border)',borderRadius:8,padding:'16px 20px'}}>
         {sectionHead('Grading Criteria')}
         <div style={{fontSize:11,color:'var(--text-muted)',marginBottom:10}}>
-          Each criterion is scored pass/fail during call analysis. Weights must sum to 100%.
+          Each criterion is scored Pass/Fail during call analysis. Points must sum to 100. Items marked N/A in context auto-award full points.
         </div>
         {critLoading && <div style={{color:'var(--text-muted)',fontSize:12}}>Loading…</div>}
         {!critLoading && (
@@ -5826,7 +5838,7 @@ function CallSettingsSubView() {
             <table style={{width:'100%',borderCollapse:'collapse',fontSize:12,marginBottom:12}}>
               <thead>
                 <tr style={{background:'var(--bg-card)'}}>
-                  {['Criterion','Description','Weight (%)','Enabled',''].map(h => (
+                  {['Criterion','Description','Points','Enabled',''].map(h => (
                     <th key={h} style={{padding:'6px 10px',textAlign:'left',fontWeight:600,fontSize:11,color:'var(--text-muted)',borderBottom:'1px solid var(--border)'}}>{h}</th>
                   ))}
                 </tr>
@@ -6655,6 +6667,7 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
   const [budgetConstrainedSaving, setBudgetConstrainedSaving] = useState(false);
   const [campCallAttrib, setCampCallAttrib] = useState({}); // {campaign_id: {total_calls, booked_calls, confirmed_appts, new_appts}}
   const [campApptCounts, setCampApptCounts] = useState({}); // {campaign_name: count} deduped new patients scheduled
+  const [campShowedCounts, setCampShowedCounts] = useState({}); // {campaign_name: count} new patients who showed (completed consult) — used for CPAppt
   const [apptModal, setApptModal] = useState(null); // {campaign_name, rows: [...]} or null
   const [apptFilter, setApptFilter] = useState('new'); // 'new' | 'existing' | 'all'
   const [aiReviewSaving, setAiReviewSaving] = useState({});
@@ -6786,6 +6799,10 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
         const apptCounts = await api(`/api/admin/campaigns/scheduled-new-patient-counts?days=${callDays}`);
         setCampApptCounts(apptCounts || {});
       } catch(e) { setCampApptCounts({}); }
+      try {
+        const showedCounts = await api(`/api/admin/campaigns/showed-counts`);
+        setCampShowedCounts(showedCounts || {});
+      } catch(e) { setCampShowedCounts({}); }
     } catch(e) { console.error('Failed to load unified campaigns', e); }
     finally { setUnifiedLoading(false); }
   }
@@ -7953,7 +7970,8 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
               <th className="num" title="New patients who scheduled from this campaign (form + call, deduped)">Appts</th>
               <th className="num">Cost</th>
               <th className="num">CPL</th>
-              <th className="num">ROI</th>
+              <th className="num">ROAS</th>
+              <th className="num" title="Total ad spend ÷ number of patients who showed up for their appointment (completed consult). Future/scheduled-only appointments don't count.">CPAppt</th>
               <th className="num" title="Attributed income — switch between 365d paid, lifetime paid, or planned production">
                 <span style={{display:'inline-flex',alignItems:'center',gap:6}}>
                   Income
@@ -8152,6 +8170,23 @@ function ReportsTab({ campaignStats, keywordStats, ga4Data, ga4Days, ga4Loading,
                             color: displayedRoi == null ? 'var(--text-muted)'
                                  : displayedRoi > 0 ? '#059669' : displayedRoi < 0 ? 'var(--red)' : 'var(--text-muted)'
                           }}>{displayedRoi != null ? displayedRoi+'%' : '—'}</td>
+
+                          {/* CPAppt = total ad spend ÷ patients who SHOWED UP (completed consult).
+                              Future/scheduled-but-not-yet-happened appointments don't count —
+                              showed_count comes from the showed-counts bulk endpoint, which only
+                              counts leads at stage showed/treatment_presented/treatment_accepted/
+                              treatment_completed (or OD appointment_status='complete'). */}
+                          {(() => {
+                            const showedCount = campShowedCounts[c.campaign_name] || 0;
+                            const cpAppt = (showedCount > 0 && (m.cost || 0) > 0)
+                              ? (m.cost / showedCount)
+                              : null;
+                            return (
+                              <td className="num" title={showedCount > 0 ? `${showedCount} patient${showedCount!==1?'s':''} showed (completed consult)` : 'No completed appointments yet'}>
+                                {cpAppt != null ? '$'+Math.round(cpAppt).toLocaleString() : '—'}
+                              </td>
+                            );
+                          })()}
 
                           {/* Income — leads attributed_income + call income (new patients) */}
                           {/* PR 2: tooltip shows Planned production + Paid 365d + Paid LTV breakdown */}

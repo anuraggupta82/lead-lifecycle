@@ -348,20 +348,25 @@ Transcript:
 """
 
 _GRADING_PROMPT = """\
-You are a call quality analyst for Grafton Dental Care. Grade the following phone call transcript based on the criteria below.
+You are a call quality analyst for Grafton Dental Care. Grade the following phone call transcript using a Pass/Fail checklist.
 
-For EACH criterion, provide:
-1. A score from 1-10 (10 = excellent)
-2. A brief explanation (1-2 sentences) justifying the score
+For EACH criterion, determine:
+1. "pass": true (the team member did this), false (they did not), or "n/a" (not applicable to this call)
+2. A brief explanation (1-2 sentences) justifying your judgment
 
-Grading Criteria:
+APPLICABILITY RULES — read the criterion description carefully:
+- Criteria marked "Always evaluated" must be scored Pass or Fail.
+- Criteria marked "N/A if..." should be scored "n/a" when the described condition applies. When a criterion is N/A, the employee earns full points automatically — they are not penalized for something that was not relevant to the call.
+
+Grading Criteria (with point values):
 {criteria_text}
 
 IMPORTANT RULES:
-- If the call is very short, a voicemail, or has no real conversation, give N/A for all criteria and explain why.
-- Be fair and realistic. A score of 7–8 represents solid, professional performance. Reserve 9–10 for exceptional calls and 1–3 for genuinely poor performance. Most competent calls should score 6–8.
+- If the call is very short, a voicemail, or has no real conversation, mark it as not gradeable.
 - Judge staff only on what is within their control. If a patient requests something the office cannot offer (e.g. weekend hours when the office is Mon–Thu), credit the staff for clearly explaining the limitation and offering alternatives.
-- The pre-recorded IVR greeting ("Thank you for calling Grafton Dental Care...") is NOT staff performance — ignore it entirely.
+- The pre-recorded IVR greeting ("Thank you for calling Grafton Dental Care...") is NOT staff performance — ignore it entirely. Only evaluate the live team member's words.
+- For "Sounded bubbly and enthusiastic": judge from word choice and language only (warm phrases like "Absolutely!", "Of course!", "We'd love to see you!" vs flat, disengaged phrasing). You cannot hear tone — infer energy from language.
+- For "Call less than 3 minutes": estimate from transcript length and conversation flow.
 - Never include PHI (patient names, phone numbers, dates of birth) in your response.
 - Keep all string values on a single line — do not use line breaks inside JSON string values.
 - Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
@@ -369,11 +374,14 @@ IMPORTANT RULES:
 {{
   "gradeable": true,
   "scores": [
-    {{"criterion": "Criterion Name", "score": 8, "explanation": "Brief justification"}},
+    {{"criterion": "Criterion Name", "pass": true, "points": 10, "explanation": "Brief justification"}},
+    {{"criterion": "Criterion Name", "pass": "n/a", "points": 5, "explanation": "Not applicable because..."}},
+    {{"criterion": "Criterion Name", "pass": false, "points": 5, "explanation": "Brief justification"}},
     ...
   ],
+  "total_earned": 85,
+  "total_possible": 100,
   "overall_notes": "1-2 sentence overall assessment of the call.",
-  "overall_score": 7.5,
   "recommendations": [
     "Specific, actionable coaching tip #1.",
     "Specific, actionable coaching tip #2.",
@@ -381,11 +389,17 @@ IMPORTANT RULES:
   ]
 }}
 
+For each criterion in scores:
+- "points" is the point value from the rubric (5 or 10)
+- If "pass" is true or "n/a", the employee earns those points. If false, they earn 0.
+- "total_earned" is the sum of points for all passed and n/a items.
+- "total_possible" is always 100.
+
 Guidelines for recommendations:
 - Write 2-3 concrete, specific recommendations (not vague like "be more professional").
-- Focus on the lowest-scoring criteria and what the staff member can do differently next time.
+- Focus on the failed criteria and what the staff member can do differently next time.
 - Phrase each as a direct coaching instruction.
-- If the call scored 9+ on all criteria, acknowledge strengths and suggest one stretch goal.
+- If all criteria passed, acknowledge strengths and suggest one stretch goal.
 - Never include PHI in recommendations.
 
 If the call is not gradeable (voicemail, empty, too short), respond with:
@@ -631,7 +645,7 @@ def _grade(transcript: str, vertex_project_id: str, vertex_location: str,
 
     criteria = db.get_call_grading_criteria()
     criteria_lines = [
-        f"{i}. {c['name']} (Weight: {c['weight']}%): {c['description']}"
+        f"{i}. {c['name']} ({c['weight']} pts): {c['description']}"
         for i, c in enumerate(criteria, 1)
         if c.get("enabled", 1)
     ]
@@ -1109,33 +1123,27 @@ def process_call(call_row: dict, mango_token: Optional[str] = None) -> None:
 
                 gradeable = bool(grade.get("gradeable"))
                 if gradeable:
-                    # Normalise 1–10 scores → 0–100 scale and rename explanation→notes
+                    # Pass/Fail scoring: each criterion has pass (true/false/"n/a") and points
                     raw_scores = grade.get("scores", [])
-                    normalised_scores = [
-                        {
+                    normalised_scores = []
+                    total_earned = 0
+                    for s in raw_scores:
+                        pass_val = s.get("pass", False)
+                        points = int(s.get("points", 0))
+                        # pass=true or pass="n/a" → full points; pass=false → 0
+                        earned = points if (pass_val is True or pass_val == "n/a") else 0
+                        total_earned += earned
+                        # Store score as 100 (pass/n/a) or 0 (fail) for backward compat
+                        normalised_scores.append({
                             "criterion": s.get("criterion", s.get("name", "")),
-                            "score": round(float(s.get("score", 0)) * 10),
+                            "score": 100 if earned > 0 else 0,
+                            "pass": pass_val,
+                            "points": points,
+                            "earned": earned,
                             "notes": s.get("explanation", s.get("notes", "")),
-                        }
-                        for s in raw_scores
-                    ]
-                    raw_overall = float(grade.get("overall_score") or 0)
-                    # Guard: if Gemini returned overall_score=0 but criterion scores
-                    # exist (e.g. family-member call where overall was skipped),
-                    # compute from the mean of criterion scores (already on 0-100 scale).
-                    if raw_overall == 0 and normalised_scores:
-                        # M5 fix: criterion scores are already 0-100; compute mean directly
-                        _crit_scores = [s["score"] for s in normalised_scores if s["score"] > 0]
-                        if _crit_scores:
-                            overall_pct = round(sum(_crit_scores) / len(_crit_scores))
-                            log.info(
-                                "[pipeline] overall_score was 0 — computed from criterion mean: "
-                                "%d%% for %s", overall_pct, uuid
-                            )
-                        else:
-                            overall_pct = 0  # no non-zero criterion scores either
-                    else:
-                        overall_pct = round(raw_overall * 10)
+                        })
+                    # Use Gemini's total if provided, else compute ourselves
+                    overall_pct = int(grade.get("total_earned", total_earned))
                     scores_json = json.dumps(normalised_scores)
                     recs_json = json.dumps(grade.get("recommendations", []))
                     db.update_mango_call_analysis(

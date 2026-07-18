@@ -367,8 +367,8 @@ def match_leads_to_od() -> dict:
                                 _match_type = dict(_kw_row).get("match_type", "")
                         except Exception:
                             pass
-                        # Determine appointment date from apt_info
-                        _apt_date = apt_info.get("next_apt_date", "")
+                        # Determine appointment date from apt_info (first/consult apt)
+                        _apt_date = apt_info.get("first_apt_date", "")
                         if not _apt_date and apt_info.get("last_complete_date"):
                             _apt_date = str(apt_info["last_complete_date"])[:10]
                         append_keyword_production_log(
@@ -429,7 +429,7 @@ def match_leads_to_od() -> dict:
                                 _match_type = dict(_kw_row).get("match_type", "")
                         except Exception:
                             pass
-                        _apt_date = apt_info.get("next_apt_date", "")
+                        _apt_date = apt_info.get("first_apt_date", "")
                         if not _apt_date and apt_info.get("last_complete_date"):
                             _apt_date = str(apt_info["last_complete_date"])[:10]
                         from database import append_keyword_production_log
@@ -522,6 +522,11 @@ def sync_treatment_stages() -> dict:
                 # Update production, income, appointment info, treatment_plan_value, and od_relationship
                 lconn = _get_sqlite()
                 now = datetime.now(timezone.utc).isoformat()
+                # If income changed, clear payment_synced_at so the payment
+                # sync step re-queries OD for this lead's paid_amount_365d/ltv.
+                prev_income = float(lead.get("attributed_income") or 0)
+                income_changed = abs(income - prev_income) > 0.01
+
                 lconn.execute("""
                     UPDATE leads SET
                         attributed_production=?,
@@ -531,16 +536,18 @@ def sync_treatment_stages() -> dict:
                         appointment_status=?,
                         no_show_count=?,
                         od_relationship=?,
+                        payment_synced_at = CASE WHEN ? = 1 THEN '' ELSE payment_synced_at END,
                         updated_at=?
                     WHERE id=?
                 """, (
                     production["total"],
                     income,
                     tp_status["plan_value"],
-                    apt_info.get("next_apt_date", ""),
+                    apt_info.get("first_apt_date", ""),
                     apt_info.get("status", ""),
                     apt_info.get("broken_count", 0),
                     od_rel,
+                    1 if income_changed else 0,
                     now,
                     lead["id"],
                 ))
@@ -742,7 +749,9 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
         "broken_count": 0,
         "next_apt_date": "",
         "next_apt_datetime": "",   # full ISO datetime of next scheduled appointment
-        "status": "",
+        "status": "",              # status of the FIRST (consult) appointment
+        "first_apt_date": "",      # date of the earliest appointment (consult)
+        "first_apt_status": "",    # status of the earliest appointment
         "last_complete_date": None,  # datetime | None — used by _compute_od_relationship
         "latest_scheduled_note": "",  # Note text of most recent Scheduled apt (for ATTR: marker)
     }
@@ -760,6 +769,11 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
             """, [int(pat_num)])
             rows = cur.fetchall()
 
+            # Track earliest appointment (consult) — rows are DESC so last
+            # relevant row we see is the earliest.
+            earliest_apt_date = None
+            earliest_apt_status = None
+
             for row in rows:
                 status = int(row[0])
                 apt_date = row[1]  # datetime object from pymysql
@@ -768,11 +782,17 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
                 if status == 5:  # Broken
                     result["has_broken"] = True
                     result["broken_count"] += 1
+                    if apt_date:
+                        earliest_apt_date = apt_date
+                        earliest_apt_status = "broken"
                 elif status == 2:  # Complete
                     result["has_showed"] = True
                     # Capture only the MOST RECENT completed apt (rows are DESC so first wins)
                     if result["last_complete_date"] is None and apt_date:
                         result["last_complete_date"] = apt_date  # keep as datetime
+                    if apt_date:
+                        earliest_apt_date = apt_date
+                        earliest_apt_status = "complete"
                 elif status == 1:  # Scheduled
                     result["has_scheduled"] = True
                     if apt_date:
@@ -781,12 +801,23 @@ def _get_appointment_info(conn, pat_num: str) -> dict:
                     # Capture Note from the FIRST (most recent) scheduled apt only
                     if not result["latest_scheduled_note"] and note_text:
                         result["latest_scheduled_note"] = note_text
+                    if apt_date:
+                        earliest_apt_date = apt_date
+                        earliest_apt_status = "scheduled"
 
-            # Determine overall status string
-            if result["has_scheduled"]:
-                result["status"] = "scheduled"
+            # Store first (consult) appointment info
+            if earliest_apt_date:
+                result["first_apt_date"] = str(earliest_apt_date)[:10]
+                result["first_apt_status"] = earliest_apt_status
+
+            # Display status = first appointment status (consult-centric)
+            # Stage transitions use has_showed/has_scheduled/has_broken directly.
+            if earliest_apt_status:
+                result["status"] = earliest_apt_status
             elif result["has_showed"]:
                 result["status"] = "complete"
+            elif result["has_scheduled"]:
+                result["status"] = "scheduled"
             elif result["has_broken"]:
                 result["status"] = "broken"
 
