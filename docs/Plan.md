@@ -1,6 +1,6 @@
 # Marketing Project — Central Plan & Execution Tracker
 
-**Grafton Dental Care**  ·  Last updated: 2026-07-11 (Session 6)
+**Grafton Dental Care**  ·  Last updated: 2026-07-18 (Session 19)
 
 > **How this file works.** This is the single place to see *what we're working on and what's next* across the whole marketing effort. It pairs with **`Marketing project details and status.md`** (facts & current status). Flow: we **add plans here** → build (Sonnet builds, Opus verifies, ask before git push) → when done, **update the status doc** and mark the item `[DONE]` here. Big topics get their **own detailed plan file** (e.g. the attribution plan) — registered in §5 with its location, and summarized here.
 >
@@ -403,6 +403,25 @@ Fields to populate:
 **Problem 2:** Pipeline cards showed caller-ID-style names (ALL CAPS, commas, city/state) instead of patient names. Existing leads finalized before the §2.3n code change were stuck.
 **Fix (main.py):** Added `POST /api/admin/calls/fix-caller-id-names` endpoint. Finds leads with caller-ID names, updates from `od_patient_name` (priority) or `ai_patient_name` via linked `mango_calls`. Supports dry_run. Fixed 10 leads on first run.
 
+### §2.3q Payment Sync Auto-Trigger `[DONE — Session 19, commit a386455]`
+
+**Problem:** When the OD matcher updated `attributed_income` (live SUM from paysplit), the campaign table's income column (`paid_amount_365d`) didn't update because `sync_od_payments()` skipped leads synced within `days_back=7` via the `payment_synced_at` staleness guard.
+
+**Fix (od_matcher.py):** Compare prev vs new `attributed_income`; if changed (>$0.01 tolerance), clear `payment_synced_at` so step 5 of the unified sync chain re-queries OD.
+
+**Verified:** Claire Richard's campaign income updated from $24,178 to $47,155 after OD sync.
+
+### §2.3r Campaign Table Improvements — ROAS + CPAppt + First-Apt Status `[DONE — Session 19, commit a386455]`
+
+- **ROI → ROAS:** Renamed the column header in the campaign table (calculation unchanged — Revenue/Spend).
+- **CPAppt (Cost per Appointment):** New column = Total Spend / patients who showed (completed appointments only). New backend endpoint `/api/admin/campaigns/showed-counts`. Showed = stage in (showed/treatment_presented/accepted/completed) OR appointment_status='complete' OR showed_at populated. Shows "$1,434" for nXtsmile.
+- **First-appointment status tracking:** `_get_appointment_info()` (od_matcher.py) previously prioritized "scheduled" over "complete" — Claire showed "scheduled" (next apt 2026-08-10) despite completing her consult with $47K income. Now tracks the earliest appointment (consult); `appointment_date`/`appointment_status` show the first apt, not the latest scheduled. Stage transitions (`has_showed`/`has_scheduled`/`has_broken`) unchanged — only display changed.
+- **Server management scripts:** `start.sh`/`stop.sh` — PID file management, graceful SIGTERM-first shutdown, port-free check. `.gitignore` updated for `server.pid`.
+- **Slow page load fix:** bloated WAL file (40MB, recurrence of Jul 5 issue) forced full scans on every parallel mount-time API query. `PRAGMA wal_checkpoint(TRUNCATE)` dropped page load from 30s to 8ms. TODO: add periodic auto-checkpoint to prevent recurrence.
+- **database.py NameError fix:** migration code used `log.info()` with no logger defined → crash on startup when old 7-criteria grading exists. Fixed to `print()`.
+- **Call grading overhaul** (pre-existing, committed): 7-criteria numeric scoring → 14-criteria pass/fail rubric (100pts); updated prompt + response parsing in mango_pipeline.py.
+- **Blocker found:** `gcloud auth application-default login` needed — Firestore sync failing with RefreshError.
+
 ### §2.3g Local Whisper Support `[PLAN — P3]`
 
 **Problem:** All transcription currently goes through OpenAI's cloud API ($0.006/min). For high call volume, local Whisper on Mac Mini (or GPU server) would eliminate per-call cost.
@@ -441,16 +460,77 @@ Fields to populate:
 - `[QUEUED]` **P2** Plan Mac Mini → Cloud Run migration for the dashboard (after math consolidation).
 - `[PLAN]` **P2** Test coverage + CI gate for money math.
 
+### §2.9 Facebook Retargeting Campaign (Meta)  *(ref: `project_facebook_retargeting_jun30.md`)*
+
+**Goal:** Retarget nxtsmile.com visitors via Meta/Facebook ads to convert warm traffic into consult bookings.
+
+**Infrastructure already done (Jun 30 2026):**
+- Meta Pixel (`1024139923307877`) installed + verified (PageView + ViewContent firing)
+- Server-side CAPI (`_send_meta_capi_lead()`) live on Cloud Run — SHA-256 hashed PII, `await`-based (no fire-and-forget)
+- `META_PIXEL_ACCESS_TOKEN` in Cloud Run env vars
+- Data source restriction: "Health & wellness provider" — review rejected; CAPI bypasses browser-side blocks
+- CTA decision: drive to nxtsmile.com (not phone or instant form) — AI smile preview reduces friction
+
+**Setup steps:**
+1. `[QUEUED — P1]` **Create AI video ad.** Use Creatify for AI avatar video (9:16, 30s). 4 retargeting scripts already written (validation / cost / fear / candidacy angles). Finish selected script, generate video.
+2. `[QUEUED — P1]` **Build Custom Audience** in Meta Ads Manager: Website visitors → last 180 days → nxtsmile.com. Need ~100 visitors minimum before Meta will serve ads.
+3. `[QUEUED — P1]` **Launch retargeting campaign.** Objective: Traffic (not Conversions) until Lead restriction lifts. Start with AI video creative.
+4. `[QUEUED — P2]` **Testimonial videos.** Research videographer/editor to create emotional patient testimonial videos from real cases. Replace AI video with these once available. Multiple versions for A/B testing.
+5. `[QUEUED — P1]` **Lead lifecycle tracking for Meta.** Ensure Meta-sourced leads are properly attributed in lead lifecycle dashboard — verify `source` field captures Meta/Facebook origin, UTM params flow through, and pipeline board shows correct attribution. Test end-to-end: ad click → nxtsmile form → lead in dashboard with Meta attribution.
+6. `[QUEUED — P2]` **Re-appeal data source category** once CAPI is confirmed working with real leads — shows Meta we have direct server integration.
+
+### §2.10 nXtsmile Blog — Full-Arch Case Studies
+
+**Goal:** Build organic traffic to nxtsmile.com through case study blog content. Patients are arriving from Google search and ChatGPT directly to nxtsmile.com — a blog captures and converts this organic interest.
+
+**Strategy shift (owner decision Jul 17 2026):** Previous rule (PROJECT_STATUS.md #10, ORGANIC_STRATEGY_YEAR1.md) kept all blog content on graftondentalcare.com with CTAs to nxtsmile. Owner now wants a blog directly on nxtsmile.com for case studies. Rationale: nxtsmile.com is already receiving direct organic/AI traffic; case studies on the same domain keep visitors engaged without a domain switch.
+
+**Content plan:**
+- **Cadence:** Start at 1 post/month, increase over time
+- **Format:** Each post covers a real patient case — their unique situation, challenges, and how the full-arch restoration was handled
+- **YouTube integration:** Some posts will include an embedded YouTube video of the case (owner-produced)
+- **Focus:** Full-arch restoration / All-on-X only (aligned with nxtsmile positioning)
+
+**Technical implementation (research needed before build):**
+- nxtsmile.com is static HTML + FastAPI on Cloud Run (no CMS, no WordPress)
+- Options to evaluate:
+  1. **Static HTML blog pages** — hand-coded, served by existing Cloud Run setup. Simplest, no new dependencies. Each post is an HTML file with shared header/footer template.
+  2. **Static site generator** (e.g., Hugo, Eleventy) — markdown-based authoring, auto-generates HTML. Better for scaling past ~10 posts.
+  3. **Headless CMS** (e.g., Ghost, Strapi, Contentful) — richest editing experience, overkill for 1/month cadence initially.
+  4. **FastAPI blog routes** — serve blog content from database/markdown via existing backend. Keeps everything in one codebase.
+- **Recommendation:** Start with option 1 (static HTML) for speed. Migrate to option 2 if cadence increases past 2/month.
+- Need: `/blog/` route, blog index page, individual post template, meta tags for SEO, structured data (Article schema), sitemap update, GSC already verified (Jul 7)
+
+### §2.11 Lead Lifecycle Reporting Optimization
+
+**Goal:** Continuously improve lead lifecycle dashboard reporting based on owner observation and real-world usage.
+
+- `[ONGOING]` **Observation-driven refinements.** As owner reviews the dashboard in daily use, note any confusing metrics, missing data, or incorrect attributions. Fix iteratively — no fixed scope, driven by what surfaces.
+- `[ONGOING]` **Pipeline board accuracy.** Ensure stage transitions, lead counts, and attribution labels reflect reality. Correct any misclassifications as they're discovered (e.g., existing-patient handling per §2.3m).
+
+### §2.12 GAds Campaign Analysis & Optimization (Claude-Driven)
+
+**Goal:** Use Claude + GDC Marketing MCP tools to regularly analyze Google Ads campaign performance and recommend optimizations.
+
+- `[QUEUED — P1]` **Automated performance review.** Claude accesses GAds reports via MCP (get_campaign_performance, get_search_terms, get_keyword_landscape, get_geo_performance, get_device_performance) to analyze spend, conversions, CPA, and ROAS.
+- `[QUEUED — P1]` **Search term analysis.** Regular review of search terms for negative keyword opportunities, wasted spend, and new keyword ideas.
+- `[QUEUED — P2]` **Bid & budget optimization.** Use keyword bid estimates, click share data, and auction insights to recommend bid adjustments and budget reallocation.
+- `[QUEUED — P2]` **Scheduled analysis cadence.** Set up periodic (weekly or bi-weekly) Claude-driven campaign review with actionable recommendations for owner approval.
+
 ---
 
 ## §3 Sequenced roadmap (suggested order)
 
-1. **Attribution cleanup** (§2.1) — start Phase 1.1 (classifier) + 1.1b backfill; do the CallRail/Google CDF config checks in parallel. *← current focus.*
-2. **Stop-the-bleeding safety** (§2.4 false-confirm email, §2.7 secrets, §2.2 optimizer kill switch, §2.8 monitoring/backups).
-3. **Dashboard calculation fixes** (§2.2 double-count, CPL, pacing) + call-analysis gating (§2.3).
-4. **graftondentalcare gclid + forms** (§2.5) to complete end-to-end capture.
-5. **Structural** — consolidate math + tests/CI (§2.2), then plan cloud migration (§2.8).
-6. **Conversion upload** (§2.1, deferred) once attribution is trustworthy.
+1. **Facebook retargeting campaign** (§2.9) — finish AI video, build audience, launch campaign, verify lead lifecycle tracking. *← next up.*
+2. **nXtsmile blog setup** (§2.10) — build blog infrastructure, publish first case study post.
+3. **GAds analysis & optimization** (§2.12) — Claude-driven campaign reviews via MCP tools.
+4. **Lead lifecycle reporting** (§2.11) — ongoing, observation-driven refinements.
+5. **Attribution cleanup** (§2.1) — Phase 1.1 (classifier) + 1.1b backfill; CallRail/Google CDF config checks in parallel.
+6. **Stop-the-bleeding safety** (§2.4 false-confirm email, §2.7 secrets, §2.2 optimizer kill switch, §2.8 monitoring/backups).
+7. **Dashboard calculation fixes** (§2.2 double-count, CPL, pacing) + call-analysis gating (§2.3).
+8. **graftondentalcare gclid + forms** (§2.5) to complete end-to-end capture.
+9. **Structural** — consolidate math + tests/CI (§2.2), then plan cloud migration (§2.8).
+10. **Conversion upload** (§2.1, deferred) once attribution is trustworthy.
 
 ---
 
@@ -477,6 +557,7 @@ Fields to populate:
 
 ## §6 Recently completed
 
+- **2026-07-17/18 (Session 19, commit a386455)** — **§2.3q payment sync auto-trigger** (od_matcher.py clears `payment_synced_at` on `attributed_income` change so campaign income refreshes without waiting out the 7-day staleness guard; verified Claire Richard $24,178 → $47,155). **§2.3r campaign table improvements**: ROI column renamed ROAS; new CPAppt column (spend / showed patients, new `/api/admin/campaigns/showed-counts` endpoint); first-appointment (not latest-scheduled) status tracking in `_get_appointment_info()`. Also: `start.sh`/`stop.sh` server scripts, slow-page-load fix (WAL checkpoint, 30s→8ms), database.py NameError fix (log.info→print), call grading overhaul (7-criteria numeric → 14-criteria pass/fail rubric). Blocker: `gcloud auth application-default login` needed for Firestore sync. Prior to this: nXtsmile lead notification email overhaul (urgent subject, parsed concern rows, funnel/progress-bar UI fixes; commits c05c159/b673f98/58985f8). Full detail: `SESSION_SUMMARY_2026-07-17.md`.
 - **2026-07-11 (Session 6 cont.)** — **Task #13 automated campaign status sync SHIPPED (code, UNCOMMITTED).** New `sync_all_campaign_statuses_from_gads()` + shared `_map_gads_status_to_db()` helper + wired into 6 AM `_gads_morning_refresh_job` + on-demand `POST /api/admin/campaigns/sync-statuses` endpoint (all `backend/main.py`). Verified read-only vs live data — caught "Emergency Dentistry" ACTIVE-in-DB / PAUSED-in-GAds. End-to-end write-test started but **interrupted (not yet confirmed)**. Found pre-existing bug: manual sync-from-gads never persisted status (`update_campaign_fields` drops non-whitelisted `status`) — relevant to item #7. **Infra:** installed `com.grafton.pipeline.plist` under launchd (KeepAlive+RunAtLoad) so the dashboard can be restarted via `launchctl kickstart -k gui/$(id -u)/com.grafton.pipeline` (owner granted standing restart permission). First load hit exit-78 (missing `/usr/local/var/log`); fixed by repointing installed-plist logs to `~/Library/Logs/grafton-pipeline.log` — server live under launchd (PID 15806). **TODO:** repo plist still has the `/usr/local/var/log` path — fix before a fresh install. Full detail: `SESSION_SUMMARY_2026-07-11.md`.
 - **2026-07-11 (Session 5+6)** — **Concurrency throttle** (Semaphore(2)) fixed file descriptor exhaustion; 395 calls attributed on 90-day reconcile. **CallRail source case fix** ("Google Ads" vs "google_ads") in 6+ files — Paul Varghese now correctly shows "Ad call" + Gemini inferred "nXtsmile Implants". **Campaign sync investigation** — root cause of T,a's wrong "Dentures" attribution: no automated GAds→dashboard campaign status sync; paused campaigns with 30-day impressions leak into Gemini context. Plan created: daily status sync cron + paused_at/activated_at fields + Gemini context filter + lead-campaign sync + patient name extraction. CallRail pool bumped 4→5 numbers (deactivated idle "First Number"). **UNCOMMITTED:** source case fixes, campaign context rewrite, force parameter on infer-campaigns.
 - **2026-07-10 (Session 4)** — **Phone linking bug FIXED** (REPLACE chain for formatted Mango numbers; 7/8 GAds calls now linked). **Auto-transcription gate FIXED** (DNI pool no longer forces google_ads). **Gemini inference VERIFIED WORKING** (1 inferred — wrong campaign due to stale context; JSON parse fix for markdown fences; max_tokens 300→1200; response_mime_type removed). Manual reconcile now does 90-day relink before attribution. Vertex block-reason logging added.
